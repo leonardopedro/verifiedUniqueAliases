@@ -1,0 +1,6 @@
+flask
+gunicorn
+requests
+azure-identity
+azure-keyvault-secrets
+python-jose[cryptography]
