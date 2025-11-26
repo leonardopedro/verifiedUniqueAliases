@@ -58,7 +58,7 @@ sed -i "s|x86_64-unknown-linux-musl|$BUILD_TARGET|g" \
 # Build initramfs
 echo "🔨 Building initramfs with dracut..."
 
-KERNEL_VERSION=$(uname -r)
+KERNEL_VERSION=$(find /lib/modules -maxdepth 1 -type d -name "[0-9]*" | xargs basename)
 OUTPUT_FILE="initramfs-paypal-auth.img"
 
 dracut \
