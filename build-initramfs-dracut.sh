@@ -46,13 +46,13 @@ fi
 
 # Prepare local dracut module
 echo "📋 Preparing local dracut module..."
-chmod +x dracut-module/paypal-auth-vm/*.sh
+chmod +x dracut-module/99paypal-auth-vm/*.sh
 
 # Update module-setup.sh with correct build path
 sed -i "s|/build/paypal-auth-vm|$BUILD_DIR|g" \
-    dracut-module/paypal-auth-vm/module-setup.sh
+    dracut-module/99paypal-auth-vm/module-setup.sh
 sed -i "s|x86_64-unknown-linux-musl|$BUILD_TARGET|g" \
-    dracut-module/paypal-auth-vm/module-setup.sh
+    dracut-module/99paypal-auth-vm/module-setup.sh
 
 
 # Build initramfs
@@ -66,7 +66,7 @@ dracut \
     --kver "$KERNEL_VERSION" \
     --conf ./dracut.conf \
     --confdir . \
-    --add "paypal-auth-vm" \
+    --add "99paypal-auth-vm" \
     --tmpdir $HOME/dracut-build \
     "$OUTPUT_FILE"
 
