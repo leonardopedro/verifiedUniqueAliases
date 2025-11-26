@@ -11,14 +11,28 @@
     #pkgs.python311Packages.pip
     # pkgs.nodejs_20
     # pkgs.nodePackages.nodemon
-    pkgs.curl,
-    pkgs.build-essential,
-    pkgs.musl-tools,
-    pkgs.musl-dev
+    pkgs.curl
+    pkgs.gcc
+    pkgs.gnumake
+    pkgs.rustup
+    pkgs.dracut
+    pkgs.linux
+    pkgs.musl
+    pkgs.musl.dev
+    pkgs.pkgsMusl.stdenv.cc
   ];
 
   # Sets environment variables in the workspace
-  env = {};
+  env = { # Tell Cargo to use 'musl-gcc' for the musl target instead of guessing
+    CC_x86_64_unknown_linux_musl = "musl-gcc";
+    CXX_x86_64_unknown_linux_musl = "musl-g++";
+    
+    # Linker configuration
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "musl-gcc";
+    
+    # Optional: Archive tool
+    AR_x86_64_unknown_linux_musl = "ar";
+    };
   idx = {
     # Search for the extensions you want on https://open-vsx.org/ and use "publisher.id"
     extensions = [
