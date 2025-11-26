@@ -20,6 +20,8 @@
     pkgs.musl
     pkgs.musl.dev
     pkgs.pkgsMusl.stdenv.cc
+    pkgs.docker
+    pkgs.docker-compose
   ];
 
   # Sets environment variables in the workspace
@@ -33,6 +35,9 @@
     # Optional: Archive tool
     AR_x86_64_unknown_linux_musl = "ar";
     };
+
+  services.docker.enable = true;
+
   idx = {
     # Search for the extensions you want on https://open-vsx.org/ and use "publisher.id"
     extensions = [
