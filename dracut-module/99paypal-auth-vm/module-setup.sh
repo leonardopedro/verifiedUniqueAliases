@@ -1,4 +1,31 @@
 #!/bin/bash
+
+# dracut module setup script for paypal-auth-vm
+
+# Called by dracut to check if the module should be included.
+check() {
+    # Always include this module.
+    return 0
+}
+
+# Called by dracut to list module dependencies.
+depends() {
+    # Add any modules your custom module depends on.
+    # e.g. echo " network base shutdown "
+    return 0
+}
+
+# Called by dracut to install the module files.
+install() {
+    # Install the main rust binary.
+    # The path /home/user/verifieduniquealiases/target/x86_64-unknown-linux-musl/release/paypal-auth-vm
+    # is a placeholder that will be replaced by the build script.
+    inst_simple "/home/user/verifieduniquealiases/target/x86_64-unknown-linux-musl/release/paypal-auth-vm" "/usr/bin/paypal-auth-vm"
+
+    # Install the helper script.
+    inst_simple "$moddir/init-disk.sh" "/usr/bin/init-disk.sh"
+}
+#!/bin/bash
 # module-setup.sh - Dracut module setup script
 
 check() {
