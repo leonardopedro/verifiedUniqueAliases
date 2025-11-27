@@ -72,4 +72,4 @@ WORKDIR /output
 
 # 12. Expose the output of the build
 FROM scratch AS export-stage
-COPY --from=builder /output/ .
+COPY --from=builder /output/ ./img/
