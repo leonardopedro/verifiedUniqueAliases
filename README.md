@@ -320,8 +320,6 @@ See `src/main.rs` for the full implementation.
 
 ## Part 4: Reproducible Initramfs with Dracut
 
-### Option A: Build with Docker (Recommended)
-
 This method ensures a bit-for-bit reproducible build by using a fixed environment (Fedora Minimal + specific Rust version).
 
 1.  **Build and Export Artifacts**:
@@ -336,89 +334,7 @@ This method ensures a bit-for-bit reproducible build by using a fixed environmen
     - `build-manifest.json`: Metadata about the build (versions, hashes).
     - `initramfs-paypal-auth.img.sha256`: Checksum for verification.
 
-### Option B: Manual Build (For Development)
 
-### Step 4.1: Install Dracut
-
-```bash
-# On your build machine (Debian/Ubuntu)
-sudo apt-get update
-sudo apt-get install -y dracut dracut-core
-
-# On Fedora/RHEL
-sudo dnf install -y dracut
-```
-
-### Step 4.2: Create Dracut Module
-
-Create the directory structure for the custom module:
-
-```bash
-mkdir -p dracut-module/99paypal-auth-vm
-cd dracut-module/99paypal-auth-vm
-```
-
-### Step 4.3: module-setup.sh
-
-See `dracut-module/99paypal-auth-vm/module-setup.sh`.
-
-### Step 4.4: parse-paypal-auth.sh
-
-```bash
-#!/bin/sh
-# parse-paypal-auth.sh - Early boot configuration
-
-type getarg >/dev/null 2>&1 || . /lib/dracut-lib.sh
-
-# Fetch metadata from OCI
-fetch_metadata() {
-    local key=$1
-    curl -sf -H "Authorization: Bearer Oracle" \
-        "http://169.254.169.254/opc/v1/instance/metadata/$key"
-}
-
-# Wait for network
-while ! curl -sf http://169.254.169.254/ >/dev/null 2>&1; do
-    echo "Waiting for metadata service..."
-    sleep 1
-done
-
-# Export configuration
-export PAYPAL_CLIENT_ID=$(fetch_metadata paypal_client_id)
-export DOMAIN=$(fetch_metadata domain)
-export SECRET_OCID=$(fetch_metadata secret_ocid)
-export OCI_REGION=$(curl -sf http://169.254.169.254/opc/v2/instance/region)
-export NOTIFICATION_TOPIC_ID=$(fetch_metadata notification_topic_id)
-
-# Persist for later stages
-{
-    echo "PAYPAL_CLIENT_ID=$PAYPAL_CLIENT_ID"
-    echo "DOMAIN=$DOMAIN"
-    echo "SECRET_OCID=$SECRET_OCID"
-    echo "OCI_REGION=$OCI_REGION"
-    echo "NOTIFICATION_TOPIC_ID=$NOTIFICATION_TOPIC_ID"
-} > /run/paypal-auth.env
-```
-
-### Step 4.6: start-app.sh
-
-```bash
-#!/bin/sh
-# start-app.sh - Start the Rust application
-
-. /run/paypal-auth.env
-
-# Create runtime directories
-mkdir -p /run/certs
-mkdir -p /tmp/acme-challenge
-
-# The Rust application will handle ACME certificate acquisition
-# We just need to exec into it
-echo "Starting PayPal Auth application..."
-
-# Execute application (this replaces init)
-exec /bin/paypal-auth-vm
-```
 
 ---
 
