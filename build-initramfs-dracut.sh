@@ -28,11 +28,10 @@ rustup target add $BUILD_TARGET 2>/dev/null || true
 # These flags ensure deterministic output:
 # - target-cpu=generic: Avoid host-specific optimizations
 # - codegen-units=1: Single codegen unit for deterministic output
-# - embed-bitcode=no: Don't embed LLVM bitcode (can vary)
 # - strip=symbols: Strip debug symbols for smaller, deterministic binary
-export RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C embed-bitcode=no -C strip=symbols"
+export RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C strip=symbols"
 
-# Ensure reproducible build
+# Ensure reproducible build with LTO
 export CARGO_PROFILE_RELEASE_LTO=true
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
 
