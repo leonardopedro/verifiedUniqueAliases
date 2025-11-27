@@ -24,11 +24,24 @@ echo "📦 Building Rust application for $BUILD_TARGET..."
 # Add target if not already added
 rustup target add $BUILD_TARGET 2>/dev/null || true
 
-# Build Rust binary (reproducible)
-export RUSTFLAGS="-C target-cpu=generic"
+# Build Rust binary with full reproducibility flags
+# These flags ensure deterministic output:
+# - target-cpu=generic: Avoid host-specific optimizations
+# - codegen-units=1: Single codegen unit for deterministic output
+# - embed-bitcode=no: Don't embed LLVM bitcode (can vary)
+# - strip=symbols: Strip debug symbols for smaller, deterministic binary
+export RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C embed-bitcode=no -C strip=symbols"
+
+# Ensure reproducible build
+export CARGO_PROFILE_RELEASE_LTO=true
+export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
 
 cargo build --release --target $BUILD_TARGET
-strip target/$BUILD_TARGET/release/paypal-auth-vm
+# Strip the binary for smaller size and reproducibility
+strip --strip-all target/$BUILD_TARGET/release/paypal-auth-vm
+
+# Normalize the binary timestamp to SOURCE_DATE_EPOCH
+touch -d "@${SOURCE_DATE_EPOCH}" target/$BUILD_TARGET/release/paypal-auth-vm
 
 BINARY_SIZE=$(du -h target/$BUILD_TARGET/release/paypal-auth-vm | cut -f1)
 echo "📊 Binary size: $BINARY_SIZE"
@@ -46,6 +59,10 @@ sed -i "s|/build/paypal-auth-vm|$BUILD_DIR|g" \
 sed -i "s|x86_64-unknown-linux-gnu|$BUILD_TARGET|g" \
     /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
 
+# CRITICAL: Normalize all file timestamps BEFORE dracut packages them
+echo "🔧 Normalizing timestamps for reproducibility..."
+find target/$BUILD_TARGET/release -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
+find /usr/lib/dracut/modules.d/99paypal-auth-vm -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
 
 # Build initramfs with reproducibility flags
 echo "🔨 Building initramfs with dracut..."
