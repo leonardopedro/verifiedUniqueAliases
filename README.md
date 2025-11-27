@@ -336,6 +336,192 @@ This method ensures a bit-for-bit reproducible build by using a fixed environmen
 
 
 
+
+
+---
+
+## Part 5: Deploy VM to Oracle Cloud
+
+### Step 5.1: Upload Initramfs to Object Storage
+
+First, create a bucket and upload your initramfs:
+
+```bash
+# Create Object Storage bucket
+oci os bucket create \
+    --compartment-id $COMPARTMENT_ID \
+    --name paypal-vm-images
+
+# Upload the initramfs
+oci os object put \
+    --bucket-name paypal-vm-images \
+    --file initramfs-paypal-auth.img \
+    --name initramfs-paypal-auth.img
+
+# Get the object URL for later use
+export INITRAMFS_URL=$(oci os object list \
+    --bucket-name paypal-vm-images \
+    --name initramfs-paypal-auth.img \
+    --query 'data[0]."name"' \
+    --raw-output)
+
+echo "Initramfs uploaded to: https://objectstorage.${REGION}.oraclecloud.com/n/<namespace>/b/paypal-vm-images/o/initramfs-paypal-auth.img"
+```
+
+### Step 5.2: Create Custom Image from Initramfs
+
+```bash
+# Import the initramfs as a custom image
+# Note: For confidential computing, we need a minimal kernel that supports initramfs boot
+# You'll need to provide a compatible kernel image or use Oracle's base image
+
+# For now, we'll create a boot volume from the initramfs
+# This is a placeholder - actual implementation depends on OCI's confidential VM requirements
+```
+
+### Step 5.3: Create Confidential VM Instance
+
+Create the VM with custom metadata for configuration:
+
+```bash
+# Set your PayPal credentials and domain
+export PAYPAL_CLIENT_ID="your-paypal-client-id"
+export DOMAIN="auth.yourdomain.com"
+export SECRET_OCID="$SECRET_ID"  # From Part 1.3
+export NOTIFICATION_TOPIC_ID="$TOPIC_ID"  # From Part 7
+
+# Create instance with custom metadata
+oci compute instance launch \
+    --compartment-id $COMPARTMENT_ID \
+    --availability-domain "$(oci iam availability-domain list --query 'data[0].name' --raw-output)" \
+    --shape "VM.Standard.E4.Flex" \
+    --shape-config '{"ocpus": 1, "memoryInGBs": 8}' \
+    --subnet-id $SUBNET_ID \
+    --assign-public-ip false \
+    --display-name "paypal-auth-vm" \
+    --metadata '{
+        "paypal_client_id": "'"$PAYPAL_CLIENT_ID"'",
+        "domain": "'"$DOMAIN"'",
+        "secret_ocid": "'"$SECRET_OCID"'",
+        "notification_topic_id": "'"$NOTIFICATION_TOPIC_ID"'"
+    }' \
+    --image-id <CONFIDENTIAL_VM_IMAGE_ID> \
+    --boot-volume-size-in-gbs 50
+
+export INSTANCE_ID="<output-instance-id>"
+```
+
+**Important Notes:**
+- Replace `<CONFIDENTIAL_VM_IMAGE_ID>` with the OCID of an OCI image that supports AMD SEV-SNP confidential computing
+- The instance must be on a shape that supports confidential computing (E4 shapes with AMD processors)
+- Custom metadata is passed to the VM and accessible via the metadata service
+
+### Step 5.4: Configure Static Private IP
+
+```bash
+# Get the VNIC ID
+export VNIC_ID=$(oci compute instance list-vnics \
+    --instance-id $INSTANCE_ID \
+    --query 'data[0].id' \
+    --raw-output)
+
+# The private IP is already assigned during instance creation
+# Verify it:
+oci network vnic get \
+    --vnic-id $VNIC_ID \
+    --query 'data."private-ip"'
+
+export PRIVATE_IP="<output-private-ip>"
+```
+
+### Step 5.5: Configure Load Balancer
+
+Now configure the load balancer to point to your VM:
+
+```bash
+# Create backend set (TCP passthrough for TLS termination at VM)
+oci lb backend-set create \
+    --load-balancer-id $LB_ID \
+    --name "paypal-backend" \
+    --policy "ROUND_ROBIN" \
+    --health-checker-protocol "TCP" \
+    --health-checker-port 443 \
+    --health-checker-interval-in-millis 30000 \
+    --health-checker-timeout-in-millis 3000 \
+    --health-checker-retries 3
+
+# Add the VM as a backend
+oci lb backend create \
+    --load-balancer-id $LB_ID \
+    --backend-set-name "paypal-backend" \
+    --ip-address $PRIVATE_IP \
+    --port 443 \
+    --weight 1 \
+    --backup false \
+    --drain false \
+    --offline false
+
+# Create TCP listener (passthrough mode for TLS)
+oci lb listener create \
+    --load-balancer-id $LB_ID \
+    --name "https-listener" \
+    --default-backend-set-name "paypal-backend" \
+    --protocol "TCP" \
+    --port 443
+
+# Also create HTTP listener for ACME challenge (Let's Encrypt)
+oci lb listener create \
+    --load-balancer-id $LB_ID \
+    --name "http-listener" \
+    --default-backend-set-name "paypal-backend" \
+    --protocol "TCP" \
+    --port 80
+```
+
+### Step 5.6: Associate Reserved Public IP
+
+```bash
+# Get the load balancer's IP address
+export LB_IP=$(oci lb load-balancer get \
+    --load-balancer-id $LB_ID \
+    --query 'data."ip-addresses"[0]."ip-address"' \
+    --raw-output)
+
+echo "Load Balancer IP: $LB_IP"
+
+# Update DNS A record to point to this IP
+# Example using Cloudflare API (adjust for your DNS provider):
+# curl -X PUT "https://api.cloudflare.com/client/v4/zones/<zone-id>/dns_records/<record-id>" \
+#   -H "Authorization: Bearer <api-token>" \
+#   -H "Content-Type: application/json" \
+#   --data '{"type":"A","name":"auth.yourdomain.com","content":"'$LB_IP'","proxied":false}'
+```
+
+**Manual DNS Configuration:**
+1. Go to your DNS provider (e.g., Cloudflare, Route53, etc.)
+2. Create/Update an A record:
+   - **Name**: `auth` (or your subdomain)
+   - **Type**: `A`
+   - **Value**: `$LB_IP` (from above)
+   - **TTL**: 300 (5 minutes)
+
+### Step 5.7: Verify VM Boot and Metadata Access
+
+```bash
+# Check instance status
+oci compute instance get \
+    --instance-id $INSTANCE_ID \
+    --query 'data."lifecycle-state"'
+
+# View console output (for debugging)
+oci compute instance get-console-history \
+    --instance-id $INSTANCE_ID \
+    --latest
+
+# Test metadata endpoint (from another VM in the same VCN)
+# curl http://<PRIVATE_IP>/.well-known/acme-challenge/test
+```
+
 ---
 
 ## Part 6: Attestation Implementation
