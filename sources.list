@@ -1,2 +1,0 @@
-deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20240215T000000Z/ bookworm main
-deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/20240215T000000Z/ bookworm-security main
