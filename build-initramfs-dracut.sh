@@ -4,7 +4,9 @@ set -e
 echo "🏗️  Building reproducible initramfs with Dracut..."
 
 # Set the build target to musl for a small, static binary.
-BUILD_TARGET="x86_64-unknown-linux-musl"
+BUILD_TARGET="x86_64-unknown-linux-gnu"
+#BUILD_TARGET="x86_64-unknown-linux-musl"
+
 echo "✅ Using musl target for smallest binary"
 
 # Set reproducible build environment
@@ -39,7 +41,9 @@ chmod +x /usr/lib/dracut/modules.d/99paypal-auth-vm/*.sh
 # Update module-setup.sh with correct build path
 sed -i "s|/build/paypal-auth-vm|$BUILD_DIR|g" \
     /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
-sed -i "s|x86_64-unknown-linux-musl|$BUILD_TARGET|g" \
+#sed -i "s|x86_64-unknown-linux-musl|$BUILD_TARGET|g" \
+#    /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
+sed -i "s|x86_64-unknown-linux-gnu|$BUILD_TARGET|g" \
     /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
 
 

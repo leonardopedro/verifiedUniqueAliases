@@ -1,7 +1,7 @@
 # 1. Use a specific version of the Fedora minimal image for reproducibility.
 #    See https://registry.fedoraproject.org/
-FROM registry.fedoraproject.org/fedora-minimal:43 AS builder
-
+#FROM registry.fedoraproject.org/fedora-minimal:43 AS builder
+FROM oraclelinux:10-slim AS builder
 # 2. Install dependencies for building the initramfs
 #    - dracut is a core tool on Fedora, but we ensure it and its dependencies are present.
 #    - microdnf is the lightweight package manager available on Fedora Minimal.
@@ -17,9 +17,9 @@ RUN microdnf install -y \
     gcc \
     gcc-c++ \
     make \
-    musl-gcc \
-    musl-devel \
-    fakeroot \
+    # musl-gcc \
+    # musl-devel \
+    #fakeroot \
     util-linux \
     && microdnf clean all
 
@@ -36,10 +36,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # 4. Set up environment for reproducible musl builds
 #    These are sourced from the project's .idx/dev.nix file to align the
 #    container environment with the local development environment.
-ENV CC_x86_64_unknown_linux_musl="musl-gcc" \
-    CXX_x86_64_unknown_linux_musl="musl-g++" \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="musl-gcc" \
-    AR_x86_64_unknown_linux_musl="ar"
+#ENV CC_x86_64_unknown_linux_musl="musl-gcc" \
+#    CXX_x86_64_unknown_linux_musl="musl-g++" \
+#    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="musl-gcc" \
+#    AR_x86_64_unknown_linux_musl="ar"
 
 # 5. Set up the application build environment
 WORKDIR /app
@@ -57,8 +57,8 @@ RUN chmod +x ./build-initramfs-dracut.sh
 # 9. Run the build script within a fakeroot environment to allow dracut to work
 #    - `sh -c` is used to source the cargo environment before running the script
 #    - This ensures that both dracut permissions and the cargo path are correct
-RUN fakeroot sh -c "source /usr/local/cargo/env && ./build-initramfs-dracut.sh"
-
+RUN sh -c "source /usr/local/cargo/env && ./build-initramfs-dracut.sh"
+#RUN fakeroot sh -c "source /usr/local/cargo/env && ./build-initramfs-dracut.sh"
 # 10. Create an output directory and move the build artifacts
 RUN mkdir /output && \
     mv initramfs-paypal-auth.img /output/ && \
