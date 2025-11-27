@@ -47,7 +47,7 @@ sed -i "s|x86_64-unknown-linux-gnu|$BUILD_TARGET|g" \
     /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
 
 
-# Build initramfs
+# Build initramfs with reproducibility flags
 echo "🔨 Building initramfs with dracut..."
 
 KERNEL_VERSION=$(find /lib/modules -maxdepth 1 -type d -name "[0-9]*" | xargs basename)
@@ -56,11 +56,25 @@ OUTPUT_FILE="initramfs-paypal-auth.img"
 # Create the temporary directory for dracut
 mkdir -p "$HOME/dracut-build"
 
+# Build with reproducibility flags
+# --reproducible: Use SOURCE_DATE_EPOCH for timestamps
+# --gzip: Use gzip (more deterministic than zstd/lz4)
+# --force: Overwrite existing file
+# Note: We explicitly set compression to gzip for reproducibility
 dracut \
     --force \
+    --reproducible \
+    --gzip \
     --kver "$KERNEL_VERSION" \
     --tmpdir "$HOME/dracut-build" \
     "$OUTPUT_FILE"
+
+# Normalize the initramfs for reproducibility
+# Strip any remaining non-deterministic data
+if command -v strip-nondeterminism &> /dev/null; then
+    echo "🔧 Stripping non-deterministic data..."
+    strip-nondeterminism "$OUTPUT_FILE"
+fi
 
 # Calculate hash for verification
 HASH=$(sha256sum "$OUTPUT_FILE" | cut -d' ' -f1)
