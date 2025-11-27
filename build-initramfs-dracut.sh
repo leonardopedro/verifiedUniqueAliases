@@ -31,11 +31,6 @@ strip target/$BUILD_TARGET/release/paypal-auth-vm
 BINARY_SIZE=$(du -h target/$BUILD_TARGET/release/paypal-auth-vm | cut -f1)
 echo "📊 Binary size: $BINARY_SIZE"
 
-# Generate LUKS key
-if [ ! -f luks.key ]; then
-    echo "🔑 Generating LUKS key..."
-    dd if=/dev/urandom of=luks.key bs=512 count=1
-fi
 
 # Prepare local dracut module
 echo "📋 Preparing local dracut module..."
@@ -76,7 +71,6 @@ echo "🎯 Target: $BUILD_TARGET"
 echo ""
 echo "Files created:"
 echo "  • $OUTPUT_FILE - Initramfs image"
-echo "  • luks.key - LUKS encryption key"
 echo ""
 echo "To verify reproducibility:"
 echo "  1. Build on another machine with same inputs"

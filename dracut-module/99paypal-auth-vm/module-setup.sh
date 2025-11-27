@@ -36,7 +36,7 @@ check() {
 depends() {
     # Dependencies on other dracut modules
     # These modules provide essential binaries and functionality
-    echo "base network crypt"
+    echo "base network"
     return 0
 }
 
@@ -66,22 +66,21 @@ install() {
     # We don't need to manually copy any .so files
     
     # Create directory structure
-    inst_dir /mnt/encrypted
+    # Create directory structure
     inst_dir /run/certs
     inst_dir /tmp/acme-challenge
     
-    # Install LUKS key (embedded in initramfs - part of measured boot)
-    inst_simple /build/luks.key /etc/luks.key
-    chmod 600 "${initdir}/etc/luks.key"
-    
     # Install our custom hook scripts
+    # 'cmdline 00': Runs very early, just after kernel command line parsing. 
+    # We use this to fetch OCI metadata and set up environment variables before anything else.
     inst_hook cmdline 00 "$moddir/parse-paypal-auth.sh"
-    inst_hook pre-mount 50 "$moddir/mount-encrypted.sh"
+    
+    # 'pre-pivot 99': Runs at the very end of initramfs execution, just before switching to rootfs.
+    # We use this to start our application, effectively replacing the standard init process.
     inst_hook pre-pivot 99 "$moddir/start-app.sh"
-    inst_hook shutdown 50 "$moddir/save-cert.sh"
 }
 
 installkernel() {
     # Install required kernel modules
-    instmods virtio_pci virtio_blk dm_crypt
+    instmods virtio_pci virtio_blk
 }

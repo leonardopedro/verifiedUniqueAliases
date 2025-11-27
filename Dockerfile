@@ -62,7 +62,6 @@ RUN fakeroot sh -c "source /usr/local/cargo/env && ./build-initramfs-dracut.sh"
 # 10. Create an output directory and move the build artifacts
 RUN mkdir /output && \
     mv initramfs-paypal-auth.img /output/ && \
-    mv luks.key /output/ && \
     mv build-manifest.json /output/ && \
     mv initramfs-paypal-auth.img.sha256 /output/
 
