@@ -20,8 +20,7 @@
     pkgs.musl
     pkgs.musl.dev
     pkgs.pkgsMusl.stdenv.cc
-    pkgs.docker
-    pkgs.docker-compose
+    pkgs.podman
   ];
 
   # Sets environment variables in the workspace
