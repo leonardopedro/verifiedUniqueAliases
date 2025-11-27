@@ -1,10 +1,10 @@
 {
-  "timestamp": "2025-11-27T16:43:46Z",
+  "timestamp": "2025-11-27T17:07:30Z",
   "source_date_epoch": "1640995200",
   "kernel_version": "6.12.0-55.43.1.0.1.el10_0.x86_64",
   "rust_version": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
   "target": "x86_64-unknown-linux-gnu",
-  "initramfs_sha256": "854d7fd63454947e0d4108d3dd98edcf3702c784c247bf87b80fb514a88ec7d0",
+  "initramfs_sha256": "cddce63e62a5ded64251503f45486f9451ad20c92cb7bfa3e17cbb1c37ed2cc6",
   "binary_size": "4.8M",
   "components": {
     "rust_binary": "paypal-auth-vm",
