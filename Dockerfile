@@ -1,7 +1,9 @@
 # 1. Use a specific version of the Fedora minimal image for reproducibility.
 #    See https://registry.fedoraproject.org/
 #FROM registry.fedoraproject.org/fedora-minimal:43 AS builder
-FROM oraclelinux:10-slim AS builder
+#docker buildx imagetools inspect oraclelinux:10-slim  #to know the sha256 of the docker image
+FROM oraclelinux@sha256:2d7cd00cea5d1422e1b8242418c695e902dfd6ceeac164d8fae880fa688e5bb2 AS builder
+
 # 2. Install dependencies for building the initramfs
 #    - dracut is a core tool on Fedora, but we ensure it and its dependencies are present.
 #    - microdnf is the lightweight package manager available on Fedora Minimal.
