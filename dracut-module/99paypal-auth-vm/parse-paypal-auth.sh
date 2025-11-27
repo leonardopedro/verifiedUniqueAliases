@@ -17,12 +17,18 @@ while ! curl -sf http://169.254.169.254/ >/dev/null 2>&1; do
 done
 
 # Export configuration
+# Here is what each variable is for:
+# PAYPAL_CLIENT_ID: The unique ID of the PayPal client. The app uses this ID to know exactly which client to fetch to get the PAYPAL_SECRET.
+# DOMAIN: The domain name (e.g., auth.example.com). The Rust app needs this to tell Let's Encrypt which domain it wants a certificate for.
+# SECRET_OCID: The unique ID of the secret in OCI Vault. The app uses this ID to know exactly which secret to fetch to get the PAYPAL_SECRET.
+# OCI_REGION: The cloud region (e.g., us-ashburn-1). The app needs this to connect to the correct OCI Vault endpoint.
+# Note: This one is actually fetched from a standard Oracle endpoint (opc/v2/instance/region), so you don't even need to provide it manually!
+# NOTIFICATION_TOPIC_ID: The ID for the OCI Notification system. This allows the app to send you an email alert if something goes wrong (like a failed login attempt).
 export PAYPAL_CLIENT_ID=$(fetch_metadata paypal_client_id)
 export DOMAIN=$(fetch_metadata domain)
 export SECRET_OCID=$(fetch_metadata secret_ocid)
 export OCI_REGION=$(curl -sf http://169.254.169.254/opc/v2/instance/region)
 export NOTIFICATION_TOPIC_ID=$(fetch_metadata notification_topic_id)
-export SIGNING_KEY=$(fetch_metadata signing_key)
 
 # Persist for later stages
 {
@@ -31,5 +37,4 @@ export SIGNING_KEY=$(fetch_metadata signing_key)
     echo "SECRET_OCID=$SECRET_OCID"
     echo "OCI_REGION=$OCI_REGION"
     echo "NOTIFICATION_TOPIC_ID=$NOTIFICATION_TOPIC_ID"
-    echo "SIGNING_KEY=$SIGNING_KEY"
 } > /run/paypal-auth.env

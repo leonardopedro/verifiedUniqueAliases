@@ -49,7 +49,6 @@ In the remaining of this file, I will provide the step by step instructions to i
 │  ┌────────────────────────────────────┐ │
 │  │  RAM (tmpfs)                       │ │
 │  │  - Used PayPal IDs (HashSet)       │ │
-│  │  - Private signing key             │ │
 │  │  - PAYPAL_SECRET (from Vault)      │ │
 │  │  - Active TLS certificate          │ │
 │  │  - ACME challenge responses        │ │
@@ -201,13 +200,14 @@ oci kms management key create \
     --compartment-id $COMPARTMENT_ID \
     --display-name "paypal-master-key" \
     --key-shape '{"algorithm": "AES", "length": 32}' \
-    --management-endpoint "https://your-vault-endpoint"
+    --endpoint "https://your-vault-endpoint"
 
 export KEY_ID="<output-key-id>"
 
 # Create Secret for PAYPAL_SECRET
 # First, base64 encode your PayPal client secret
-echo -n "your-paypal-client-secret" | base64
+# Beaware that the PAYPAL_SECRET must be converted from BASE64_URL to BASE64
+#echo -n "your-paypal-client-secret" | base64
 
 oci vault secret create-base64 \
     --compartment-id $COMPARTMENT_ID \
@@ -215,6 +215,7 @@ oci vault secret create-base64 \
     --vault-id $VAULT_ID \
     --key-id $KEY_ID \
     --secret-content-content "base64-encoded-secret"
+
 
 export SECRET_ID="<output-secret-id>"
 ```
@@ -388,7 +389,6 @@ export DOMAIN=$(fetch_metadata domain)
 export SECRET_OCID=$(fetch_metadata secret_ocid)
 export OCI_REGION=$(curl -sf http://169.254.169.254/opc/v2/instance/region)
 export NOTIFICATION_TOPIC_ID=$(fetch_metadata notification_topic_id)
-export SIGNING_KEY=$(fetch_metadata signing_key)
 
 # Persist for later stages
 {
@@ -397,7 +397,6 @@ export SIGNING_KEY=$(fetch_metadata signing_key)
     echo "SECRET_OCID=$SECRET_OCID"
     echo "OCI_REGION=$OCI_REGION"
     echo "NOTIFICATION_TOPIC_ID=$NOTIFICATION_TOPIC_ID"
-    echo "SIGNING_KEY=$SIGNING_KEY"
 } > /run/paypal-auth.env
 ```
 
@@ -444,41 +443,31 @@ cp target/release/snpguest ../paypal-auth-vm/initramfs/bin/
 # verify_attestation.py - Client tool to verify attestation
 
 import json
-import base64
 import hashlib
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import ed25519
 
-def verify_attestation(response_json, signature_b64, public_key_pem):
-    """Verify the signed attestation response"""
+def verify_report_data(attestation, client_id, user_id):
+    """
+    Verify that the attestation REPORT_DATA contains the SHA256 hash of:
+    PAYPAL_CLIENT_ID=<client_id>|PAYPAL_USER_ID=<user_id>
+    """
+    report_data_hex = attestation.get('report_data', '')
     
-    # Parse public key
-    public_key = serialization.load_pem_public_key(
-        public_key_pem.encode(),
-        backend=None
-    )
+    # Reconstruct the expected data string
+    expected_data = f"PAYPAL_CLIENT_ID={client_id}|PAYPAL_USER_ID={user_id}"
     
-    # Decode signature
-    signature = base64.b64decode(signature_b64)
+    # Calculate SHA256 hash
+    expected_hash = hashlib.sha256(expected_data.encode()).hexdigest()
     
-    # Verify signature
-    try:
-        public_key.verify(signature, response_json.encode())
-        print("✅ Signature valid!")
-        return True
-    except Exception as e:
-        print(f"❌ Signature invalid: {e}")
-        return False
-
-def check_paypal_client_id(attestation, expected_client_id):
-    """Verify PAYPAL_CLIENT_ID in attestation report"""
-    report_data = attestation.get('report_data', '')
+    print(f"ℹ️  Expected Data: {expected_data}")
+    print(f"ℹ️  Expected Hash: {expected_hash}")
+    print(f"ℹ️  Report Data:   {report_data_hex}")
     
-    if f"PAYPAL_CLIENT_ID={expected_client_id}" in report_data:
-        print("✅ PAYPAL_CLIENT_ID matches in attestation!")
+    if expected_hash in report_data_hex:
+        print("✅ REPORT_DATA matches expected hash!")
+        print("   This confirms the attestation is bound to this specific PayPal User and Client.")
         return True
     else:
-        print("❌ PAYPAL_CLIENT_ID mismatch in attestation!")
+        print("❌ REPORT_DATA mismatch!")
         return False
 
 def check_vm_measurement(attestation, expected_hash):
@@ -506,20 +495,14 @@ if __name__ == "__main__":
     
     # Extract components
     attestation = json.loads(response['attestation'])
-    signature = response['signature']  # From the signed_data in the response
-    public_key = response['public_key']
+    userinfo = response['userinfo']
     
-    # Verify
-    print("🔍 Verifying attestation...")
-    verify_attestation(
-        json.dumps(response, indent=2),
-        signature,
-        public_key
-    )
+    user_id = userinfo['user_id']
+    print(f"👤 Verifying attestation for User ID: {user_id}")
     
-    # Check PAYPAL_CLIENT_ID
+    # Check REPORT_DATA binding
     expected_client_id = input("Enter expected PAYPAL_CLIENT_ID: ")
-    check_paypal_client_id(attestation, expected_client_id)
+    verify_report_data(attestation, expected_client_id, user_id)
     
     # Check VM measurement
     expected_hash = input("Enter expected VM image hash: ")

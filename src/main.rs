@@ -20,10 +20,6 @@ use instant_acme::{
 };
 use parking_lot::RwLock;
 use rcgen::{Certificate, CertificateParams, DistinguishedName};
-use ring::{
-    rand,
-    signature::{Ed25519KeyPair, KeyPair},
-};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
@@ -82,23 +78,7 @@ struct AppState {
     paypal_client_secret: String,
     redirect_uri: String,
     used_paypal_ids: Arc<RwLock<HashSet<String>>>,
-    signing_key: Arc<SigningKey>,
     domain: String,
-}
-
-struct SigningKey {
-    key_pair: Ed25519KeyPair,
-}
-
-impl SigningKey {
-    fn public_key_pem(&self) -> String {
-        let public_key = self.key_pair.public_key().as_ref();
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-        format!(
-            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
-            STANDARD.encode(public_key)
-        )
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -304,68 +284,22 @@ impl AcmeManager {
 // CRYPTOGRAPHY
 // ============================================================================
 
-fn load_or_generate_signing_key() -> SigningKey {
-    // Try to load key from environment variable (injected by init script)
-    if let Ok(key_pem) = std::env::var("SIGNING_KEY") {
-        if !key_pem.is_empty() {
-            info!("🔑 Loading signing key from environment...");
-            // In a real implementation, we would parse the PEM and load the key pair.
-            // For this single-file demo without extra dependencies for PEM parsing of private keys
-            // (ring doesn't do it directly easily), we'll assume the env var contains
-            // the PKCS8 bytes base64 encoded for simplicity, or just fallback if invalid.
-
-            // NOTE: To properly support PEM private key loading here we would need
-            // `rustls-pemfile` or similar to extract the DER, then `ring` to load it.
-            // Since we already have `rustls-pemfile` for TLS, we could use it.
-
-            // However, to keep it simple and robust as per "RAM only - never persisted"
-            // (which implies we might want to generate it if not provided, OR provided via secure channel),
-            // the spec says "private key is a secret environment variable".
-
-            // Let's try to decode it as base64 PKCS8 first (easiest to pass in env var).
-            use base64::{engine::general_purpose::STANDARD, Engine as _};
-            if let Ok(pkcs8_bytes) = STANDARD.decode(&key_pem) {
-                if let Ok(key_pair) = Ed25519KeyPair::from_pkcs8(&pkcs8_bytes) {
-                    info!("✅ Successfully loaded signing key from environment");
-                    return SigningKey { key_pair };
-                }
-            }
-
-            warn!(
-                "⚠️ Failed to parse SIGNING_KEY from environment, falling back to fresh generation"
-            );
-        }
-    }
-
-    // Fallback: Generate fresh key in RAM (never persisted)
-    let rng = rand::SystemRandom::new();
-    let pkcs8_bytes = Ed25519KeyPair::generate_pkcs8(&rng).expect("Failed to generate key pair");
-
-    let key_pair =
-        Ed25519KeyPair::from_pkcs8(pkcs8_bytes.as_ref()).expect("Failed to create key pair");
-
-    info!("🔑 Generated fresh signing key (RAM only)");
-
-    SigningKey { key_pair }
-}
-
-fn sign_data(signing_key: &SigningKey, data: &[u8]) -> String {
-    let signature = signing_key.key_pair.sign(data);
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    STANDARD.encode(signature.as_ref())
-}
-
 // ============================================================================
 // ATTESTATION
 // ============================================================================
 
 async fn generate_attestation(
     paypal_client_id: &str,
+    paypal_user_id: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // On AMD SEV-SNP, attestation is retrieved via /dev/sev-guest
-    // Include PAYPAL_CLIENT_ID in REPORT_DATA field
+    // Include PAYPAL_CLIENT_ID and PAYPAL_USER_ID in REPORT_DATA field
+    // Format: PAYPAL_CLIENT_ID=<id>|PAYPAL_USER_ID=<id>
 
-    let report_data = format!("PAYPAL_CLIENT_ID={}", paypal_client_id);
+    let report_data = format!(
+        "PAYPAL_CLIENT_ID={}|PAYPAL_USER_ID={}",
+        paypal_client_id, paypal_user_id
+    );
     let report_data_hash = sha2_hash(&report_data);
 
     // Try to get SEV-SNP attestation report
@@ -376,7 +310,7 @@ async fn generate_attestation(
                 "Failed to get SEV-SNP report: {}. Using mock attestation.",
                 e
             );
-            create_mock_attestation(paypal_client_id)
+            create_mock_attestation(paypal_client_id, paypal_user_id)
         }
     };
 
@@ -400,12 +334,12 @@ fn get_sev_snp_report(report_data: &str) -> Result<String, Box<dyn std::error::E
     Ok(report)
 }
 
-fn create_mock_attestation(paypal_client_id: &str) -> String {
+fn create_mock_attestation(paypal_client_id: &str, paypal_user_id: &str) -> String {
     // For testing on non-SEV hardware
     serde_json::json!({
         "type": "mock_attestation",
         "warning": "This is a mock attestation for testing purposes only",
-        "report_data": format!("PAYPAL_CLIENT_ID={}", paypal_client_id),
+        "report_data": format!("PAYPAL_CLIENT_ID={}|PAYPAL_USER_ID={}", paypal_client_id, paypal_user_id),
         "measurement": "0000000000000000000000000000000000000000000000000000000000000000",
         "platform_version": "mock",
         "policy": "0x30000"
@@ -616,26 +550,13 @@ async fn callback(
     }
 
     // Generate attestation report
-    let attestation = match generate_attestation(&state.paypal_client_id).await {
+    let attestation = match generate_attestation(&state.paypal_client_id, &userinfo.user_id).await {
         Ok(a) => a,
         Err(e) => {
             error!("Failed to generate attestation: {}", e);
             format!("Attestation generation failed: {}", e)
         }
     };
-
-    // Create signed response
-    let response_data = serde_json::json!({
-        "userinfo": userinfo,
-        "attestation": attestation,
-        "cert_ram_only": true,
-        "running_from_initramfs": true,
-        "public_key": state.signing_key.public_key_pem(),
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-    });
-
-    let response_json = serde_json::to_string_pretty(&response_data).unwrap();
-    let signature = sign_data(&state.signing_key, response_json.as_bytes());
 
     let cert_badge = r#"<span class="cert-ram">🟢 RAM ONLY (Fresh)</span>"#;
 
@@ -656,12 +577,7 @@ async fn callback(
             <p><strong>Disk Usage:</strong> TLS certificate storage only</p>
             <hr>
             <p><strong>Attestation Report:</strong></p>
-            <pre>{}</pre>
-            <hr>
-            <p><strong>Digital Signature (Ed25519):</strong></p>
-            <pre>{}</pre>
-            <hr>
-            <p><strong>Public Key (for verification):</strong></p>
+            <p><em>Contains hash of PAYPAL_CLIENT_ID and PAYPAL_USER_ID in REPORT_DATA</em></p>
             <pre>{}</pre>
         </div>
         <a href="/" class="btn">← Back to Home</a>
@@ -672,8 +588,6 @@ async fn callback(
         userinfo.email_verified.unwrap_or(false),
         cert_badge,
         html_escape::encode_text(&attestation),
-        html_escape::encode_text(&signature),
-        html_escape::encode_text(&state.signing_key.public_key_pem()),
     );
 
     Html(HTML_TEMPLATE.replace("{{CONTENT}}", &content)).into_response()
@@ -739,15 +653,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Fetch PAYPAL_SECRET from OCI Vault using instance principals
     let paypal_client_secret = fetch_secret_from_vault().await?;
 
-    // Load or generate signing key (RAM only - never persisted)
-    let signing_key = Arc::new(load_or_generate_signing_key());
-    let public_key_pem = signing_key.public_key_pem();
-
-    info!(
-        "📝 Public signing key (generated in RAM):\n{}",
-        public_key_pem
-    );
-
     // Handle ACME certificate acquisition
     let acme = AcmeManager::new(domain.clone());
     let (cert_pem, key_pem) = acme.ensure_certificate().await?;
@@ -760,7 +665,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         paypal_client_secret,
         redirect_uri,
         used_paypal_ids: Arc::new(RwLock::new(HashSet::new())),
-        signing_key,
         domain: domain.clone(),
     });
 
