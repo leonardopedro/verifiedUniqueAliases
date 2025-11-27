@@ -3,16 +3,9 @@ set -e
 
 echo "🏗️  Building reproducible initramfs with Dracut..."
 
-# Detect if musl is available
-if command -v x86_64-linux-musl-gcc &> /dev/null; then
-    BUILD_TARGET="x86_64-unknown-linux-musl"
-    echo "✅ Using musl target for smallest binary"
-else
-    BUILD_TARGET="x86_64-unknown-linux-gnu"
-    echo "⚠️  musl not available, using glibc target (larger binary)"
-    echo "   Install musl-tools for smaller binary: sudo apt-get install musl-tools"
-fi
+# Set the build target to musl for a small, static binary.
 BUILD_TARGET="x86_64-unknown-linux-musl"
+echo "✅ Using musl target for smallest binary"
 
 # Set reproducible build environment
 export SOURCE_DATE_EPOCH=1640995200  # 2022-01-01 00:00:00 UTC
@@ -46,13 +39,13 @@ fi
 
 # Prepare local dracut module
 echo "📋 Preparing local dracut module..."
-chmod +x dracut-module/99paypal-auth-vm/*.sh
+chmod +x /usr/lib/dracut/modules.d/99paypal-auth-vm/*.sh
 
 # Update module-setup.sh with correct build path
 sed -i "s|/build/paypal-auth-vm|$BUILD_DIR|g" \
-    dracut-module/99paypal-auth-vm/module-setup.sh
+    /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
 sed -i "s|x86_64-unknown-linux-musl|$BUILD_TARGET|g" \
-    dracut-module/99paypal-auth-vm/module-setup.sh
+    /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
 
 
 # Build initramfs
@@ -61,13 +54,13 @@ echo "🔨 Building initramfs with dracut..."
 KERNEL_VERSION=$(find /lib/modules -maxdepth 1 -type d -name "[0-9]*" | xargs basename)
 OUTPUT_FILE="initramfs-paypal-auth.img"
 
+# Create the temporary directory for dracut
+mkdir -p "$HOME/dracut-build"
+
 dracut \
     --force \
     --kver "$KERNEL_VERSION" \
-    --conf ./dracut.conf \
-    --confdir . \
-    --add "99paypal-auth-vm" \
-    --tmpdir $HOME/dracut-build \
+    --tmpdir "$HOME/dracut-build" \
     "$OUTPUT_FILE"
 
 # Calculate hash for verification
