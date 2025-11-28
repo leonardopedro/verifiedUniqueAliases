@@ -129,6 +129,15 @@ dracut \
     --tmpdir "$HOME/dracut-build" \
     "$OUTPUT_FILE"
 
+# Re-compress with gzip -n to ensure deterministic gzip headers (no timestamp)
+# and avoid non-determinism from parallel compression (pigz)
+echo "🔧 Re-compressing initramfs for strict reproducibility..."
+if command -v gzip >/dev/null; then
+    # Decompress and recompress with -n (no-name/no-timestamp) and -9 (best compression)
+    gzip -d -c "$OUTPUT_FILE" | gzip -n -9 > "${OUTPUT_FILE}.tmp"
+    mv "${OUTPUT_FILE}.tmp" "$OUTPUT_FILE"
+fi
+
 # Normalize the initramfs for reproducibility
 # Strip any remaining non-deterministic data
 if command -v strip-nondeterminism &> /dev/null; then
