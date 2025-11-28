@@ -334,8 +334,86 @@ This method ensures a bit-for-bit reproducible build by using a fixed environmen
     - `build-manifest.json`: Metadata about the build (versions, hashes).
     - `initramfs-paypal-auth.img.sha256`: Checksum for verification.
 
+### Reproducible Builds
 
+This project implements **bit-for-bit reproducible builds**, ensuring that anyone can independently verify that the initramfs matches the published hash.
 
+#### Reproducibility Guarantees
+
+The build process is deterministic through:
+
+1. **Fixed Build Environment**:
+   - Pinned Docker base image with SHA256 digest
+   - Specific Rust version (1.91.1)
+   - All dependencies locked in `Cargo.lock`
+
+2. **Deterministic Compilation**:
+   - `RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C strip=symbols"`
+   - `SOURCE_DATE_EPOCH=1640995200` (fixed timestamp)
+   - Path remapping to remove build directory from binary
+
+3. **Binary Normalization**:
+   - [`add-determinism`](https://crates.io/crates/add-determinism) removes non-deterministic metadata (build IDs, timestamps)
+   - Applied to all binaries before packaging
+
+4. **Dracut Reproducibility**:
+   - `dracut --reproducible` flag respects `SOURCE_DATE_EPOCH`
+   - Gzip compression (more deterministic than zstd/lz4)
+   - Normalized file timestamps and permissions
+
+#### Tools Used
+
+- **add-det**: Removes non-deterministic metadata from ELF binaries
+- **diffoscope**: Analyzes differences between builds (installed in Docker)
+- **cargo-reproduce**: Optional tool for testing Rust binary reproducibility
+
+#### Verifying Reproducibility
+
+**Test Binary Reproducibility** (locally):
+```bash
+./test-binary-reproducibility.sh
+```
+
+This script builds the Rust binary twice and compares SHA256 hashes. Expected output:
+```
+✅ SUCCESS: Binaries are IDENTICAL! 🎉
+```
+
+**Test Full Initramfs Reproducibility**:
+```bash
+# Build twice and compare hashes
+DOCKER_BUILDKIT=1 docker build --output /tmp/build1 .
+DOCKER_BUILDKIT=1 docker build --output /tmp/build2 .
+
+sha256sum /tmp/build1/img/initramfs-paypal-auth.img
+sha256sum /tmp/build2/img/initramfs-paypal-auth.img
+# Hashes should be identical
+```
+
+**Compare with Published Hash**:
+```bash
+# Download published initramfs and manifest
+curl -O https://objectstorage.<region>.oraclecloud.com/.../initramfs-paypal-auth.img
+curl -O https://objectstorage.<region>.oraclecloud.com/.../build-manifest.json
+
+# Verify hash matches manifest
+sha256sum initramfs-paypal-auth.img
+cat build-manifest.json | jq -r '.initramfs_sha256'
+```
+
+#### Debugging Non-Reproducibility
+
+If builds differ, use `diffoscope` to analyze:
+
+```bash
+DOCKER_BUILDKIT=1 docker build --output /tmp/build1 .
+DOCKER_BUILDKIT=1 docker build --output /tmp/build2 .
+
+diffoscope /tmp/build1/img/initramfs-paypal-auth.img \
+           /tmp/build2/img/initramfs-paypal-auth.img
+```
+
+This will show exactly which bytes differ and why.
 
 
 ---
