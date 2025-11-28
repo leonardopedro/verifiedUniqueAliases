@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# Ensure cargo binaries are in PATH (for add-det and other tools)
+export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"
+
 echo "🏗️  Building reproducible initramfs with Dracut..."
 
 # Set the build target to musl for a small, static binary.
