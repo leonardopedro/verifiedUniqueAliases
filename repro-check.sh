@@ -5,12 +5,12 @@ echo "🧪 Starting Reproducibility Check..."
 
 # Build 1
 echo "🔄 Running Build 1..."
-./build-initramfs-dracut.sh
+/app/build-initramfs-dracut.sh
 mv initramfs-paypal-auth.img initramfs.1.img
 
 # Build 2
 echo "🔄 Running Build 2..."
-./build-initramfs-dracut.sh
+/app/build-initramfs-dracut.sh
 mv initramfs-paypal-auth.img initramfs.2.img
 
 # Compare
