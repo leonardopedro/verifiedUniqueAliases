@@ -119,7 +119,7 @@ dracut \
     --force \
     --reproducible \
     --gzip \
-    --omit " dash plymouth syslog" \
+    --omit " dash plymouth syslog firmware " \
     --no-hostonly \
     --no-hostonly-cmdline \
     --nofscks \
