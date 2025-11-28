@@ -1,9 +1,11 @@
+# docker buildx rm default
 # 1. Use a specific version of the Fedora minimal image for reproducibility.
 #    See https://registry.fedoraproject.org/
 #FROM registry.fedoraproject.org/fedora-minimal:43 AS builder
 #docker buildx imagetools inspect oraclelinux:10-slim  #to know the sha256 of the docker image
-FROM oraclelinux@sha256:2d7cd00cea5d1422e1b8242418c695e902dfd6ceeac164d8fae880fa688e5bb2 AS builder
+FROM docker.io/library/oraclelinux@sha256:2d7cd00cea5d1422e1b8242418c695e902dfd6ceeac164d8fae880fa688e5bb2 AS builder
 
+#FROM oraclelinux:10-slim AS builder
 # 2. Install dependencies for building the initramfs
 #    - dracut is a core tool on Fedora, but we ensure it and its dependencies are present.
 #    - microdnf is the lightweight package manager available on Fedora Minimal.
@@ -23,6 +25,10 @@ RUN microdnf install -y \
     # musl-devel \
     #fakeroot \
     util-linux \
+    # Install python for diffoscope
+    python3-pip \
+    libarchive \
+    && pip3 install diffoscope \
     && microdnf clean all
 
 # 3. Install a specific version of Rust for a reproducible build environment
@@ -33,7 +39,7 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain ${RUST_VERSION} --no-modify-path
+    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal --no-modify-path
 
 # 4. Set up environment for reproducible musl builds
 #    These are sourced from the project's .idx/dev.nix file to align the
@@ -52,6 +58,19 @@ COPY . .
 
 # 7. Copy the custom dracut module to the system-wide location
 COPY dracut-module/99paypal-auth-vm /usr/lib/dracut/modules.d/99paypal-auth-vm
+
+# 7.1 Copy dracut configuration
+RUN mkdir -p /etc/dracut.conf.d
+COPY dracut.conf /etc/dracut.conf.d/99-paypal-auth.conf
+
+# 7.5 Debug: Verify the module was copied
+RUN echo "=== Verifying module copy ===" && \
+    ls -la /usr/lib/dracut/modules.d/ | grep -i paypal && \
+    ls -la /usr/lib/dracut/modules.d/99paypal-auth-vm/ && \
+    echo "=== Module files ===" && \
+    cat /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh | head -20 && \
+    echo "=== Dracut config ===" && \
+    cat /etc/dracut.conf.d/99-paypal-auth.conf | head -20
 
 # 8. Make the build script executable
 RUN chmod +x ./build-initramfs-dracut.sh

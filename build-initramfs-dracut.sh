@@ -7,7 +7,7 @@ echo "🏗️  Building reproducible initramfs with Dracut..."
 BUILD_TARGET="x86_64-unknown-linux-gnu"
 #BUILD_TARGET="x86_64-unknown-linux-musl"
 
-echo "✅ Using musl target for smallest binary"
+#echo "✅ Using musl target for smallest binary"
 
 # Set reproducible build environment
 export SOURCE_DATE_EPOCH=1640995200  # 2022-01-01 00:00:00 UTC
@@ -35,20 +35,24 @@ export RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C strip=symbols"
 export CARGO_PROFILE_RELEASE_LTO=true
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
 
-cargo build --release --target $BUILD_TARGET
+## Cargo build happens inside dracut module-setup.sh
+# This is intentionally commented - the build happens in the dracut module's install() function
+
+#cargo build --release --target $BUILD_TARGET
 # Strip the binary for smaller size and reproducibility
-strip --strip-all target/$BUILD_TARGET/release/paypal-auth-vm
+#strip --strip-all target/$BUILD_TARGET/release/paypal-auth-vm
 
 # Normalize the binary timestamp to SOURCE_DATE_EPOCH
-touch -d "@${SOURCE_DATE_EPOCH}" target/$BUILD_TARGET/release/paypal-auth-vm
+#touch -d "@${SOURCE_DATE_EPOCH}" target/$BUILD_TARGET/release/paypal-auth-vm
 
-BINARY_SIZE=$(du -h target/$BUILD_TARGET/release/paypal-auth-vm | cut -f1)
-echo "📊 Binary size: $BINARY_SIZE"
+#BINARY_SIZE=$(du -h target/$BUILD_TARGET/release/paypal-auth-vm | cut -f1)
+#echo "📊 Binary size: $BINARY_SIZE"
 
 
 # Prepare local dracut module
 echo "📋 Preparing local dracut module..."
 chmod +x /usr/lib/dracut/modules.d/99paypal-auth-vm/*.sh
+
 
 # Update module-setup.sh with correct build path
 sed -i "s|/build/paypal-auth-vm|$BUILD_DIR|g" \
@@ -58,10 +62,32 @@ sed -i "s|/build/paypal-auth-vm|$BUILD_DIR|g" \
 sed -i "s|x86_64-unknown-linux-gnu|$BUILD_TARGET|g" \
     /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
 
-# CRITICAL: Normalize all file timestamps BEFORE dracut packages them
-echo "🔧 Normalizing timestamps for reproducibility..."
-find target/$BUILD_TARGET/release -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
+# CRITICAL: Normalize module timestamps BEFORE dracut packages them
+echo "🔧 Normalizing module timestamps for reproducibility..."
+# Note: Binary timestamps are normalized inside module-setup.sh during install()
 find /usr/lib/dracut/modules.d/99paypal-auth-vm -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
+
+# Debug: Verify module exists
+echo "🔍 Debugging: Checking if module exists..."
+ls -la /usr/lib/dracut/modules.d/ | grep paypal || echo "❌ paypal module directory not found!"
+if [ -d /usr/lib/dracut/modules.d/99paypal-auth-vm ]; then
+    echo "✅ Module directory exists"
+    ls -la /usr/lib/dracut/modules.d/99paypal-auth-vm/
+else
+    echo "❌ Module directory does NOT exist!"
+fi
+
+# List all available dracut modules
+echo "📋 Available dracut modules:"
+ls -1 /usr/lib/dracut/modules.d/ | head -20
+
+# Test if dracut can see our module
+echo "🧪 Testing if dracut can see our module..."
+dracut --list-modules 2>&1 | grep -i paypal && echo "✅ Dracut sees the module!" || echo "❌ Dracut does NOT see the module!"
+
+# Show what dracut thinks about our module
+echo "🔍 Checking module with dracut..."
+dracut --list-modules 2>&1 | head -30
 
 # Build initramfs with reproducibility flags
 echo "🔨 Building initramfs with dracut..."
@@ -72,15 +98,30 @@ OUTPUT_FILE="initramfs-paypal-auth.img"
 # Create the temporary directory for dracut
 mkdir -p "$HOME/dracut-build"
 
+#echo 'hostonly="no"' > /etc/dracut.conf.d/force-no-hostonly.conf
+cp dracut.conf /etc/dracut.conf.d/force-no-hostonly.conf
+
+
 # Build with reproducibility flags
 # --reproducible: Use SOURCE_DATE_EPOCH for timestamps
 # --gzip: Use gzip (more deterministic than zstd/lz4)
 # --force: Overwrite existing file
+# --no-hostonly: Don't limit to current host (better for containers)
+# --no-hostonly-cmdline: Don't include host-specific kernel command line
+# --nofscks: Skip filesystem checks (not needed in containers)
+# --no-early-microcode: Skip early microcode (not available in containers)
+# --add: Explicitly include our custom module
 # Note: We explicitly set compression to gzip for reproducibility
 dracut \
     --force \
     --reproducible \
     --gzip \
+    --omit " dash plymouth syslog firmware " \
+    --no-hostonly \
+    --no-hostonly-cmdline \
+    --nofscks \
+    --no-early-microcode \
+    --add "paypal-auth-vm" \
     --kver "$KERNEL_VERSION" \
     --tmpdir "$HOME/dracut-build" \
     "$OUTPUT_FILE"
