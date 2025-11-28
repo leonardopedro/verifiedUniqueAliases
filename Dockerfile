@@ -39,7 +39,11 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal --no-modify-path
+    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal --no-modify-path \
+    && source /usr/local/cargo/env \
+    && export RUST_MIN_STACK=16777216 \
+    && cargo install -j 1 add-determinism \
+    && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
 
 # 4. Set up environment for reproducible musl builds
 #    These are sourced from the project's .idx/dev.nix file to align the

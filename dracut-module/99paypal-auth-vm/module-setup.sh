@@ -36,6 +36,9 @@ install() {
     BUILD_TARGET="x86_64-unknown-linux-gnu"
     cargo build --release --target $BUILD_TARGET
     
+    # Post-process binary for determinism (removes build ID, etc.)
+    add-det target/$BUILD_TARGET/release/paypal-auth-vm
+    
     # Strip the binary for smaller size and reproducibility
     strip --strip-all target/$BUILD_TARGET/release/paypal-auth-vm
     
