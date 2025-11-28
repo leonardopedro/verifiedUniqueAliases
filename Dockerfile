@@ -26,10 +26,18 @@ RUN microdnf install -y \
     #fakeroot \
     util-linux \
     # Install python for diffoscope
+    python3 \
     python3-pip \
     libarchive \
-    && pip3 install diffoscope \
     && microdnf clean all
+
+# Install diffoscope in a Python virtual environment
+RUN python3 -m venv /opt/diffoscope-venv \
+    && /opt/diffoscope-venv/bin/pip install --upgrade pip \
+    && /opt/diffoscope-venv/bin/pip install diffoscope
+
+# Add diffoscope venv to PATH
+ENV PATH="/opt/diffoscope-venv/bin:$PATH"
 
 # 3. Install a specific version of Rust for a reproducible build environment
 #    - We install to /usr/local to make it available system-wide in the container.

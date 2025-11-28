@@ -36,11 +36,11 @@ install() {
     BUILD_TARGET="x86_64-unknown-linux-gnu"
     cargo build --release --target $BUILD_TARGET
     
-    # Post-process binary for determinism (removes build ID, etc.)
+    # Post-process binary for determinism
+    # add-det removes non-deterministic metadata (build IDs, timestamps, etc.)
+    # and normalizes the binary. RUSTFLAGS already includes strip=symbols, so no
+    # additional stripping is needed (and could undo add-det's work).
     add-det target/$BUILD_TARGET/release/paypal-auth-vm
-    
-    # Strip the binary for smaller size and reproducibility
-    strip --strip-all target/$BUILD_TARGET/release/paypal-auth-vm
     
     # Normalize the binary timestamp to SOURCE_DATE_EPOCH
     touch -d "@${SOURCE_DATE_EPOCH}" target/$BUILD_TARGET/release/paypal-auth-vm
