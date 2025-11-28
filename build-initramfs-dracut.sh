@@ -119,7 +119,7 @@ dracut \
     --force \
     --reproducible \
     --gzip \
-    --omit " dash plymouth syslog firmware " \
+    --omit " dash plymouth " \
     --no-hostonly \
     --no-hostonly-cmdline \
     --nofscks \
@@ -129,28 +129,49 @@ dracut \
     --tmpdir "$HOME/dracut-build" \
     "$OUTPUT_FILE"
 
-# Re-compress with gzip -n to ensure deterministic gzip headers (no timestamp)
-# and avoid non-determinism from parallel compression (pigz)
-echo "🔧 Re-compressing initramfs for strict reproducibility..."
-if command -v gzip >/dev/null; then
-    # Decompress and recompress with -n (no-name/no-timestamp) and -9 (best compression)
-    gzip -d -c "$OUTPUT_FILE" | gzip -n -9 > "${OUTPUT_FILE}.tmp"
-    mv "${OUTPUT_FILE}.tmp" "$OUTPUT_FILE"
-fi
+# Full Normalization Cycle: Unpack -> Normalize -> Repack -> Recompress
+# This ensures:
+# 1. Deterministic file ordering (sort)
+# 2. Deterministic timestamps (SOURCE_DATE_EPOCH)
+# 3. Deterministic inodes (cpio --renumber-inodes)
+# 4. Deterministic ownership (root:root)
+# 5. Deterministic gzip headers (gzip -n)
 
-# Normalize the initramfs for reproducibility
-# Strip any remaining non-deterministic data
-if command -v strip-nondeterminism &> /dev/null; then
-    echo "🔧 Stripping non-deterministic data..."
-    strip-nondeterminism "$OUTPUT_FILE"
-fi
-
-# Use add-det to normalize compression and metadata
-if command -v add-det &> /dev/null; then
-    echo "🔧 Normalizing initramfs metadata with add-det..."
-    add-det "$OUTPUT_FILE"
+echo "🔧 Normalizing initramfs (CPIO + GZIP)..."
+if command -v cpio >/dev/null && command -v gzip >/dev/null; then
+    TEMP_EXTRACT_DIR=$(mktemp -d)
+    
+    # 1. Extract
+    echo "   Extracting..."
+    cd "$TEMP_EXTRACT_DIR"
+    gzip -d -c "$BUILD_DIR/$OUTPUT_FILE" | cpio -id --quiet
+    
+    # 2. Normalize timestamps and ownership
+    echo "   Normalizing timestamps to @$SOURCE_DATE_EPOCH..."
+    find . -print0 | xargs -0 touch -h -d "@$SOURCE_DATE_EPOCH"
+    
+    # 3. Repack with deterministic flags
+    echo "   Repacking..."
+    find . -print0 | \
+        LC_ALL=C sort -z | \
+        cpio --quiet -o -0 -H newc \
+             --owner=0:0 \
+             --reproducible \
+             --renumber-inodes \
+             --ignore-devno | \
+        gzip -n -9 > "$BUILD_DIR/$OUTPUT_FILE.fixed"
+        
+    mv "$BUILD_DIR/$OUTPUT_FILE.fixed" "$BUILD_DIR/$OUTPUT_FILE"
+    cd "$BUILD_DIR"
+    rm -rf "$TEMP_EXTRACT_DIR"
 else
-    echo "⚠️  add-det not found, skipping normalization..."
+    echo "⚠️  cpio or gzip not found, skipping full normalization..."
+fi
+
+# Use add-det for any remaining metadata (though cpio+gzip normalization should handle most)
+if command -v add-det &> /dev/null; then
+    echo "🔧 Running add-det as final check..."
+    add-det "$OUTPUT_FILE"
 fi
 
 # Calculate hash for verification

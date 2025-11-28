@@ -13,22 +13,23 @@ FROM docker.io/library/oraclelinux@sha256:2d7cd00cea5d1422e1b8242418c695e902dfd6
 #    - musl-devel provides the headers and libraries needed for musl compilation.
 #    - util-linux provides the 'logger' utility for dracut.
 RUN microdnf install -y \
-    dracut \
-    kernel-core \
-    kernel-modules \
-    kmod \
-    curl \
-    gcc \
-    gcc-c++ \
-    make \
+    dracut-105-4.0.1.el10_0.x86_64 \
+    kernel-core-6.12.0-55.43.1.0.1.el10_0.x86_64 \
+    kernel-modules-6.12.0-55.43.1.0.1.el10_0.x86_64 \
+    kmod-31-11.0.2.el10.x86_64 \
+    curl-8.9.1-5.el10.x86_64 \
+    gcc-14.2.1-7.el10.x86_64 \
+    gcc-c++-14.2.1-7.el10.x86_64 \
+    make-4.4.1-9.el10.x86_64 \
     # musl-gcc \
     # musl-devel \
     #fakeroot \
-    util-linux \
+    util-linux-2.40.2-10.el10.x86_64 \
+    linux-firmware-20251030-999.44.1.gite9292517.el10.noarch \
     # Install python for diffoscope
-    python3 \
-    python3-pip \
-    libarchive \
+    python3-3.12.9-2.0.1.el10_0.3.x86_64 \
+    python3-pip-23.3.2-7.el10.noarch \
+    libarchive-3.7.7-4.el10_0.x86_64 \
     && microdnf clean all
 
 # Install diffoscope in a Python virtual environment
