@@ -136,6 +136,14 @@ if command -v strip-nondeterminism &> /dev/null; then
     strip-nondeterminism "$OUTPUT_FILE"
 fi
 
+# Use add-det to normalize compression and metadata
+if command -v add-det &> /dev/null; then
+    echo "🔧 Normalizing initramfs metadata with add-det..."
+    add-det "$OUTPUT_FILE"
+else
+    echo "⚠️  add-det not found, skipping normalization..."
+fi
+
 # Calculate hash for verification
 HASH=$(sha256sum "$OUTPUT_FILE" | cut -d' ' -f1)
 
