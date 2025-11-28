@@ -21,6 +21,7 @@
     pkgs.musl.dev
     pkgs.pkgsMusl.stdenv.cc
     pkgs.podman
+    pkgs.cpio
   ];
 
   # Sets environment variables in the workspace
