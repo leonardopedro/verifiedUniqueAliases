@@ -1,31 +1,4 @@
 #!/bin/bash
-
-# dracut module setup script for paypal-auth-vm
-
-# Called by dracut to check if the module should be included.
-check() {
-    # Always include this module.
-    return 0
-}
-
-# Called by dracut to list module dependencies.
-depends() {
-    # Add any modules your custom module depends on.
-    # e.g. echo " network base shutdown "
-    return 0
-}
-
-# Called by dracut to install the module files.
-install() {
-    # Install the main rust binary.
-    # The path /home/user/verifieduniquealiases/target/x86_64-unknown-linux-musl/release/paypal-auth-vm
-    # is a placeholder that will be replaced by the build script.
-    inst_simple "/home/user/verifieduniquealiases/target/x86_64-unknown-linux-musl/release/paypal-auth-vm" "/usr/bin/paypal-auth-vm"
-
-    # Install the helper script.
-    inst_simple "$moddir/init-disk.sh" "/usr/bin/init-disk.sh"
-}
-#!/bin/bash
 # module-setup.sh - Dracut module setup script
 
 check() {
@@ -35,21 +8,44 @@ check() {
 
 depends() {
     # Dependencies on other dracut modules
-    # These modules provide essential binaries and functionality
-    echo "base network"
+    # Note: 'network' module doesn't work in containers, so we manually install curl
+    echo "base"
     return 0
 }
 
 install() {
     # Build Rust binary first
     echo "Building Rust application..."
-    cd /home/user/verifieduniquealiases
-    cargo build --release --target x86_64-unknown-linux-musl
-    strip target/x86_64-unknown-linux-musl/release/paypal-auth-vm
+    cd /app
+    
+    # Add target if not already added
+    rustup target add x86_64-unknown-linux-gnu 2>/dev/null || true
+    
+    # Build Rust binary with full reproducibility flags
+    # These flags ensure deterministic output:
+    # - target-cpu=generic: Avoid host-specific optimizations
+    # - codegen-units=1: Single codegen unit for deterministic output
+    # - strip=symbols: Strip debug symbols for smaller, deterministic binary
+    export RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C strip=symbols"
+    
+    # Ensure reproducible build with LTO
+    export CARGO_PROFILE_RELEASE_LTO=true
+    export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
+    source /usr/local/cargo/env 
+    
+    BUILD_TARGET="x86_64-unknown-linux-gnu"
+    cargo build --release --target $BUILD_TARGET
+    
+    # Strip the binary for smaller size and reproducibility
+    strip --strip-all target/$BUILD_TARGET/release/paypal-auth-vm
+    
+    # Normalize the binary timestamp to SOURCE_DATE_EPOCH
+    touch -d "@${SOURCE_DATE_EPOCH}" target/$BUILD_TARGET/release/paypal-auth-vm
+    find target/$BUILD_TARGET/release -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
+    find /usr/lib/dracut/modules.d/99paypal-auth-vm -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
     
     # Install our Rust binary (this is the ONLY custom binary we add)
-    inst_simple /home/user/verifieduniquealiases/target/x86_64-unknown-linux-musl/release/paypal-auth-vm \
-        /bin/paypal-auth-vm
+    inst_simple target/$BUILD_TARGET/release/paypal-auth-vm /bin/paypal-auth-vm
     
     # Everything else comes from dracut modules:
     # - "base" module provides: sh, mount, umount, mkdir, etc.
