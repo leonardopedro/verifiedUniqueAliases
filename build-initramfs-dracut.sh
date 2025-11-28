@@ -119,15 +119,20 @@ dracut \
     --force \
     --reproducible \
     --gzip \
-    --omit " dash plymouth " \
+    --omit " dash plymouth syslog" \
     --no-hostonly \
     --no-hostonly-cmdline \
     --nofscks \
     --no-early-microcode \
     --add "paypal-auth-vm" \
     --kver "$KERNEL_VERSION" \
+    --fwdir "/usr/lib/firmware" \
     --tmpdir "$HOME/dracut-build" \
     "$OUTPUT_FILE"
+
+# Check if dracut succeeded
+# Note: We need to enable pipefail to catch dracut errors
+set -o pipefail
 
 # Full Normalization Cycle: Unpack -> Normalize -> Repack -> Recompress
 # This ensures:
