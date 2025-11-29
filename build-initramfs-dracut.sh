@@ -102,7 +102,8 @@ OUTPUT_FILE="initramfs-paypal-auth.img"
 mkdir -p "$HOME/dracut-build"
 
 #echo 'hostonly="no"' > /etc/dracut.conf.d/force-no-hostonly.conf
-cp dracut.conf /etc/dracut.conf.d/force-no-hostonly.conf
+#cp dracut.conf /etc/dracut.conf.d/force-no-hostonly.conf
+cp dracut.conf /etc/dracut.conf.d/99force-no-hostonly.conf
 
 
 # Build with reproducibility flags
