@@ -1,4 +1,4 @@
-{ pkgs ? import <nixpkgs> {}, binaryPath }:
+{ pkgs ? import <nixpkgs> {}, binaryPath ? null }:
 
 let
   # Create the init script
