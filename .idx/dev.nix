@@ -2,18 +2,12 @@
 # see: https://firebase.google.com/docs/studio/customize-workspace
 { pkgs, ... }: {
   # Which nixpkgs channel to use.
-  # Channel: stable-25.11
+  # Channel: nixos-23.11
   # This provides reproducible builds with security updates
-  channel = "stable-25.11"; # or "unstable"
+  channel = "stable-25.05"; # or "unstable"
 
   # Use https://search.nixos.org/packages to find packages
   packages = [
-    # pkgs.go
-    #pkgs.python311
-    #pkgs.python311Packages.pip
-    # pkgs.nodejs_20
-    # pkgs.nodePackages.nodemon
-    
     # Build tools
     pkgs.curl
     pkgs.gcc
@@ -21,19 +15,10 @@
     pkgs.rustup
     
     # Dracut and kernel
-    # pkgs.dracut # Removed as we use native Nix build
     pkgs.xorriso  # Required for grub-mkrescue
     pkgs.linux
     pkgs.kmod
     
-    # Musl for static binaries (Removed)
-    # pkgs.musl
-    # pkgs.musl.dev
-    # pkgs.pkgsMusl.stdenv.cc
-    
-    # Container support (optional, can be removed if not using Docker/Podman)
-    pkgs.podman
-    pkgs.sudo
     
     # Archive tools
     pkgs.cpio
@@ -50,12 +35,7 @@
   ];
 
   # Sets environment variables in the workspace
-  env = { 
-    # Optional: Archive tool
-    # AR_x86_64_unknown_linux_musl = "ar";
-  };
-
-  services.docker.enable = true;
+  env = {};
 
   idx = {
     # Search for the extensions you want on https://open-vsx.org/ and use "publisher.id"
@@ -66,18 +46,7 @@
     # Enable previews
     previews = {
       enable = true;
-      previews = {
-        # web = {
-        #   # Example: run "npm run dev" with PORT set to IDX's defined port for previews,
-        #   # and show it in IDX's web preview panel
-        #   command = ["npm" "run" "dev"];
-        #   manager = "web";
-        #   env = {
-        #     # Environment variables to set for your server
-        #     PORT = "$PORT";
-        #   };
-        # };
-      };
+      previews = {};
     };
 
     # Workspace lifecycle hooks
