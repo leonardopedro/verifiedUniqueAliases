@@ -86,6 +86,8 @@ ls -1 /usr/lib/dracut/modules.d/ | head -20
 
 # Test if dracut can see our module
 echo "🧪 Testing if dracut can see our module..."
+cp dracut.conf /etc/dracut.conf.d/99force-no-hostonly.conf
+cp dracut.conf /etc/dracut.conf
 dracut --list-modules 2>&1 | grep -i paypal && echo "✅ Dracut sees the module!" || echo "❌ Dracut does NOT see the module!"
 
 # Show what dracut thinks about our module
@@ -103,7 +105,7 @@ mkdir -p "$HOME/dracut-build"
 
 #echo 'hostonly="no"' > /etc/dracut.conf.d/force-no-hostonly.conf
 #cp dracut.conf /etc/dracut.conf.d/force-no-hostonly.conf
-cp dracut.conf /etc/dracut.conf.d/99force-no-hostonly.conf
+
 
 
 # Build with reproducibility flags
@@ -135,49 +137,34 @@ dracut \
 # Note: We need to enable pipefail to catch dracut errors
 set -o pipefail
 
-# Full Normalization Cycle: Unpack -> Normalize -> Repack -> Recompress
-# This ensures:
-# 1. Deterministic file ordering (sort)
-# 2. Deterministic timestamps (SOURCE_DATE_EPOCH)
-# 3. Deterministic inodes (cpio --renumber-inodes)
-# 4. Deterministic ownership (root:root)
-# 5. Deterministic gzip headers (gzip -n)
+# Simplified Normalization: Decompress -> add-det -> Recompress -> add-det
+# This approach normalizes the cpio archive and gzip compression without extracting files
 
-echo "🔧 Normalizing initramfs (CPIO + GZIP)..."
-if command -v cpio >/dev/null && command -v gzip >/dev/null; then
-    TEMP_EXTRACT_DIR=$(mktemp -d)
+echo "🔧 Normalizing initramfs..."
+if command -v gzip >/dev/null && command -v add-det &> /dev/null; then
+    # 1. Decompress
+    echo "   Decompressing..."
+    gzip -d -c "$OUTPUT_FILE" > "$OUTPUT_FILE.uncompressed"
     
-    # 1. Extract
-    echo "   Extracting..."
-    cd "$TEMP_EXTRACT_DIR"
-    gzip -d -c "$BUILD_DIR/$OUTPUT_FILE" | cpio -id --quiet
+    # 2. Normalize uncompressed cpio archive
+    echo "   Normalizing uncompressed archive with add-det..."
+    add-det "$OUTPUT_FILE.uncompressed"
     
-    # 2. Normalize timestamps and ownership
-    echo "   Normalizing timestamps to @$SOURCE_DATE_EPOCH..."
-    find . -print0 | xargs -0 touch -h -d "@$SOURCE_DATE_EPOCH"
+    # 3. Recompress with deterministic gzip
+    echo "   Recompressing with gzip -n..."
+    gzip -n -9 < "$OUTPUT_FILE.uncompressed" > "$OUTPUT_FILE.tmp"
     
-    # 3. Repack with deterministic flags
-    echo "   Repacking..."
-    find . -print0 | \
-        LC_ALL=C sort -z | \
-        cpio --quiet -o -0 -H newc \
-             --owner=0:0 \
-             --reproducible \
-             --renumber-inodes \
-             --ignore-devno | \
-        gzip -n -9 > "$BUILD_DIR/$OUTPUT_FILE.fixed"
-        
-    mv "$BUILD_DIR/$OUTPUT_FILE.fixed" "$BUILD_DIR/$OUTPUT_FILE"
-    cd "$BUILD_DIR"
-    rm -rf "$TEMP_EXTRACT_DIR"
+    # 4. Normalize compressed archive
+    echo "   Normalizing compressed archive with add-det..."
+    add-det "$OUTPUT_FILE.tmp"
+    
+    # Replace original
+    mv "$OUTPUT_FILE.tmp" "$OUTPUT_FILE"
+    rm -f "$OUTPUT_FILE.uncompressed"
+    
+    echo "✅ Normalization complete"
 else
-    echo "⚠️  cpio or gzip not found, skipping full normalization..."
-fi
-
-# Use add-det for any remaining metadata (though cpio+gzip normalization should handle most)
-if command -v add-det &> /dev/null; then
-    echo "🔧 Running add-det as final check..."
-    add-det "$OUTPUT_FILE"
+    echo "⚠️  gzip or add-det not found, skipping normalization..."
 fi
 
 # Calculate hash for verification
