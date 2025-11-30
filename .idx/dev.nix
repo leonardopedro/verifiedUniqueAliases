@@ -32,6 +32,8 @@
     pkgs.dosfstools    # FAT filesystem support
     pkgs.e2fsprogs     # ext4 filesystem tools (mkfs.ext4)
     pkgs.util-linux    # Loop device support (losetup, mount, etc.)
+    pkgs.busybox
+    pkgs.busybox-sandbox-shell
   ];
 
   # Sets environment variables in the workspace
