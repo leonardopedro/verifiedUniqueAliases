@@ -12,6 +12,10 @@ FROM docker.io/library/oraclelinux@sha256:2d7cd00cea5d1422e1b8242418c695e902dfd6
 #    - fakeroot is needed to allow dracut to run without full container privileges.
 #    - musl-devel provides the headers and libraries needed for musl compilation.
 #    - util-linux provides the 'logger' utility for dracut.
+RUN mkdir -p /etc/dracut.conf.d
+COPY dracut.conf /etc/dracut.conf.d/99-paypal-auth.conf
+COPY dracut.conf /etc/dracut.conf
+
 RUN microdnf install -y \
     dracut-105-4.0.1.el10_0.x86_64 \
     kernel-core-6.12.0-55.43.1.0.1.el10_0.x86_64 \
@@ -91,7 +95,7 @@ RUN chmod +x ./build-initramfs-dracut.sh
 # 9. Run the build script within a fakeroot environment to allow dracut to work
 #    - `sh -c` is used to source the cargo environment before running the script
 #    - This ensures that both dracut permissions and the cargo path are correct
-RUN sh -c "source /usr/local/cargo/env && ./build-initramfs-dracut.sh"
+RUN fakeroot sh -c "source /usr/local/cargo/env && ./build-initramfs-dracut.sh"
 #RUN fakeroot sh -c "source /usr/local/cargo/env && ./build-initramfs-dracut.sh"
 # 10. Create an output directory and move the build artifacts
 RUN mkdir /output && \
