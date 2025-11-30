@@ -18,8 +18,8 @@ export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"
 # Build configuration
 # Build configuration
 BUILD_DIR=$(pwd)
-# Use musl for static binary to avoid dependency issues in initramfs
-BUILD_TARGET="x86_64-unknown-linux-musl"
+# Use gnu target for dynamic linking (glibc)
+BUILD_TARGET="x86_64-unknown-linux-gnu"
 INITRAMFS_FILE="$BUILD_DIR/initramfs-paypal-auth.img"
 OUTPUT_IMG="$BUILD_DIR/paypal-auth-vm.qcow2"
 ISO_FILE="$BUILD_DIR/boot.iso"
@@ -32,12 +32,12 @@ echo ""
 # Clean up previous build artifacts
 rm -rf "$ISO_ROOT" "$INITRAMFS_FILE" "$ISO_FILE" result
 
-# Step 1: Build Rust binary (Static)
-echo "🦀 Building Rust binary (static)..."
-rustup target add "$BUILD_TARGET" 2>/dev/null || true
+# Step 1: Build Rust binary (Dynamic)
+echo "🦀 Building Rust binary (dynamic)..."
+# rustup target add "$BUILD_TARGET" 2>/dev/null || true # Usually installed by default
 
-# Set flags for static build and reproducibility
-export RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C strip=symbols -C target-feature=+crt-static"
+# Clear RUSTFLAGS to avoid static linking
+export RUSTFLAGS=""
 export CARGO_PROFILE_RELEASE_LTO=true
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=z
 
