@@ -81,6 +81,34 @@ fi
 echo "✅ Initramfs built: $INITRAMFS_FILE"
 echo "   Kernel found: $KERNEL_FILE"
 
+# Normalize initramfs for reproducibility
+echo "🔧 Normalizing initramfs..."
+if command -v add-det &>/dev/null; then
+    # Decompress initramfs
+    echo "   Decompressing initramfs..."
+    gzip -d -c "$INITRAMFS_FILE" > "$INITRAMFS_FILE.uncompressed"
+    
+    # Apply add-det to uncompressed initramfs
+    echo "   Applying add-det to uncompressed initramfs..."
+    add-det "$INITRAMFS_FILE.uncompressed"
+    
+    # Recompress with deterministic gzip
+    echo "   Recompressing with deterministic gzip..."
+    gzip -n -9 < "$INITRAMFS_FILE.uncompressed" > "$INITRAMFS_FILE.tmp"
+    
+    # Apply add-det to compressed initramfs
+    echo "   Applying add-det to compressed initramfs..."
+    add-det "$INITRAMFS_FILE.tmp"
+    
+    # Replace original
+    mv "$INITRAMFS_FILE.tmp" "$INITRAMFS_FILE"
+    rm -f "$INITRAMFS_FILE.uncompressed"
+    
+    echo "   ✅ Initramfs normalized"
+else
+    echo "   ⚠️  add-det not found, skipping initramfs normalization"
+fi
+
 INITRAMFS_HASH=$(sha256sum "$INITRAMFS_FILE" | awk '{print $1}')
 echo "📊 Initramfs SHA256: $INITRAMFS_HASH"
 
