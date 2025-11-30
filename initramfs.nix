@@ -16,8 +16,9 @@ let
     
     # Load virtio network drivers
     echo "Loading virtio network drivers..."
-    /bin/modprobe virtio_pci 2>/dev/null || true
-    /bin/modprobe virtio_net 2>/dev/null || true
+    export MODULE_DIR=/modules
+    /bin/modprobe -d /modules virtio_pci 2>/dev/null || true
+    /bin/modprobe -d /modules virtio_net 2>/dev/null || true
     /bin/sleep 2
     
     # Network setup - be resilient to missing interfaces
