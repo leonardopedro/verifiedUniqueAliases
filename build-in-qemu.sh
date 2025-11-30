@@ -70,8 +70,10 @@ qemu-system-x86_64 \
     -smp 4 \
     $ACCEL \
     -drive file="$SNAPSHOT_NAME",format=qcow2 \
+    -enable-kvm \
     -drive file=/dev/vg_qemu/my_vm_disk,format=raw,if=virtio,cache=none \
-    -nographic \
+    -nographic 
     #-virtfs local,path=$(pwd),mount_tag=source,security_model=mapped-xattr,id=source \
+    #-nographic \
     
 echo "✅ VM exited."
