@@ -10,6 +10,7 @@ build-manifest.json
 metadata.json
 
 result-initramfs
+result-kernel
 *.img
 *.box
 *.raw
