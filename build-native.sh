@@ -61,7 +61,7 @@ touch -d "@${SOURCE_DATE_EPOCH}" "$BINARY_PATH"
 echo "❄️  Building initramfs with Nix..."
 
 # Build initramfs
-nix-build initramfs.nix -A initramfs --arg binaryPath "$BINARY_PATH" -o result-initramfs
+nix-build initramfs.nix -A initramfs --arg binaryPath "/. + \"$BINARY_PATH\"" -o result-initramfs
 cp result-initramfs/initrd "$INITRAMFS_FILE"
 
 # Get kernel
