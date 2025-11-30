@@ -110,8 +110,8 @@ in
       # Copy glibc and essential libraries for dynamic binaries
       { object = "${pkgs.glibc}/lib"; symlink = "/lib"; }
       
-      # Kernel modules for virtio network support
-      { object = "${pkgs.linuxPackages.kernel}/lib/modules"; symlink = "/lib/modules"; }
+      # Kernel modules for virtio network support (at /modules to avoid conflict with /lib)
+      { object = "${pkgs.linuxPackages.kernel}/lib/modules"; symlink = "/modules"; }
     ];
     
     compressor = "gzip -9";
