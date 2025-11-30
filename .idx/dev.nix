@@ -2,6 +2,8 @@
 # see: https://firebase.google.com/docs/studio/customize-workspace
 { pkgs, ... }: {
   # Which nixpkgs channel to use.
+  # Channel: stable-24.05 (nixos-24.05.7376.b134951a4c9f as of 2024-12-31)
+  # This provides reproducible builds with security updates
   channel = "stable-24.05"; # or "unstable"
 
   # Use https://search.nixos.org/packages to find packages
@@ -11,18 +13,38 @@
     #pkgs.python311Packages.pip
     # pkgs.nodejs_20
     # pkgs.nodePackages.nodemon
+    
+    # Build tools
     pkgs.curl
     pkgs.gcc
     pkgs.gnumake
     pkgs.rustup
+    
+    # Dracut and kernel
     pkgs.dracut
     pkgs.linux
+    pkgs.kmod
+    
+    # Musl for static binaries
     pkgs.musl
     pkgs.musl.dev
     pkgs.pkgsMusl.stdenv.cc
+    
+    # Container support (optional, can be removed if not using Docker/Podman)
     pkgs.podman
+    
+    # Archive tools
     pkgs.cpio
-    pkgs.qemu_kvm
+    pkgs.gzip
+    pkgs.xz
+    
+    # QEMU and image creation tools
+    pkgs.qemu_kvm      # Provides qemu-img for image conversion
+    pkgs.grub2         # Bootloader installation
+    pkgs.parted        # Disk partitioning
+    pkgs.dosfstools    # FAT filesystem support
+    pkgs.e2fsprogs     # ext4 filesystem tools (mkfs.ext4)
+    pkgs.util-linux    # Loop device support (losetup, mount, etc.)
   ];
 
   # Sets environment variables in the workspace
@@ -66,8 +88,9 @@
     workspace = {
       # Runs when a workspace is first created
       onCreate = {
-        # Example: install JS dependencies from NPM
-        # npm-install = "npm install";
+        # Install add-determinism for reproducible builds
+        # This tool normalizes binaries and archives to remove non-deterministic metadata
+        install-add-determinism = "cargo install add-determinism || echo 'add-determinism installation skipped'";
       };
       # Runs when the workspace is (re)started
       onStart = {

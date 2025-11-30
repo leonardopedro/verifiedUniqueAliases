@@ -55,12 +55,10 @@ export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
 # Prepare local dracut module
 echo "📋 Preparing local dracut module..."
 
-# Copy module if it doesn't exist in system location (critical for QEMU build)
-if [ ! -d "/usr/lib/dracut/modules.d/99paypal-auth-vm" ]; then
-    echo "   Copying module from source..."
-    mkdir -p /usr/lib/dracut/modules.d/
-    cp -r ./dracut-module/99paypal-auth-vm /usr/lib/dracut/modules.d/
-fi
+# Always remove and re-copy to ensure clean state
+rm -rf /usr/lib/dracut/modules.d/99paypal-auth-vm
+mkdir -p /usr/lib/dracut/modules.d/
+cp -r ./dracut-module/99paypal-auth-vm /usr/lib/dracut/modules.d/
 
 chmod +x /usr/lib/dracut/modules.d/99paypal-auth-vm/*.sh
 
@@ -76,9 +74,10 @@ sed -i "s|source /usr/local/cargo/env|export PATH=\"/root/.cargo/bin:\$PATH\"|g"
     /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
 
 # Force absolute paths for cargo and add-det to be safe
-sed -i "s|cargo build|/root/.cargo/bin/cargo build|g" \
+# Only replace if not already absolute path (to prevent duplication)
+sed -i "s| cargo build| /root/.cargo/bin/cargo build|g" \
     /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
-sed -i "s|add-det|/root/.cargo/bin/add-det|g" \
+sed -i "s| add-det | /root/.cargo/bin/add-det |g" \
     /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
 
 #sed -i "s|x86_64-unknown-linux-musl|$BUILD_TARGET|g" \

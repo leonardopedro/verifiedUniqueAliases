@@ -318,7 +318,55 @@ See `src/main.rs` for the full implementation.
 
 ---
 
-## Part 4: Reproducible Initramfs with Dracut
+---
+
+## Part 4: Reproducible Initramfs Build Options
+
+You can build the initramfs and qcow2 image using one of three methods:
+
+### Option A: Native Build (Firebase Studio - Recommended)
+
+If you're using [Firebase Studio](https://firebase.studio) (formerly Project IDX), you can build the image directly without Docker or QEMU:
+
+**Prerequisites:**
+- Workspace with `.idx/dev.nix` configured (included in this repo)
+- Packages will be installed automatically from NixOS stable-24.05 channel
+
+**Steps:**
+
+1. **Check Environment** (first time only):
+   ```bash
+   ./check-native-env.sh
+   ```
+
+2. **Build Everything**:
+   ```bash
+   ./build-native.sh
+   ```
+
+   This single command will:
+   - Build the Rust binary with reproducibility flags
+   - Create the dracut initramfs image
+- Package everything into a bootable qcow2 disk image
+   - Generate SHA256 checksums and build manifest
+
+**Output Files:**
+- `initramfs-paypal-auth.img` - The initramfs image  
+- `paypal-auth-vm.qcow2` - Bootable VM image (ready for OCI upload)
+- `build-manifest.json` - Build metadata for reproducibility
+- `*.sha256` - Checksums for verification
+
+**Advantages:**
+- ✅ **Fastest**: No VM or container overhead
+- ✅ **Simplest**: Runs directly in your workspace
+- ✅ **Same Output**: Produces identical images (verify with SHA256)
+- ✅ **Integrated**: Part of your development workflow
+
+**See Also:** [`BUILD_NATIVE.md`](BUILD_NATIVE.md) for detailed documentation.
+
+---
+
+### Option B: Docker Build
 
 This method ensures a bit-for-bit reproducible build by using a fixed environment (Fedora Minimal + specific Rust version).
 
@@ -448,13 +496,41 @@ echo "Initramfs uploaded to: https://objectstorage.${REGION}.oraclecloud.com/n/<
 
 ### Step 5.2: Create Custom Image from Initramfs
 
-```bash
-# Import the initramfs as a custom image
-# Note: For confidential computing, we need a minimal kernel that supports initramfs boot
-# You'll need to provide a compatible kernel image or use Oracle's base image
+### Step 5.2: Create Bootable Disk Image
 
-# For now, we'll create a boot volume from the initramfs
-# This is a placeholder - actual implementation depends on OCI's confidential VM requirements
+Since OCI requires a bootable disk image (not just an initramfs), we need to package our kernel and initramfs into a `.qcow2` image.
+
+```bash
+# 1. Create a minimal bootable disk image
+# We'll use a helper script (create-boot-image.sh) to:
+# - Create a disk image with a single partition
+# - Install GRUB bootloader
+# - Copy the kernel (vmlinuz) and our initramfs
+# - Configure GRUB to boot our initramfs
+
+./create-boot-image.sh \
+    --kernel /boot/vmlinuz-$(uname -r) \
+    --initramfs img/initramfs-paypal-auth.img \
+    --output paypal-auth-vm.qcow2
+
+# 2. Upload the disk image to Object Storage
+oci os object put \
+    --bucket-name paypal-vm-images \
+    --file paypal-auth-vm.qcow2 \
+    --name paypal-auth-vm.qcow2
+
+# 3. Import as a Custom Image
+export IMAGE_OCID=$(oci compute image import from-object \
+    --compartment-id $COMPARTMENT_ID \
+    --display-name "paypal-auth-cvm-v1" \
+    --launch-mode NATIVE \
+    --source-image-type QCOW2 \
+    --bucket-name paypal-vm-images \
+    --namespace $NAMESPACE \
+    --name paypal-auth-vm.qcow2 \
+    --query 'data.id' --raw-output)
+
+echo "Custom Image created with OCID: $IMAGE_OCID"
 ```
 
 ### Step 5.3: Create Confidential VM Instance
@@ -483,7 +559,7 @@ oci compute instance launch \
         "secret_ocid": "'"$SECRET_OCID"'",
         "notification_topic_id": "'"$NOTIFICATION_TOPIC_ID"'"
     }' \
-    --image-id <CONFIDENTIAL_VM_IMAGE_ID> \
+    --image-id $IMAGE_OCID \
     --boot-volume-size-in-gbs 50
 
 export INSTANCE_ID="<output-instance-id>"
