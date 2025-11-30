@@ -19,7 +19,7 @@ use instant_acme::{
     OrderStatus,
 };
 use parking_lot::RwLock;
-use rcgen::{Certificate, CertificateParams, DistinguishedName};
+use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
@@ -237,10 +237,12 @@ impl AcmeManager {
         // Generate CSR
         info!("🔑 Generating certificate signing request...");
 
-        let mut params = CertificateParams::new(vec![self.domain.clone()]);
-        params.distinguished_name = DistinguishedName::new();
-        let cert = Certificate::from_params(params)?;
-        let csr = cert.serialize_request_der()?;
+        // Generate CSR
+        info!("🔑 Generating certificate signing request...");
+
+        let params = CertificateParams::new(vec![self.domain.clone()])?;
+        let key_pair = KeyPair::generate()?;
+        let csr = params.serialize_request(&key_pair)?;
 
         // Finalize order
         order.finalize(&csr).await?;
@@ -266,13 +268,12 @@ impl AcmeManager {
         }
 
         // Download certificate
-        let cert_chain_pem = order
-            .certificate()
-            .await?
-            .ok_or("Failed to download certificate")?;
+        let cert_chain_pem: Option<String> = order.certificate().await?;
+
+        let cert_chain_pem = cert_chain_pem.ok_or("Failed to download certificate")?;
 
         // Extract private key
-        let private_key_pem = cert.serialize_private_key_pem();
+        let private_key_pem = key_pair.serialize_pem();
 
         info!("✅ Certificate obtained and stored in RAM!");
 

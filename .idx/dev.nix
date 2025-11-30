@@ -2,9 +2,9 @@
 # see: https://firebase.google.com/docs/studio/customize-workspace
 { pkgs, ... }: {
   # Which nixpkgs channel to use.
-  # Channel: stable-24.05 (nixos-24.05.7376.b134951a4c9f as of 2024-12-31)
+  # Channel: stable-25.11
   # This provides reproducible builds with security updates
-  channel = "stable-24.05"; # or "unstable"
+  channel = "stable-25.11"; # or "unstable"
 
   # Use https://search.nixos.org/packages to find packages
   packages = [
