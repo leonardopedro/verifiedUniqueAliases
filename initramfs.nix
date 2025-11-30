@@ -7,7 +7,6 @@ let
   # Create the init script
   initScript = pkgs.writeScript "init" ''
     #!/bin/sh
-    set -e
     
     # Mount essential filesystems
     /bin/mkdir -p /proc /sys /dev /run /tmp /var/tmp /var/lib/dhcpcd
@@ -15,37 +14,64 @@ let
     /bin/mount -t sysfs sysfs /sys
     /bin/mount -t devtmpfs devtmpfs /dev || true
     
-    # Network setup
+    # Network setup - be resilient to missing interfaces
     echo "Bringing up network..."
-    /bin/ip link set lo up
-    /bin/ip link set eth0 up
-    /bin/dhcpcd eth0
+    /bin/ip link set lo up || true
+    
+    # Wait for eth0 to appear (QEMU virtio-net may take time)
+    for i in $(/bin/seq 1 10); do
+        if /bin/ip link show eth0 >/dev/null 2>&1; then
+            echo "Found eth0, configuring..."
+            /bin/ip link set eth0 up
+            /bin/dhcpcd eth0 &
+            break
+        fi
+        echo "Waiting for eth0... ($i/10)"
+        /bin/sleep 1
+    done
+    
+    if ! /bin/ip link show eth0 >/dev/null 2>&1; then
+        echo "WARNING: eth0 not found. Network will not be available."
+        echo "To enable networking, run QEMU with: -nic user,model=virtio-net-pci"
+    fi
     
     # Metadata fetcher
     fetch_metadata() {
         local key=$1
         /bin/curl -sf -H "Authorization: Bearer Oracle" \
-            "http://169.254.169.254/opc/v1/instance/metadata/$key"
+            "http://169.254.169.254/opc/v1/instance/metadata/$key" 2>/dev/null || echo "mock-$key"
     }
 
-    # Wait for metadata service
+    # Wait for metadata service (optional)
     echo "Waiting for metadata service..."
-    for i in $(/bin/seq 1 30); do
+    for i in $(/bin/seq 1 10); do
         if /bin/curl -sf http://169.254.169.254/ >/dev/null 2>&1; then
+            echo "Metadata service available"
             break
         fi
         /bin/sleep 1
     done
 
-    # Fetch environment variables
+    # Fetch environment variables (with fallbacks for testing)
     export PAYPAL_CLIENT_ID=$(fetch_metadata paypal_client_id)
     export DOMAIN=$(fetch_metadata domain)
     export SECRET_OCID=$(fetch_metadata secret_ocid)
-    export OCI_REGION=$(/bin/curl -sf http://169.254.169.254/opc/v2/instance/region)
+    export OCI_REGION=$(/bin/curl -sf http://169.254.169.254/opc/v2/instance/region 2>/dev/null || echo "mock-region")
     export NOTIFICATION_TOPIC_ID=$(fetch_metadata notification_topic_id)
 
     echo "Starting PayPal Auth application..."
-    exec /bin/paypal-auth-vm
+    echo "Environment:"
+    echo "  PAYPAL_CLIENT_ID: $PAYPAL_CLIENT_ID"
+    echo "  DOMAIN: $DOMAIN"
+    echo ""
+    
+    if [ -f /bin/paypal-auth-vm ]; then
+        exec /bin/paypal-auth-vm
+    else
+        echo "ERROR: /bin/paypal-auth-vm not found"
+        echo "Dropping to shell for debugging..."
+        exec /bin/sh
+    fi
   '';
 
 in
