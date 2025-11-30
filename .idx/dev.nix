@@ -1,10 +1,9 @@
 # To learn more about how to use Nix to configure your environment
 # see: https://firebase.google.com/docs/studio/customize-workspace
 { pkgs, ... }: {
-  # Which nixpkgs channel to use.
-  # Channel: nixos-23.11
-  # This provides reproducible builds with security updates
-  channel = "stable-25.05"; # or "unstable"
+  # Which nixpkgs channel to use - pinned for reproducibility
+  # Using stable-25.05 ensures consistent package versions
+  channel = "stable-25.05";
 
   # Use https://search.nixos.org/packages to find packages
   packages = [
@@ -14,7 +13,7 @@
     pkgs.gnumake
     pkgs.rustup
     
-    # Dracut and kernel
+    # Kernel and boot tools
     pkgs.xorriso  # Required for grub-mkrescue
     pkgs.linux
     pkgs.kmod
@@ -32,8 +31,6 @@
     pkgs.dosfstools    # FAT filesystem support
     pkgs.e2fsprogs     # ext4 filesystem tools (mkfs.ext4)
     pkgs.util-linux    # Loop device support (losetup, mount, etc.)
-    pkgs.busybox
-    pkgs.busybox-sandbox-shell
   ];
 
   # Sets environment variables in the workspace
