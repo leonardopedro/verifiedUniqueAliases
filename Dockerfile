@@ -95,7 +95,7 @@ RUN chmod +x ./build-initramfs-dracut.sh
 # 9. Run the build script within a fakeroot environment to allow dracut to work
 #    - `sh -c` is used to source the cargo environment before running the script
 #    - This ensures that both dracut permissions and the cargo path are correct
-RUN fakeroot sh -c "source /usr/local/cargo/env && ./build-initramfs-dracut.sh"
+RUN sh -c "source /usr/local/cargo/env && ./build-initramfs-dracut.sh"
 #RUN fakeroot sh -c "source /usr/local/cargo/env && ./build-initramfs-dracut.sh"
 # 10. Create an output directory and move the build artifacts
 RUN mkdir /output && \
