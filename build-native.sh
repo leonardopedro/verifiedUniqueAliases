@@ -76,7 +76,7 @@ echo "🔍 Verifying dracut module..."
 # Create temporary directory early for verification
 mkdir -p "$DRACUT_TMP_DIR"
 
-if (cd "$DRACUT_BASE_DIR" && dracut --local --tmpdir "$DRACUT_TMP_DIR" --list-modules 2>&1 | grep -q paypal); then
+if (cd "$DRACUT_MODULE_PATH" && dracut --local --no-kernel --tmpdir "$DRACUT_TMP_DIR" --list-modules 2>&1 | grep -q paypal); then
     echo "✅ Dracut sees the paypal-auth-vm module"
 else
     echo "⚠️  Warning: Dracut may not see the module. Please check directory structure."
@@ -97,9 +97,9 @@ echo "   Kernel version: $KERNEL_VERSION"
 mkdir -p "$DRACUT_TMP_DIR"
 
 # Build with reproducibility flags and the --local flag
-# We must cd into DRACUT_BASE_DIR for --local to work effectively with modules in ./modules.d
+# We must cd into DRACUT_MODULE_PATH for --local to work effectively with modules in the current dir
 (
-    cd "$DRACUT_BASE_DIR"
+    cd "$DRACUT_MODULE_PATH"
     dracut \
         --force \
         --reproducible \
