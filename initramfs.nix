@@ -14,6 +14,12 @@ let
     /bin/mount -t sysfs sysfs /sys
     /bin/mount -t devtmpfs devtmpfs /dev || true
     
+    # Load virtio network drivers
+    echo "Loading virtio network drivers..."
+    /bin/modprobe virtio_pci 2>/dev/null || true
+    /bin/modprobe virtio_net 2>/dev/null || true
+    /bin/sleep 2
+    
     # Network setup - be resilient to missing interfaces
     echo "Bringing up network..."
     /bin/ip link set lo up || true
@@ -93,6 +99,8 @@ in
       { object = "${busybox}/bin/busybox"; symlink = "/bin/sleep"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/cat"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/seq"; }
+      { object = "${busybox}/bin/busybox"; symlink = "/bin/modprobe"; }
+      { object = "${busybox}/bin/busybox"; symlink = "/bin/insmod"; }
       
       # Network utilities (dynamic - simpler and more reliable)
       { object = "${pkgs.iproute2}/bin/ip"; symlink = "/bin/ip"; }
@@ -101,6 +109,9 @@ in
       
       # Copy glibc and essential libraries for dynamic binaries
       { object = "${pkgs.glibc}/lib"; symlink = "/lib"; }
+      
+      # Kernel modules for virtio network support
+      { object = "${pkgs.linuxPackages.kernel}/lib/modules"; symlink = "/lib/modules"; }
     ];
     
     compressor = "gzip -9";
