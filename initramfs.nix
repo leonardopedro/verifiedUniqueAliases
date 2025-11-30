@@ -68,10 +68,13 @@ in
       { object = "${busybox}/bin/busybox"; symlink = "/bin/cat"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/seq"; }
       
-      # Network utilities (static)
-      { object = "${pkgs.pkgsStatic.iproute2}/bin/ip"; symlink = "/bin/ip"; }
-      { object = "${pkgs.pkgsStatic.dhcpcd}/bin/dhcpcd"; symlink = "/bin/dhcpcd"; }
-      { object = "${pkgs.pkgsStatic.curl}/bin/curl"; symlink = "/bin/curl"; }
+      # Network utilities (dynamic - simpler and more reliable)
+      { object = "${pkgs.iproute2}/bin/ip"; symlink = "/bin/ip"; }
+      { object = "${pkgs.dhcpcd}/bin/dhcpcd"; symlink = "/bin/dhcpcd"; }
+      { object = "${pkgs.curl}/bin/curl"; symlink = "/bin/curl"; }
+      
+      # Copy glibc and essential libraries for dynamic binaries
+      { object = "${pkgs.glibc}/lib"; symlink = "/lib"; }
     ];
     
     compressor = "gzip -9";
