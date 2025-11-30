@@ -5,32 +5,23 @@ let
   busybox = pkgs.pkgsStatic.busybox;
   curl = pkgs.pkgsStatic.curl;
   iproute = pkgs.pkgsStatic.iproute2;
-  # Removed 'dhcpcd' (it fails to build). We will use busybox's 'udhcpc'.
   
-  # Kernel version for modules
   kernel = pkgs.linuxPackages.kernel;
   kernelVersion = kernel.modDirVersion;
 
   # 2. DHCP Callback Script
-  # Busybox's udhcpc needs this small script to actually apply the IP address it finds.
   udhcpcScript = pkgs.writeScript "udhcpc.script" ''
     #!/bin/sh
-    # $1 is the action (bound, renew, etc.)
-    # Environment variables ($ip, $mask, $router, $dns) are passed by udhcpc
-    
     case "$1" in
       deconfig)
         /bin/ip addr flush dev $interface
         ;;
       bound|renew)
         /bin/ip addr add $ip/$mask dev $interface
-        
         if [ -n "$router" ]; then
            /bin/ip route add default via $router
         fi
-        
         if [ -n "$dns" ]; then
-           # Set DNS for Curl
            echo "nameserver $dns" > /etc/resolv.conf
         fi
         ;;
@@ -64,7 +55,6 @@ let
     echo "Scanning for network interface..."
     INTERFACE=""
     for i in $(seq 1 10); do
-        # Find first non-loopback interface
         CANDIDATE=$(ip -o link show | awk -F': ' '$2 != "lo" {print $2; exit}')
         if [ -n "$CANDIDATE" ]; then
             INTERFACE=$CANDIDATE
@@ -77,12 +67,6 @@ let
     if [ -n "$INTERFACE" ]; then
         echo "Configuring $INTERFACE..."
         ip link set $INTERFACE up
-        
-        # USE UDHCPC (Busybox) instead of dhcpcd
-        # -i: Interface
-        # -s: Script to run when IP is found
-        # -n: Exit if lease fails (don't loop forever)
-        # -q: Exit after obtaining lease (one-shot mode)
         udhcpc -i $INTERFACE -s /bin/udhcpc.script -n -q || echo "DHCP failed"
     else
         echo "ERROR: No network interface found."
@@ -105,9 +89,9 @@ let
     export SECRET_OCID=$(fetch_metadata secret_ocid)
     
     echo "Starting PayPal Auth VM..."
-    echo "Domain target: $DOMAIN"
 
     if [ -f /bin/paypal-auth-vm ]; then
+        # ERROR WAS HERE: chmod is now available
         chmod +x /bin/paypal-auth-vm
         exec /bin/paypal-auth-vm
     else
@@ -121,11 +105,9 @@ in
   initramfs = pkgs.makeInitrd {
     contents = [
       { object = initScript; symlink = "/init"; }
-      
-      # Add the DHCP callback script
       { object = udhcpcScript; symlink = "/bin/udhcpc.script"; }
       
-      # Static Tools
+      # BUSYBOX TOOLS
       { object = "${busybox}/bin/busybox"; symlink = "/bin/busybox"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/sh"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/mkdir"; }
@@ -135,11 +117,13 @@ in
       { object = "${busybox}/bin/busybox"; symlink = "/bin/seq"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/awk"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/mdev"; }
-      
-      # We use busybox's 'udhcpc' symlink now
       { object = "${busybox}/bin/busybox"; symlink = "/bin/udhcpc"; }
+      
+      # ADDED HERE: chmod (and ls for debugging)
+      { object = "${busybox}/bin/busybox"; symlink = "/bin/chmod"; }
+      { object = "${busybox}/bin/busybox"; symlink = "/bin/ls"; }
 
-      # Other Static Tools
+      # External Static Tools
       { object = "${pkgs.kmod}/bin/kmod"; symlink = "/bin/modprobe"; }
       { object = "${iproute}/bin/ip"; symlink = "/bin/ip"; }
       { object = "${curl}/bin/curl"; symlink = "/bin/curl"; }
