@@ -144,6 +144,15 @@ echo "⚙️  Converting ISO to QCOW2..."
 qemu-img convert -f raw -O qcow2 "$ISO_FILE" "$OUTPUT_IMG"
 rm -f "$ISO_FILE"
 
+# Normalize QCOW2 for reproducibility
+echo "🔧 Normalizing QCOW2 image..."
+if command -v add-det &>/dev/null; then
+    add-det "$OUTPUT_IMG"
+    echo "   ✅ QCOW2 normalized"
+else
+    echo "   ⚠️  add-det not found, skipping QCOW2 normalization"
+fi
+
 QCOW2_HASH=$(sha256sum "$OUTPUT_IMG" | awk '{print $1}')
 
 # Step 5: Record build metadata
