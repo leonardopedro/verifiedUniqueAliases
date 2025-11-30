@@ -1,24 +1,8 @@
 { pkgs ? import <nixpkgs> {}, binaryPath ? null }:
 
 let
-  # Create a minimal busybox for basic utilities
-  # This is the simplest approach for a minimal initramfs
-  busybox = pkgs.pkgsStatic.busybox.override {
-    enableStatic = true;
-    enableMinimal = true;
-    extraConfig = ''
-      CONFIG_FEATURE_SH_STANDALONE y
-      CONFIG_ASH y
-      CONFIG_ASH_BUILTIN_ECHO y
-      CONFIG_ASH_BUILTIN_TEST y
-      CONFIG_MKDIR y
-      CONFIG_MOUNT y
-      CONFIG_UMOUNT y
-      CONFIG_SLEEP y
-      CONFIG_CAT y
-      CONFIG_SEQ y
-    '';
-  };
+  # Use pre-built static busybox from nixpkgs
+  busybox = pkgs.pkgsStatic.busybox;
 
   # Create the init script
   initScript = pkgs.writeScript "init" ''
