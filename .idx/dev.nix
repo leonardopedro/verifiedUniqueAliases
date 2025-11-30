@@ -18,12 +18,15 @@
     pkgs.linux
     pkgs.kmod
     
+    # Musl toolchain for static linking
+    pkgs.pkgsMusl.stdenv.cc
+    pkgs.musl
     
     # Archive tools
     pkgs.cpio
     pkgs.gzip
     pkgs.xz
-    pkgs.git-lfs
+    
     # QEMU and image creation tools
     pkgs.qemu_kvm      # Provides qemu-img for image conversion
     pkgs.grub2         # Bootloader installation
@@ -34,7 +37,12 @@
   ];
 
   # Sets environment variables in the workspace
-  env = {};
+  env = {
+    # Point cc-rs to the musl compiler
+    CC_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-gcc";
+    # Also set generic CC for musl target just in case
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "x86_64-unknown-linux-musl-gcc";
+  };
 
   idx = {
     # Search for the extensions you want on https://open-vsx.org/ and use "publisher.id"

@@ -19,6 +19,10 @@ pkgs.mkShell {
     linuxPackages.kernel
     kmod
     
+    # Musl toolchain for static linking
+    pkgsMusl.stdenv.cc
+    musl
+    
     # Container support (optional)
     podman
     sudo
@@ -39,6 +43,10 @@ pkgs.mkShell {
 
   # Environment variables
   shellHook = ''
+    # Configure musl compiler for Rust
+    export CC_x86_64_unknown_linux_musl="x86_64-unknown-linux-musl-gcc"
+    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="x86_64-unknown-linux-musl-gcc"
+    
     echo "🚀 PayPal Auth VM Development Environment"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "Available tools:"
