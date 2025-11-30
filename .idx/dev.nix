@@ -21,7 +21,8 @@
     pkgs.rustup
     
     # Dracut and kernel
-    pkgs.dracut
+    # pkgs.dracut # Removed as we use native Nix build
+    pkgs.xorriso  # Required for grub-mkrescue
     pkgs.linux
     pkgs.kmod
     

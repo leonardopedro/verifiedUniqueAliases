@@ -16,16 +16,13 @@ export LC_ALL=C.UTF-8
 export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"
 
 # Build configuration
+# Build configuration
 BUILD_DIR=$(pwd)
-BUILD_TARGET="x86_64-unknown-linux-gnu"
+# Use musl for static binary to avoid dependency issues in initramfs
+BUILD_TARGET="x86_64-unknown-linux-musl"
 INITRAMFS_FILE="$BUILD_DIR/initramfs-paypal-auth.img"
 OUTPUT_IMG="$BUILD_DIR/paypal-auth-vm.qcow2"
 ISO_FILE="$BUILD_DIR/boot.iso"
-
-# Local directories for build artifacts
-DRACUT_BASE_DIR="$BUILD_DIR/dracut-local"
-DRACUT_MODULE_PATH="$DRACUT_BASE_DIR/modules.d"
-DRACUT_TMP_DIR="$HOME/dracut-build"
 ISO_ROOT="$BUILD_DIR/iso_root"
 
 echo "📍 Build directory: $BUILD_DIR"
@@ -33,133 +30,67 @@ echo "🎯 Target: $BUILD_TARGET"
 echo ""
 
 # Clean up previous build artifacts
-rm -rf "$DRACUT_BASE_DIR" "$DRACUT_TMP_DIR" "$ISO_ROOT" "$INITRAMFS_FILE" "$ISO_FILE"
+rm -rf "$ISO_ROOT" "$INITRAMFS_FILE" "$ISO_FILE" result
 
-# Step 1: Prepare dracut module in a local directory that mimics the system layout
-echo "📋 Preparing dracut module..."
-MODULE_DIR="$DRACUT_MODULE_PATH/99paypal-auth-vm"
-MODULE_SETUP_SH="$MODULE_DIR/module-setup.sh"
-mkdir -p "$MODULE_DIR"
+# Step 1: Build Rust binary (Static)
+echo "🦀 Building Rust binary (static)..."
+rustup target add "$BUILD_TARGET" 2>/dev/null || true
 
-cp ./dracut-module/99paypal-auth-vm/* "$MODULE_DIR/"
-chmod +x "$MODULE_DIR"/*.sh
+# Set flags for static build and reproducibility
+export RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C strip=symbols -C target-feature=+crt-static"
+export CARGO_PROFILE_RELEASE_LTO=true
+export CARGO_PROFILE_RELEASE_OPT_LEVEL=z
 
-# Update module-setup.sh with correct paths using a robust awk script
-TMP_MODULE_SETUP_SH="${MODULE_SETUP_SH}.tmp"
-awk \
-    -v build_dir="$BUILD_DIR" \
-    -v home="$HOME" \
-    -v path="$PATH" \
-    -v target="$BUILD_TARGET" \
-'
-{
-    sub("cd /app", "cd " build_dir);
-    sub("source /usr/local/cargo/env", "export PATH=\"" home "/.cargo/bin:" path "\"");
-    sub(" cargo build", " " home "/.cargo/bin/cargo build");
-    sub(" add-det ", " " home "/.cargo/bin/add-det ");
-    sub("x86_64-unknown-linux-gnu", target);
-    print;
-}
-' "$MODULE_SETUP_SH" > "$TMP_MODULE_SETUP_SH"
-mv "$TMP_MODULE_SETUP_SH" "$MODULE_SETUP_SH"
+cargo build --release --target "$BUILD_TARGET"
 
-# Normalize module timestamps for reproducibility
-echo "🔧 Normalizing module timestamps..."
-find "$MODULE_DIR" -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
+BINARY_PATH="$BUILD_DIR/target/$BUILD_TARGET/release/paypal-auth-vm"
 
-# Step 2: Configure dracut locally
-echo "📝 Configuring dracut..."
-# We will pass the config file directly on the command line
-
-# Verify module is visible using the --local flag
-echo "🔍 Verifying dracut module..."
-# Create temporary directory early for verification
-mkdir -p "$DRACUT_TMP_DIR"
-
-if (cd "$DRACUT_MODULE_PATH" && dracut --local --no-kernel --tmpdir "$DRACUT_TMP_DIR" --list-modules 2>&1 | grep -q paypal); then
-    echo "✅ Dracut sees the paypal-auth-vm module"
-else
-    echo "⚠️  Warning: Dracut may not see the module. Please check directory structure."
+if [ ! -f "$BINARY_PATH" ]; then
+    echo "❌ Cargo build failed! Binary not found: $BINARY_PATH"
     exit 1
 fi
 
-# Step 3: Build initramfs
-echo "🔨 Building initramfs with dracut..."
-
-KERNEL_VERSION=$(find /nix/store -path "*/lib/modules/*" -type d -name "[0-9]*" 2>/dev/null | head -1 | xargs basename)
-if [ -z "$KERNEL_VERSION" ]; then
-    echo "❌ Could not find kernel version in /nix/store"
-    exit 1
+# Normalize binary
+echo "🔧 Normalizing binary..."
+if command -v add-det &>/dev/null; then
+    add-det "$BINARY_PATH"
 fi
-echo "   Kernel version: $KERNEL_VERSION"
+touch -d "@${SOURCE_DATE_EPOCH}" "$BINARY_PATH"
 
-# Create temporary directory
-mkdir -p "$DRACUT_TMP_DIR"
+# Step 2: Build Initramfs and get Kernel using Nix
+echo "❄️  Building initramfs with Nix..."
 
-# Build with reproducibility flags and the --local flag
-# We must cd into DRACUT_MODULE_PATH for --local to work effectively with modules in the current dir
-(
-    cd "$DRACUT_MODULE_PATH"
-    dracut \
-        --force \
-        --reproducible \
-        --gzip \
-        --conf "$BUILD_DIR/dracut.conf" \
-        --local \
-        --omit " dash plymouth syslog firmware " \
-        --no-hostonly \
-        --no-hostonly-cmdline \
-        --nofscks \
-        --no-early-microcode \
-        --add "paypal-auth-vm" \
-        --kver "$KERNEL_VERSION" \
-        --fwdir "/nix/store/*/lib/firmware" \
-        --tmpdir "$DRACUT_TMP_DIR" \
-        "$INITRAMFS_FILE"
-)
+# Build initramfs
+nix-build initramfs.nix -A initramfs --arg binaryPath "$BINARY_PATH" -o result-initramfs
+cp result-initramfs/initrd "$INITRAMFS_FILE"
 
-# Check if dracut succeeded
+# Get kernel
+nix-build initramfs.nix -A kernel -o result-kernel
+KERNEL_FILE=$(find result-kernel -name "bzImage" -o -name "vmlinuz" | head -1)
+
 if [ ! -f "$INITRAMFS_FILE" ]; then
-    echo "❌ Initramfs build failed! File not found: $INITRAMFS_FILE"
+    echo "❌ Initramfs build failed!"
     exit 1
 fi
 
-# Step 4: Normalize initramfs
-echo "🔧 Normalizing initramfs for reproducibility..."
-if command -v gzip >/dev/null && command -v add-det &>/dev/null; then
-    gzip -d -c "$INITRAMFS_FILE" > "$INITRAMFS_FILE.uncompressed"
-    add-det "$INITRAMFS_FILE.uncompressed"
-    gzip -n -9 < "$INITRAMFS_FILE.uncompressed" > "$INITRAMFS_FILE.tmp"
-    add-det "$INITRAMFS_FILE.tmp"
-    mv "$INITRAMFS_FILE.tmp" "$INITRAMFS_FILE"
-    rm -f "$INITRAMFS_FILE.uncompressed"
-    echo "✅ Normalization complete"
-else
-    echo "⚠️  gzip or add-det not found, skipping normalization"
-fi
+echo "✅ Initramfs built: $INITRAMFS_FILE"
+echo "   Kernel found: $KERNEL_FILE"
 
 INITRAMFS_HASH=$(sha256sum "$INITRAMFS_FILE" | awk '{print $1}')
 echo "📊 Initramfs SHA256: $INITRAMFS_HASH"
 
-# Step 5: Create bootable ISO image with GRUB
+# Step 3: Create bootable ISO image with GRUB
 echo ""
 echo "💿 Creating bootable ISO image..."
 
 # Prepare ISO root directory
 mkdir -p "$ISO_ROOT/boot/grub"
 
-# Find and copy kernel
-KERNEL_FILE=$(find /nix/store -name "vmlinuz-$KERNEL_VERSION" 2>/dev/null | head -1 || find /nix/store -path "*/boot/vmlinuz*" 2>/dev/null | head -1)
-if [ -z "$KERNEL_FILE" ]; then
-    echo "❌ No kernel found in /nix/store"
-    exit 1
-fi
-echo "   Using kernel: $KERNEL_FILE"
 cp "$KERNEL_FILE" "$ISO_ROOT/boot/vmlinuz"
 cp "$INITRAMFS_FILE" "$ISO_ROOT/boot/initramfs.img"
 
 # Create GRUB config
-tee "$ISO_ROOT/boot/grub/gracut.cfg" > /dev/null <<EOF
+tee "$ISO_ROOT/boot/grub/grub.cfg" > /dev/null <<EOF
 set default=0
 set timeout=1
 
@@ -175,14 +106,14 @@ grub-mkrescue -o "$ISO_FILE" "$ISO_ROOT"
 # Clean up ISO root
 rm -rf "$ISO_ROOT"
 
-# Step 6: Convert ISO to QCOW2
+# Step 4: Convert ISO to QCOW2
 echo "⚙️  Converting ISO to QCOW2..."
 qemu-img convert -f raw -O qcow2 "$ISO_FILE" "$OUTPUT_IMG"
 rm -f "$ISO_FILE"
 
 QCOW2_HASH=$(sha256sum "$OUTPUT_IMG" | awk '{print $1}')
 
-# Step 7: Record build metadata
+# Step 5: Record build metadata
 echo ""
 echo "📝 Recording build metadata..."
 NIXPKGS_COMMIT=$(nix-instantiate --eval -E '(import <nixpkgs> {}).lib.version' 2>/dev/null | tr -d '"' || echo "unknown")
@@ -194,19 +125,11 @@ cat > build-manifest.json <<EOF
 {
   "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "source_date_epoch": "$SOURCE_DATE_EPOCH",
-  "build_environment": "firebase.studio native (no-sudo)",
-  "nixpkgs_channel": "stable-24.05",
+  "build_environment": "firebase.studio native (nix-build)",
   "nixpkgs_version": "$NIXPKGS_COMMIT",
-  "kernel_version": "$KERNEL_VERSION",
-  "rust_version": "$(rustc --version)",
   "target": "$BUILD_TARGET",
   "initramfs_sha256": "$INITRAMFS_HASH",
-  "qcow2_sha256": "$QCOW2_HASH",
-  "components": {
-    "rust_binary": "paypal-auth-vm",
-    "dracut_version": "$(dracut --version 2>&1 | head -1)",
-    "compression": "gzip -9"
-  }
+  "qcow2_sha256": "$QCOW2_HASH"
 }
 EOF
 
@@ -220,8 +143,6 @@ echo ""
 echo "💿 QCOW2 Image: $OUTPUT_IMG"
 echo "   SHA256: $QCOW2_HASH"
 echo "   Size: $(du -h "$OUTPUT_IMG" | cut -f1)"
-echo ""
-echo "📝 Build manifest: build-manifest.json"
 echo ""
 echo "To test the image:"
 echo "  qemu-system-x86_64 -m 2G -drive file=$OUTPUT_IMG,format=qcow2 -nographic"
