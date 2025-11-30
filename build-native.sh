@@ -66,7 +66,12 @@ cp result-initramfs/initrd "$INITRAMFS_FILE"
 
 # Get kernel
 nix-build initramfs.nix -A kernel -o result-kernel
-KERNEL_FILE=$(find result-kernel -name "bzImage" -o -name "vmlinuz" | head -1)
+KERNEL_FILE="result-kernel/bzImage"
+
+if [ ! -f "$KERNEL_FILE" ]; then
+    echo "❌ Kernel not found at $KERNEL_FILE"
+    exit 1
+fi
 
 if [ ! -f "$INITRAMFS_FILE" ]; then
     echo "❌ Initramfs build failed!"

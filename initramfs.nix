@@ -80,5 +80,5 @@ in
     compressor = "gzip -9";
   };
   
-  kernel = pkgs.linux;
+  kernel = pkgs.linuxPackages.kernel;
 }
