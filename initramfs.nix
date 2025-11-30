@@ -1,25 +1,49 @@
 { pkgs ? import <nixpkgs> {}, binaryPath ? null }:
 
 let
-  # 1. USE STATIC PACKAGES
-  # This avoids "file not found" errors and library dependency hell inside the initramfs
+  # 1. Static Packages
   busybox = pkgs.pkgsStatic.busybox;
   curl = pkgs.pkgsStatic.curl;
   iproute = pkgs.pkgsStatic.iproute2;
-  dhcpcd = pkgs.pkgsStatic.dhcpcd;
+  # Removed 'dhcpcd' (it fails to build). We will use busybox's 'udhcpc'.
   
-  # Get kernel version for module paths
+  # Kernel version for modules
   kernel = pkgs.linuxPackages.kernel;
   kernelVersion = kernel.modDirVersion;
 
-  # Create the init script
+  # 2. DHCP Callback Script
+  # Busybox's udhcpc needs this small script to actually apply the IP address it finds.
+  udhcpcScript = pkgs.writeScript "udhcpc.script" ''
+    #!/bin/sh
+    # $1 is the action (bound, renew, etc.)
+    # Environment variables ($ip, $mask, $router, $dns) are passed by udhcpc
+    
+    case "$1" in
+      deconfig)
+        /bin/ip addr flush dev $interface
+        ;;
+      bound|renew)
+        /bin/ip addr add $ip/$mask dev $interface
+        
+        if [ -n "$router" ]; then
+           /bin/ip route add default via $router
+        fi
+        
+        if [ -n "$dns" ]; then
+           # Set DNS for Curl
+           echo "nameserver $dns" > /etc/resolv.conf
+        fi
+        ;;
+    esac
+  '';
+
+  # 3. Main Init Script
   initScript = pkgs.writeScript "init" ''
     #!${busybox}/bin/sh
 
-    # Set path to include our static tools
     export PATH=/bin:/sbin
 
-    # Mount essential filesystems
+    # Mount filesystems
     mkdir -p /proc /sys /dev /run /tmp /var/tmp /etc/ssl/certs
     mount -t proc proc /proc
     mount -t sysfs sysfs /sys
@@ -27,29 +51,24 @@ let
 
     echo "=== Init System Started ==="
 
-    # Load virtio network drivers (try-catch style)
-    # We map the modules to /lib/modules/<ver> so modprobe works natively
+    # Load Kernel Modules
     echo "Loading network modules..."
     modprobe virtio_net 2>/dev/null || true
     modprobe virtio_pci 2>/dev/null || true
     modprobe e1000 2>/dev/null || true
 
-    # Network setup - DYNAMIC INTERFACE DETECTION
-    echo "Bringing up loopback..."
+    # Enable Loopback
     ip link set lo up
 
-    echo "Waiting for network interface..."
+    # Dynamic Network Interface Detection
+    echo "Scanning for network interface..."
     INTERFACE=""
-    
-    # Retry loop to find ANY network interface that isn't lo
     for i in $(seq 1 10); do
-        # Find the first interface that starts with 'e' (eth0, enp3s0, ens3, etc.)
-        # or just take the first non-loopback device.
+        # Find first non-loopback interface
         CANDIDATE=$(ip -o link show | awk -F': ' '$2 != "lo" {print $2; exit}')
-        
         if [ -n "$CANDIDATE" ]; then
             INTERFACE=$CANDIDATE
-            echo "Found network interface: $INTERFACE"
+            echo "Found interface: $INTERFACE"
             break
         fi
         sleep 1
@@ -59,44 +78,40 @@ let
         echo "Configuring $INTERFACE..."
         ip link set $INTERFACE up
         
-        # Run dhcpcd in foreground first to ensure we get an IP before proceeding
-        dhcpcd -1 -t 10 $INTERFACE || echo "DHCP failed, continuing anyway..."
+        # USE UDHCPC (Busybox) instead of dhcpcd
+        # -i: Interface
+        # -s: Script to run when IP is found
+        # -n: Exit if lease fails (don't loop forever)
+        # -q: Exit after obtaining lease (one-shot mode)
+        udhcpc -i $INTERFACE -s /bin/udhcpc.script -n -q || echo "DHCP failed"
     else
-        echo "ERROR: No network interface found. Is -netdev user/tap attached?"
+        echo "ERROR: No network interface found."
     fi
 
-    # SSL Cert setup for Curl
+    # Setup SSL for Curl
     export SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt
 
-    # Metadata fetcher
+    # Metadata Helper
     fetch_metadata() {
         local key=$1
         curl -sf --connect-timeout 2 -H "Authorization: Bearer Oracle" \
             "http://169.254.169.254/opc/v1/instance/metadata/$key" 2>/dev/null || echo "mock-$key"
     }
 
-    # Wait for metadata service (optional)
-    echo "Checking metadata service..."
-    if curl -sf --connect-timeout 3 http://169.254.169.254/ >/dev/null 2>&1; then
-        echo "Metadata service available"
-    else
-        echo "Metadata service unreachable (skipping wait)"
-    fi
-
-    # Fetch environment variables
+    # Fetch Vars
+    echo "Fetching metadata..."
     export PAYPAL_CLIENT_ID=$(fetch_metadata paypal_client_id)
     export DOMAIN=$(fetch_metadata domain)
     export SECRET_OCID=$(fetch_metadata secret_ocid)
     
-    echo "Starting PayPal Auth application..."
-    echo "Target: $DOMAIN"
+    echo "Starting PayPal Auth VM..."
+    echo "Domain target: $DOMAIN"
 
     if [ -f /bin/paypal-auth-vm ]; then
         chmod +x /bin/paypal-auth-vm
         exec /bin/paypal-auth-vm
     else
-        echo "ERROR: /bin/paypal-auth-vm not found"
-        echo "Dropping to shell..."
+        echo "Binary not found, dropping to shell."
         exec /bin/sh
     fi
   '';
@@ -107,7 +122,10 @@ in
     contents = [
       { object = initScript; symlink = "/init"; }
       
-      # STATIC TOOLS (No /lib/* hacking required)
+      # Add the DHCP callback script
+      { object = udhcpcScript; symlink = "/bin/udhcpc.script"; }
+      
+      # Static Tools
       { object = "${busybox}/bin/busybox"; symlink = "/bin/busybox"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/sh"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/mkdir"; }
@@ -115,22 +133,21 @@ in
       { object = "${busybox}/bin/busybox"; symlink = "/bin/sleep"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/cat"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/seq"; }
-      { object = "${busybox}/bin/busybox"; symlink = "/bin/awk"; }  # Added for parsing
-      { object = "${busybox}/bin/busybox"; symlink = "/bin/mdev"; } 
+      { object = "${busybox}/bin/busybox"; symlink = "/bin/awk"; }
+      { object = "${busybox}/bin/busybox"; symlink = "/bin/mdev"; }
       
-      # Essential Kernel Tools
+      # We use busybox's 'udhcpc' symlink now
+      { object = "${busybox}/bin/busybox"; symlink = "/bin/udhcpc"; }
+
+      # Other Static Tools
       { object = "${pkgs.kmod}/bin/kmod"; symlink = "/bin/modprobe"; }
-      
-      # Network Tools (Static)
       { object = "${iproute}/bin/ip"; symlink = "/bin/ip"; }
-      { object = "${dhcpcd}/bin/dhcpcd"; symlink = "/bin/dhcpcd"; }
       { object = "${curl}/bin/curl"; symlink = "/bin/curl"; }
       
-      # CA Certificates (Required for Curl HTTPS)
+      # Certificates
       { object = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"; symlink = "/etc/ssl/certs/ca-bundle.crt"; }
 
-      # Kernel Modules (Mapped correctly for modprobe)
-      # We symlink the specific kernel version folder
+      # Kernel Modules
       { object = "${kernel}/lib/modules/${kernelVersion}"; symlink = "/lib/modules/${kernelVersion}"; }
 
     ] ++ pkgs.lib.optionals (binaryPath != null) [
