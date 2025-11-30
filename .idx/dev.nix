@@ -26,10 +26,10 @@
     pkgs.linux
     pkgs.kmod
     
-    # Musl for static binaries
-    pkgs.musl
-    pkgs.musl.dev
-    pkgs.pkgsMusl.stdenv.cc
+    # Musl for static binaries (Removed)
+    # pkgs.musl
+    # pkgs.musl.dev
+    # pkgs.pkgsMusl.stdenv.cc
     
     # Container support (optional, can be removed if not using Docker/Podman)
     pkgs.podman
@@ -50,16 +50,10 @@
   ];
 
   # Sets environment variables in the workspace
-  env = { # Tell Cargo to use 'musl-gcc' for the musl target instead of guessing
-    CC_x86_64_unknown_linux_musl = "musl-gcc";
-    CXX_x86_64_unknown_linux_musl = "musl-g++";
-    
-    # Linker configuration
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "musl-gcc";
-    
+  env = { 
     # Optional: Archive tool
-    AR_x86_64_unknown_linux_musl = "ar";
-    };
+    # AR_x86_64_unknown_linux_musl = "ar";
+  };
 
   services.docker.enable = true;
 

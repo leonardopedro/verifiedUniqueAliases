@@ -1,92 +1,112 @@
 { pkgs ? import <nixpkgs> {}, binaryPath }:
 
 let
-  # Use static packages for standalone tools
-  static = pkgs.pkgsStatic;
-  
-  initScript = pkgs.writeScript "init" ''
-    #!${static.bash}/bin/bash
-    
-    export PATH=/bin
-    
-    # Mount filesystems
-    mkdir -p /proc /sys /dev /run /tmp /var/tmp /etc/ssl/certs /var/lib/dhcpcd
-    mount -t proc proc /proc
-    mount -t sysfs sysfs /sys
-    mount -t devtmpfs devtmpfs /dev
-    
-    # Basic network setup
-    echo "Bringing up network..."
-    ip link set lo up
-    ip link set eth0 up
-    # Static IP or DHCP? The original script used dracut's network module.
-    # We'll assume simple DHCP is needed, but standard iproute2 doesn't have a DHCP client.
-    # We might need a standalone dhcp client if not using busybox's udhcpc.
-    # For OCI, we often get IP via DHCP. 
-    # Let's try to use 'dhcpcd' if available static, or just rely on the fact that 
-    # in some OCI environments, we might need to configure it.
-    # Actually, without busybox/udhcpc, we need a DHCP client. 
-    # 'dhcpcd' is a good choice.
-    dhcpcd eth0
-    
-    # Metadata fetcher using curl
-    fetch_metadata() {
-        local key=$1
-        curl -sf -H "Authorization: Bearer Oracle" \
-            "http://169.254.169.254/opc/v1/instance/metadata/$key"
-    }
+  # Define a minimal NixOS configuration to generate the initrd
+  config = (pkgs.lib.evalModules {
+    modules = [
+      ({ config, pkgs, ... }: {
+        # Use the same package set
+        nixpkgs.pkgs = pkgs;
 
-    # Wait for metadata service
-    echo "Waiting for metadata service..."
-    # Loop a few times
-    for i in $(seq 1 30); do
-        if curl -sf http://169.254.169.254/ >/dev/null 2>&1; then
-            break
-        fi
-        sleep 1
-    done
+        # Minimal initrd configuration
+        boot.initrd = {
+          enable = true;
+          
+          # We don't need systemd in initrd for this simple use case, 
+          # but the standard initrd builder is flexible.
+          # We will use 'extraUtilsCommands' to install our binary and its libs.
+          
+          extraUtilsCommands = ''
+            # Copy the binary
+            cp ${binaryPath} $out/bin/paypal-auth-vm
+            
+            # Use copy_bin_and_libs to copy shared libraries (glibc, etc.)
+            # This function is provided by the initrd builder environment
+            copy_bin_and_libs $out/bin/paypal-auth-vm
+          '';
 
-    # Fetch env vars
-    export PAYPAL_CLIENT_ID=$(fetch_metadata paypal_client_id)
-    export DOMAIN=$(fetch_metadata domain)
-    export SECRET_OCID=$(fetch_metadata secret_ocid)
-    export OCI_REGION=$(curl -sf http://169.254.169.254/opc/v2/instance/region)
-    export NOTIFICATION_TOPIC_ID=$(fetch_metadata notification_topic_id)
+          # Custom init script
+          # We replace the default init with our own script
+          preLVMCommands = ''
+            # Basic network setup (using standard tools included in extraUtils)
+            echo "Bringing up network..."
+            ip link set lo up
+            ip link set eth0 up
+            
+            # DHCP
+            # We need to make sure dhcpcd is available. 
+            # It's usually not in the minimal initrd unless added.
+            # But we can add it to extraUtilsCommands if needed, 
+            # or use busybox udhcpc if we kept busybox.
+            # Since user didn't want busybox, we rely on what we have.
+            # Let's add dhcpcd to extraUtilsCommands below.
+            
+            dhcpcd eth0
+            
+            # Metadata fetcher
+            fetch_metadata() {
+                local key=$1
+                curl -sf -H "Authorization: Bearer Oracle" \
+                    "http://169.254.169.254/opc/v1/instance/metadata/$key"
+            }
 
-    echo "Starting PayPal Auth application..."
-    exec /bin/paypal-auth-vm
-  '';
+            # Wait for metadata service
+            echo "Waiting for metadata service..."
+            for i in $(seq 1 30); do
+                if curl -sf http://169.254.169.254/ >/dev/null 2>&1; then
+                    break
+                fi
+                sleep 1
+            done
+
+            # Fetch env vars
+            export PAYPAL_CLIENT_ID=$(fetch_metadata paypal_client_id)
+            export DOMAIN=$(fetch_metadata domain)
+            export SECRET_OCID=$(fetch_metadata secret_ocid)
+            export OCI_REGION=$(curl -sf http://169.254.169.254/opc/v2/instance/region)
+            export NOTIFICATION_TOPIC_ID=$(fetch_metadata notification_topic_id)
+
+            echo "Starting PayPal Auth application..."
+            exec paypal-auth-vm
+          '';
+        };
+        
+        # Add necessary tools to the initrd
+        boot.initrd.extraUtilsCommandsTest = ''
+          $out/bin/curl --version
+          $out/bin/dhcpcd --version
+        '';
+        
+        # We need to explicitly add tools to extraUtilsCommands
+        boot.initrd.extraUtilsCommands = pkgs.lib.mkAfter ''
+          # Add curl
+          cp ${pkgs.curl}/bin/curl $out/bin/curl
+          copy_bin_and_libs $out/bin/curl
+          
+          # Add dhcpcd
+          cp ${pkgs.dhcpcd}/bin/dhcpcd $out/bin/dhcpcd
+          copy_bin_and_libs $out/bin/dhcpcd
+          
+          # Add basic tools (ip, etc are usually there, but let's be safe)
+          # The standard initrd has busybox or minimal tools. 
+          # If we want to avoid busybox, we should ensure we have what we need.
+          # But 'copy_bin_and_libs' is the key.
+        '';
+      })
+      
+      # Import the standard NixOS initrd module
+      <nixpkgs/nixos/modules/system/boot/initrd.nix>
+      <nixpkgs/nixos/modules/system/boot/kernel.nix>
+      <nixpkgs/nixos/modules/misc/nixpkgs.nix>
+      <nixpkgs/nixos/modules/system/etc/etc.nix>
+    ];
+  });
 
 in
 {
-  initramfs = pkgs.makeInitrd {
-    contents = [
-      { object = initScript; symlink = "/init"; }
-      { object = binaryPath; symlink = "/bin/paypal-auth-vm"; }
-      
-      # Shell
-      { object = "${static.bash}/bin/bash"; symlink = "/bin/bash"; }
-      { object = "${static.bash}/bin/sh"; symlink = "/bin/sh"; }
-      
-      # Coreutils (mkdir, sleep, seq, etc.)
-      { object = "${static.coreutils}/bin/mkdir"; symlink = "/bin/mkdir"; }
-      { object = "${static.coreutils}/bin/sleep"; symlink = "/bin/sleep"; }
-      { object = "${static.coreutils}/bin/seq"; symlink = "/bin/seq"; }
-      { object = "${static.coreutils}/bin/cat"; symlink = "/bin/cat"; }
-      
-      # Util-linux (mount)
-      { object = "${static.util-linux}/bin/mount"; symlink = "/bin/mount"; }
-      
-      # Network
-      { object = "${static.iproute2}/bin/ip"; symlink = "/bin/ip"; }
-      { object = "${static.dhcpcd}/bin/dhcpcd"; symlink = "/bin/dhcpcd"; }
-      { object = "${static.curl}/bin/curl"; symlink = "/bin/curl"; }
-      
-      # Certs
-      { object = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"; symlink = "/etc/ssl/certs/ca-certificates.crt"; }
-    ];
-  };
+  # The initrd derivation
+  initramfs = config.config.system.build.initialRamdisk;
   
-  # Export the kernel so the build script can find it
-  kernel = pkgs.linux;
+  # The kernel
+  kernel = config.config.boot.kernelPackages.kernel;
 }
