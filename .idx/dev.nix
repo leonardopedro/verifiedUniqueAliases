@@ -23,7 +23,7 @@
     pkgs.cpio
     pkgs.gzip
     pkgs.xz
-    
+    pkgs.git-lfs
     # QEMU and image creation tools
     pkgs.qemu_kvm      # Provides qemu-img for image conversion
     pkgs.grub2         # Bootloader installation
