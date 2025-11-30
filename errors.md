@@ -4,7 +4,7 @@
   # Which nixpkgs channel to use.
   # Channel: nixos-23.11
   # This provides reproducible builds with security updates
-  channel = "stable-25.05"; # or "unstable"
+  channel = "nixos-25.05"; # or "unstable"
 
   # Use https://search.nixos.org/packages to find packages
   packages = [
@@ -16,9 +16,12 @@
     
     # Dracut and kernel
     pkgs.xorriso  # Required for grub-mkrescue
-    pkgs.linux
+    pkgs.linuxPackages.linux
     pkgs.kmod
     
+    # Container support
+    pkgs.podman
+    pkgs.sudo
     
     # Archive tools
     pkgs.cpio
