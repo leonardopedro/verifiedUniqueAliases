@@ -54,7 +54,7 @@ else
 fi
 
 qemu-system-x86_64 \
-    -m 4G \
+    -m 8G \
     -smp 4 \
     $ACCEL \
     -drive file="$SNAPSHOT_NAME",format=qcow2 \
