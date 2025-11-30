@@ -32,6 +32,7 @@
     
     # Container support (optional, can be removed if not using Docker/Podman)
     pkgs.podman
+    pkgs.sudo
     
     # Archive tools
     pkgs.cpio
