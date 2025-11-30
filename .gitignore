@@ -9,6 +9,7 @@ initramfs-paypal-auth.img.sha256
 build-manifest.json
 metadata.json
 
+result-initramfs
 *.img
 *.box
 *.raw
