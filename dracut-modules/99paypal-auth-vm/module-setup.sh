@@ -31,16 +31,16 @@ install() {
     # Ensure reproducible build with LTO
     export CARGO_PROFILE_RELEASE_LTO=true
     export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
-    source /usr/local/cargo/env 
+    export PATH="/home/user/.cargo/bin:/home/user/.cargo/bin:/usr/local/cargo/bin:/nix/store/ksk32k6riwgp32aa7kfdd869cq2s1qi4-code-oss/bin/remote-cli:/usr/bin:/usr/sbin:~/.global_modules/bin:/nix/store/957m0yh9vxc9mmgrlv6pdrpswsdglxhi-idx-builtins/bin:node_modules/.bin:/home/user/flutter/bin:/home/user/.pub-cache/bin:/opt/android/platform-tools" 
     
     BUILD_TARGET="x86_64-unknown-linux-gnu"
-    cargo build --release --target $BUILD_TARGET
+    /home/user/.cargo/bin/cargo build --release --target $BUILD_TARGET
     
     # Post-process binary for determinism
-    # add-det removes non-deterministic metadata (build IDs, timestamps, etc.)
+    # /home/user/.cargo/bin/add-det removes non-deterministic metadata (build IDs, timestamps, etc.)
     # and normalizes the binary. RUSTFLAGS already includes strip=symbols, so no
     # additional stripping is needed (and could undo add-det's work).
-    add-det target/$BUILD_TARGET/release/paypal-auth-vm
+    /home/user/.cargo/bin/add-det target/$BUILD_TARGET/release/paypal-auth-vm
     
     # Normalize the binary timestamp to SOURCE_DATE_EPOCH
     touch -d "@${SOURCE_DATE_EPOCH}" target/$BUILD_TARGET/release/paypal-auth-vm

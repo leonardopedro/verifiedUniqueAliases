@@ -23,8 +23,8 @@ OUTPUT_IMG="paypal-auth-vm.qcow2"
 ISO_FILE="boot.iso"
 
 # Local directories for build artifacts
-DRACUT_MODULE_DIR="$BUILD_DIR/dracut-modules"
-DRACUT_CONF_DIR="$BUILD_DIR/dracut-conf"
+DRACUT_BASE_DIR="$BUILD_DIR/dracut-local"
+DRACUT_MODULE_PATH="$DRACUT_BASE_DIR/modules.d"
 DRACUT_TMP_DIR="$HOME/dracut-build"
 ISO_ROOT="$BUILD_DIR/iso_root"
 
@@ -33,41 +33,50 @@ echo "🎯 Target: $BUILD_TARGET"
 echo ""
 
 # Clean up previous build artifacts
-rm -rf "$DRACUT_MODULE_DIR" "$DRACUT_CONF_DIR" "$DRACUT_TMP_DIR" "$ISO_ROOT" "$INITRAMFS_FILE" "$ISO_FILE"
+rm -rf "$DRACUT_BASE_DIR" "$DRACUT_TMP_DIR" "$ISO_ROOT" "$INITRAMFS_FILE" "$ISO_FILE"
 
-# Step 1: Prepare dracut module in a local directory
+# Step 1: Prepare dracut module in a local directory that mimics the system layout
 echo "📋 Preparing dracut module..."
-mkdir -p "$DRACUT_MODULE_DIR/99paypal-auth-vm"
-cp ./dracut-module/99paypal-auth-vm/* "$DRACUT_MODULE_DIR/99paypal-auth-vm/"
-chmod +x "$DRACUT_MODULE_DIR/99paypal-auth-vm/"*.sh
+MODULE_DIR="$DRACUT_MODULE_PATH/99paypal-auth-vm"
+MODULE_SETUP_SH="$MODULE_DIR/module-setup.sh"
+mkdir -p "$MODULE_DIR"
 
-# Update module-setup.sh with correct paths
-sed -i "s|cd /app|cd $BUILD_DIR|g" \
-    "$DRACUT_MODULE_DIR/99paypal-auth-vm/module-setup.sh"
-sed -i "s|source /usr/local/cargo/env|export PATH=\\"$HOME/.cargo/bin:$PATH\\"|g" \
-    "$DRACUT_MODULE_DIR/99paypal-auth-vm/module-setup.sh"
-sed -i "s| cargo build| $HOME/.cargo/bin/cargo build|g" \
-    "$DRACUT_MODULE_DIR/99paypal-auth-vm/module-setup.sh"
-sed -i "s| add-det | $HOME/.cargo/bin/add-det |g" \
-    "$DRACUT_MODULE_DIR/99paypal-auth-vm/module-setup.sh"
-sed -i "s|x86_64-unknown-linux-gnu|$BUILD_TARGET|g" \
-    "$DRACUT_MODULE_DIR/99paypal-auth-vm/module-setup.sh"
+cp ./dracut-module/99paypal-auth-vm/* "$MODULE_DIR/"
+chmod +x "$MODULE_DIR"/*.sh
+
+# Update module-setup.sh with correct paths using a robust awk script
+TMP_MODULE_SETUP_SH="${MODULE_SETUP_SH}.tmp"
+awk \
+    -v build_dir="$BUILD_DIR" \
+    -v home="$HOME" \
+    -v path="$PATH" \
+    -v target="$BUILD_TARGET" \
+'
+{
+    sub("cd /app", "cd " build_dir);
+    sub("source /usr/local/cargo/env", "export PATH=\"" home "/.cargo/bin:" path "\"");
+    sub(" cargo build", " " home "/.cargo/bin/cargo build");
+    sub(" add-det ", " " home "/.cargo/bin/add-det ");
+    sub("x86_64-unknown-linux-gnu", target);
+    print;
+}
+' "$MODULE_SETUP_SH" > "$TMP_MODULE_SETUP_SH"
+mv "$TMP_MODULE_SETUP_SH" "$MODULE_SETUP_SH"
 
 # Normalize module timestamps for reproducibility
 echo "🔧 Normalizing module timestamps..."
-find "$DRACUT_MODULE_DIR" -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
+find "$MODULE_DIR" -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
 
 # Step 2: Configure dracut locally
 echo "📝 Configuring dracut..."
-mkdir -p "$DRACUT_CONF_DIR"
-cp dracut.conf "$DRACUT_CONF_DIR/dracut.conf"
+# We will pass the config file directly on the command line
 
-# Verify module is visible
+# Verify module is visible using the --dracutdir flag
 echo "🔍 Verifying dracut module..."
-if dracut --module-dir "$DRACUT_MODULE_DIR" --list-modules 2>&1 | grep -q paypal; then
+if dracut --dracutdir "$DRACUT_BASE_DIR" --list-modules 2>&1 | grep -q paypal; then
     echo "✅ Dracut sees the paypal-auth-vm module"
 else
-    echo "⚠️  Warning: Dracut may not see the module"
+    echo "⚠️  Warning: Dracut may not see the module. Please check directory structure."
     exit 1
 fi
 
@@ -84,13 +93,13 @@ echo "   Kernel version: $KERNEL_VERSION"
 # Create temporary directory
 mkdir -p "$DRACUT_TMP_DIR"
 
-# Build with reproducibility flags and local paths
+# Build with reproducibility flags and the --dracutdir flag
 dracut \
     --force \
     --reproducible \
     --gzip \
-    --conf "$DRACUT_CONF_DIR/dracut.conf" \
-    --module-dir "$DRACUT_MODULE_DIR" \
+    --conf "$BUILD_DIR/dracut.conf" \
+    --dracutdir "$DRACUT_BASE_DIR" \
     --omit " dash plymouth syslog firmware " \
     --no-hostonly \
     --no-hostonly-cmdline \
@@ -122,7 +131,7 @@ else
     echo "⚠️  gzip or add-det not found, skipping normalization"
 fi
 
-INITRAMFS_HASH=$(sha256sum "$INITRAMFS_FILE" | cut -d\' \' -f1)
+INITRAMFS_HASH=$(sha256sum "$INITRAMFS_FILE" | awk '{print $1}')
 echo "📊 Initramfs SHA256: $INITRAMFS_HASH"
 
 # Step 5: Create bootable ISO image with GRUB
@@ -143,11 +152,11 @@ cp "$KERNEL_FILE" "$ISO_ROOT/boot/vmlinuz"
 cp "$INITRAMFS_FILE" "$ISO_ROOT/boot/initramfs.img"
 
 # Create GRUB config
-tee "$ISO_ROOT/boot/grub/grub.cfg" > /dev/null <<EOF
+tee "$ISO_ROOT/boot/grub/gracut.cfg" > /dev/null <<EOF
 set default=0
 set timeout=1
 
-menuentry \'PayPal Auth VM\' {
+menuentry 'PayPal Auth VM' {
     linux /boot/vmlinuz ro console=ttyS0
     initrd /boot/initramfs.img
 }
@@ -164,12 +173,12 @@ echo "⚙️  Converting ISO to QCOW2..."
 qemu-img convert -f raw -O qcow2 "$ISO_FILE" "$OUTPUT_IMG"
 rm -f "$ISO_FILE"
 
-QCOW2_HASH=$(sha256sum "$OUTPUT_IMG" | cut -d\' \' -f1)
+QCOW2_HASH=$(sha256sum "$OUTPUT_IMG" | awk '{print $1}')
 
 # Step 7: Record build metadata
 echo ""
 echo "📝 Recording build metadata..."
-NIXPKGS_COMMIT=$(nix-instantiate --eval -E \'(import <nixpkgs> {}).lib.version\' 2>/dev/null | tr -d \'\"\' || echo "unknown")
+NIXPKGS_COMMIT=$(nix-instantiate --eval -E '(import <nixpkgs> {}).lib.version' 2>/dev/null | tr -d '"' || echo "unknown")
 
 echo "$INITRAMFS_HASH" > "${INITRAMFS_FILE}.sha256"
 echo "$QCOW2_HASH" > "${OUTPUT_IMG}.sha256"
@@ -210,4 +219,3 @@ echo ""
 echo "To test the image:"
 echo "  qemu-system-x86_64 -m 2G -drive file=$OUTPUT_IMG,format=qcow2 -nographic"
 echo ""
-
