@@ -18,9 +18,9 @@ export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"
 # Build configuration
 BUILD_DIR=$(pwd)
 BUILD_TARGET="x86_64-unknown-linux-gnu"
-INITRAMFS_FILE="initramfs-paypal-auth.img"
-OUTPUT_IMG="paypal-auth-vm.qcow2"
-ISO_FILE="boot.iso"
+INITRAMFS_FILE="$BUILD_DIR/initramfs-paypal-auth.img"
+OUTPUT_IMG="$BUILD_DIR/paypal-auth-vm.qcow2"
+ISO_FILE="$BUILD_DIR/boot.iso"
 
 # Local directories for build artifacts
 DRACUT_BASE_DIR="$BUILD_DIR/dracut-local"
@@ -71,9 +71,12 @@ find "$MODULE_DIR" -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
 echo "📝 Configuring dracut..."
 # We will pass the config file directly on the command line
 
-# Verify module is visible using the --dracutdir flag
+# Verify module is visible using the --local flag
 echo "🔍 Verifying dracut module..."
-if dracut --dracutdir "$DRACUT_BASE_DIR" --list-modules 2>&1 | grep -q paypal; then
+# Create temporary directory early for verification
+mkdir -p "$DRACUT_TMP_DIR"
+
+if (cd "$DRACUT_BASE_DIR" && dracut --local --tmpdir "$DRACUT_TMP_DIR" --list-modules 2>&1 | grep -q paypal); then
     echo "✅ Dracut sees the paypal-auth-vm module"
 else
     echo "⚠️  Warning: Dracut may not see the module. Please check directory structure."
@@ -93,23 +96,27 @@ echo "   Kernel version: $KERNEL_VERSION"
 # Create temporary directory
 mkdir -p "$DRACUT_TMP_DIR"
 
-# Build with reproducibility flags and the --dracutdir flag
-dracut \
-    --force \
-    --reproducible \
-    --gzip \
-    --conf "$BUILD_DIR/dracut.conf" \
-    --dracutdir "$DRACUT_BASE_DIR" \
-    --omit " dash plymouth syslog firmware " \
-    --no-hostonly \
-    --no-hostonly-cmdline \
-    --nofscks \
-    --no-early-microcode \
-    --add "paypal-auth-vm" \
-    --kver "$KERNEL_VERSION" \
-    --fwdir "/nix/store/*/lib/firmware" \
-    --tmpdir "$DRACUT_TMP_DIR" \
-    "$INITRAMFS_FILE"
+# Build with reproducibility flags and the --local flag
+# We must cd into DRACUT_BASE_DIR for --local to work effectively with modules in ./modules.d
+(
+    cd "$DRACUT_BASE_DIR"
+    dracut \
+        --force \
+        --reproducible \
+        --gzip \
+        --conf "$BUILD_DIR/dracut.conf" \
+        --local \
+        --omit " dash plymouth syslog firmware " \
+        --no-hostonly \
+        --no-hostonly-cmdline \
+        --nofscks \
+        --no-early-microcode \
+        --add "paypal-auth-vm" \
+        --kver "$KERNEL_VERSION" \
+        --fwdir "/nix/store/*/lib/firmware" \
+        --tmpdir "$DRACUT_TMP_DIR" \
+        "$INITRAMFS_FILE"
+)
 
 # Check if dracut succeeded
 if [ ! -f "$INITRAMFS_FILE" ]; then
