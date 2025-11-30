@@ -1,10 +1,10 @@
 #!/bin/bash
 # Native build script for firebase.studio
-# Builds the initramfs and qcow2 image directly without QEMU/Docker/Podman
+# Builds the initramfs and qcow2 image directly without QEMU/Docker/Podman/sudo
 
 set -e
 
-echo "🏗️  Building reproducible initramfs and qcow2 image natively..."
+echo "🏗️  Building reproducible initramfs and qcow2 image natively (no-sudo)..."
 
 # Set reproducible build environment
 export SOURCE_DATE_EPOCH=1640995200  # 2022-01-01 00:00:00 UTC
@@ -20,69 +20,58 @@ BUILD_DIR=$(pwd)
 BUILD_TARGET="x86_64-unknown-linux-gnu"
 INITRAMFS_FILE="initramfs-paypal-auth.img"
 OUTPUT_IMG="paypal-auth-vm.qcow2"
-RAW_IMG="disk.raw"
+ISO_FILE="boot.iso"
+
+# Local directories for build artifacts
+DRACUT_MODULE_DIR="$BUILD_DIR/dracut-modules"
+DRACUT_CONF_DIR="$BUILD_DIR/dracut-conf"
+DRACUT_TMP_DIR="$HOME/dracut-build"
+ISO_ROOT="$BUILD_DIR/iso_root"
 
 echo "📍 Build directory: $BUILD_DIR"
 echo "🎯 Target: $BUILD_TARGET"
 echo ""
 
-# Step 1: Build Rust binary with reproducibility flags
-echo "📦 Building Rust application..."
-rustup target add $BUILD_TARGET 2>/dev/null || true
+# Clean up previous build artifacts
+rm -rf "$DRACUT_MODULE_DIR" "$DRACUT_CONF_DIR" "$DRACUT_TMP_DIR" "$ISO_ROOT" "$INITRAMFS_FILE" "$ISO_FILE"
 
-export RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C strip=symbols"
-export CARGO_PROFILE_RELEASE_LTO=true
-export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
-
-# Note: Binary build happens inside dracut module-setup.sh
-# This keeps the build process consistent with the QEMU/Docker approach
-
-# Step 2: Prepare dracut module
+# Step 1: Prepare dracut module in a local directory
 echo "📋 Preparing dracut module..."
+mkdir -p "$DRACUT_MODULE_DIR/99paypal-auth-vm"
+cp ./dracut-module/99paypal-auth-vm/* "$DRACUT_MODULE_DIR/99paypal-auth-vm/"
+chmod +x "$DRACUT_MODULE_DIR/99paypal-auth-vm/"*.sh
 
-# Always remove and re-copy to ensure clean state
-sudo rm -rf /usr/lib/dracut/modules.d/99paypal-auth-vm
-sudo mkdir -p /usr/lib/dracut/modules.d/
-sudo cp -r ./dracut-module/99paypal-auth-vm /usr/lib/dracut/modules.d/
-sudo chmod +x /usr/lib/dracut/modules.d/99paypal-auth-vm/*.sh
-
-# Update module-setup.sh with correct build path
-sudo sed -i "s|cd /app|cd $BUILD_DIR|g" \
-    /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
-
-# Update cargo paths for native environment
-sudo sed -i "s|source /usr/local/cargo/env|export PATH=\"$HOME/.cargo/bin:\$PATH\"|g" \
-    /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
-
-# Ensure absolute cargo paths
-sudo sed -i "s| cargo build| $HOME/.cargo/bin/cargo build|g" \
-    /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
-sudo sed -i "s| add-det | $HOME/.cargo/bin/add-det |g" \
-    /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
-
-# Update target architecture
-sudo sed -i "s|x86_64-unknown-linux-gnu|$BUILD_TARGET|g" \
-    /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
+# Update module-setup.sh with correct paths
+sed -i "s|cd /app|cd $BUILD_DIR|g" \
+    "$DRACUT_MODULE_DIR/99paypal-auth-vm/module-setup.sh"
+sed -i "s|source /usr/local/cargo/env|export PATH=\\"$HOME/.cargo/bin:$PATH\\"|g" \
+    "$DRACUT_MODULE_DIR/99paypal-auth-vm/module-setup.sh"
+sed -i "s| cargo build| $HOME/.cargo/bin/cargo build|g" \
+    "$DRACUT_MODULE_DIR/99paypal-auth-vm/module-setup.sh"
+sed -i "s| add-det | $HOME/.cargo/bin/add-det |g" \
+    "$DRACUT_MODULE_DIR/99paypal-auth-vm/module-setup.sh"
+sed -i "s|x86_64-unknown-linux-gnu|$BUILD_TARGET|g" \
+    "$DRACUT_MODULE_DIR/99paypal-auth-vm/module-setup.sh"
 
 # Normalize module timestamps for reproducibility
 echo "🔧 Normalizing module timestamps..."
-sudo find /usr/lib/dracut/modules.d/99paypal-auth-vm -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
+find "$DRACUT_MODULE_DIR" -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
 
-# Step 3: Configure dracut
+# Step 2: Configure dracut locally
 echo "📝 Configuring dracut..."
-sudo mkdir -p /etc/dracut.conf.d
-sudo cp dracut.conf /etc/dracut.conf.d/99force-no-hostonly.conf
-sudo cp dracut.conf /etc/dracut.conf
+mkdir -p "$DRACUT_CONF_DIR"
+cp dracut.conf "$DRACUT_CONF_DIR/dracut.conf"
 
 # Verify module is visible
 echo "🔍 Verifying dracut module..."
-if dracut --list-modules 2>&1 | grep -q paypal; then
+if dracut --module-dir "$DRACUT_MODULE_DIR" --list-modules 2>&1 | grep -q paypal; then
     echo "✅ Dracut sees the paypal-auth-vm module"
 else
     echo "⚠️  Warning: Dracut may not see the module"
+    exit 1
 fi
 
-# Step 4: Build initramfs
+# Step 3: Build initramfs
 echo "🔨 Building initramfs with dracut..."
 
 KERNEL_VERSION=$(find /nix/store -path "*/lib/modules/*" -type d -name "[0-9]*" 2>/dev/null | head -1 | xargs basename)
@@ -93,13 +82,15 @@ fi
 echo "   Kernel version: $KERNEL_VERSION"
 
 # Create temporary directory
-mkdir -p "$HOME/dracut-build"
+mkdir -p "$DRACUT_TMP_DIR"
 
-# Build with reproducibility flags
-sudo dracut \
+# Build with reproducibility flags and local paths
+dracut \
     --force \
     --reproducible \
     --gzip \
+    --conf "$DRACUT_CONF_DIR/dracut.conf" \
+    --module-dir "$DRACUT_MODULE_DIR" \
     --omit " dash plymouth syslog firmware " \
     --no-hostonly \
     --no-hostonly-cmdline \
@@ -108,11 +99,8 @@ sudo dracut \
     --add "paypal-auth-vm" \
     --kver "$KERNEL_VERSION" \
     --fwdir "/nix/store/*/lib/firmware" \
-    --tmpdir "$HOME/dracut-build" \
+    --tmpdir "$DRACUT_TMP_DIR" \
     "$INITRAMFS_FILE"
-
-# Fix permissions
-sudo chown $(whoami):$(whoami) "$INITRAMFS_FILE" || true
 
 # Check if dracut succeeded
 if [ ! -f "$INITRAMFS_FILE" ]; then
@@ -120,135 +108,77 @@ if [ ! -f "$INITRAMFS_FILE" ]; then
     exit 1
 fi
 
-# Step 5: Normalize initramfs
+# Step 4: Normalize initramfs
 echo "🔧 Normalizing initramfs for reproducibility..."
 if command -v gzip >/dev/null && command -v add-det &>/dev/null; then
-    # Decompress
     gzip -d -c "$INITRAMFS_FILE" > "$INITRAMFS_FILE.uncompressed"
-    
-    # Normalize uncompressed archive
     add-det "$INITRAMFS_FILE.uncompressed"
-    
-    # Recompress with deterministic gzip
     gzip -n -9 < "$INITRAMFS_FILE.uncompressed" > "$INITRAMFS_FILE.tmp"
-    
-    # Normalize compressed archive
     add-det "$INITRAMFS_FILE.tmp"
-    
-    # Replace original
     mv "$INITRAMFS_FILE.tmp" "$INITRAMFS_FILE"
     rm -f "$INITRAMFS_FILE.uncompressed"
-    
     echo "✅ Normalization complete"
 else
     echo "⚠️  gzip or add-det not found, skipping normalization"
 fi
 
-# Calculate hash
-INITRAMFS_HASH=$(sha256sum "$INITRAMFS_FILE" | cut -d' ' -f1)
+INITRAMFS_HASH=$(sha256sum "$INITRAMFS_FILE" | cut -d\' \' -f1)
 echo "📊 Initramfs SHA256: $INITRAMFS_HASH"
 
-# Step 6: Create bootable qcow2 image
+# Step 5: Create bootable ISO image with GRUB
 echo ""
-echo "💿 Creating bootable QCOW2 image..."
+echo "💿 Creating bootable ISO image..."
 
-# Create raw disk file (2GB)
-truncate -s 2G "$RAW_IMG"
+# Prepare ISO root directory
+mkdir -p "$ISO_ROOT/boot/grub"
 
-# Partition disk (GPT)
-parted -s "$RAW_IMG" mklabel gpt
-parted -s "$RAW_IMG" mkpart primary ext4 1MiB 100%
-parted -s "$RAW_IMG" set 1 bios_grub on
-
-# Setup loop device
-LOOP_DEV=$(sudo losetup -fP --show "$RAW_IMG")
-echo "   Loop device: $LOOP_DEV"
-
-# Ensure cleanup on exit
-trap "sudo losetup -d $LOOP_DEV 2>/dev/null || true" EXIT
-
-# Format partition
-sudo mkfs.ext4 "${LOOP_DEV}p1"
-
-# Mount
-MOUNT_DIR=$(mktemp -d)
-sudo mount "${LOOP_DEV}p1" "$MOUNT_DIR" || { echo "❌ Mount failed"; exit 1; }
-
-# Ensure cleanup includes umount
-trap "sudo umount $MOUNT_DIR 2>/dev/null || true; sudo losetup -d $LOOP_DEV 2>/dev/null || true; rm -rf $MOUNT_DIR" EXIT
-
-# Install kernel and initramfs
-sudo mkdir -p "$MOUNT_DIR/boot"
-
-# Find kernel in nix store
-KERNEL_FILE=$(find /nix/store -name "vmlinuz-$KERNEL_VERSION" 2>/dev/null | head -1)
-if [ -z "$KERNEL_FILE" ]; then
-    # Try alternative pattern
-    KERNEL_FILE=$(find /nix/store -path "*/boot/vmlinuz*" 2>/dev/null | head -1)
-fi
-
+# Find and copy kernel
+KERNEL_FILE=$(find /nix/store -name "vmlinuz-$KERNEL_VERSION" 2>/dev/null | head -1 || find /nix/store -path "*/boot/vmlinuz*" 2>/dev/null | head -1)
 if [ -z "$KERNEL_FILE" ]; then
     echo "❌ No kernel found in /nix/store"
     exit 1
 fi
-
 echo "   Using kernel: $KERNEL_FILE"
-sudo cp "$KERNEL_FILE" "$MOUNT_DIR/boot/vmlinuz"
-sudo cp "$INITRAMFS_FILE" "$MOUNT_DIR/boot/initramfs.img"
+cp "$KERNEL_FILE" "$ISO_ROOT/boot/vmlinuz"
+cp "$INITRAMFS_FILE" "$ISO_ROOT/boot/initramfs.img"
 
-# Install GRUB with proper modules for reliable booting
-sudo grub-install \
-    --target=i386-pc \
-    --boot-directory="$MOUNT_DIR/boot" \
-    --modules="part_gpt part_msdos ext2 biosdisk" \
-    --force \
-    "$LOOP_DEV"
-
-# Configure GRUB (create directory and config file)
-sudo mkdir -p "$MOUNT_DIR/boot/grub"
-sudo tee "$MOUNT_DIR/boot/grub/grub.cfg" > /dev/null <<EOF
+# Create GRUB config
+tee "$ISO_ROOT/boot/grub/grub.cfg" > /dev/null <<EOF
 set default=0
 set timeout=1
 
-menuentry 'PayPal Auth VM' {
-    linux /boot/vmlinuz root=/dev/sda1 ro console=ttyS0
+menuentry \'PayPal Auth VM\' {
+    linux /boot/vmlinuz ro console=ttyS0
     initrd /boot/initramfs.img
 }
 EOF
 
-# Cleanup mounts
-sudo umount "$MOUNT_DIR"
-sudo losetup -d "$LOOP_DEV"
-rm -rf "$MOUNT_DIR"
-trap - EXIT  # Clear trap
+# Create bootable ISO
+grub-mkrescue -o "$ISO_FILE" "$ISO_ROOT"
 
-# Convert to QCOW2
-qemu-img convert -f raw -O qcow2 "$RAW_IMG" "$OUTPUT_IMG"
-rm -f "$RAW_IMG"
+# Clean up ISO root
+rm -rf "$ISO_ROOT"
 
-# Calculate final hash
-QCOW2_HASH=$(sha256sum "$OUTPUT_IMG" | cut -d' ' -f1)
+# Step 6: Convert ISO to QCOW2
+echo "⚙️  Converting ISO to QCOW2..."
+qemu-img convert -f raw -O qcow2 "$ISO_FILE" "$OUTPUT_IMG"
+rm -f "$ISO_FILE"
 
-# Step 7: Record nixpkgs version for reproducibility
+QCOW2_HASH=$(sha256sum "$OUTPUT_IMG" | cut -d\' \' -f1)
+
+# Step 7: Record build metadata
 echo ""
 echo "📝 Recording build metadata..."
+NIXPKGS_COMMIT=$(nix-instantiate --eval -E \'(import <nixpkgs> {}).lib.version\' 2>/dev/null | tr -d \'\"\' || echo "unknown")
 
-# Try to find nixpkgs revision
-NIXPKGS_COMMIT="unknown"
-if [ -f "$HOME/.nix-profile/manifest.nix" ]; then
-    NIXPKGS_COMMIT=$(nix-instantiate --eval -E '(import <nixpkgs> {}).lib.version' 2>/dev/null | tr -d '"' || echo "unknown")
-fi
-
-# Save hashes
 echo "$INITRAMFS_HASH" > "${INITRAMFS_FILE}.sha256"
 echo "$QCOW2_HASH" > "${OUTPUT_IMG}.sha256"
 
-# Create build manifest
 cat > build-manifest.json <<EOF
 {
   "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "source_date_epoch": "$SOURCE_DATE_EPOCH",
-  "build_environment": "firebase.studio native",
+  "build_environment": "firebase.studio native (no-sudo)",
   "nixpkgs_channel": "stable-24.05",
   "nixpkgs_version": "$NIXPKGS_COMMIT",
   "kernel_version": "$KERNEL_VERSION",
@@ -280,3 +210,4 @@ echo ""
 echo "To test the image:"
 echo "  qemu-system-x86_64 -m 2G -drive file=$OUTPUT_IMG,format=qcow2 -nographic"
 echo ""
+
