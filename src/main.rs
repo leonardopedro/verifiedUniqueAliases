@@ -16,10 +16,9 @@ use axum::{
 };
 use instant_acme::{
     Account, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
-    OrderStatus,
 };
 use parking_lot::RwLock;
-use rcgen::{CertificateParams, DistinguishedName, KeyPair};
+
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
@@ -131,34 +130,32 @@ impl AcmeManager {
     ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
         info!("🔐 Connecting to Let's Encrypt...");
 
-        // Create ACME account
-        let (account, _credentials) = Account::create(
-            &NewAccount {
-                contact: &[&format!("mailto:admin@{}", self.domain)],
-                terms_of_service_agreed: true,
-                only_return_existing: false,
-            },
-            LetsEncrypt::Production.url(),
-            None,
-        )
-        .await?;
+        //Create ACME account
+        let (account, _credentials) = Account::builder()?
+            .create(
+                &NewAccount {
+                    contact: &[&format!("mailto:admin@{}", self.domain)],
+                    terms_of_service_agreed: true,
+                    only_return_existing: false,
+                },
+                LetsEncrypt::Production.url().to_owned(),
+                None,
+            )
+            .await?;
 
         info!("✅ ACME account created");
 
         // Create order
         let identifier = Identifier::Dns(self.domain.clone());
-        let mut order = account
-            .new_order(&NewOrder {
-                identifiers: &[identifier],
-            })
-            .await?;
+        let mut order = account.new_order(&NewOrder::new(&[identifier])).await?;
 
         info!("📋 Order created, obtaining authorizations...");
 
-        // Get authorizations
-        let authorizations = order.authorizations().await?;
+        // Get authorizations (now returns an iterator)
+        let mut authorizations = order.authorizations();
 
-        for authz in &authorizations {
+        while let Some(result) = authorizations.next().await {
+            let mut authz = result?;
             match authz.status {
                 AuthorizationStatus::Pending => {}
                 AuthorizationStatus::Valid => continue,
@@ -166,114 +163,37 @@ impl AcmeManager {
             }
 
             // Find HTTP-01 challenge
-            let challenge = authz
-                .challenges
-                .iter()
-                .find(|c| c.r#type == ChallengeType::Http01)
+            let mut challenge = authz
+                .challenge(ChallengeType::Http01)
                 .ok_or("No HTTP-01 challenge found")?;
-
-            let key_auth = order.key_authorization(challenge);
 
             // Write challenge to filesystem for Axum to serve
             let challenge_dir = "/tmp/acme-challenge";
             fs::create_dir_all(challenge_dir).await?;
             fs::write(
                 format!("{}/{}", challenge_dir, challenge.token),
-                key_auth.as_str(),
+                challenge.key_authorization().as_str(),
             )
             .await?;
 
             info!("📝 HTTP-01 challenge ready: {}", challenge.token);
 
             // Tell Let's Encrypt we're ready
-            order.set_challenge_ready(&challenge.url).await?;
+            challenge.set_ready().await?;
 
             info!("⏳ Waiting for Let's Encrypt to validate challenge...");
-
-            // Poll for validation
-            let mut tries = 0;
-            let mut delay_ms = 1000u64;
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-
-                // Refresh the order to get updated authorization status
-                let _ = order.refresh().await?;
-
-                // Re-fetch authorizations
-                let updated_authorizations = order.authorizations().await?;
-
-                // Match by comparing the first authorization (since we only have one domain)
-                // In a multi-domain scenario, you'd need to compare identifier values
-                let updated_authz = updated_authorizations
-                    .first()
-                    .ok_or("Authorization not found")?;
-
-                match updated_authz.status {
-                    AuthorizationStatus::Valid => {
-                        info!("✅ Challenge validated!");
-                        break;
-                    }
-                    AuthorizationStatus::Pending => {
-                        tries += 1;
-                        if tries > 30 {
-                            return Err("Challenge validation timeout".into());
-                        }
-                        delay_ms = std::cmp::min(delay_ms * 2, 5000); // Exponential backoff
-                    }
-                    AuthorizationStatus::Invalid => {
-                        return Err("Challenge validation failed - marked invalid".into());
-                    }
-                    _ => {
-                        return Err(format!(
-                            "Challenge validation failed - unexpected status: {:?}",
-                            updated_authz.status
-                        )
-                        .into());
-                    }
-                }
-            }
         }
 
-        // Generate CSR
-        info!("🔑 Generating certificate signing request...");
-
-        // Generate CSR
-        info!("🔑 Generating certificate signing request...");
-
-        let params = CertificateParams::new(vec![self.domain.clone()])?;
-        let key_pair = KeyPair::generate()?;
-        let csr = params.serialize_request(&key_pair)?;
-
-        // Finalize order
-        order.finalize(&csr).await?;
+        // Finalize order (instant-acme 0.8 handles CSR generation internally)
+        info!("🔑 Finalizing order...");
+        let private_key_pem = order.finalize().await?;
 
         info!("⏳ Waiting for certificate issuance...");
 
-        // Poll for certificate
-        let mut tries = 0;
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-            let order_state = order.refresh().await?;
-            match order_state.status {
-                OrderStatus::Valid => break,
-                OrderStatus::Processing => {
-                    tries += 1;
-                    if tries > 30 {
-                        return Err("Certificate issuance timeout".into());
-                    }
-                }
-                _ => return Err("Order failed".into()),
-            }
-        }
-
-        // Download certificate
-        let cert_chain_pem: Option<String> = order.certificate().await?;
-
-        let cert_chain_pem = cert_chain_pem.ok_or("Failed to download certificate")?;
-
-        // Extract private key
-        let private_key_pem = key_pair.serialize_pem();
+        // Poll for certificate using retry policy
+        let cert_chain_pem = order
+            .poll_certificate(&instant_acme::RetryPolicy::default())
+            .await?;
 
         info!("✅ Certificate obtained and stored in RAM!");
 
