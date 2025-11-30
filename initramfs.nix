@@ -44,6 +44,10 @@ let
 
     # Load Kernel Modules
     echo "Loading network modules..."
+    # REQUIRED for DHCP (Fixes 'Address family not supported')
+    modprobe af_packet 2>/dev/null || true
+    
+    # VirtIO drivers
     modprobe virtio_net 2>/dev/null || true
     modprobe virtio_pci 2>/dev/null || true
     modprobe e1000 2>/dev/null || true
@@ -91,13 +95,21 @@ let
     echo "Starting PayPal Auth VM..."
 
     if [ -f /bin/paypal-auth-vm ]; then
-        # ERROR WAS HERE: chmod is now available
+        # Check if the binary is executable
         chmod +x /bin/paypal-auth-vm
-        exec /bin/paypal-auth-vm
+        
+        # Debug info
+        echo "Binary found. Attempting execution..."
+        
+        # Executing...
+        exec /bin/paypal-auth-vm || echo "EXEC FAILED: The binary might be dynamically linked. See instructions below."
     else
-        echo "Binary not found, dropping to shell."
-        exec /bin/sh
+        echo "Binary not found at /bin/paypal-auth-vm"
     fi
+
+    # Fallback to shell if exec fails or binary missing
+    echo "Dropping to emergency shell..."
+    exec /bin/sh
   '';
 
 in
@@ -107,7 +119,7 @@ in
       { object = initScript; symlink = "/init"; }
       { object = udhcpcScript; symlink = "/bin/udhcpc.script"; }
       
-      # BUSYBOX TOOLS
+      # Busybox tools
       { object = "${busybox}/bin/busybox"; symlink = "/bin/busybox"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/sh"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/mkdir"; }
@@ -118,8 +130,6 @@ in
       { object = "${busybox}/bin/busybox"; symlink = "/bin/awk"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/mdev"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/udhcpc"; }
-      
-      # ADDED HERE: chmod (and ls for debugging)
       { object = "${busybox}/bin/busybox"; symlink = "/bin/chmod"; }
       { object = "${busybox}/bin/busybox"; symlink = "/bin/ls"; }
 
