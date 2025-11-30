@@ -22,6 +22,7 @@
     pkgs.pkgsMusl.stdenv.cc
     pkgs.podman
     pkgs.cpio
+    pkgs.qemu_kvm
   ];
 
   # Sets environment variables in the workspace
