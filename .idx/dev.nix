@@ -9,7 +9,7 @@
   packages = [
     # Build tools
     pkgs.curl
-    pkgs.gcc
+    pkgs.clang
     pkgs.gnumake
     pkgs.rustup
     
@@ -18,8 +18,8 @@
     pkgs.linux
     pkgs.kmod
     
-    # Musl toolchain for static linking
-    pkgs.pkgsMusl.stdenv.cc
+    # Musl toolchain for static linking (Clang)
+    pkgs.pkgsMusl.clang
     pkgs.musl
     
     # Archive tools
@@ -38,10 +38,15 @@
 
   # Sets environment variables in the workspace
   env = {
-    # Point cc-rs to the musl compiler
-    CC_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-gcc";
-    # Also set generic CC for musl target just in case
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "x86_64-unknown-linux-musl-gcc";
+    # Point cc-rs to the musl clang compiler
+    CC_x86_64_unknown_linux_musl = "clang";
+    CXX_x86_64_unknown_linux_musl = "clang++";
+    
+    # Configure linker
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "clang";
+    
+    # Clang specific flags for static musl build
+    CFLAGS_x86_64_unknown_linux_musl = "-static";
   };
 
   idx = {
