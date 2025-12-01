@@ -13,14 +13,15 @@ pkgs.mkShell {
     gcc
     gnumake
     rustup
+    nix # Ensure nix-build is available
     
     # Kernel and boot tools
     xorriso  # Required for grub-mkrescue
     linuxPackages.kernel
     kmod
     
-    # Musl toolchain for static linking
-    pkgsMusl.stdenv.cc
+    # Musl toolchain for static linking (GCC)
+    pkgsCross.musl64.stdenv.cc
     musl
     
     # Container support (optional)
@@ -43,11 +44,13 @@ pkgs.mkShell {
 
   # Environment variables
   shellHook = ''
-    # Configure musl compiler for Rust
+    # Configure musl compiler for Rust (GCC)
     export CC_x86_64_unknown_linux_musl="x86_64-unknown-linux-musl-gcc"
+    export CXX_x86_64_unknown_linux_musl="x86_64-unknown-linux-musl-g++"
     export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="x86_64-unknown-linux-musl-gcc"
+    export CFLAGS_x86_64_unknown_linux_musl="-static"
     
-    echo "🚀 PayPal Auth VM Development Environment"
+    echo "🚀 PayPal Auth VM Development Environment (GCC + Musl)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "Available tools:"
     echo "  - Rust toolchain (via rustup)"
