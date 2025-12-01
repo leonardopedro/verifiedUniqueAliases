@@ -21,7 +21,7 @@
     
     # Musl toolchain for static linking
     # Use pkgsCross to get the x86_64-unknown-linux-musl-gcc binary
-    pkgs.pkgsCross.musl64.stdenv.cc
+    #pkgs.pkgsCross.musl64.stdenv.cc
     pkgs.musl
     
     # Archive tools
