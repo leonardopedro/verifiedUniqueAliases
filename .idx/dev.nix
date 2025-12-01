@@ -3,46 +3,50 @@
 
   packages = [
     pkgs.rustup
-    pkgs.xorriso
-    pkgs.git-lfs
+    pkgs.pkgsStatic.xorriso
+    pkgs.pkgsStatic.git-lfs
     pkgs.linux
     pkgs.pkgsStatic.busybox
     
     
     # Build tools
-    pkgs.curl
-    pkgs.gnumake
-    pkgs.rustup
+    pkgs.pkgsStatic.curl
+    pkgs.pkgsStatic.gnumake
     
     # Kernel and boot tools
-    pkgs.xorriso  # Required for grub-mkrescue
-    pkgs.linux
-    pkgs.kmod
+    # pkgs.xorriso is already added above
+    # pkgs.linux is already added above
+    pkgs.pkgsStatic.kmod
     
     # Musl toolchain for static linking
-    # Use pkgsCross to get the x86_64-unknown-linux-musl-gcc binary
-    pkgs.pkgsCross.musl64.stdenv.cc
-    pkgs.musl
+    # Use pkgsStatic to get the static gcc binary
+    pkgs.pkgsStatic.stdenv.cc
+    # pkgs.musl # pkgsStatic implies musl on linux usually, or we can add it if needed explicitly, but stdenv.cc should cover the compiler.
     
     # Archive tools
-    pkgs.cpio
-    pkgs.gzip
-    pkgs.xz
+    pkgs.pkgsStatic.cpio
+    pkgs.pkgsStatic.gzip
+    pkgs.pkgsStatic.xz
     
     # QEMU and image creation tools
-    pkgs.qemu_kvm      # Provides qemu-img for image conversion
-    pkgs.grub2         # Bootloader installation
-    pkgs.parted        # Disk partitioning
-    pkgs.dosfstools    # FAT filesystem support
-    pkgs.e2fsprogs     # ext4 filesystem tools (mkfs.ext4)
-    pkgs.util-linux    # Loop device support (losetup, mount, etc.)
+    pkgs.qemu_kvm      # Keep dynamic for host performance/compatibility
+    pkgs.grub2         # Keep dynamic, grub build is complex
+    pkgs.pkgsStatic.parted        # Disk partitioning
+    pkgs.pkgsStatic.dosfstools    # FAT filesystem support
+    pkgs.pkgsStatic.e2fsprogs     # ext4 filesystem tools (mkfs.ext4)
+    pkgs.pkgsStatic.util-linux    # Loop device support (losetup, mount, etc.)
   ];
 
   # Sets environment variables in the workspace
   env = {
     # Point cc-rs to the musl compiler
+    # pkgsStatic.stdenv.cc provides the compiler wrapper. 
+    # For x86_64-linux, pkgsStatic uses musl.
+    # The binary name might be just 'gcc' or 'x86_64-unknown-linux-musl-gcc' depending on how it's wrapped.
+    # We'll assume standard cross names or just 'gcc' if it's the primary compiler in that env, 
+    # but since we are adding it to a normal env, it might be prefixed.
+    # Actually, pkgsStatic.stdenv.cc usually provides the cross-compiler.
     CC_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-gcc";
-    # Also set generic CC for musl target just in case
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "x86_64-unknown-linux-musl-gcc";
   };
 
