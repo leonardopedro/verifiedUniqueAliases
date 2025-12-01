@@ -36,8 +36,14 @@ rm -rf "$ISO_ROOT" "$INITRAMFS_FILE" "$ISO_FILE" result
 echo "🦀 Building Rust binary (static)..."
 rustup target add "$BUILD_TARGET" 2>/dev/null || true
 
-# Set RUSTFLAGS for static linking
-export RUSTFLAGS="-C target-feature=+crt-static"
+# Check if linker is available
+if ! command -v x86_64-unknown-linux-musl-gcc &>/dev/null; then
+    echo "⚠️  Linker 'x86_64-unknown-linux-musl-gcc' not found in PATH."
+    echo "    Please ensure you are in the nix-shell environment."
+    echo "    Run: nix-shell"
+    exit 1
+fi
+
 export CARGO_PROFILE_RELEASE_LTO=true
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=z
 
