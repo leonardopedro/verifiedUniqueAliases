@@ -1,73 +1,63 @@
-# To learn more about how to use Nix to configure your environment
-# see: https://firebase.google.com/docs/studio/customize-workspace
 { pkgs, ... }: {
-  # Which nixpkgs channel to use - pinned for reproducibility
-  # Using stable-25.05 ensures consistent package versions
-  channel = "stable-25.05";
+  channel = "stable-24.05"; 
 
-  # Use https://search.nixos.org/packages to find packages
   packages = [
+    pkgs.rustup
+    pkgs.xorriso
+    pkgs.git-lfs
+    pkgs.linux
+    
     # Build tools
     pkgs.curl
-    pkgs.gcc
     pkgs.gnumake
-    pkgs.rustup
+    pkgs.cmake        # aws-lc-sys often requires cmake
+    pkgs.pkg-config   # Helps find libraries
     
-    # Kernel and boot tools
-    pkgs.xorriso  # Required for grub-mkrescue
-    pkgs.linux
+    # --- CLANG FOR MUSL ---
+    # This provides the Clang compiler configured for Musl libc
+    pkgs.pkgsMusl.clang
+    # This provides llvm-ar and other binutils
+    pkgs.pkgsMusl.llvmPackages.bintools 
+    
+    # Standard tools
     pkgs.kmod
-    
-    # Musl toolchain for static linking
-    pkgs.pkgsMusl.stdenv.cc
-    pkgs.musl
-    
-    # Archive tools
-    pkgs.cpio
-    pkgs.gzip
-    pkgs.xz
-    
-    # QEMU and image creation tools
-    pkgs.qemu_kvm      # Provides qemu-img for image conversion
-    pkgs.grub2         # Bootloader installation
-    pkgs.parted        # Disk partitioning
-    pkgs.dosfstools    # FAT filesystem support
-    pkgs.e2fsprogs     # ext4 filesystem tools (mkfs.ext4)
-    pkgs.util-linux    # Loop device support (losetup, mount, etc.)
+    pkgs.qemu_kvm
+    pkgs.grub2
+    pkgs.parted
+    pkgs.dosfstools
+    pkgs.e2fsprogs
+    pkgs.util-linux
   ];
 
-  # Sets environment variables in the workspace
-  env = {
-    # Point cc-rs to the musl compiler
-    CC_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-gcc";
-    # Also set generic CC for musl target just in case
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "x86_64-unknown-linux-musl-gcc";
+  env = { 
+    # --- RUST & C INTEROP CONFIGURATION ---
+    
+    # 1. Tell Cargo to use Clang for the Musl target
+    CC_x86_64_unknown_linux_musl = "clang";
+    CXX_x86_64_unknown_linux_musl = "clang++";
+    
+    # 2. Tell Cargo to use LLVM-AR (essential for Clang builds)
+    AR_x86_64_unknown_linux_musl = "llvm-ar";
+    
+    # 3. Tell Cargo to use Clang as the Linker
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "clang";
+    
+    # 4. Ensure flags are set for static linking
+    CFLAGS_x86_64_unknown_linux_musl = "-static -flto=thin";
+    CXXFLAGS_x86_64_unknown_linux_musl = "-static -flto=thin";
+    
+    # 5. Help Bindgen find Clang (used by aws-lc-sys)
+    LIBCLANG_PATH = "${pkgs.pkgsMusl.libclang.lib}/lib";
   };
 
+  services.docker.enable = true;
+
   idx = {
-    # Search for the extensions you want on https://open-vsx.org/ and use "publisher.id"
-    extensions = [
-      # "vscodevim.vim"
-    ];
-
-    # Enable previews
-    previews = {
-      enable = true;
-      previews = {};
-    };
-
-    # Workspace lifecycle hooks
+    extensions = [ "rust-lang.rust-analyzer" ];
+    previews = { enable = true; previews = {}; };
     workspace = {
-      # Runs when a workspace is first created
       onCreate = {
-        # Install add-determinism for reproducible builds
-        # This tool normalizes binaries and archives to remove non-deterministic metadata
-        install-add-determinism = "cargo install add-determinism || echo 'add-determinism installation skipped'";
-      };
-      # Runs when the workspace is (re)started
-      onStart = {
-        # Example: start a background task to watch and re-build backend code
-        # watch-backend = "npm run watch-backend";
+        install-add-determinism = "cargo install add-determinism || echo 'skipped'";
       };
     };
   };
