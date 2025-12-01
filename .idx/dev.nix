@@ -6,6 +6,8 @@
     pkgs.xorriso
     pkgs.git-lfs
     pkgs.linux
+    pkgs.pkgsStatic.busybox
+    
     
     # Build tools
     pkgs.curl
