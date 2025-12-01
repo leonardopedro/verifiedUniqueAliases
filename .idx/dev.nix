@@ -18,7 +18,8 @@
     pkgs.kmod
     
     # Musl toolchain for static linking
-    pkgs.pkgsMusl.stdenv.cc
+    # Use pkgsCross to get the x86_64-unknown-linux-musl-gcc binary
+    pkgs.pkgsCross.musl64.stdenv.cc
     pkgs.musl
     
     # Archive tools
