@@ -134,12 +134,12 @@ in
       { object = "${busybox}/bin/busybox"; symlink = "/bin/ls"; }
 
       # External Static Tools
-      { object = "${pkgs.kmod}/bin/kmod"; symlink = "/bin/modprobe"; }
+      { object = "${pkgs.pkgsStatic.kmod}/bin/kmod"; symlink = "/bin/modprobe"; }
       { object = "${iproute}/bin/ip"; symlink = "/bin/ip"; }
       { object = "${curl}/bin/curl"; symlink = "/bin/curl"; }
       
       # Certificates
-      { object = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"; symlink = "/etc/ssl/certs/ca-bundle.crt"; }
+      { object = "${pkgs.pkgsStatic.cacert}/etc/ssl/certs/ca-bundle.crt"; symlink = "/etc/ssl/certs/ca-bundle.crt"; }
 
       # Kernel Modules
       { object = "${kernel}/lib/modules/${kernelVersion}"; symlink = "/lib/modules/${kernelVersion}"; }
