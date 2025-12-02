@@ -91,6 +91,7 @@ let
     export PAYPAL_CLIENT_ID=$(fetch_metadata paypal_client_id)
     export DOMAIN=$(fetch_metadata domain)
     export SECRET_OCID=$(fetch_metadata secret_ocid)
+    export OCI_REGION=$(fetch_metadata region)
     
     echo "Starting PayPal Auth VM..."
 
