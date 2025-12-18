@@ -118,37 +118,87 @@ fi
 INITRAMFS_HASH=$(sha256sum "$INITRAMFS_FILE" | awk '{print $1}')
 echo "📊 Initramfs SHA256: $INITRAMFS_HASH"
 
-# Step 3: Create bootable ISO image with GRUB
+# Step 3: Create UEFI Disk Image (FAT32 ESP)
 echo ""
-echo "💿 Creating bootable ISO image..."
+echo "💿 Creating UEFI disk image..."
 
-# Prepare ISO root directory
-mkdir -p "$ISO_ROOT/boot/grub"
+RAW_DISK="disk.raw"
+ESP_IMG="esp.img"
 
-cp "$KERNEL_FILE" "$ISO_ROOT/boot/vmlinuz"
-cp "$INITRAMFS_FILE" "$ISO_ROOT/boot/initramfs.img"
+# 1. Create a 256MB raw disk image
+qemu-img create -f raw "$RAW_DISK" 256M
 
-# Create GRUB config
-tee "$ISO_ROOT/boot/grub/grub.cfg" > /dev/null <<EOF
-set default=0
+# 2. Partition it with GPT and a single ESP partition
+# Start at 1MB (2048 sectors), End at 255MB (leaving 1MB for backup GPT)
+# We use 'parted' which is in shell.nix
+parted -s "$RAW_DISK" mklabel gpt mkpart ESP fat32 2048s 255MB set 1 esp on
+
+# 3. Create the ESP filesystem image separately
+# Size = 254MB (Fits within the 1MB to 255MB range)
+dd if=/dev/zero of="$ESP_IMG" bs=1M count=254
+
+# Format as FAT32 using mtools
+mformat -i "$ESP_IMG" -F ::
+
+# Create directory structure
+mmd -i "$ESP_IMG" ::EFI
+mmd -i "$ESP_IMG" ::EFI/BOOT
+mmd -i "$ESP_IMG" ::boot
+
+# 4. Create GRUB EFI bootloader
+echo "   Building GRUB EFI binary..."
+GRUB_MODULES="part_gpt fat normal console serial terminal boot linux configfile xzio echo test loadenv search search_fs_file search_fs_uuid search_label cat"
+
+# Check for grub modules location
+GRUB_LIB="/usr/lib/grub/x86_64-efi"
+if [ ! -d "$GRUB_LIB" ]; then
+    # Helper to find where nix installed grub
+    GRUB_LIB=$(find /nix/store -name "x86_64-efi" -type d | head -n 1)
+    if [ -z "$GRUB_LIB" ]; then
+        echo "❌ Could not find GRUB EFI modules!"
+        exit 1
+    fi
+fi
+echo "   Using GRUB modules from: $GRUB_LIB"
+
+grub-mkimage \
+    -d "$GRUB_LIB" \
+    -O x86_64-efi \
+    -o BOOTX64.EFI \
+    -p /EFI/BOOT \
+    $GRUB_MODULES
+
+# 5. Create GRUB config
+cat > grub.cfg <<EOF
 set timeout=1
+set default=0
 
 menuentry 'PayPal Auth VM' {
+    # Search for the partition containing the kernel by looking for a marker file or just standard path
+    # Since we have one partition, root=(hd0,gpt1) is likely but let's be safe
     linux /boot/vmlinuz ro console=ttyS0
     initrd /boot/initramfs.img
 }
 EOF
 
-# Create bootable ISO
-grub-mkrescue -o "$ISO_FILE" "$ISO_ROOT"
+# 6. Copy files to ESP
+echo "   Populating ESP..."
+mcopy -i "$ESP_IMG" BOOTX64.EFI ::EFI/BOOT/BOOTX64.EFI
+mcopy -i "$ESP_IMG" grub.cfg ::EFI/BOOT/grub.cfg
+mcopy -i "$ESP_IMG" "$KERNEL_FILE" ::boot/vmlinuz
+mcopy -i "$ESP_IMG" "$INITRAMFS_FILE" ::boot/initramfs.img
 
-# Clean up ISO root
-rm -rf "$ISO_ROOT"
+# 7. Merge ESP into the raw disk image at offset 1MB
+echo "   Merging ESP into disk image..."
+dd if="$ESP_IMG" of="$RAW_DISK" bs=1M seek=1 conv=notrunc status=none
 
-# Step 4: Convert ISO to QCOW2
-echo "⚙️  Converting ISO to QCOW2..."
-qemu-img convert -f raw -O qcow2 "$ISO_FILE" "$OUTPUT_IMG"
-rm -f "$ISO_FILE"
+# Cleanup intermediate files
+rm -f "$ESP_IMG" BOOTX64.EFI grub.cfg
+
+# Step 4: Convert to QCOW2
+echo "⚙️  Converting to QCOW2..."
+qemu-img convert -f raw -O qcow2 "$RAW_DISK" "$OUTPUT_IMG"
+rm -f "$RAW_DISK"
 
 # Normalize QCOW2 for reproducibility
 echo "🔧 Normalizing QCOW2 image..."

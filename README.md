@@ -522,7 +522,7 @@ oci os object put \
 # 3. Import as a Custom Image
 export IMAGE_OCID=$(oci compute image import from-object \
     --compartment-id $COMPARTMENT_ID \
-    --display-name "paypal-auth-cvm-v1" \
+    --display-name "paypal-auth-cvm-v2" \
     --launch-mode NATIVE \
     --source-image-type QCOW2 \
     --bucket-name paypal-vm-images \
@@ -581,11 +581,10 @@ export VNIC_ID=$(oci compute instance list-vnics \
 
 # The private IP is already assigned during instance creation
 # Verify it:
-oci network vnic get \
+export PRIVATE_IP=$(oci network vnic get \
     --vnic-id $VNIC_ID \
-    --query 'data."private-ip"'
+    --query 'data."private-ip"')
 
-export PRIVATE_IP="<output-private-ip>"
 ```
 
 ### Step 5.5: Configure Load Balancer
@@ -600,8 +599,8 @@ oci lb backend-set create \
     --policy "ROUND_ROBIN" \
     --health-checker-protocol "TCP" \
     --health-checker-port 443 \
-    --health-checker-interval-in-millis 30000 \
-    --health-checker-timeout-in-millis 3000 \
+    --health-checker-interval-in-ms 30000 \
+    --health-checker-timeout-in-ms 3000 \
     --health-checker-retries 3
 
 # Add the VM as a backend
@@ -668,9 +667,9 @@ oci compute instance get \
     --query 'data."lifecycle-state"'
 
 # View console output (for debugging)
-oci compute instance get-console-history \
-    --instance-id $INSTANCE_ID \
-    --latest
+oci compute console-history get-content \
+    --instance-console-history-id $(oci compute console-history capture --instance-id $INSTANCE_ID --query data.id --raw-output) \
+    --file console.log
 
 # Test metadata endpoint (from another VM in the same VCN)
 # curl http://<PRIVATE_IP>/.well-known/acme-challenge/test
@@ -786,3 +785,31 @@ oci ons subscription create \
     --protocol "EMAIL" \
     --subscription-endpoint "your-email@example.com"
 ```
+
+
+### Step 7.2: Deploy Traffic Monitor ("Traffic Cop")
+
+We have implemented a "Traffic Cop" function to automatically shut down the instance if egress traffic exceeds 9.5 TB (just under the 10 TB free tier limit).
+
+**1. Configure Environment:**
+```bash
+export COMPARTMENT_ID="<your-compartment-id>"
+export INSTANCE_ID="$INSTANCE_ID" # From Step 5.3
+export SUBNET_ID="$SUBNET_ID"     # From Step 1.2
+```
+
+**2. Deploy the Function:**
+We have provided a script to automate the deployment:
+
+```bash
+./deploy-monitor.sh
+```
+
+**3. Schedule the Function:**
+The script will output specific instructions to schedule the function using OCI Events or specific `fn` commands if the automated part needs manual intervention. Ensure the function allows you to create a trigger that runs every 5-15 minutes.
+
+The function logic is located in `oci-monitor/func.py` and performs the following:
+- Calculates start of the current month.
+- Queries `oci_internet_gateway` metrics for `BytesToIgw`.
+- Checks if usage > 9.5 TB.
+- Stops the Compute Instance if the limit is exceeded.
