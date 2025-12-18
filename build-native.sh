@@ -178,7 +178,7 @@ set default=0
 menuentry 'PayPal Auth VM' {
     # Search for the partition containing the kernel by looking for a marker file or just standard path
     # Since we have one partition, root=(hd0,gpt1) is likely but let's be safe
-    linux /boot/vmlinuz ro console=ttyS0,115200 earlyprintk=ttyS0 console=tty0 nomodeset debug panic=1
+    linux /boot/vmlinuz ro console=tty0 console=ttyS0,115200 earlyprintk=ttyS0 ignore_loglevel keep_bootcon nomodeset debug panic=1
 
     initrd /boot/initramfs.img
 }
