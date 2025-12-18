@@ -1,4 +1,3 @@
-#git lfs install && rustup default stable
 { pkgs, ... }: {
   channel = "stable-25.05"; 
 
