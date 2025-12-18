@@ -51,6 +51,7 @@ let
     modprobe virtio_net 2>/dev/null || true
     modprobe virtio_pci 2>/dev/null || true
     modprobe e1000 2>/dev/null || true
+    modprobe virtio_console 2>/dev/null || true
 
     # Enable Loopback
     ip link set lo up
@@ -83,7 +84,8 @@ let
     fetch_metadata() {
         local key=$1
         curl -sf --connect-timeout 2 -H "Authorization: Bearer Oracle" \
-            "http://169.254.169.254/opc/v1/instance/metadata/$key" 2>/dev/null || echo "mock-$key"
+        curl -sf --connect-timeout 2 -H "Authorization: Bearer Oracle" \
+            "http://169.254.169.254/opc/v1/instance/metadata/$key" 2>/dev/null || echo "example.com"
     }
 
     # Fetch Vars
