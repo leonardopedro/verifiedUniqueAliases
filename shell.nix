@@ -41,6 +41,7 @@ pkgs.mkShell {
     e2fsprogs     # ext4 filesystem tools (mkfs.ext4)
     util-linux    # Loop device support (losetup, mount, etc.)
     mtools        # MS-DOS tools for mcopy/mformat (rootless)
+    OVMF          # UEFI firmware for QEMU testing
   ];
 
   # Environment variables
