@@ -147,10 +147,11 @@ mmd -i "$ESP_IMG" ::boot
 
 # 4. Create GRUB EFI bootloader
 echo "   Building GRUB EFI binary..."
-GRUB_MODULES="part_gpt fat normal console serial terminal boot linux configfile xzio echo test loadenv search search_fs_file search_fs_uuid search_label cat"
+#GRUB_MODULES=$(ls -d /nix/store/*grub*/lib/grub/x86_64-efi | head -n 1)
+GRUB_MODULES="part_gpt fat normal serial terminal boot linux configfile xzio echo test loadenv search search_fs_file search_fs_uuid search_label cat efi_gop efi_uga gfxterm"
 
 # Check for grub modules location
-GRUB_LIB="/usr/lib/grub/x86_64-efi"
+GRUB_LIB=$(ls -d /nix/store/*grub*/lib/grub/x86_64-efi | head -n 1)
 if [ ! -d "$GRUB_LIB" ]; then
     # Helper to find where nix installed grub
     GRUB_LIB=$(find /nix/store -name "x86_64-efi" -type d | head -n 1)

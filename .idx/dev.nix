@@ -39,11 +39,14 @@
     pkgs.e2fsprogs     # ext4 filesystem tools (mkfs.ext4)
     pkgs.util-linux    # Loop device support (losetup, mount, etc.)
     pkgs.binutilsNoLibc
-     pkgs.cmake
+    pkgs.cmake
     pkgs.clang
     pkgs.musl
     pkgs.pkg-config
     pkgs.llvmPackages.libclang 
+    pkgs.grub2_efi
+    pkgs.mtools
+    pkgs.dosfstools
   ];
 
   env = {
