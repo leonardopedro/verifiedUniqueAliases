@@ -555,6 +555,9 @@ async fn load_tls_config(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Explicitly set the crypto provider to Ring to avoid autodetection panics
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)

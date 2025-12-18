@@ -1,6 +1,7 @@
 #!/bin/bash
 # Native build script for firebase.studio
 # Builds the initramfs and qcow2 image directly without QEMU/Docker/Podman/sudo
+# qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd -m 2G -drive file=paypal-auth-vm.qcow2,format=qcow2 -nic user,model=virtio-net-pci -nographic
 
 set -e
 
