@@ -79,7 +79,7 @@
     previews = { enable = true; previews = {}; };
     workspace = {
       onCreate = {
-        install-add-determinism = "cargo install add-determinism || echo 'skipped'";
+        install-add-determinism = "git lfs install && rustup default stable && cargo install add-determinism || echo 'skipped'";
       };
     };
   };
