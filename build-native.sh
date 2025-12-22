@@ -147,56 +147,41 @@ mmd -i "$ESP_IMG" ::EFI/BOOT
 mmd -i "$ESP_IMG" ::boot
 
 # 4. Create GRUB EFI bootloader
-echo "   Building GRUB EFI binary..."
-#GRUB_MODULES=$(ls -d /nix/store/*grub*/lib/grub/x86_64-efi | head -n 1)
-GRUB_MODULES="part_gpt fat normal serial terminal boot linux configfile xzio echo test loadenv search search_fs_file search_fs_uuid search_label cat"
+# 4. Create Unified Kernel Image (UKI)
+echo "   Creating Unified Kernel Image (UKI)..."
 
-# Check for grub modules location
-GRUB_LIB=$(ls -d /nix/store/*grub*/lib/grub/x86_64-efi | head -n 1)
-if [ ! -d "$GRUB_LIB" ]; then
-    # Helper to find where nix installed grub
-    GRUB_LIB=$(find /nix/store -name "x86_64-efi" -type d | head -n 1)
-    if [ -z "$GRUB_LIB" ]; then
-        echo "❌ Could not find GRUB EFI modules!"
-        exit 1
-    fi
+# Find UEFI boot stub
+STUB_FILE=$(find /nix/store -name "linuxx64.efi.stub" | head -n 1)
+if [ -z "$STUB_FILE" ]; then
+    echo "❌ Could not find linuxx64.efi.stub! Ensure 'systemd' is in shell.nix."
+    exit 1
 fi
-echo "   Using GRUB modules from: $GRUB_LIB"
+echo "   Using UEFI Stub: $STUB_FILE"
 
-grub-mkimage \
-    -d "$GRUB_LIB" \
-    -O x86_64-efi \
-    -o BOOTX64.EFI \
-    -p /EFI/BOOT \
-    $GRUB_MODULES
+# Create kernel command line
+# Note: root= is handled by initrd, but we need basic console/debug flags
+echo "ro console=ttyS0,115200n8 earlyprintk=ttyS0 ignore_loglevel keep_bootcon nomodeset debug panic=1 initcall_debug swiotlb=65536" > cmdline.txt
 
-# 5. Create GRUB config
-cat > grub.cfg <<EOF
-set timeout=1
-set default=0
+# Create BOOTX64.EFI using objcopy
+objcopy \
+    --add-section .osrel=/etc/os-release --change-section-vma .osrel=0x20000 \
+    --add-section .cmdline="cmdline.txt" --change-section-vma .cmdline=0x30000 \
+    --add-section .linux="$KERNEL_FILE" --change-section-vma .linux=0x40000 \
+    --add-section .initrd="$INITRAMFS_FILE" --change-section-vma .initrd=0x3000000 \
+    "$STUB_FILE" BOOTX64.EFI
 
-menuentry 'PayPal Auth VM' {
-    # Search for the partition containing the kernel by looking for a marker file or just standard path
-    # Since we have one partition, root=(hd0,gpt1) is likely but let's be safe
-    linux /boot/vmlinuz ro console=ttyS0,115200n8 earlyprintk=ttyS0 ignore_loglevel keep_bootcon nomodeset debug panic=1 initcall_debug swiotlb=65536
+echo "   ✅ Generated BOOTX64.EFI"
 
-    initrd /boot/initramfs.img
-}
-EOF
-
-# 6. Copy files to ESP
+# 5. Populate ESP
 echo "   Populating ESP..."
 mcopy -i "$ESP_IMG" BOOTX64.EFI ::EFI/BOOT/BOOTX64.EFI
-mcopy -i "$ESP_IMG" grub.cfg ::EFI/BOOT/grub.cfg
-mcopy -i "$ESP_IMG" "$KERNEL_FILE" ::boot/vmlinuz
-mcopy -i "$ESP_IMG" "$INITRAMFS_FILE" ::boot/initramfs.img
 
-# 7. Merge ESP into the raw disk image at offset 1MB
+# 6. Merge ESP into the raw disk image at offset 1MB
 echo "   Merging ESP into disk image..."
 dd if="$ESP_IMG" of="$RAW_DISK" bs=1M seek=1 conv=notrunc status=none
 
 # Cleanup intermediate files
-rm -f "$ESP_IMG" BOOTX64.EFI grub.cfg
+rm -f "$ESP_IMG" BOOTX64.EFI cmdline.txt
 
 # Step 4: Convert to QCOW2
 echo "⚙️  Converting to QCOW2..."

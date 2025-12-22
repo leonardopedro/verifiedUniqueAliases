@@ -42,6 +42,8 @@ pkgs.mkShell {
     util-linux    # Loop device support (losetup, mount, etc.)
     mtools        # MS-DOS tools for mcopy/mformat (rootless)
     OVMF          # UEFI firmware for QEMU testing
+    binutils      # For objcopy (UKI creation)
+    systemd       # For linuxx64.efi.stub
   ];
 
   # Environment variables
