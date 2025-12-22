@@ -522,7 +522,7 @@ oci os object put \
 # 3. Import as a Custom Image
 export IMAGE_OCID=$(oci compute image import from-object \
     --compartment-id $COMPARTMENT_ID \
-    --display-name "paypal-auth-cvm-v5" \
+    --display-name "paypal-auth-cvm-v6" \
     --launch-mode NATIVE \
     --source-image-type QCOW2 \
     --bucket-name paypal-vm-images \
@@ -560,7 +560,8 @@ oci compute instance launch \
         "notification_topic_id": "'"$NOTIFICATION_TOPIC_ID"'"
     }' \
     --image-id $IMAGE_OCID \
-    --boot-volume-size-in-gbs 50
+    --boot-volume-size-in-gbs 50 \
+    --platform-config '{"type": "AMD_VM", "isMemoryEncryptionEnabled": true}'
 
 export INSTANCE_ID="<output-instance-id>"
 ```
