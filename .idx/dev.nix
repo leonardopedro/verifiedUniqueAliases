@@ -9,6 +9,10 @@
     pkgs.git-lfs
     pkgs.linux
     pkgs.pkgsStatic.busybox
+
+    pkgs.OVMF          # UEFI firmware for QEMU testing
+    pkgs.binutils      # For objcopy (UKI creation)
+    pkgs.systemd       # For linuxx64.efi.stub
     
     
     # Build tools
