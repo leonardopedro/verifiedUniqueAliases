@@ -545,7 +545,7 @@ export SECRET_OCID="$SECRET_ID"  # From Part 1.3
 export NOTIFICATION_TOPIC_ID="$TOPIC_ID"  # From Part 7
 
 # Create instance with custom metadata
-oci compute instance launch \
+export INSTANCE_ID=$(oci compute instance launch \
     --compartment-id $COMPARTMENT_ID \
     --availability-domain "$(oci iam availability-domain list --query 'data[0].name' --raw-output)" \
     --shape "VM.Standard.E4.Flex" \
@@ -561,7 +561,8 @@ oci compute instance launch \
     }' \
     --image-id $IMAGE_OCID \
     --boot-volume-size-in-gbs 50 \
-    --platform-config '{"type": "AMD_VM", "isMemoryEncryptionEnabled": true}'
+    --platform-config '{"type": "AMD_VM", "isMemoryEncryptionEnabled": true}'\
+    --query 'data.id' --raw-output)
 
 export INSTANCE_ID="<output-instance-id>"
 ```
