@@ -3,7 +3,7 @@ set -e
 
 # Configuration
 INSTANCE_NAME="paypal-auth-vm"
-IMAGE_NAME="paypal-auth-cvm-v2"
+IMAGE_NAME="paypal-auth-cvm-v7"
 BUCKET_NAME="paypal-vm-images"
 OBJECT_NAME="paypal-auth-vm.qcow2"
 
@@ -41,12 +41,28 @@ fi
 
 if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "null" ]; then
     echo "   Found Instance: $INSTANCE_ID"
+
+    # Get Availability Domain and Boot Volume ID
+    AVAILABILITY_DOMAIN=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."availability-domain"' --raw-output)
+    BOOT_VOLUME_ID=$(oci compute boot-volume-attachment list --instance-id "$INSTANCE_ID" --availability-domain "$AVAILABILITY_DOMAIN" --compartment-id "$COMPARTMENT_ID" --query 'data[0]."boot-volume-id"' --raw-output)
+    if [ -n "$BOOT_VOLUME_ID" ] && [ "$BOOT_VOLUME_ID" != "null" ]; then
+        echo "   Found Boot Volume: $BOOT_VOLUME_ID"
+    else
+        BOOT_VOLUME_ID=""
+    fi
     echo "🗑️  Terminating instance..."
     oci compute instance terminate --instance-id "$INSTANCE_ID" --force
     
     echo "⏳ Waiting for instance to terminate..."
     oci compute instance get --instance-id "$INSTANCE_ID" --wait-for-state TERMINATED
     echo "✅ Instance terminated."
+
+    # Delete Boot Volume
+    if [ -n "$BOOT_VOLUME_ID" ]; then
+        echo "🗑️  Deleting Boot Volume..."
+        oci bv boot-volume delete  --boot-volume-id "$BOOT_VOLUME_ID" --force
+        echo "✅ Boot Volume deleted."
+    fi
 else
     echo "   Instance not found (active or stopped). Skipping."
 fi
