@@ -548,7 +548,7 @@ export NOTIFICATION_TOPIC_ID="$TOPIC_ID"  # From Part 7
 export INSTANCE_ID=$(oci compute instance launch \
     --compartment-id $COMPARTMENT_ID \
     --availability-domain "$(oci iam availability-domain list --query 'data[0].name' --raw-output)" \
-    --shape "VM.Standard.E4.Flex" \
+    --shape "VM.Standard.E5.Flex" \
     --shape-config '{"ocpus": 1, "memoryInGBs": 8}' \
     --subnet-id $SUBNET_ID \
     --assign-public-ip false \
