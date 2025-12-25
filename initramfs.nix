@@ -84,7 +84,6 @@ let
     fetch_metadata() {
         local key=$1
         curl -sf --connect-timeout 2 -H "Authorization: Bearer Oracle" \
-        curl -sf --connect-timeout 2 -H "Authorization: Bearer Oracle" \
             "http://169.254.169.254/opc/v1/instance/metadata/$key" 2>/dev/null || echo "example.com"
     }
 

@@ -522,7 +522,7 @@ oci os object put \
 # 3. Import as a Custom Image
 export IMAGE_OCID=$(oci compute image import from-object \
     --compartment-id $COMPARTMENT_ID \
-    --display-name "paypal-auth-cvm-v9" \
+    --display-name "paypal-auth-cvm-v10" \
     --launch-mode NATIVE \
     --source-image-type QCOW2 \
     --bucket-name paypal-vm-images \
@@ -536,22 +536,51 @@ echo "Custom Image created with OCID: $IMAGE_OCID"
 # These steps are critical to prevent firmware crashes on Flex shapes
 
 # Add Shape Compatibility for E4 and E5 Flex
-oci compute image-shape-compatibility-entry create \
+oci compute image-shape-compatibility-entry add \
     --image-id $IMAGE_OCID \
     --shape-name "VM.Standard.E4.Flex"
 
-oci compute image-shape-compatibility-entry create \
+oci compute image-shape-compatibility-entry add \
     --image-id $IMAGE_OCID \
     --shape-name "VM.Standard.E5.Flex"
 
-# Enable AMD SEV Capability
-export GLOBAL_VERSION_NAME=$(oci compute global-image-capability-schema list --query 'data[0].current-version-name' --raw-output)
+# Enable AMD SEV Capability (Corrected JSON format)
+# Ensure variables are set
+echo "Using Compartment: $COMPARTMENT_ID"
+echo "Using Image:       $IMAGE_OCID"
+
+export GLOBAL_VERSION_NAME=$(oci compute global-image-capability-schema list --all --query 'data[0]."current-version-name"' --raw-output)
+echo "Global Schema:     $GLOBAL_VERSION_NAME"
+
+if [ -z "$GLOBAL_VERSION_NAME" ]; then
+    echo "❌ Error: GLOBAL_VERSION_NAME is empty. Check your OCI CLI login and region."
+    exit 1
+fi
+
+# Create a temporary JSON file for the schema data
+cat > schema-data.json <<EOF
+{
+  "Compute.AMD_SecureEncryptedVirtualization": {
+    "descriptorType": "boolean",
+    "source": "IMAGE",
+    "defaultValue": true
+  },
+  "Compute.Firmware": {
+    "descriptorType": "enumstring",
+    "source": "IMAGE",
+    "defaultValue": "UEFI_64",
+    "values": ["BIOS", "UEFI_64"]
+  }
+}
+EOF
 
 oci compute image-capability-schema create \
-    --compartment-id $COMPARTMENT_ID \
-    --image-id $IMAGE_OCID \
-    --global-image-capability-schema-version-name $GLOBAL_VERSION_NAME \
-    --schema-keys '{"Compute.AMD_SecureEncryptedVirtualization": {"source": "IMAGE", "defaultValue": "true"}, "Compute.UEFI_64": {"source": "IMAGE", "defaultValue": "true"}}'
+    --compartment-id "$COMPARTMENT_ID" \
+    --image-id "$IMAGE_OCID" \
+    --global-image-capability-schema-version-name "$GLOBAL_VERSION_NAME" \
+    --schema-data file://schema-data.json
+
+rm schema-data.json
 ```
 
 ### Step 5.3: Create Confidential VM Instance
@@ -569,7 +598,7 @@ export NOTIFICATION_TOPIC_ID="$TOPIC_ID"  # From Part 7
 export INSTANCE_ID=$(oci compute instance launch \
     --compartment-id $COMPARTMENT_ID \
     --availability-domain "$(oci iam availability-domain list --query 'data[0].name' --raw-output)" \
-    --shape "VM.Standard.E4.Flex" \
+    --shape "VM.Standard.E5.Flex" \
     --shape-config '{"ocpus": 1, "memoryInGBs": 8}' \
     --subnet-id $SUBNET_ID \
     --assign-public-ip false \
