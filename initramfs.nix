@@ -6,7 +6,7 @@ let
   curl = pkgs.pkgsStatic.curl;
   iproute = pkgs.pkgsStatic.iproute2;
   
-  kernel = pkgs.linuxPackages.kernel;
+  kernel = pkgs.linuxPackages_latest.kernel;
   kernelVersion = kernel.modDirVersion;
 
   # 2. DHCP Callback Script

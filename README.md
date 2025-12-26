@@ -519,10 +519,11 @@ oci os object put \
     --file paypal-auth-vm.qcow2 \
     --name paypal-auth-vm.qcow2
 
+IMAGE_NAME="paypal-auth-cvm-v11"
 # 3. Import as a Custom Image
 export IMAGE_OCID=$(oci compute image import from-object \
     --compartment-id $COMPARTMENT_ID \
-    --display-name "paypal-auth-cvm-v10" \
+    --display-name $IMAGE_NAME \
     --launch-mode NATIVE \
     --source-image-type QCOW2 \
     --bucket-name paypal-vm-images \
@@ -558,21 +559,7 @@ if [ -z "$GLOBAL_VERSION_NAME" ]; then
 fi
 
 # Create a temporary JSON file for the schema data
-cat > schema-data.json <<EOF
-{
-  "Compute.AMD_SecureEncryptedVirtualization": {
-    "descriptorType": "boolean",
-    "source": "IMAGE",
-    "defaultValue": true
-  },
-  "Compute.Firmware": {
-    "descriptorType": "enumstring",
-    "source": "IMAGE",
-    "defaultValue": "UEFI_64",
-    "values": ["BIOS", "UEFI_64"]
-  }
-}
-EOF
+echo -e "{\n\"Compute.AMD_SecureEncryptedVirtualization\": {\n\"descriptorType\": \"boolean\",\n\"source\": \"IMAGE\",\n\"defaultValue\": true\n},\n\"Compute.Firmware\": {\n\"descriptorType\": \"enumstring\",\n\"source\": \"IMAGE\",\n\"defaultValue\": \"UEFI_64\",\n\"values\": [\"BIOS\", \"UEFI_64\"]\n}\n}"> schema-data.json
 
 oci compute image-capability-schema create \
     --compartment-id "$COMPARTMENT_ID" \
@@ -598,7 +585,7 @@ export NOTIFICATION_TOPIC_ID="$TOPIC_ID"  # From Part 7
 export INSTANCE_ID=$(oci compute instance launch \
     --compartment-id $COMPARTMENT_ID \
     --availability-domain "$(oci iam availability-domain list --query 'data[0].name' --raw-output)" \
-    --shape "VM.Standard.E5.Flex" \
+    --shape "VM.Standard.E4.Flex" \
     --shape-config '{"ocpus": 1, "memoryInGBs": 8}' \
     --subnet-id $SUBNET_ID \
     --assign-public-ip false \
