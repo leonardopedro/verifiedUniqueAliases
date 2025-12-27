@@ -160,7 +160,7 @@ echo "   Using UEFI Stub: $STUB_FILE"
 
 # Create kernel command line
 # Note: root= is handled by initrd, but we need basic console/debug flags
-echo "ro console=ttyS0,115200n8 earlyprintk=ttyS0 ignore_loglevel keep_bootcon nomodeset panic=0 swiotlb=65536 pci=nommconf mem_encrypt=on nokaslr iommu=off random.trust_cpu=on" > cmdline.txt
+echo "ro console=ttyS0,115200n8 earlyprintk=ttyS0 ignore_loglevel keep_bootcon nomodeset panic=0 swiotlb=65536 pci=nommconf mem_encrypt=on nokaslr iommu=off random.trust_cpu=on acpi=off" > cmdline.txt
 
 # Create BOOTX64.EFI using objcopy
 objcopy \
