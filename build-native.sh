@@ -188,10 +188,31 @@ mmd -i "$ESP_IMG" ::boot
 # 4. Create Unified Kernel Image (UKI)
 echo "   Creating Unified Kernel Image (UKI)..."
 
-# Find UEFI boot stub
-STUB_FILE=$(find /nix/store -name "linuxx64.efi.stub" | head -n 1)
+# Find UEFI boot stub (portable across Nix and FHS distros like Debian)
+STUB_FILE=""
+SEARCH_PATHS=(
+    "/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
+    "/lib/systemd/boot/efi/linuxx64.efi.stub"
+    "/usr/lib/systemd/boot/efi/x86_64/linuxx64.efi.stub"
+)
+
+# Check standard FHS paths first
+for path in "${SEARCH_PATHS[@]}"; do
+    if [ -f "$path" ]; then
+        STUB_FILE="$path"
+        break
+    fi
+done
+
+# Fallback to nix-store if not found
 if [ -z "$STUB_FILE" ]; then
-    echo "❌ Could not find linuxx64.efi.stub! Ensure 'systemd' is in shell.nix."
+    STUB_FILE=$(find /nix/store -name "linuxx64.efi.stub" 2>/dev/null | head -n 1)
+fi
+
+if [ -z "$STUB_FILE" ]; then
+    echo "❌ Could not find linuxx64.efi.stub!"
+    echo "   On Debian/Ubuntu: sudo apt install systemd-boot"
+    echo "   On Nix: Ensure 'systemd' is in buildInputs"
     exit 1
 fi
 echo "   Using UEFI Stub: $STUB_FILE"

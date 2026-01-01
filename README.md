@@ -324,43 +324,34 @@ See `src/main.rs` for the full implementation.
 
 You can build the initramfs and qcow2 image using one of three methods:
 
-### Option A: Native Build (Firebase Studio - Recommended)
+### Option C: Debian Shell Environment (Recommended for Debian hosts)
 
-If you're using [Firebase Studio](https://firebase.studio) (formerly Project IDX), you can build the image directly without Docker or QEMU:
+If you are running on a **Debian-based** host:
 
-**Prerequisites:**
-- Workspace with `.idx/dev.nix` configured (included in this repo)
-- Packages will be installed automatically from NixOS stable-24.05 channel
-
-**Steps:**
-
-1. **Check Environment** (first time only):
+1. **Install Dependencies**:
    ```bash
-   ./check-native-env.sh
+   sudo apt update && sudo apt install -y mtools qemu-utils binutils systemd-boot parted dosfstools
    ```
 
-2. **Build Everything**:
+2. **Build the QCOW2 Image**:
    ```bash
-   ./build-native.sh
+   ./build-native.sh --skip-initramfs
    ```
 
-   This single command will:
-   - Build the Rust binary with reproducibility flags
-   - Create the dracut initramfs image
-- Package everything into a bootable qcow2 disk image
-   - Generate SHA256 checksums and build manifest
-
-**Output Files:**
-- `initramfs-paypal-auth.img` - The initramfs image  
-- `paypal-auth-vm.qcow2` - Bootable VM image (ready for OCI upload)
-- `build-manifest.json` - Build metadata for reproducibility
-- `*.sha256` - Checksums for verification
+3. **Local Testing (QEMU)**:
+   You can verify the image boots correctly using QEMU:
+   ```bash
+   qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd -m 2G \
+       -drive file=paypal-auth-vm.qcow2,format=qcow2 \
+       -nic user,model=virtio-net-pci -nographic
+   ```
 
 **Advantages:**
 - ✅ **Fastest**: No VM or container overhead
-- ✅ **Simplest**: Runs directly in your workspace
-- ✅ **Same Output**: Produces identical images (verify with SHA256)
-- ✅ **Integrated**: Part of your development workflow
+- ✅ **Native**: Uses host tools directly
+- ✅ **Minimalist**: RAM-only execution (no persistent storage)
+
+**See Also:** [`BUILD_NATIVE.md`](BUILD_NATIVE.md) for detailed documentation.
 
 **See Also:** [`BUILD_NATIVE.md`](BUILD_NATIVE.md) for detailed documentation.
 
