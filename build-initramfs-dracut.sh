@@ -60,6 +60,17 @@ if [ -d "kernel-oracle" ] && [ -f "kernel-oracle/version.txt" ]; then
     
     # Just in case readlink fails or dracut is picky
     export DRACUT_KMODDIR_OVERRIDE=1
+
+    # Check for modules.dep
+    if [ ! -f "$KMOD_DIR/modules.dep" ]; then
+        echo "🔧 Generating module dependencies (depmod)..."
+        # depmod -b <basedir> <version> 
+        # where <basedir>/lib/modules/<version> exists
+        # Our KMOD_DIR is .../lib/modules/<version>
+        # So basedir should be the parent of parent of KMOD_DIR
+        DEPMOD_BASE=$(dirname $(dirname "$KMOD_DIR"))
+        depmod -b "$DEPMOD_BASE" "$KERNEL_VERSION" || echo "⚠️ depmod failed, but continuing..."
+    fi
 elif [ -n "$KERNEL_DIR" ]; then
     echo "❄️  Using Nix-provided Kernel..."
     KERNEL_VERSION=$(ls "$KERNEL_DIR" | head -n1)

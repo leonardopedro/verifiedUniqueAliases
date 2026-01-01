@@ -32,6 +32,10 @@ pkgs.mkShell {
     cpio
     gzip
     xz
+    rpm           # For extracting OCI kernel packages
+    p7zip         # Fallback for RPM extraction
+    zstd          # Modern compression support
+    pkgs.kmod     # For modprobe and depmod
     
     # QEMU and image creation tools
     qemu_kvm      # Provides qemu-img for image conversion
