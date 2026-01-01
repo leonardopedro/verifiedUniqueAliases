@@ -28,94 +28,27 @@ echo "📦 Building Rust application for $BUILD_TARGET..."
 rustup target add $BUILD_TARGET 2>/dev/null || true
 
 # Build Rust binary with full reproducibility flags
-# These flags ensure deterministic output:
-# - target-cpu=generic: Avoid host-specific optimizations
-# - codegen-units=1: Single codegen unit for deterministic output
-# - strip=symbols: Strip debug symbols for smaller, deterministic binary
 export RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C strip=symbols"
-
-# Ensure reproducible build with LTO
 export CARGO_PROFILE_RELEASE_LTO=true
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
 
-## Cargo build happens inside dracut module-setup.sh
-# This is intentionally commented - the build happens in the dracut module's install() function
+cargo build --release --target $BUILD_TARGET || { echo "❌ Cargo build failed"; exit 1; }
 
-#cargo build --release --target $BUILD_TARGET
-# Strip the binary for smaller size and reproducibility
-#strip --strip-all target/$BUILD_TARGET/release/paypal-auth-vm
-
-# Normalize the binary timestamp to SOURCE_DATE_EPOCH
-#touch -d "@${SOURCE_DATE_EPOCH}" target/$BUILD_TARGET/release/paypal-auth-vm
-
-#BINARY_SIZE=$(du -h target/$BUILD_TARGET/release/paypal-auth-vm | cut -f1)
-#echo "📊 Binary size: $BINARY_SIZE"
-
-
-# Prepare local dracut module
-echo "📋 Preparing local dracut module..."
-
-# Always remove and re-copy to ensure clean state
-rm -rf /usr/lib/dracut/modules.d/99paypal-auth-vm
-mkdir -p /usr/lib/dracut/modules.d/
-cp -r ./dracut-module/99paypal-auth-vm /usr/lib/dracut/modules.d/
-
-chmod +x /usr/lib/dracut/modules.d/99paypal-auth-vm/*.sh
-
-
-# Update module-setup.sh with correct build path
-# Replace hardcoded /app with actual build directory
-sed -i "s|cd /app|cd $BUILD_DIR|g" \
-    /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
-
-# Remove Docker-specific cargo env sourcing and inject correct PATH
-# We need to explicitly set PATH because dracut might sanitize the environment
-sed -i "s|source /usr/local/cargo/env|export PATH=\"/root/.cargo/bin:\$PATH\"|g" \
-    /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
-
-# Force absolute paths for cargo and add-det to be safe
-# Only replace if not already absolute path (to prevent duplication)
-sed -i "s| cargo build| /root/.cargo/bin/cargo build|g" \
-    /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
-sed -i "s| add-det | /root/.cargo/bin/add-det |g" \
-    /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
-
-#sed -i "s|x86_64-unknown-linux-musl|$BUILD_TARGET|g" \
-#    /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
-sed -i "s|x86_64-unknown-linux-gnu|$BUILD_TARGET|g" \
-    /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
-
-# CRITICAL: Normalize module timestamps BEFORE dracut packages them
-echo "🔧 Normalizing module timestamps for reproducibility..."
-# Note: Binary timestamps are normalized inside module-setup.sh during install()
-find /usr/lib/dracut/modules.d/99paypal-auth-vm -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
-
-# Debug: Verify module exists
-echo "🔍 Debugging: Checking if module exists..."
-ls -la /usr/lib/dracut/modules.d/ | grep paypal || echo "❌ paypal module directory not found!"
-if [ -d /usr/lib/dracut/modules.d/99paypal-auth-vm ]; then
-    echo "✅ Module directory exists"
-    ls -la /usr/lib/dracut/modules.d/99paypal-auth-vm/
-else
-    echo "❌ Module directory does NOT exist!"
+BINARY_PATH="target/$BUILD_TARGET/release/paypal-auth-vm"
+if [ ! -f "$BINARY_PATH" ]; then
+    echo "❌ Binary not found at $BINARY_PATH"
+    exit 1
 fi
 
-# List all available dracut modules
-echo "📋 Available dracut modules:"
-ls -1 /usr/lib/dracut/modules.d/ | head -20
+# Normalize the binary
+echo "🔧 Normalizing binary..."
+if command -v add-det &>/dev/null; then
+    add-det "$BINARY_PATH"
+fi
+touch -d "@${SOURCE_DATE_EPOCH}" "$BINARY_PATH"
 
-# Test if dracut can see our module
-echo "🧪 Testing if dracut can see our module..."
-cp dracut.conf /etc/dracut.conf.d/99force-no-hostonly.conf
-cp dracut.conf /etc/dracut.conf
-dracut --list-modules 2>&1 | grep -i paypal && echo "✅ Dracut sees the module!" || echo "❌ Dracut does NOT see the module!"
-
-# Show what dracut thinks about our module
-echo "🔍 Checking module with dracut..."
-dracut --list-modules 2>&1 | head -30
-
-# Build initramfs with reproducibility flags
-echo "🔨 Building initramfs with dracut..."
+echo "📋 Preparing files for initramfs..."
+# We cannot install to /usr/lib/dracut/modules.d (read-only), so we use --include.
 
 # Determine kernel version
 if [ -d "kernel-oracle" ] && [ -f "kernel-oracle/version.txt" ]; then
@@ -159,6 +92,12 @@ fi
 # Build with reproducibility flags
 # --reproducible: Use SOURCE_DATE_EPOCH for timestamps
 # --gzip: Use gzip (more deterministic than zstd/lz4)
+# --include: Manually inject binary and hooks since we can't install a module
+echo "🔨 Generatng initramfs..."
+
+# Ensure hooks are executable
+chmod +x dracut-module/99paypal-auth-vm/*.sh
+
 dracut \
     --force \
     --reproducible \
@@ -169,7 +108,10 @@ dracut \
     --no-hostonly-cmdline \
     --nofscks \
     --no-early-microcode \
-    --add "paypal-auth-vm" \
+    --install "curl" \
+    --include "$BINARY_PATH" "/bin/paypal-auth-vm" \
+    --include "dracut-module/99paypal-auth-vm/parse-paypal-auth.sh" "/usr/lib/dracut/hooks/cmdline/00-parse-paypal-auth.sh" \
+    --include "dracut-module/99paypal-auth-vm/start-app.sh" "/usr/lib/dracut/hooks/pre-pivot/99-start-app.sh" \
     --kver "$KERNEL_VERSION" \
     --fwdir "/usr/lib/firmware" \
     --tmpdir "$HOME/dracut-build" \
