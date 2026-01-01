@@ -341,7 +341,8 @@ If you are running on a **Debian-based** host:
 3. **Local Testing (QEMU)**:
    You can verify the image boots correctly using QEMU:
    ```bash
-   qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd -m 2G \
+   qemu-system-x86_64 -m 2G \
+       -drive if=pflash,format=raw,readonly=on,file=/usr/share/ovmf/OVMF.fd \
        -drive file=paypal-auth-vm.qcow2,format=qcow2 \
        -nic user,model=virtio-net-pci -nographic
    ```
