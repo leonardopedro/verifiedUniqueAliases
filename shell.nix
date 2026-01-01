@@ -47,6 +47,8 @@ pkgs.mkShell {
     dracut        # For initramfs generation
     linuxPackages_latest.kernel # Latest kernel (6.9+)
     rpm           # For extracting OCI kernel packages
+    p7zip         # Fallback for RPM extraction
+    zstd          # Modern compression support
   ];
 
   # Environment variables
