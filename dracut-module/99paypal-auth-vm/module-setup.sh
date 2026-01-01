@@ -9,7 +9,7 @@ check() {
 depends() {
     # Dependencies on other dracut modules
     # Note: 'network' module doesn't work in containers, so we manually install curl
-    echo "base"
+    echo "base network"
     return 0
 }
 

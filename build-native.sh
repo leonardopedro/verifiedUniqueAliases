@@ -219,7 +219,7 @@ echo "   Using UEFI Stub: $STUB_FILE"
 
 # Create kernel command line
 # Note: root= is handled by initrd, but we need basic console/debug flags
-echo "ro console=ttyS0,115200n8 earlyprintk=ttyS0 ignore_loglevel keep_bootcon nomodeset panic=0 swiotlb=65536 pci=nommconf mem_encrypt=on nokaslr iommu=off random.trust_cpu=on acpi=noirq noapic" > cmdline.txt
+echo "ro console=ttyS0,115200n8 earlyprintk=ttyS0 ignore_loglevel keep_bootcon nomodeset panic=0 swiotlb=65536 pci=nommconf mem_encrypt=on nokaslr iommu=off random.trust_cpu=on acpi=noirq noapic ip=dhcp rd.neednet=1 rd.skipfsck" > cmdline.txt
 
 # Create BOOTX64.EFI using objcopy
 objcopy \
@@ -235,12 +235,16 @@ echo "   ✅ Generated BOOTX64.EFI"
 echo "   Populating ESP..."
 mcopy -i "$ESP_IMG" BOOTX64.EFI ::EFI/BOOT/BOOTX64.EFI
 
+echo "   Creating startup.nsh..."
+echo "fs0:\EFI\BOOT\BOOTX64.EFI" > startup.nsh
+mcopy -i "$ESP_IMG" startup.nsh ::startup.nsh
+
 # 6. Merge ESP into the raw disk image at offset 1MB
 echo "   Merging ESP into disk image..."
 dd if="$ESP_IMG" of="$RAW_DISK" bs=1M seek=1 conv=notrunc status=none
 
 # Cleanup intermediate files
-rm -f "$ESP_IMG" BOOTX64.EFI cmdline.txt
+rm -f "$ESP_IMG" BOOTX64.EFI cmdline.txt startup.nsh
 
 # Step 4: Convert to QCOW2
 echo "⚙️  Converting to QCOW2..."
