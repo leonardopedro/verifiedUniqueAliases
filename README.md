@@ -504,7 +504,7 @@ oci os object put \
     --file paypal-auth-vm.qcow2 \
     --name paypal-auth-vm.qcow2
 
-IMAGE_NAME="paypal-auth-cvm-v14"
+IMAGE_NAME="paypal-auth-cvm-v15"
 # 3. Import as a Custom Image
 export IMAGE_OCID=$(oci compute image import from-object \
     --compartment-id $COMPARTMENT_ID \

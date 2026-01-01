@@ -4,8 +4,8 @@
 # REPRODUCIBILITY: This Dockerfile pins the base image and package versions
 # to ensure bit-by-bit reproducible builds.
 
-# Use Oracle Linux 10 with pinned SHA256 for reproducibility
-FROM container-registry.oracle.com/os/oraclelinux@sha256:3daebe163a923bc60cc923eae6e9a307f24e2682f3bfa922b0059aac1f7ec82a AS builder
+# Use Oracle Linux 10 Slim from Oracle Container Registry
+FROM container-registry.oracle.com/os/oraclelinux:10-slim AS builder
 
 # Reproducibility environment
 ENV SOURCE_DATE_EPOCH=1640995200
@@ -16,7 +16,8 @@ ENV LC_ALL=C.UTF-8
 # Enable UEK R8 repository and install packages
 # Note: In OL10, UEK8 kernel packages have the 'kernel-uek' prefix 
 # but are located in the 'ol10_UEKR8' repository which must be enabled.
-RUN dnf install -y --enablerepo=ol10_UEKR8 \
+# OL10 Slim uses microdnf as the package manager.
+RUN microdnf install -y --enablerepo=ol10_UEKR8 \
     # UEK R8 kernel Update 1 (8.1) - official kernel for OCI
     kernel-uek-core \
     kernel-uek-modules \
@@ -38,7 +39,7 @@ RUN dnf install -y --enablerepo=ol10_UEKR8 \
     cpio \
     gzip \
     xz \
-    && dnf clean all
+    && microdnf clean all
 
 # Verify UEK kernel is installed
 RUN echo "=== Installed UEK Kernel ===" && \
