@@ -54,9 +54,12 @@ echo "📋 Preparing files for initramfs..."
 if [ -d "kernel-oracle" ] && [ -f "kernel-oracle/version.txt" ]; then
     echo "🌟 Using downloaded Oracle UEK Kernel..."
     KERNEL_VERSION=$(cat kernel-oracle/version.txt)
-    # Dracut needs full path to modules
-    KMOD_DIR="$(pwd)/kernel-oracle/modules"
+    # Dracut needs the real path so directory name matches version
+    KMOD_DIR=$(readlink -f kernel-oracle/modules)
     KERNEL_BINARY="$(pwd)/kernel-oracle/vmlinuz"
+    
+    # Just in case readlink fails or dracut is picky
+    export DRACUT_KMODDIR_OVERRIDE=1
 elif [ -n "$KERNEL_DIR" ]; then
     echo "❄️  Using Nix-provided Kernel..."
     KERNEL_VERSION=$(ls "$KERNEL_DIR" | head -n1)
