@@ -4,6 +4,11 @@
 
 set -e
 
+# Fix for IDX/Podman: ensure TMPDIR points to an existing directory
+# Podman defaults to /var/tmp which is missing in some IDX environments
+export TMPDIR="/tmp"
+mkdir -p "$TMPDIR"
+
 echo "🐳 Building initramfs using Docker (Oracle Linux)..."
 echo ""
 

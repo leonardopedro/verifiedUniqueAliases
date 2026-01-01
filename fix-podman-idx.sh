@@ -33,6 +33,15 @@ location = "docker.io"
 [[registry]]
 location = "container-registry.oracle.com"
 EOF
+
+    echo "   Writing containers.conf..."
+    cat <<EOF > "$CONF_DIR/containers.conf"
+[containers]
+# Ensure Podman doesn't use /var/tmp which is missing in IDX
+[engine]
+# Temporary directory for image content
+tmp_dir = "/tmp"
+EOF
     echo "   ✅ Updated $CONF_DIR"
 done
 
