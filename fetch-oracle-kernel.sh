@@ -28,25 +28,35 @@ echo "   URL: $RPM_URL"
 curl -L -o "kernel.rpm" "$RPM_URL"
 
 echo "📦 Extracting kernel RPM..."
-# Try 7z if available (handles modern RPM compression better than old rpm2cpio)
+# Try 7z if available (handles modern RPM wrapping)
 if command -v 7z &>/dev/null; then
-    # 7z recursively extracts the RPM content (cpio) then the cpio content
+    # 7z recursively extracts the RPM content
     7z x -y kernel.rpm
-    # The output is usually a cpio archive named 'kernel.cpio' or similar, or just raw files
-    # Check what we got
-    if [ -f "kernel.cpio" ]; then
-        7z x -y kernel.cpio
-    elif [ -f "payload.cpio" ]; then # Some older RPM variants
-        7z x -y payload.cpio
-    elif ls *.cpio 1> /dev/null 2>&1; then
+    
+    # Handle the payload which might be zstd compressed cpio
+    # Look for .cpio.zstd first
+    if ls *.cpio.zstd 1> /dev/null 2>&1; then
+        ZSTD_FILE=$(ls *.cpio.zstd | head -n1)
+        echo "   Decompressing $ZSTD_FILE..."
+        if command -v zstd &>/dev/null; then
+            zstd -d --rm "$ZSTD_FILE"
+        else
+            7z x -y "$ZSTD_FILE"
+        fi
+    fi
+    
+    # Now look for .cpio (either directly extracted or decompressed above)
+    if ls *.cpio 1> /dev/null 2>&1; then
         CPIO_FILE=$(ls *.cpio | head -n1)
-        7z x -y "$CPIO_FILE"
+        echo "   Extracting CPIO archive: $CPIO_FILE"
+        # Use 7z or cpio to extract the archive
+        # 7z is robust, but cpio -idm is classic
+        cpio -idm --quiet < "$CPIO_FILE"
     else
-        # Sometimes 7z extracts directly to dirs
-        echo "   7z extraction complete (direct)."
+        echo "⚠️ No .cpio file found after extraction? Checking for directories..."
     fi
 else
-    # Fallback to rpm2cpio
+    # Fallback to rpm2cpio (likely to fail on zstd RPMs)
     rpm2cpio kernel.rpm | cpio -idm --quiet
 fi
 
