@@ -93,6 +93,9 @@
           install-add-determinism = "git lfs install && rustup default stable && cargo install add-determinism || echo 'skipped'";
           setup-podman = "./fix-podman-idx.sh";
         };
+        onStart = {
+          share-mount = "sudo mount --make-rshared /";
+        };
       };
   };
 }
