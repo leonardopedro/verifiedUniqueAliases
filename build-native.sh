@@ -45,36 +45,40 @@ echo ""
 rm -rf "$ISO_ROOT" "$INITRAMFS_FILE" "$ISO_FILE" result
 
 # Step 1: Build Rust binary (Static)
-echo "🦀 Building Rust binary (static)..."
-rustup target add "$BUILD_TARGET" 2>/dev/null || true
+if [ "$SKIP_INITRAMFS" = true ]; then
+    echo "⏭️  Skipping Rust binary build (--skip-initramfs)"
+else
+    echo "🦀 Building Rust binary (static)..."
+    rustup target add "$BUILD_TARGET" 2>/dev/null || true
 
-# Check if linker is available
-if ! command -v x86_64-unknown-linux-musl-gcc &>/dev/null; then
-    echo "⚠️  Linker 'x86_64-unknown-linux-musl-gcc' not found in PATH."
-    echo "    Please ensure you are in the nix-shell environment."
-    echo "    Run: nix-shell"
-    exit 1
+    # Check if linker is available
+    if ! command -v x86_64-unknown-linux-musl-gcc &>/dev/null; then
+        echo "⚠️  Linker 'x86_64-unknown-linux-musl-gcc' not found in PATH."
+        echo "    Please ensure you are in the nix-shell environment."
+        echo "    Run: nix-shell"
+        exit 1
+    fi
+
+    export CARGO_PROFILE_RELEASE_LTO=true
+    export CARGO_PROFILE_RELEASE_OPT_LEVEL=z
+
+    cargo build --release --target "$BUILD_TARGET"
+
+    BINARY_PATH="$BUILD_DIR/target/$BUILD_TARGET/release/paypal-auth-vm"
+    export BUILD_TARGET
+
+    if [ ! -f "$BINARY_PATH" ]; then
+        echo "❌ Cargo build failed! Binary not found: $BINARY_PATH"
+        exit 1
+    fi
+
+    # Normalize binary
+    echo "🔧 Normalizing binary..."
+    if command -v add-det &>/dev/null; then
+        add-det "$BINARY_PATH"
+    fi
+    touch -d "@${SOURCE_DATE_EPOCH}" "$BINARY_PATH"
 fi
-
-export CARGO_PROFILE_RELEASE_LTO=true
-export CARGO_PROFILE_RELEASE_OPT_LEVEL=z
-
-cargo build --release --target "$BUILD_TARGET"
-
-export BINARY_PATH="$BUILD_DIR/target/$BUILD_TARGET/release/paypal-auth-vm"
-export BUILD_TARGET
-
-if [ ! -f "$BINARY_PATH" ]; then
-    echo "❌ Cargo build failed! Binary not found: $BINARY_PATH"
-    exit 1
-fi
-
-# Normalize binary
-echo "🔧 Normalizing binary..."
-if command -v add-det &>/dev/null; then
-    add-det "$BINARY_PATH"
-fi
-touch -d "@${SOURCE_DATE_EPOCH}" "$BINARY_PATH"
 
 # Step 2: Build Initramfs and get Kernel using Dracut
 INITRAMFS_SRC="initramfs-paypal-auth.img"
