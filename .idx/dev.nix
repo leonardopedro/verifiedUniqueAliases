@@ -8,6 +8,7 @@
     pkgs.xorriso
     pkgs.git-lfs
     pkgs.linux
+    pkgs.sudo
     pkgs.pkgsStatic.busybox
 
     pkgs.OVMF          # UEFI firmware for QEMU testing
