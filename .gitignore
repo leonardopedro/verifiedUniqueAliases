@@ -4,6 +4,7 @@ debug
 target
 img
 kernel-oracle
+vmlinuz
 
 initramfs-paypal-auth.img
 initramfs-paypal-auth.img.sha256
