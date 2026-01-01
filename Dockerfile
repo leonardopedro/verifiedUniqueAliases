@@ -26,6 +26,7 @@ RUN microdnf install -y --enablerepo=ol10_UEKR8 \
     # Dracut for initramfs generation
     dracut \
     dracut-network \
+    dbus-daemon \
     # Build essentials
     curl \
     gcc \
