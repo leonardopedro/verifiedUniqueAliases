@@ -14,41 +14,18 @@ depends() {
 }
 
 install() {
-    # Build Rust binary first
-    echo "Building Rust application..."
-    cd /app
+    # Use pre-built Rust binary
+    BINARY_SOURCE="/app/target/x86_64-unknown-linux-gnu/release/paypal-auth-vm"
     
-    # Add target if not already added
-    rustup target add x86_64-unknown-linux-gnu 2>/dev/null || true
+    if [ ! -f "$BINARY_SOURCE" ]; then
+        echo "❌ Binary not found at $BINARY_SOURCE"
+        exit 1
+    fi
     
-    # Build Rust binary with full reproducibility flags
-    # These flags ensure deterministic output:
-    # - target-cpu=generic: Avoid host-specific optimizations
-    # - codegen-units=1: Single codegen unit for deterministic output
-    # - strip=symbols: Strip debug symbols for smaller, deterministic binary
-    export RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C strip=symbols"
-    
-    # Ensure reproducible build with LTO
-    export CARGO_PROFILE_RELEASE_LTO=true
-    export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
-    source /usr/local/cargo/env 
-    
-    BUILD_TARGET="x86_64-unknown-linux-gnu"
-    cargo build --release --target $BUILD_TARGET
-    
-    # Post-process binary for determinism
-    # add-det removes non-deterministic metadata (build IDs, timestamps, etc.)
-    # and normalizes the binary. RUSTFLAGS already includes strip=symbols, so no
-    # additional stripping is needed (and could undo add-det's work).
-    add-det target/$BUILD_TARGET/release/paypal-auth-vm
-    
-    # Normalize the binary timestamp to SOURCE_DATE_EPOCH
-    touch -d "@${SOURCE_DATE_EPOCH}" target/$BUILD_TARGET/release/paypal-auth-vm
-    find target/$BUILD_TARGET/release -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
+    # Install our Rust binary
+    inst_simple "$BINARY_SOURCE" /bin/paypal-auth-vm
     find /usr/lib/dracut/modules.d/99paypal-auth-vm -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
     
-    # Install our Rust binary (this is the ONLY custom binary we add)
-    inst_simple target/$BUILD_TARGET/release/paypal-auth-vm /bin/paypal-auth-vm
     
     # Everything else comes from dracut modules:
     # - "base" module provides: sh, mount, umount, mkdir, etc.

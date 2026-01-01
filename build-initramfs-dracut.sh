@@ -55,7 +55,7 @@ cp -r ./dracut-module/99paypal-auth-vm /usr/lib/dracut/modules.d/
 chmod +x /usr/lib/dracut/modules.d/99paypal-auth-vm/*.sh
 
 # Update module-setup.sh with correct build path
-sed -i "s|cd /app|cd $BUILD_DIR|g" \
+sed -i "s|BINARY_SOURCE=.*|BINARY_SOURCE=\"$BUILD_DIR/$BINARY_PATH\"|g" \
     /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
 
 # Normalize module timestamps
@@ -89,10 +89,14 @@ fi
 
 # Build initramfs
 echo "🔨 Building initramfs with dracut..."
+# --no-early-microcode: Prevent prepending uncompressed CPIO (fixes gzip error)
+# --reproducible: Use SOURCE_DATE_EPOCH for timestamps
+# --gzip: Use gzip compression
 dracut \
     --force \
     --reproducible \
     --gzip \
+    --no-early-microcode \
     --add "paypal-auth-vm" \
     --kver "$KERNEL_VERSION" \
     --fwdir "/lib/firmware" \
@@ -106,11 +110,20 @@ fi
 # Normalize initramfs
 echo "🔧 Normalizing initramfs..."
 if command -v add-det &>/dev/null; then
-    gzip -d -c "$OUTPUT_FILE" > "$OUTPUT_FILE.uncompressed"
-    add-det "$OUTPUT_FILE.uncompressed"
-    gzip -n -9 < "$OUTPUT_FILE.uncompressed" > "$OUTPUT_FILE.tmp"
-    mv "$OUTPUT_FILE.tmp" "$OUTPUT_FILE"
-    rm -f "$OUTPUT_FILE.uncompressed"
+    # Detect if it's gzip
+    if gzip -t "$OUTPUT_FILE" 2>/dev/null; then
+        echo "   (Detected gzip format, applying normalization)"
+        gzip -d -c "$OUTPUT_FILE" > "$OUTPUT_FILE.uncompressed"
+        add-det "$OUTPUT_FILE.uncompressed"
+        gzip -n -9 < "$OUTPUT_FILE.uncompressed" > "$OUTPUT_FILE.tmp"
+        mv "$OUTPUT_FILE.tmp" "$OUTPUT_FILE"
+        rm -f "$OUTPUT_FILE.uncompressed"
+    else
+        echo "   ⚠️  Initramfs is not in gzip format (possibly multi-segment or uncompressed)"
+        echo "       Relying on dracut --reproducible flags."
+        # Still run add-det on the file itself just in case it's an uncompressed CPIO
+        add-det "$OUTPUT_FILE"
+    fi
 fi
 touch -d "@${SOURCE_DATE_EPOCH}" "$OUTPUT_FILE"
 
