@@ -60,21 +60,49 @@ else
     rpm2cpio kernel.rpm | cpio -idm --quiet
 fi
 
-# Locate version and files
-MODULES_DIR=$(find lib/modules -maxdepth 1 -type d -name "5.*" | head -n1)
-KERNEL_VERSION=$(basename "$MODULES_DIR")
-VMLINUZ=$(find lib/modules/"$KERNEL_VERSION" -name "vmlinuz" -o -name "bzImage" | head -n1)
-
-if [ -z "$VMLINUZ" ]; then
-    # Sometimes it's in /boot in the RPM
-    VMLINUZ=$(find boot -name "vmlinuz*" | head -n1)
+# Locate version and files using recursive find to handle UsrMerge (usr/lib/modules)
+echo "🔍 Searching for kernel files..."
+MODULES_DIR=$(find . -type d -name "modules" | grep -v "kernel/" | head -n1)
+if [ -z "$MODULES_DIR" ]; then
+    echo "❌ Could not find 'modules' directory."
+    echo "Directory listing:"
+    ls -F
+    exit 1
 fi
 
+# Drill down to actual version directory (usually inside modules/)
+# e.g., usr/lib/modules/5.15.0-300.el9...
+ACTUAL_MODULE_DIR=$(find "$MODULES_DIR" -maxdepth 1 -type d -name "5.*" | head -n1)
+
+if [ -z "$ACTUAL_MODULE_DIR" ]; then
+    echo "❌ Could not find kernel version directory inside $MODULES_DIR"
+    exit 1
+fi
+
+KERNEL_VERSION=$(basename "$ACTUAL_MODULE_DIR")
+echo "   Found version: $KERNEL_VERSION"
+
+# Find vmlinuz anywhere
+VMLINUZ=$(find . -name "vmlinuz*" | grep "$KERNEL_VERSION" | head -n1)
+
+if [ -z "$VMLINUZ" ]; then
+    # Try generic find
+    VMLINUZ=$(find . -name "vmlinuz*" | head -n1)
+fi
+
+if [ -z "$VMLINUZ" ]; then
+    echo "❌ Could not find vmlinuz binary."
+    exit 1
+fi
+
+MODULES_ABS_DIR="$(pwd)/$ACTUAL_MODULE_DIR"
+VMLINUZ_ABS="$(pwd)/$VMLINUZ"
+
 echo "✅ Extracted Oracle UEK Kernel: $KERNEL_VERSION"
-echo "   Modules: $MODULES_DIR"
-echo "   Kernel:  $VMLINUZ"
+echo "   Modules: $MODULES_ABS_DIR"
+echo "   Kernel:  $VMLINUZ_ABS"
 
 # Create helper for dracut build
 echo "$KERNEL_VERSION" > version.txt
-ln -sf "$VMLINUZ" vmlinuz
-ln -sf "$MODULES_DIR" modules
+ln -sf "$VMLINUZ_ABS" vmlinuz
+ln -sf "$MODULES_ABS_DIR" modules
