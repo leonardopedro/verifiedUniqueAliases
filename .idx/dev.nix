@@ -88,11 +88,12 @@
   idx = {
     extensions = [ "rust-lang.rust-analyzer" ];
     previews = { enable = true; previews = {}; };
-    workspace = {
-      onCreate = {
-        install-add-determinism = "git lfs install && rustup default stable && cargo install add-determinism || echo 'skipped'";
+      workspace = {
+        onCreate = {
+          install-add-determinism = "git lfs install && rustup default stable && cargo install add-determinism || echo 'skipped'";
+          setup-podman = "./fix-podman-idx.sh";
+        };
       };
-    };
   };
 }
 
