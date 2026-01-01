@@ -501,17 +501,10 @@ echo "Initramfs uploaded to: https://objectstorage.${REGION}.oraclecloud.com/n/<
 Since OCI requires a bootable disk image (not just an initramfs), we need to package our kernel and initramfs into a `.qcow2` image.
 
 ```bash
-# 1. Create a minimal bootable disk image
-# We'll use a helper script (create-boot-image.sh) to:
-# - Create a disk image with a single partition
-# - Install GRUB bootloader
-# - Copy the kernel (vmlinuz) and our initramfs
-# - Configure GRUB to boot our initramfs
-
-./create-boot-image.sh \
-    --kernel /boot/vmlinuz-$(uname -r) \
-    --initramfs img/initramfs-paypal-auth.img \
-    --output paypal-auth-vm.qcow2
+# 1. Create a minimal bootable disk image (UKI based)
+# This script builds the initramfs using Dracut, packages it into a UEFI executable (UKI),
+# and places it on a GPT-partitioned disk image.
+nix-shell --run ./build-native.sh
 
 # 2. Upload the disk image to Object Storage
 oci os object put \
@@ -519,7 +512,7 @@ oci os object put \
     --file paypal-auth-vm.qcow2 \
     --name paypal-auth-vm.qcow2
 
-IMAGE_NAME="paypal-auth-cvm-v13"
+IMAGE_NAME="paypal-auth-cvm-v14"
 # 3. Import as a Custom Image
 export IMAGE_OCID=$(oci compute image import from-object \
     --compartment-id $COMPARTMENT_ID \

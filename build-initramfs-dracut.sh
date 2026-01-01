@@ -117,31 +117,53 @@ dracut --list-modules 2>&1 | head -30
 # Build initramfs with reproducibility flags
 echo "🔨 Building initramfs with dracut..."
 
-KERNEL_VERSION=$(find /lib/modules -maxdepth 1 -type d -name "[0-9]*" | xargs basename)
+# Determine kernel version
+if [ -d "kernel-oracle" ] && [ -f "kernel-oracle/version.txt" ]; then
+    echo "🌟 Using downloaded Oracle UEK Kernel..."
+    KERNEL_VERSION=$(cat kernel-oracle/version.txt)
+    # Dracut needs full path to modules
+    KMOD_DIR="$(pwd)/kernel-oracle/modules"
+    KERNEL_BINARY="$(pwd)/kernel-oracle/vmlinuz"
+elif [ -n "$KERNEL_DIR" ]; then
+    echo "❄️  Using Nix-provided Kernel..."
+    KERNEL_VERSION=$(ls "$KERNEL_DIR" | head -n1)
+    KMOD_DIR="$KERNEL_DIR/$KERNEL_VERSION" 
+    KERNEL_ROOT=$(dirname $(dirname "$KERNEL_DIR"))
+    KERNEL_BINARY="$KERNEL_ROOT/bzImage"
+else
+    echo "🖥️  Using Application/System Kernel..."
+    KERNEL_VERSION=$(uname -r)
+    # If finding locally, check /lib/modules
+    if [ -d "/lib/modules/$KERNEL_VERSION" ]; then
+        KMOD_DIR="/lib/modules/$KERNEL_VERSION"
+    else
+        # Last resort fallback
+        KERNEL_VERSION=$(find /lib/modules -maxdepth 1 -type d -name "[0-9]*" | xargs basename | head -n1)
+        KMOD_DIR="/lib/modules/$KERNEL_VERSION"
+    fi
+    KERNEL_BINARY="/boot/vmlinuz-$KERNEL_VERSION"
+fi
+
 OUTPUT_FILE="initramfs-paypal-auth.img"
 
 # Create the temporary directory for dracut
 mkdir -p "$HOME/dracut-build"
 
-#echo 'hostonly="no"' > /etc/dracut.conf.d/force-no-hostonly.conf
-#cp dracut.conf /etc/dracut.conf.d/force-no-hostonly.conf
-
-
+# Copy kernel image to current directory for build-native.sh to find
+if [ -f "$KERNEL_BINARY" ]; then 
+    cp "$KERNEL_BINARY" ./vmlinuz || echo "⚠️ Could not copy kernel from $KERNEL_BINARY"
+else
+    echo "⚠️ Kernel binary not found at $KERNEL_BINARY"
+fi
 
 # Build with reproducibility flags
 # --reproducible: Use SOURCE_DATE_EPOCH for timestamps
 # --gzip: Use gzip (more deterministic than zstd/lz4)
-# --force: Overwrite existing file
-# --no-hostonly: Don't limit to current host (better for containers)
-# --no-hostonly-cmdline: Don't include host-specific kernel command line
-# --nofscks: Skip filesystem checks (not needed in containers)
-# --no-early-microcode: Skip early microcode (not available in containers)
-# --add: Explicitly include our custom module
-# Note: We explicitly set compression to gzip for reproducibility
 dracut \
     --force \
     --reproducible \
     --gzip \
+    --kmoddir "$KMOD_DIR" \
     --omit " dash plymouth syslog firmware " \
     --no-hostonly \
     --no-hostonly-cmdline \

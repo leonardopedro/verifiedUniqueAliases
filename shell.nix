@@ -44,6 +44,9 @@ pkgs.mkShell {
     OVMF          # UEFI firmware for QEMU testing
     binutils      # For objcopy (UKI creation)
     systemd       # For linuxx64.efi.stub
+    dracut        # For initramfs generation
+    linuxPackages_latest.kernel # Latest kernel (6.9+)
+    rpm           # For extracting OCI kernel packages
   ];
 
   # Environment variables
@@ -53,6 +56,10 @@ pkgs.mkShell {
     export CXX_x86_64_unknown_linux_musl="x86_64-unknown-linux-musl-g++"
     export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="x86_64-unknown-linux-musl-gcc"
     export CFLAGS_x86_64_unknown_linux_musl="-static"
+
+    # Export kernel module path for Dracut
+    export KERNEL_DIR="${pkgs.linuxPackages_latest.kernel}/lib/modules"
+    export KERNEL_VERSION=$(ls $KERNEL_DIR)
     
     echo "🚀 PayPal Auth VM Development Environment (GCC + Musl)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

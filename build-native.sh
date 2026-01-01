@@ -64,26 +64,28 @@ if command -v add-det &>/dev/null; then
 fi
 touch -d "@${SOURCE_DATE_EPOCH}" "$BINARY_PATH"
 
-# Step 2: Build Initramfs and get Kernel using Nix
-echo "❄️  Building initramfs with Nix..."
+# Step 2: Build Initramfs and get Kernel using Dracut
+echo "❄️  Building initramfs with Dracut..."
 
-# Build initramfs
-nix-build initramfs.nix -A initramfs --arg binaryPath $BINARY_PATH -o result-initramfs
-cp result-initramfs/initrd "$INITRAMFS_FILE"
+./build-initramfs-dracut.sh
 
-# Get kernel
-nix-build initramfs.nix -A kernel -o result-kernel
-KERNEL_FILE="result-kernel/bzImage"
+# Dracut script outputs to initramfs-paypal-auth.img and copies vmlinuz to current dir
+INITRAMFS_SRC="initramfs-paypal-auth.img"
+KERNEL_SRC="vmlinuz"
 
-if [ ! -f "$KERNEL_FILE" ]; then
-    echo "❌ Kernel not found at $KERNEL_FILE"
+if [ ! -f "$KERNEL_SRC" ]; then
+    echo "❌ Kernel not found at $KERNEL_SRC"
     exit 1
 fi
 
-if [ ! -f "$INITRAMFS_FILE" ]; then
+if [ ! -f "$INITRAMFS_SRC" ]; then
     echo "❌ Initramfs build failed!"
     exit 1
 fi
+
+# Move to expected locations
+cp "$INITRAMFS_SRC" "$INITRAMFS_FILE"
+KERNEL_FILE="$KERNEL_SRC"
 
 echo "✅ Initramfs built: $INITRAMFS_FILE"
 echo "   Kernel found: $KERNEL_FILE"
