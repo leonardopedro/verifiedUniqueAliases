@@ -57,10 +57,9 @@
     pkgs.linuxPackages_latest.kernel
     pkgs.rpm
     pkgs.p7zip
-    pkgs.rpm
-    pkgs.p7zip
     pkgs.zstd
     pkgs.kmod
+    pkgs.iproute2
   ];
 
   env = {

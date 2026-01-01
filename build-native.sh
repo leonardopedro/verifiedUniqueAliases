@@ -50,7 +50,8 @@ export CARGO_PROFILE_RELEASE_OPT_LEVEL=z
 
 cargo build --release --target "$BUILD_TARGET"
 
-BINARY_PATH="$BUILD_DIR/target/$BUILD_TARGET/release/paypal-auth-vm"
+export BINARY_PATH="$BUILD_DIR/target/$BUILD_TARGET/release/paypal-auth-vm"
+export BUILD_TARGET
 
 if [ ! -f "$BINARY_PATH" ]; then
     echo "❌ Cargo build failed! Binary not found: $BINARY_PATH"

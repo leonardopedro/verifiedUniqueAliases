@@ -35,7 +35,8 @@ pkgs.mkShell {
     rpm           # For extracting OCI kernel packages
     p7zip         # Fallback for RPM extraction
     zstd          # Modern compression support
-    pkgs.kmod     # For modprobe and depmod
+    kmod          # For modprobe and depmod
+    iproute2      # For 'ip' command required by dracut
     
     # QEMU and image creation tools
     qemu_kvm      # Provides qemu-img for image conversion
@@ -47,12 +48,9 @@ pkgs.mkShell {
     mtools        # MS-DOS tools for mcopy/mformat (rootless)
     OVMF          # UEFI firmware for QEMU testing
     binutils      # For objcopy (UKI creation)
-    systemd       # For linuxx64.efi.stub
+    systemd       # For linuxx64.efi.stub, udevadm, etc.
     dracut        # For initramfs generation
     linuxPackages_latest.kernel # Latest kernel (6.9+)
-    rpm           # For extracting OCI kernel packages
-    p7zip         # Fallback for RPM extraction
-    zstd          # Modern compression support
   ];
 
   # Environment variables

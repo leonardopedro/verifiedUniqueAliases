@@ -22,30 +22,34 @@ export LC_ALL=C.UTF-8
 BUILD_DIR=$(pwd)
 cd $BUILD_DIR
 
-echo "📦 Building Rust application for $BUILD_TARGET..."
-
-# Add target if not already added
-rustup target add $BUILD_TARGET 2>/dev/null || true
-
-# Build Rust binary with full reproducibility flags
-export RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C strip=symbols"
-export CARGO_PROFILE_RELEASE_LTO=true
-export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
-
-cargo build --release --target $BUILD_TARGET || { echo "❌ Cargo build failed"; exit 1; }
-
-BINARY_PATH="target/$BUILD_TARGET/release/paypal-auth-vm"
-if [ ! -f "$BINARY_PATH" ]; then
-    echo "❌ Binary not found at $BINARY_PATH"
-    exit 1
+if [ -n "$BINARY_PATH" ] && [ -f "$BINARY_PATH" ]; then
+    echo "✅ Using pre-built binary at: $BINARY_PATH"
+else
+    echo "📦 Building Rust application for $BUILD_TARGET..."
+    
+    # Add target if not already added
+    rustup target add $BUILD_TARGET 2>/dev/null || true
+    
+    # Build Rust binary with full reproducibility flags
+    export RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C strip=symbols"
+    export CARGO_PROFILE_RELEASE_LTO=true
+    export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
+    
+    cargo build --release --target $BUILD_TARGET || { echo "❌ Cargo build failed"; exit 1; }
+    
+    BINARY_PATH="target/$BUILD_TARGET/release/paypal-auth-vm"
+    if [ ! -f "$BINARY_PATH" ]; then
+        echo "❌ Binary not found at $BINARY_PATH"
+        exit 1
+    fi
+    
+    # Normalize the binary
+    echo "🔧 Normalizing binary..."
+    if command -v add-det &>/dev/null; then
+        add-det "$BINARY_PATH"
+    fi
+    touch -d "@${SOURCE_DATE_EPOCH}" "$BINARY_PATH"
 fi
-
-# Normalize the binary
-echo "🔧 Normalizing binary..."
-if command -v add-det &>/dev/null; then
-    add-det "$BINARY_PATH"
-fi
-touch -d "@${SOURCE_DATE_EPOCH}" "$BINARY_PATH"
 
 echo "📋 Preparing files for initramfs..."
 # We cannot install to /usr/lib/dracut/modules.d (read-only), so we use --include.
@@ -111,6 +115,15 @@ else
     echo "⚠️ Kernel binary not found at $KERNEL_BINARY"
 fi
 
+# Check for critical tools required by Dracut
+for tool in ip udevadm modprobe depmod; do
+    if ! command -v $tool &>/dev/null; then
+        echo "❌ Critical tool '$tool' not found in PATH!"
+        echo "   Please ensure 'iproute2', 'systemd', and 'kmod' are installed and you have reloaded the shell."
+        exit 1
+    fi
+done
+
 # Build with reproducibility flags
 # --reproducible: Use SOURCE_DATE_EPOCH for timestamps
 # --gzip: Use gzip (more deterministic than zstd/lz4)
@@ -120,12 +133,14 @@ echo "🔨 Generatng initramfs..."
 # Ensure hooks are executable
 chmod +x dracut-module/99paypal-auth-vm/*.sh
 
+# Omit systemd to avoid complex dependencies in this minimal environment
+# We rely on 'base' script-based init and our hooks
 dracut \
     --force \
     --reproducible \
     --gzip \
     --kmoddir "$KMOD_DIR" \
-    --omit " dash plymouth syslog firmware " \
+    --omit " systemd systemd-initrd systemd-networkd systemd-udevd dash plymouth syslog firmware " \
     --no-hostonly \
     --no-hostonly-cmdline \
     --nofscks \
