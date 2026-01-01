@@ -27,6 +27,9 @@ echo "   URL: $RPM_URL"
 
 curl -L -o "kernel.rpm" "$RPM_URL"
 
+# Cleanup old artifacts to avoid confusion
+rm -f *.cpio *.zstd
+
 echo "📦 Extracting kernel RPM..."
 # Try 7z if available (handles modern RPM wrapping)
 if command -v 7z &>/dev/null; then
@@ -45,12 +48,14 @@ if command -v 7z &>/dev/null; then
         fi
     fi
     
-    # Now look for .cpio (either directly extracted or decompressed above)
+    # Now look for .cpio
+    # CRITICAL: Prioritize the LARGEST cpio file found.
+    # The RPM might contain a small wrapper cpio and the big payload cpio.
     if ls *.cpio 1> /dev/null 2>&1; then
-        CPIO_FILE=$(ls *.cpio | head -n1)
+        # ls -S sorts by size (largest first)
+        CPIO_FILE=$(ls -S *.cpio | head -n1)
         echo "   Extracting CPIO archive: $CPIO_FILE"
         # Use 7z or cpio to extract the archive
-        # 7z is robust, but cpio -idm is classic
         cpio -idm --quiet < "$CPIO_FILE"
     else
         echo "⚠️ No .cpio file found after extraction? Checking for directories..."
