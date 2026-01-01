@@ -28,7 +28,27 @@ echo "   URL: $RPM_URL"
 curl -L -o "kernel.rpm" "$RPM_URL"
 
 echo "📦 Extracting kernel RPM..."
-rpm2cpio kernel.rpm | cpio -idm --quiet
+# Try 7z if available (handles modern RPM compression better than old rpm2cpio)
+if command -v 7z &>/dev/null; then
+    # 7z recursively extracts the RPM content (cpio) then the cpio content
+    7z x -y kernel.rpm
+    # The output is usually a cpio archive named 'kernel.cpio' or similar, or just raw files
+    # Check what we got
+    if [ -f "kernel.cpio" ]; then
+        7z x -y kernel.cpio
+    elif [ -f "payload.cpio" ]; then # Some older RPM variants
+        7z x -y payload.cpio
+    elif ls *.cpio 1> /dev/null 2>&1; then
+        CPIO_FILE=$(ls *.cpio | head -n1)
+        7z x -y "$CPIO_FILE"
+    else
+        # Sometimes 7z extracts directly to dirs
+        echo "   7z extraction complete (direct)."
+    fi
+else
+    # Fallback to rpm2cpio
+    rpm2cpio kernel.rpm | cpio -idm --quiet
+fi
 
 # Locate version and files
 MODULES_DIR=$(find lib/modules -maxdepth 1 -type d -name "5.*" | head -n1)
