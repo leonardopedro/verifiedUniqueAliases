@@ -55,6 +55,9 @@
     pkgs.dosfstools
     pkgs.dracut
     pkgs.linuxPackages_latest.kernel
+    pkgs.rpm
+    pkgs.p7zip
+    pkgs.zstd
   ];
 
   env = {
