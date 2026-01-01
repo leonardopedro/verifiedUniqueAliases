@@ -11,7 +11,7 @@ cd "$OUTPUT_DIR"
 echo "🔍 Fetching Oracle UEK kernel list..."
 # Fetch index, grep for kernel pkgs, extract filenames, sort by version, take last (latest)
 LATEST_RPM=$(curl -s "$REPO_URL/index.html" | \
-    grep -o 'href="getPackage/kernel-uek-[0-9].*\.rpm"' | \
+    grep -o 'href="getPackage/kernel-uek-core-[0-9].*\.rpm"' | \
     sed 's/href="getPackage\///;s/"//' | \
     sort -V | \
     tail -n 1)
