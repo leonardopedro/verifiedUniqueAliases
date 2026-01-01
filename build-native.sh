@@ -42,7 +42,13 @@ echo "🎯 Target: $BUILD_TARGET"
 echo ""
 
 # Clean up previous build artifacts
-rm -rf "$ISO_ROOT" "$INITRAMFS_FILE" "$ISO_FILE" result
+if [ "$SKIP_INITRAMFS" = true ]; then
+    echo "🧹 Partial cleanup (preserving initramfs/kernel for skip)..."
+    rm -rf "$ISO_ROOT" "$ISO_FILE" result ESP.img disk.raw
+else
+    echo "🧹 Full cleanup..."
+    rm -rf "$ISO_ROOT" "$INITRAMFS_FILE" "$ISO_FILE" result ESP.img disk.raw vmlinuz
+fi
 
 # Step 1: Build Rust binary (Static)
 if [ "$SKIP_INITRAMFS" = true ]; then
@@ -112,7 +118,9 @@ else
 fi
 
 # Move to expected locations
-cp "$INITRAMFS_SRC" "$INITRAMFS_FILE"
+if [ "$(realpath "$INITRAMFS_SRC")" != "$(realpath "$INITRAMFS_FILE")" ]; then
+    cp "$INITRAMFS_SRC" "$INITRAMFS_FILE"
+fi
 KERNEL_FILE="$KERNEL_SRC"
 
 echo "✅ Initramfs: $INITRAMFS_FILE"
