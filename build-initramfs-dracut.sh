@@ -64,12 +64,20 @@ if [ -d "kernel-oracle" ] && [ -f "kernel-oracle/version.txt" ]; then
     # Check for modules.dep
     if [ ! -f "$KMOD_DIR/modules.dep" ]; then
         echo "🔧 Generating module dependencies (depmod)..."
-        # depmod -b <basedir> <version> 
-        # where <basedir>/lib/modules/<version> exists
-        # Our KMOD_DIR is .../lib/modules/<version>
-        # So basedir should be the parent of parent of KMOD_DIR
-        DEPMOD_BASE=$(dirname $(dirname "$KMOD_DIR"))
-        depmod -b "$DEPMOD_BASE" "$KERNEL_VERSION" || echo "⚠️ depmod failed, but continuing..."
+        # depmod requires files at <basedir>/lib/modules/<version>
+        # We create a temp dir to satisfy this structure
+        DEPMOD_TMP=$(mktemp -d)
+        mkdir -p "$DEPMOD_TMP/lib/modules"
+        
+        # Symlink our actual module dir to the expected location
+        ln -sf "$KMOD_DIR" "$DEPMOD_TMP/lib/modules/$KERNEL_VERSION"
+        
+        # Run depmod against the temp root
+        # This will follow the symlink and write modules.dep into KMOD_DIR
+        depmod -b "$DEPMOD_TMP" "$KERNEL_VERSION" || echo "⚠️ depmod failed, but continuing..."
+        
+        # Cleanup
+        rm -rf "$DEPMOD_TMP"
     fi
 elif [ -n "$KERNEL_DIR" ]; then
     echo "❄️  Using Nix-provided Kernel..."
