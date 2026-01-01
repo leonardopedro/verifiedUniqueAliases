@@ -3,11 +3,17 @@
 
 set -e
 
-CONTAINERS_CONF_DIR="$HOME/.config/containers"
-mkdir -p "$CONTAINERS_CONF_DIR"
+# Handle both potential home directories in IDX
+TARGET_DIRS=("$HOME/.config/containers")
+if [ -d "/home/user" ]; then TARGET_DIRS+=("/home/user/.config/containers"); fi
+if [ -d "/home/leo" ]; then TARGET_DIRS+=("/home/leo/.config/containers"); fi
 
-echo "🔧 Configuring Podman policy..."
-cat <<EOF > "$CONTAINERS_CONF_DIR/policy.json"
+for CONF_DIR in "${TARGET_DIRS[@]}"; do
+    echo "🔧 Checking $CONF_DIR..."
+    mkdir -p "$CONF_DIR" 2>/dev/null || continue
+    
+    echo "   Writing policy.json..."
+    cat <<EOF > "$CONF_DIR/policy.json"
 {
     "default": [
         {
@@ -17,9 +23,8 @@ cat <<EOF > "$CONTAINERS_CONF_DIR/policy.json"
 }
 EOF
 
-echo "🔧 Configuring Podman registries..."
-if [ ! -f "$CONTAINERS_CONF_DIR/registries.conf" ]; then
-cat <<EOF > "$CONTAINERS_CONF_DIR/registries.conf"
+    echo "   Writing registries.conf..."
+    cat <<EOF > "$CONF_DIR/registries.conf"
 unqualified-search-registries = ["docker.io", "quay.io", "container-registry.oracle.com"]
 
 [[registry]]
@@ -28,7 +33,7 @@ location = "docker.io"
 [[registry]]
 location = "container-registry.oracle.com"
 EOF
-fi
+    echo "   ✅ Updated $CONF_DIR"
+done
 
-echo "✅ Podman configuration updated in $CONTAINERS_CONF_DIR"
-echo "🚀 You can now run ./build-docker.sh"
+echo "🚀 Setup complete. Please run: ./build-docker.sh"
