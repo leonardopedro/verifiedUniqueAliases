@@ -5,6 +5,17 @@
 
 set -e
 
+# Parse arguments
+SKIP_INITRAMFS=false
+for arg in "$@"; do
+    case $arg in
+        --skip-initramfs)
+            SKIP_INITRAMFS=true
+            shift
+            ;;
+    esac
+done
+
 echo "🏗️  Building reproducible initramfs and qcow2 image natively (no-sudo)..."
 
 # Set reproducible build environment
@@ -66,30 +77,42 @@ fi
 touch -d "@${SOURCE_DATE_EPOCH}" "$BINARY_PATH"
 
 # Step 2: Build Initramfs and get Kernel using Dracut
-echo "❄️  Building initramfs with Dracut..."
-
-./build-initramfs-dracut.sh
-
-# Dracut script outputs to initramfs-paypal-auth.img and copies vmlinuz to current dir
 INITRAMFS_SRC="initramfs-paypal-auth.img"
 KERNEL_SRC="vmlinuz"
 
-if [ ! -f "$KERNEL_SRC" ]; then
-    echo "❌ Kernel not found at $KERNEL_SRC"
-    exit 1
-fi
-
-if [ ! -f "$INITRAMFS_SRC" ]; then
-    echo "❌ Initramfs build failed!"
-    exit 1
+if [ "$SKIP_INITRAMFS" = true ]; then
+    echo "⏭️  Skipping initramfs build (--skip-initramfs)"
+    echo "   Using existing: $INITRAMFS_SRC and $KERNEL_SRC"
+    
+    if [ ! -f "$INITRAMFS_SRC" ]; then
+        echo "❌ Initramfs not found! Run ./build-docker.sh first."
+        exit 1
+    fi
+    if [ ! -f "$KERNEL_SRC" ]; then
+        echo "❌ Kernel not found! Run ./build-docker.sh first."
+        exit 1
+    fi
+else
+    echo "❄️  Building initramfs with Dracut..."
+    ./build-initramfs-dracut.sh
+    
+    if [ ! -f "$KERNEL_SRC" ]; then
+        echo "❌ Kernel not found at $KERNEL_SRC"
+        exit 1
+    fi
+    
+    if [ ! -f "$INITRAMFS_SRC" ]; then
+        echo "❌ Initramfs build failed!"
+        exit 1
+    fi
 fi
 
 # Move to expected locations
 cp "$INITRAMFS_SRC" "$INITRAMFS_FILE"
 KERNEL_FILE="$KERNEL_SRC"
 
-echo "✅ Initramfs built: $INITRAMFS_FILE"
-echo "   Kernel found: $KERNEL_FILE"
+echo "✅ Initramfs: $INITRAMFS_FILE"
+echo "   Kernel: $KERNEL_FILE"
 
 # Normalize initramfs for reproducibility
 echo "🔧 Normalizing initramfs..."

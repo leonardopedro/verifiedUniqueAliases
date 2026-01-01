@@ -50,8 +50,6 @@
     pkgs.llvmPackages.libclang 
     pkgs.grub2_efi
     pkgs.mtools
-    pkgs.grub2_efi
-    pkgs.mtools
     pkgs.dosfstools
     pkgs.dracut
     pkgs.linuxPackages_latest.kernel
@@ -60,6 +58,7 @@
     pkgs.zstd
     pkgs.kmod
     pkgs.iproute2
+    pkgs.podman           # Container runtime for Docker builds
   ];
 
   env = {
