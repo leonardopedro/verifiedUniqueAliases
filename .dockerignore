@@ -1,0 +1,10 @@
+# Exclude large build artifacts
+target/
+.git/
+.idx/
+*.img
+*.qcow2
+*.qcow2.mask
+*.qcow2.sha256
+docker-output/
+vmlinuz
