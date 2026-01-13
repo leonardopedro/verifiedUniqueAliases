@@ -78,7 +78,7 @@
       in {
         packages = {
           default = initramfs-normalized;
-          inherit paypal-auth-vm initramfs-normalized;
+          inherit paypal-auth-vm initramfs-normalized add-determinism;
           initramfs-raw = bootEnv.initramfs;
           initramfs-gcp = initramfs-normalized;
           kernel-gcp = bootEnv.kernel;
