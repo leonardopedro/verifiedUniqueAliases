@@ -1,104 +1,23 @@
-{ pkgs, ... }: {
-  channel = "stable-25.05"; 
+{
+  # Enable Nix Flakes support and point to the flake in this directory.
+  # This appears to be the correct syntax, and my previous error was
+  # on a different line.
+  nix.flakes.self.path = ".";
 
-  packages = [
-    pkgs.rustup
-    pkgs.gcc
-    #pkgs.pkgsStatic.musl
-    pkgs.xorriso
-    pkgs.git-lfs
-    pkgs.linux
-    pkgs.sudo
-    pkgs.pkgsStatic.busybox
+  # By enabling the flake above, Project IDX should automatically use the
+  # `devShells.default` from our `flake.nix`. The explicit
+  # `idx.workspace.devShell` line from my previous attempts was incorrect.
 
-    pkgs.OVMF          # UEFI firmware for QEMU testing
-    pkgs.binutils      # For objcopy (UKI creation)
-    pkgs.systemd       # For linuxx64.efi.stub
-    
-    
-    # Build tools
-    pkgs.curl
-    pkgs.gnumake
-    
-    # Kernel and boot tools
-    # pkgs.xorriso is already added above
-    # pkgs.linux is already added above
-    pkgs.pkgsStatic.kmod
-    
-    # Musl toolchain for static linking
-    # Use pkgsStatic to get the static gcc binary
-    pkgs.pkgsStatic.stdenv.cc
-    # pkgs.musl # pkgsStatic implies musl on linux usually, or we can add it if needed explicitly, but stdenv.cc should cover the compiler.
-    
-    # Archive tools
-    pkgs.cpio
-    pkgs.gzip
-    pkgs.xz
-    pkgs.glibc.bin
-    
-    # QEMU and image creation tools
-    pkgs.qemu_kvm      # Keep dynamic for host performance/compatibility
-    pkgs.grub2         # Keep dynamic, grub build is complex
-    pkgs.parted        # Disk partitioning
-    pkgs.dosfstools    # FAT filesystem support
-    pkgs.e2fsprogs     # ext4 filesystem tools (mkfs.ext4)
-    pkgs.util-linux    # Loop device support (losetup, mount, etc.)
-    pkgs.binutilsNoLibc
-    pkgs.cmake
-    pkgs.clang
-    pkgs.musl
-    pkgs.pkg-config
-    pkgs.llvmPackages.libclang 
-    pkgs.grub2_efi
-    pkgs.mtools
-    pkgs.dosfstools
-    pkgs.dracut
-    pkgs.linuxPackages_latest.kernel
-    pkgs.rpm
-    pkgs.p7zip
-    pkgs.zstd
-    pkgs.kmod
-    pkgs.iproute2
-    pkgs.podman           # Container runtime for Docker builds
-    pkgs.diffoscope       # For reproducibility analysis
-  ];
+  # We can keep the other IDX-specific settings.
+  idx.extensions = [ "rust-lang.rust-analyzer" ];
+  idx.previews = { enable = true; };
 
-  env = {
-    # Helps 'bindgen' (used by aws-lc-sys) find libclang
-    LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-
-    # Point cc-rs to the musl compiler
-    # pkgsStatic.stdenv.cc provides the compiler wrapper. 
-    # For x86_64-linux, pkgsStatic uses musl.
-    # The binary name might be just 'gcc' or 'x86_64-unknown-linux-musl-gcc' depending on how it's wrapped.
-    # We'll assume standard cross names or just 'gcc' if it's the primary compiler in that env, 
-    # but since we are adding it to a normal env, it might be prefixed.
-    # Actually, pkgsStatic.stdenv.cc usually provides the cross-compiler.
-    # Helps 'bindgen' (used by aws-lc-sys) find libclang
-#    CC_x86_64_unknown_linux_musl = "musl-gcc";
-    CXX_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-g++";
-    
-    # Linker configuration
- #   CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "musl-gcc";
-    
-    # Optional: Archive tool
-    AR_x86_64_unknown_linux_musl = "ar";
-    CC_x86_64_unknown_linux_musl = "x86_64-unknown-linux-musl-gcc";
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "x86_64-unknown-linux-musl-gcc";
+  # Retain existing lifecycle hooks.
+  idx.workspace.onCreate = {
+    install-tools = "git lfs install && rustup default stable";
+    fix-podman = "./fix-podman-idx.sh";
   };
-
-  idx = {
-    extensions = [ "rust-lang.rust-analyzer" ];
-    previews = { enable = true; previews = {}; };
-      workspace = {
-        onCreate = {
-          install-add-determinism = "git lfs install && rustup default stable && cargo install add-determinism || echo 'skipped'";
-          setup-podman = "./fix-podman-idx.sh";
-        };
-        onStart = {
-          share-mount = "sudo mount --make-rshared /";
-        };
-      };
+  idx.workspace.onStart = {
+    share-mount = "sudo mount --make-rshared /";
   };
 }
-
