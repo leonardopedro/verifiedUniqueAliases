@@ -1,3 +1,5 @@
+ALL IN THIS REPOSITORY IS WORK IN PROGRESS, MOSTLY AI GENERATED, PROBABLY NOTHING WORKS
+
 ## 🎯 Current Project Goals
 - **Reproducible Initramfs**: Ensure the entire boot environment is bit-for-bit reproducible using Nix.
 - **GCP Migration**: Optimize for GCP `e2-micro` instances.
