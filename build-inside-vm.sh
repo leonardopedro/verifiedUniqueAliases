@@ -7,7 +7,18 @@ echo "🔧 Setting up build environment inside VM..."
 
 # Install dependencies
 echo "📦 Installing packages..."
-microdnf install -y \
+# Package manager detection
+if command -v dnf &>/dev/null; then
+    PKG_MGR="dnf"
+elif command -v microdnf &>/dev/null; then
+    PKG_MGR="microdnf"
+else
+    echo "❌ No package manager found"
+    exit 1
+fi
+
+echo "📦 Installing packages using $PKG_MGR..."
+$PKG_MGR install -y \
     dracut \
     kernel-core \
     kernel-modules \
@@ -37,12 +48,13 @@ cargo install -j 1 add-determinism
 # Add cargo to PATH
 export PATH="$HOME/.cargo/bin:$PATH"
 
-# Change to mounted source directory
-cd /mnt/source
+# Change to synced directory
+cd /vagrant
 
 # Install QEMU tools and GRUB for image creation
 echo "📦 Installing image creation tools..."
-microdnf install -y qemu-img grub2-pc grub2-tools-extra parted dosfstools
+# Oracle Linux 10 uses dnf, and some package names might differ or require extra repos
+$PKG_MGR install -y qemu-img grub2-pc grub2-tools-extra parted dosfstools
 
 # Run the build
 echo "🏗️  Building initramfs..."
@@ -111,7 +123,7 @@ set default=0
 set timeout=1
 
 menuentry 'PayPal Auth VM' {
-    linux /boot/vmlinuz root=/dev/sda1 ro console=ttyS0
+    linux /boot/vmlinuz root=/dev/sda1 ro console=ttyS0 earlycon earlyprintk=ttyS0
     initrd /boot/initramfs.img
 }
 EOF

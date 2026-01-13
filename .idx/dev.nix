@@ -60,6 +60,7 @@
     pkgs.kmod
     pkgs.iproute2
     pkgs.podman           # Container runtime for Docker builds
+    pkgs.diffoscope       # For reproducibility analysis
   ];
 
   env = {

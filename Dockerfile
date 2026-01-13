@@ -27,6 +27,9 @@ RUN microdnf install -y --enablerepo=ol10_UEKR8 \
     dracut \
     dracut-network \
     dbus-daemon \
+    systemd-boot-unsigned \
+    file \
+    binutils \
     # Build essentials
     curl \
     gcc \
@@ -94,6 +97,7 @@ RUN sh -c "source /usr/local/cargo/env && ./build-initramfs-dracut.sh"
 RUN mkdir /output && \
     cp initramfs-paypal-auth.img /output/ 2>/dev/null || true && \
     cp vmlinuz /output/ 2>/dev/null || true && \
+    cp paypal-auth-vm.efi /output/ 2>/dev/null || true && \
     cp build-manifest.json /output/ 2>/dev/null || true && \
     cp *.sha256 /output/ 2>/dev/null || true && \
     # Normalize timestamps for reproducibility

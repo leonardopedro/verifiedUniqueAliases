@@ -1,0 +1,5 @@
+🔍 Analyzing box.img partition layout
+======================================
+
+📋 Partition table:
+fdisk: cannot open /dev/nbd0: Input/output error

@@ -1,0 +1,18 @@
+✅ Base image found: OL10U0_x86_64-vagrant-libvirt-b684.box
+🔐 Verifying SHA256 checksum...
+OL10U0_x86_64-vagrant-libvirt-b684.box: OK
+✅ SHA256 verified
+📸 Creating snapshot...
+Formatting 'vm-snapshot.qcow2', fmt=qcow2 cluster_size=65536 extended_l2=off compression_type=zlib size=21474836480 backing_file=box.img backing_fmt=qcow2 lazy_refcounts=off refcount_bits=16
+🚀 Booting QEMU VM...
+
+INSTRUCTIONS:
+1. Login with: vagrant / vagrant
+2. Switch to root: sudo su -
+3. Mount the shared directory: mkdir -p /mnt/source && mount -t 9p -o trans=virtio,version=9p2000.L source /mnt/source
+4. Run the build script: cd /mnt/source && chmod +x build-inside-vm.sh && ./build-inside-vm.sh
+5. Shutdown with: poweroff
+
+   (KVM acceleration enabled)
+QEMU 8.2.0 monitor - type 'help' for more information
+(qemu) ✅ VM exited.

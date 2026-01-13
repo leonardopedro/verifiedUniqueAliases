@@ -87,17 +87,56 @@ else
     echo "⚠️ Kernel binary not found (will need to be provided externally)"
 fi
 
-# Build initramfs
-echo "🔨 Building initramfs with dracut..."
+# Build initramfs and UKI (Unified Kernel Image)
+echo "🔨 Building initramfs and UKI with dracut..."
 # --no-early-microcode: Prevent prepending uncompressed CPIO (fixes gzip error)
 # --reproducible: Use SOURCE_DATE_EPOCH for timestamps
 # --gzip: Use gzip compression
+# --uefi: Create a Unified Kernel Image
+CMDLINE="ro console=ttyS0,115200n8 earlycon earlyprintk=ttyS0 ignore_loglevel keep_bootcon loglevel=7 swiotlb=131072 mem_encrypt=on nokaslr iommu=pt random.trust_cpu=on ip=dhcp rd.neednet=1 rd.skipfsck"
+
+# If we use --uefi, dracut creates a UKI. 
+# We'll call it .efi from the start to avoid confusion.
+UKI_FILE="paypal-auth-vm.efi"
+
 dracut \
     --force \
     --reproducible \
     --gzip \
     --no-early-microcode \
-    --add "paypal-auth-vm" \
+    --hostonly \
+    --uefi \
+    --kernel-cmdline "$CMDLINE" \
+    --add "qemu paypal-auth-vm" \
+    --add-drivers "virtio virtio_net virtio_blk virtio_pci virtio_scsi" \
+    --kver "$KERNEL_VERSION" \
+    --fwdir "/lib/firmware" \
+    "$UKI_FILE"
+
+if [ ! -f "$UKI_FILE" ]; then
+    echo "❌ Dracut failed to create UKI!"
+    exit 1
+fi
+
+# Check if it's actually an EFI binary
+if file "$UKI_FILE" | grep -q "EFI"; then
+    echo "✅ UKI generated successfully: $UKI_FILE"
+else
+    echo "⚠️  Generated file is not an EFI binary!"
+    file "$UKI_FILE"
+fi
+
+# We also still want a standard initramfs for fallback/legacy?
+# Actually, for this project we want the UKI.
+# But let's also generate a standard initramfs just in case.
+dracut \
+    --force \
+    --reproducible \
+    --gzip \
+    --no-early-microcode \
+    --hostonly \
+    --add "qemu paypal-auth-vm" \
+    --add-drivers "virtio virtio_net virtio_blk virtio_pci virtio_scsi sev-guest efi_secret dm-crypt dm-integrity" \
     --kver "$KERNEL_VERSION" \
     --fwdir "/lib/firmware" \
     "$OUTPUT_FILE"
@@ -107,30 +146,40 @@ if [ ! -f "$OUTPUT_FILE" ]; then
     exit 1
 fi
 
-# Normalize initramfs
-echo "🔧 Normalizing initramfs..."
+# Normalize initramfs/UKI
+echo "🔧 Normalizing artifacts..."
 if command -v add-det &>/dev/null; then
-    # Detect if it's gzip
-    if gzip -t "$OUTPUT_FILE" 2>/dev/null; then
-        echo "   (Detected gzip format, applying normalization)"
-        gzip -d -c "$OUTPUT_FILE" > "$OUTPUT_FILE.uncompressed"
-        add-det "$OUTPUT_FILE.uncompressed"
-        gzip -n -9 < "$OUTPUT_FILE.uncompressed" > "$OUTPUT_FILE.tmp"
-        mv "$OUTPUT_FILE.tmp" "$OUTPUT_FILE"
-        rm -f "$OUTPUT_FILE.uncompressed"
-    else
-        echo "   ⚠️  Initramfs is not in gzip format (possibly multi-segment or uncompressed)"
-        echo "       Relying on dracut --reproducible flags."
-        # Still run add-det on the file itself just in case it's an uncompressed CPIO
-        add-det "$OUTPUT_FILE"
-    fi
+    for f in "$OUTPUT_FILE" "paypal-auth-vm.efi"; do
+        if [ -f "$f" ]; then
+            if gzip -t "$f" 2>/dev/null; then
+                echo "   (Detected gzip format for $f, applying normalization)"
+                gzip -d -c "$f" > "$f.uncompressed"
+                add-det "$f.uncompressed"
+                gzip -n -9 < "$f.uncompressed" > "$f.tmp"
+                mv "$f.tmp" "$f"
+                rm -f "$f.uncompressed"
+            else
+                echo "   Applying add-det to $f..."
+                add-det "$f"
+            fi
+            touch -d "@${SOURCE_DATE_EPOCH}" "$f"
+        fi
+    done
 fi
-touch -d "@${SOURCE_DATE_EPOCH}" "$OUTPUT_FILE"
-
-INITRAMFS_HASH=$(sha256sum "$OUTPUT_FILE" | awk '{print $1}')
-echo "$INITRAMFS_HASH" > "$OUTPUT_FILE.sha256"
 
 # Build manifest
+UKI_HASH="none"
+if [ -f "paypal-auth-vm.efi" ]; then
+    UKI_HASH=$(sha256sum "paypal-auth-vm.efi" | awk '{print $1}')
+    echo "$UKI_HASH" > "paypal-auth-vm.efi.sha256"
+fi
+
+INITRAMFS_HASH="none"
+if [ -f "$OUTPUT_FILE" ]; then
+    INITRAMFS_HASH=$(sha256sum "$OUTPUT_FILE" | awk '{print $1}')
+    echo "$INITRAMFS_HASH" > "$OUTPUT_FILE.sha256"
+fi
+
 cat > build-manifest.json <<EOF
 {
   "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
@@ -138,7 +187,8 @@ cat > build-manifest.json <<EOF
   "build_environment": "docker/vm (Oracle Linux)",
   "kernel_version": "$KERNEL_VERSION",
   "target": "$BUILD_TARGET",
-  "initramfs_sha256": "$INITRAMFS_HASH"
+  "initramfs_sha256": "$INITRAMFS_HASH",
+  "uki_sha256": "$UKI_HASH"
 }
 EOF
 

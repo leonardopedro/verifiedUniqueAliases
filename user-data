@@ -1,0 +1,16 @@
+#cloud-config
+# user-data for Oracle Linux 10 build automation
+
+# The default user in the Oracle Linux box is 'vagrant' or 'oracle'
+# But we can run commands as root during boot
+
+runcmd:
+  - echo "🚀 Starting automated build..." | tee /dev/ttyS0
+  - mkdir -p /mnt/source
+  - mount -t 9p -o trans=virtio,version=9p2000.L source /mnt/source
+  - touch /mnt/source/vm_is_alive
+  - cd /mnt/source
+  - chmod +x build-inside-vm.sh
+  - ./build-inside-vm.sh 2>&1 | tee /mnt/source/build-debug.log | tee /dev/ttyS0
+  - echo "✅ Build complete. Powering off..." | tee /dev/ttyS0
+  - poweroff

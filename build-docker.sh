@@ -60,6 +60,11 @@ if [ -f "docker-output/vmlinuz" ]; then
     echo "✅ Kernel ready: vmlinuz"
 fi
 
+if [ -f "docker-output/paypal-auth-vm.efi" ]; then
+    cp docker-output/paypal-auth-vm.efi ./paypal-auth-vm.efi
+    echo "✅ UKI ready: paypal-auth-vm.efi"
+fi
+
 echo ""
 echo "✅ Docker build complete!"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

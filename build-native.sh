@@ -188,48 +188,50 @@ mmd -i "$ESP_IMG" ::boot
 # 4. Create Unified Kernel Image (UKI)
 echo "   Creating Unified Kernel Image (UKI)..."
 
-# Find UEFI boot stub (portable across Nix and FHS distros like Debian)
-STUB_FILE=""
-SEARCH_PATHS=(
-    "/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
-    "/lib/systemd/boot/efi/linuxx64.efi.stub"
-    "/usr/lib/systemd/boot/efi/x86_64/linuxx64.efi.stub"
-)
+if [ -f "paypal-auth-vm.efi" ]; then
+    echo "   Using pre-built UKI from container: paypal-auth-vm.efi"
+    cp "paypal-auth-vm.efi" BOOTX64.EFI
+else
+    # Find UEFI boot stub
+    STUB_FILE=""
+    SEARCH_PATHS=(
+        "/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
+        "/lib/systemd/boot/efi/linuxx64.efi.stub"
+        "/usr/lib/systemd/boot/efi/x86_64/linuxx64.efi.stub"
+    )
 
-# Check standard FHS paths first
-for path in "${SEARCH_PATHS[@]}"; do
-    if [ -f "$path" ]; then
-        STUB_FILE="$path"
-        break
+    for path in "${SEARCH_PATHS[@]}"; do
+        if [ -f "$path" ]; then
+            STUB_FILE="$path"
+            break
+        fi
+    done
+
+    if [ -z "$STUB_FILE" ]; then
+        STUB_FILE=$(find /nix/store -name "linuxx64.efi.stub" 2>/dev/null | head -n 1)
     fi
-done
 
-# Fallback to nix-store if not found
-if [ -z "$STUB_FILE" ]; then
-    STUB_FILE=$(find /nix/store -name "linuxx64.efi.stub" 2>/dev/null | head -n 1)
+    if [ -z "$STUB_FILE" ]; then
+        echo "❌ Could not find linuxx64.efi.stub!"
+        exit 1
+    fi
+    echo "   Using UEFI Stub: $STUB_FILE"
+
+    echo "ro console=ttyS0,115200n8 earlyprintk=ttyS0 ignore_loglevel keep_bootcon nomodeset panic=0 swiotlb=65536 pci=nommconf mem_encrypt=on nokaslr iommu=off random.trust_cpu=on acpi=noirq noapic ip=dhcp rd.neednet=1 rd.skipfsck" > cmdline.txt
+
+    # Simplified objcopy: let it handle VMAs automatically.
+    # This is more robust as it keeps the image compact and avoids manual RVA calculation errors.
+    objcopy \
+        --add-section .osrel=/etc/os-release --set-section-flags .osrel=alloc,readonly,data \
+        --add-section .cmdline="cmdline.txt" --set-section-flags .cmdline=alloc,readonly,data \
+        --add-section .linux="$KERNEL_FILE" --set-section-flags .linux=alloc,readonly,code \
+        --add-section .initrd="$INITRAMFS_FILE" --set-section-flags .initrd=alloc,readonly,data \
+        "$STUB_FILE" BOOTX64.EFI
+    
+    echo "   ✅ Generated BOOTX64.EFI (manual build)"
 fi
 
-if [ -z "$STUB_FILE" ]; then
-    echo "❌ Could not find linuxx64.efi.stub!"
-    echo "   On Debian/Ubuntu: sudo apt install systemd-boot"
-    echo "   On Nix: Ensure 'systemd' is in buildInputs"
-    exit 1
-fi
-echo "   Using UEFI Stub: $STUB_FILE"
-
-# Create kernel command line
-# Note: root= is handled by initrd, but we need basic console/debug flags
-echo "ro console=ttyS0,115200n8 earlyprintk=ttyS0 ignore_loglevel keep_bootcon nomodeset panic=0 swiotlb=65536 pci=nommconf mem_encrypt=on nokaslr iommu=off random.trust_cpu=on acpi=noirq noapic ip=dhcp rd.neednet=1 rd.skipfsck" > cmdline.txt
-
-# Create BOOTX64.EFI using objcopy
-objcopy \
-    --add-section .osrel=/etc/os-release --change-section-vma .osrel=0x20000 \
-    --add-section .cmdline="cmdline.txt" --change-section-vma .cmdline=0x30000 \
-    --add-section .linux="$KERNEL_FILE" --change-section-vma .linux=0x40000 \
-    --add-section .initrd="$INITRAMFS_FILE" --change-section-vma .initrd=0x3000000 \
-    "$STUB_FILE" BOOTX64.EFI
-
-echo "   ✅ Generated BOOTX64.EFI"
+echo "   ✅ Generated BOOTX64.EFI (optimized for firmware compatibility)"
 
 # 5. Populate ESP
 echo "   Populating ESP..."

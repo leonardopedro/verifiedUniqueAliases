@@ -332,17 +332,14 @@ async fn get_userinfo(access_token: &str) -> Result<PayPalUserInfo, Box<dyn std:
 // ============================================================================
 
 async fn fetch_secret_from_vault() -> Result<String, Box<dyn std::error::Error>> {
-    // Simplified implementation - in production use official OCI Rust SDK
-    let _secret_id = std::env::var("SECRET_OCID")?;
-    let _region = std::env::var("OCI_REGION")?;
+    // For GCP, we could use Secret Manager, but for e2-micro and simple attestation,
+    // we'll allow fetching it from a metadata attribute 'paypal_client_secret'
+    // or just return the placeholder for now.
 
-    info!("Fetching PayPal secret from OCI Vault using instance principals...");
+    info!("Fetching PayPal secret (placeholder for GCP migration)...");
 
-    // TODO: Implement proper instance principal authentication
-    // For now, return placeholder
-    // In production: use oci-rust-sdk with instance principal provider
-
-    Ok("paypal-client-secret-from-vault".to_string())
+    // In a real GCP setup, we'd use the GCP Secret Manager API here.
+    Ok("paypal-client-secret-placeholder".to_string())
 }
 
 // ============================================================================
@@ -359,13 +356,13 @@ async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
             <p><strong>Status:</strong> ✅ System operational</p>
             <p><strong>Domain:</strong> {}</p>
             <p><strong>Certificate:</strong> {}</p>
-            <p><strong>Environment:</strong> 🏗️ Running from initramfs</p>
+            <p><strong>Environment:</strong> 🏗️ GCP e2-micro (Reproducible Initramfs)</p>
         </div>
         <div class="info">
             <p>🔒 <strong>Security Architecture:</strong></p>
             <ul>
-                <li>✅ Entire application runs from <strong>measured initramfs</strong></li>
-                <li>✅ AMD SEV-SNP confidential computing</li>
+                <li>✅ Entire application runs from <strong>reproducible initramfs</strong></li>
+                <li>✅ Verified Nix build in Google Cloud</li>
                 <li>✅ Disk used <strong>only</strong> for TLS certificate storage</li>
                 <li>✅ All secrets in RAM only</li>
                 <li>✅ No SSH, no TTY, no user access</li>
@@ -494,7 +491,7 @@ async fn callback(
         <div class="attestation">
             <h3>🔒 Cryptographic Attestation & Proof</h3>
             <p><strong>Certificate Status:</strong> {}</p>
-            <p><strong>Environment:</strong> 🏗️ Running from initramfs (measured boot)</p>
+            <p><strong>Environment:</strong> 🏗️ GCP e2-micro (Reproducible Build)</p>
             <p><strong>Disk Usage:</strong> TLS certificate storage only</p>
             <hr>
             <p><strong>Attestation Report:</strong></p>
@@ -572,9 +569,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let domain = std::env::var("DOMAIN").expect("DOMAIN must be set");
 
-    let redirect_uri = format!("https://{}/callback", domain);
+    let redirect_uri = std::env::var("PAYPAL_REDIRECT_URI")
+        .unwrap_or_else(|_| format!("https://{}/callback", domain));
 
-    // Fetch PAYPAL_SECRET from OCI Vault using instance principals
+    // Fetch PAYPAL_SECRET
     let paypal_client_secret = fetch_secret_from_vault().await?;
 
     // Handle ACME certificate acquisition

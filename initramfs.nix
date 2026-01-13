@@ -47,10 +47,12 @@ let
     # REQUIRED for DHCP (Fixes 'Address family not supported')
     modprobe af_packet 2>/dev/null || true
     
-    # VirtIO drivers
+    # VirtIO drivers for GCP
+    echo "Loading VirtIO drivers..."
     modprobe virtio_net 2>/dev/null || true
     modprobe virtio_pci 2>/dev/null || true
-    modprobe e1000 2>/dev/null || true
+    modprobe virtio_blk 2>/dev/null || true
+    modprobe virtio_scsi 2>/dev/null || true
     modprobe virtio_console 2>/dev/null || true
 
     # Enable Loopback
@@ -80,21 +82,22 @@ let
     # Setup SSL for Curl
     export SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt
 
-    # Metadata Helper
+    # Metadata Helper for GCP
     fetch_metadata() {
-        local key=$1
-        curl -sf --connect-timeout 2 -H "Authorization: Bearer Oracle" \
-            "http://169.254.169.254/opc/v1/instance/metadata/$key" 2>/dev/null || echo "example.com"
+        local path=$1
+        curl -sf --connect-timeout 2 -H "Metadata-Flavor: Google" \
+            "http://metadata.google.internal/computeMetadata/v1/instance/$path" 2>/dev/null || echo "example.com"
     }
 
-    # Fetch Vars
+    # Fetch Vars from GCP Metadata
     echo "Fetching metadata..."
-    export PAYPAL_CLIENT_ID=$(fetch_metadata paypal_client_id)
-    export DOMAIN=$(fetch_metadata domain)
-    export SECRET_OCID=$(fetch_metadata secret_ocid)
-    export OCI_REGION=$(fetch_metadata region)
+    export PAYPAL_CLIENT_ID=$(fetch_metadata attributes/paypal_client_id)
+    export DOMAIN=$(fetch_metadata attributes/domain)
+    # GCP doesn't have 'secret_ocid', we might use Secret Manager or another attribute if needed.
+    # For now, let's just fetch what's needed for the app.
+    export PAYPAL_REDIRECT_URI="https://$DOMAIN/callback"
     
-    echo "Starting PayPal Auth VM..."
+    echo "Starting PayPal Auth VM on GCP..."
 
     if [ -f /bin/paypal-auth-vm ]; then
         # Check if the binary is executable

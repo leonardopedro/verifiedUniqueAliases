@@ -1,0 +1,2 @@
+qemu-system-x86_64: -drive file=box.img,format=qcow2: Failed to get "write" lock
+Is another process using the image [box.img]?

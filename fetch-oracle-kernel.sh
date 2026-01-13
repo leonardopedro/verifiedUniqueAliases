@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-# Repo URL for Oracle Linux 9 UEK R7 (x86_64)
-REPO_URL="https://yum.oracle.com/repo/OracleLinux/OL9/UEKR7/x86_64"
+# Repo URL for Oracle Linux 10 UEK R8 (x86_64)
+REPO_URL="https://yum.oracle.com/repo/OracleLinux/OL10/UEKR8/x86_64"
 OUTPUT_DIR="kernel-oracle"
 
 mkdir -p "$OUTPUT_DIR"
