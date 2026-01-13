@@ -51,17 +51,66 @@ chmod +x rebuild.sh
 
 ---
 
-## ☁️ GCP Deployment (e2-micro)
+---
 
-### Metadata Configuration
-The VM expects the following attributes in its metadata (`http://metadata.google.internal/computeMetadata/v1/instance/attributes/`):
-- `paypal_client_id`: Your PayPal REST App Client ID.
-- `domain`: The domain name where the VM will be accessible.
-- `paypal_client_secret`: (Optional/Planned) Secret for OAuth.
+## ☁️ GCP Deployment (e2-micro Free Tier)
 
-### Networking
-- **Reserved IP**: Use a static external IP in GCP.
-- **Firewall**: Allow traffic on ports 80 (ACME challenge) and 443 (HTTPS).
+To run this VM for free on Google Cloud, follow these specific configuration steps:
+
+### 1. Project & Image Setup
+1. **Build the Image**: Run `./rebuild.sh` to generate the `initrd`.
+2. **Compress**: GCP requires a `.tar.gz` for raw disk imports. Note that this VM boots the `initrd` directly via a shim or as a RAW disk image (depending on your loader).
+   ```bash
+   # Wrap the build result for GCP
+   tar -Sczf paypal-auth-image.tar.gz -C result/ initrd
+   ```
+3. **Upload to GCS**:
+   ```bash
+   gsutil cp paypal-auth-image.tar.gz gs://YOUR_BUCKET/
+   ```
+4. **Create Image**:
+   ```bash
+   gcloud compute images create paypal-auth-v1 \
+     --source-uri=gs://YOUR_BUCKET/paypal-auth-image.tar.gz \
+     --guest-os-features=UEFI_COMPATIBLE
+   ```
+
+### 2. Instance Configuration (Always Free)
+To ensure the instance stays within the **Always Free** tier:
+- **Region**: Select `us-west1` (Oregon), `us-central1` (Iowa), or `us-east1` (South Carolina).
+- **Machine Type**: `e2-micro` (2 vCPU, 1 GB RAM).
+- **Boot Disk**: 
+  - Change to your custom image `paypal-auth-v1`.
+  - **Type**: Must be **Standard Persistent Disk** (30 GB or less). *Do not use Balanced or SSD.*
+- **Identity & API Access**: 
+  - Ensure the instance has a "Static External IP" (one is free per project if attached).
+- **Firewall**: Allow HTTP (80) and HTTPS (443) traffic.
+
+### 3. Metadata Configuration
+The VM requires metadata to function. Add these in the "Metadata" section:
+| Key | Value |
+|---|---|
+| `paypal_client_id` | Your PayPal App Client ID |
+| `domain` | Your registered domain (e.g., `auth.yourdomain.com`) |
+
+---
+
+## 🔒 Security & Attestation
+
+This project uses **Measured Boot** principles. Since the entire OS is contained within a Nix-built `initramfs`, we can verify the integrity of the running system.
+
+### 1. Verification via Nix Hash
+When you run `./rebuild.sh`, Nix produces a unique hash for the `initramfs`. This hash is bit-for-bit reproducible.
+```bash
+# Get the Nix Store hash of the result
+nix-store -q --hash result/initrd
+```
+
+### 2. Runtime Attestation
+In a production GCP environment, you can verify the measurement:
+1. **Shielded VM**: Enable "Shielded VM" (vTPM and Integrity Monitoring) during instance creation.
+2. **Integrity Validation**: The GCP Console will show the "Late Launch" measurement. For this RAM-only VM, the `initramfs` measurement (PCR 9 or 10 depending on the loader) should match your local Nix build hash.
+3. **Sealed Environment**: The OS has no SSH, no user logins, and no persistent storage. Any modification to the binary requires a new build and a new hash.
 
 ---
 
