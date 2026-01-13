@@ -1,7 +1,7 @@
 # Development shell for the PayPal Auth VM project
 # Usage: nix-shell
 
-{ pkgs ? import <nixpkgs> {} }:
+{ pkgs ? import (fetchTarball "https://github.com/NixOS/nixpkgs/archive/9cb344e96d5b6918e94e1bca2d9f3ea1e9615545.tar.gz") {} }:
 
 pkgs.mkShell {
   name = "paypal-auth-vm-dev";

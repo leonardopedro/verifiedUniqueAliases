@@ -1,5 +1,6 @@
 { pkgs, ... }: {
   channel = "stable-25.05"; 
+  # Note: Locally we pin to 9cb344e96d5b6918e94e1bca2d9f3ea1e9615545 for reproducibility.
 
   packages = [
     pkgs.rustup
