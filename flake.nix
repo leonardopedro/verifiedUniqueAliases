@@ -21,6 +21,11 @@
             sha256 = "sha256-PKzFRAAdgTuGKDOrm+epzXfwNYVSON0eCEeYMg16MNw=";
           };
           cargoHash = "sha256-NfbOInNRmaFnHrbZNGTj0eXivfCNjys+IfJo/DZUrP4=";
+          
+          # Add add-det symlink for compatibility with legacy scripts
+          postInstall = ''
+            ln -s add-determinism $out/bin/add-det
+          '';
         };
 
         paypal-auth-vm = pkgsStatic.rustPlatform.buildRustPackage {
@@ -34,9 +39,10 @@
           buildInputs = [ pkgsStatic.openssl ];
 
           # Link-time optimizations and stripping are handled by Cargo.toml profile.release
-          # Post-install normalization for reproducibility
+          # Post-install normalization for reproducibility (matches build-native.sh:84-86)
           postInstall = ''
             add-determinism $out/bin/paypal-auth-vm
+            touch -d "@1640995200" $out/bin/paypal-auth-vm
           '';
 
           doCheck = false;
@@ -55,21 +61,24 @@
           dontUnpack = true;
           buildPhase = ''
             mkdir -p $out
-            echo "🔧 Normalizing initramfs with add-determinism..."
+            echo "🔧 Normalizing initramfs with add-determinism (based on build-native.sh)..."
             
-            # Decompress
-            gzip -d -c $src/initrd > initrd.cpio
+            # Step 1: Decompress
+            gzip -d -c $src/initrd > initrd.uncompressed
             
-            # Apply add-determinism to the raw CPIO
-            add-determinism initrd.cpio
+            # Step 2: Apply add-determinism to uncompressed initramfs (matches build-native.sh:138)
+            add-determinism initrd.uncompressed
             
-            # Recompress with fixed timestamp and max compression
-            gzip -n -9 < initrd.cpio > $out/initrd
+            # Step 3: Recompress with deterministic gzip (matches build-native.sh:142)
+            gzip -n -9 < initrd.uncompressed > initrd.tmp
             
-            # Force the timestamp to match legacy SOURCE_DATE_EPOCH (2022-01-01)
+            # Step 4: Apply add-determinism to COMPRESSED initramfs (matches build-native.sh:146)
+            add-determinism initrd.tmp
+            
+            # Final move and timestamp normalization
+            mv initrd.tmp $out/initrd
             touch -d "@1640995200" $out/initrd
             
-            # Also create a .gz symlink for compatibility
             ln -s initrd $out/initrd.gz
           '';
           installPhase = "true";
