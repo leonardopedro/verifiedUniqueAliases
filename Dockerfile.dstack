@@ -1,0 +1,3 @@
+FROM scratch
+COPY target/x86_64-unknown-linux-musl/release/paypal-auth-vm /paypal-auth-vm
+ENTRYPOINT ["/paypal-auth-vm"]

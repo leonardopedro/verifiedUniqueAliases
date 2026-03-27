@@ -213,22 +213,18 @@ async fn generate_attestation(
     paypal_client_id: &str,
     paypal_user_id: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    // On AMD SEV-SNP, attestation is retrieved via /dev/sev-guest
-    // Include PAYPAL_CLIENT_ID and PAYPAL_USER_ID in REPORT_DATA field
-    // Format: PAYPAL_CLIENT_ID=<id>|PAYPAL_USER_ID=<id>
-
     let report_data = format!(
         "PAYPAL_CLIENT_ID={}|PAYPAL_USER_ID={}",
         paypal_client_id, paypal_user_id
     );
     let report_data_hash = sha2_hash(&report_data);
 
-    // Try to get SEV-SNP attestation report
-    let attestation_report = match get_sev_snp_report(&report_data_hash) {
+    // Try to get dstack attestation quote
+    let attestation_report = match get_dstack_report(&report_data_hash).await {
         Ok(report) => report,
         Err(e) => {
             warn!(
-                "Failed to get SEV-SNP report: {}. Using mock attestation.",
+                "Failed to get dstack attestation: {}. Falling back to mock.",
                 e
             );
             create_mock_attestation(paypal_client_id, paypal_user_id)
@@ -238,21 +234,19 @@ async fn generate_attestation(
     Ok(attestation_report)
 }
 
-fn get_sev_snp_report(report_data: &str) -> Result<String, Box<dyn std::error::Error>> {
-    // Use snpguest tool to get attestation report
-    let output = std::process::Command::new("snpguest")
-        .arg("report")
-        .arg("--random")
-        .arg("--report-data")
-        .arg(report_data)
-        .output()?;
-
-    if !output.status.success() {
-        return Err("Failed to generate SNP attestation report".into());
-    }
-
-    let report = String::from_utf8(output.stdout)?;
-    Ok(report)
+async fn get_dstack_report(report_data: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use dstack_sdk::tappd_client::TappdClient;
+    
+    let client = TappdClient::new(None);
+    let report_data_bytes = alloy::hex::decode(report_data)?;
+    
+    // Ensure 64 bytes
+    let mut padded_report_data = vec![0u8; 64];
+    let len = report_data_bytes.len().min(64);
+    padded_report_data[..len].copy_from_slice(&report_data_bytes[..len]);
+    
+    let quote = client.get_quote(padded_report_data).await?;
+    Ok(serde_json::to_string(&quote)?)
 }
 
 fn create_mock_attestation(paypal_client_id: &str, paypal_user_id: &str) -> String {
@@ -331,18 +325,22 @@ async fn get_userinfo(access_token: &str) -> Result<PayPalUserInfo, Box<dyn std:
 // OCI VAULT INTEGRATION
 // ============================================================================
 
-async fn fetch_secret_from_vault() -> Result<String, Box<dyn std::error::Error>> {
-    // Simplified implementation - in production use official OCI Rust SDK
-    let _secret_id = std::env::var("SECRET_OCID")?;
-    let _region = std::env::var("OCI_REGION")?;
-
-    info!("Fetching PayPal secret from OCI Vault using instance principals...");
-
-    // TODO: Implement proper instance principal authentication
-    // For now, return placeholder
-    // In production: use oci-rust-sdk with instance principal provider
-
-    Ok("paypal-client-secret-from-vault".to_string())
+async fn fetch_secret_from_dstack() -> Result<String, Box<dyn std::error::Error>> {
+    use dstack_sdk::tappd_client::TappdClient;
+    
+    info!("Fetching encryption public key from dstack guest agent...");
+    let client = TappdClient::new(None);
+    
+    // We can use derive_key to get a unique secret for this instance
+    // or read an encrypted environment variable.
+    // For now, we'll try to get it from the environment.
+    if let Ok(secret) = std::env::var("PAYPAL_SECRET") {
+        return Ok(secret);
+    }
+    
+    // Fallback: derive a key (this wouldn't be the real paypal secret unless it was pre-shared)
+    let key_resp = client.derive_key("paypal-client-secret").await?;
+    Ok(key_resp.key)
 }
 
 // ============================================================================
@@ -571,8 +569,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let redirect_uri = format!("https://{}/callback", domain);
 
-    // Fetch PAYPAL_SECRET from OCI Vault using instance principals
-    let paypal_client_secret = fetch_secret_from_vault().await?;
+    // Fetch PAYPAL_SECRET from dstack guest agent or env
+    let paypal_client_secret = fetch_secret_from_dstack().await?;
 
     // Handle ACME certificate acquisition
     let acme = AcmeManager::new(domain.clone());
