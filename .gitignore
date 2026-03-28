@@ -48,3 +48,12 @@ v*-esp/
 initrd-root*/
 iso-root/
 mkosi.build/
+
+# Large binaries and archives
+*.deb
+*.tar.gz
+*.cpio.gz
+*.img
+*.raw
+docker-output/
+test-repro/out*/
