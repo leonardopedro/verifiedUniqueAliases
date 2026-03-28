@@ -1,0 +1,26 @@
+type: service
+
+# Minimal scratch image with static binary
+image:
+  file: Dockerfile.dstack
+
+# OCI AMD E4 Flex Configuration
+resources:
+  instance_type: VM.Standard.E4.Flex
+  cpu: 1
+  memory: 2GB
+
+# Custom Tags for my patched OCI Backend
+tags:
+  confidential: "true"
+  baseline_ocpu: "0.125"
+
+# Environment Variables
+envs:
+  - PAYPAL_CLIENT_ID=${PAYPAL_CLIENT_ID}
+  - DOMAIN=auth.airma.de
+
+# Service Ports
+ports:
+  - 80:80
+  - 443:443

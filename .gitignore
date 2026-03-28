@@ -38,3 +38,13 @@ result-kernel
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 disk.raw
+
+# OCI Confidential VM build artifacts and templates
+*.iso
+*.efi
+dstack-output/
+esp-*/
+v*-esp/
+initrd-root*/
+iso-root/
+mkosi.build/
