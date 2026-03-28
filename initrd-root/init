@@ -1,0 +1,53 @@
+#!/bin/bash
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+echo "Starting Unified Boot Bridge (v8)..."
+
+# 1. Mount virtual systems
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mkdir -p /run /tmp /var/volatile/tmp /dev/pts
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /var/volatile
+
+# Fix symlinks for dstack environment
+mkdir -p /var/volatile/tmp
+ln -sf /var/volatile/tmp /var/tmp
+
+# 2. Setup Loopback
+ip link set lo up
+
+# 3. Setup Networking (DHCP)
+echo "📡 Configuring network (DHCP)..."
+/sbin/udhcpc -i eth0 -n -q -T 2 || echo "⚠️  Network setup timed out (normal for local test)"
+
+# 4. Fetch OCI Instance Metadata
+echo "🔍 Checking OCI environment..."
+fetch_meta() {
+    curl -sf --connect-timeout 2 -H "Authorization: Bearer Oracle" "http://169.254.169.254/opc/v1/instance/metadata/$1" 2>/dev/null || echo ""
+}
+
+PAYPAL_CLIENT_ID=$(fetch_meta paypal_client_id)
+DOMAIN=$(fetch_meta domain)
+
+if [ -n "$PAYPAL_CLIENT_ID" ]; then
+    echo "✅ OCI Metadata Detected."
+    export PAYPAL_CLIENT_ID
+    export DOMAIN
+    export OCI_REGION=$(curl -sf --connect-timeout 2 -H "Authorization: Bearer Oracle" http://169.254.169.254/opc/v2/instance/region || echo "eu-frankfurt-1")
+else
+    echo "ℹ️  Local Environment Detected (No OCI metadata)."
+    # Fallback for local testing
+    export PAYPAL_CLIENT_ID="local-test-client"
+    export DOMAIN="localhost"
+fi
+
+# 5. Start dstack Guest Agent (tappd)
+echo "🛡️ Starting dstack-guest-agent..."
+/usr/bin/dstack-guest-agent --log-level info &
+
+# 6. Final Launch
+echo "🚀 Launching PayPal Auth VM..."
+exec /usr/bin/paypal-auth-vm
