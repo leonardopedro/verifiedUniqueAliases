@@ -63,9 +63,9 @@ pkgs.mkShell {
     echo ""
     
     # Install add-determinism if not already installed
-    if ! command -v add-det &> /dev/null; then
-      echo "📦 Installing add-determinism for reproducible builds..."
-      cargo install add-determinism 2>/dev/null || echo "⚠️  add-determinism installation skipped"
-    fi
+    # if ! command -v add-det &> /dev/null; then
+    #   echo "📦 Installing add-determinism for reproducible builds..."
+    #   cargo install add-determinism 2>/dev/null || echo "⚠️  add-determinism installation skipped"
+    # fi
   '';
 }
