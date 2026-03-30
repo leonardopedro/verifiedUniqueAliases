@@ -17,9 +17,12 @@ let
         /bin/ip addr flush dev $interface
         ;;
       bound|renew)
-        /bin/ip addr add $ip/$mask dev $interface
+        /bin/busybox ifconfig $interface $ip netmask $subnet
         if [ -n "$router" ]; then
-           /bin/ip route add default via $router
+           for r in $router; do
+             /bin/ip route add default via $r dev $interface
+             break
+           done
         fi
         if [ -n "$dns" ]; then
            echo "nameserver $dns" > /etc/resolv.conf
