@@ -217,35 +217,36 @@ async fn generate_attestation(
         "PAYPAL_CLIENT_ID={}|PAYPAL_USER_ID={}",
         paypal_client_id, paypal_user_id
     );
-    
-    // Fetch OCI Native Attestation Report (AMD SEV-SNP)
-    match get_oci_attestation_report(&report_data).await {
-        Ok(report) => Ok(report),
+    let report_data_hash = sha2_hash(&report_data);
+
+    // Try to get dstack attestation quote
+    let attestation_report = match get_dstack_report(&report_data_hash).await {
+        Ok(report) => report,
         Err(e) => {
-            warn!("OCI Attestation failed: {}. Falling back to mock.", e);
-            Ok(create_mock_attestation(paypal_client_id, paypal_user_id))
+            warn!(
+                "Failed to get dstack attestation: {}. Falling back to mock.",
+                e
+            );
+            create_mock_attestation(paypal_client_id, paypal_user_id)
         }
-    }
+    };
+
+    Ok(attestation_report)
 }
 
-async fn get_oci_attestation_report(nonce: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
+async fn get_dstack_report(report_data: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use dstack_sdk::tappd_client::TappdClient;
     
-    // OCI IMDS v2 endpoint for Confidential Computing Attestation
-    // The nonce provides freshness and binding to the session
-    let response = client
-        .get("http://169.254.169.254/opc/v2/instance/confidentialComputing/attestationReport")
-        .header("Authorization", "Bearer Oracle")
-        .query(&[("nonce", nonce)])
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(format!("OCI IMDS error: {}", response.status()).into());
-    }
-
-    let report_json: serde_json::Value = response.json().await?;
-    Ok(serde_json::to_string_pretty(&report_json)?)
+    let client = TappdClient::new(None);
+    let report_data_bytes = alloy::hex::decode(report_data)?;
+    
+    // Ensure 64 bytes
+    let mut padded_report_data = vec![0u8; 64];
+    let len = report_data_bytes.len().min(64);
+    padded_report_data[..len].copy_from_slice(&report_data_bytes[..len]);
+    
+    let quote = client.get_quote(padded_report_data).await?;
+    Ok(serde_json::to_string(&quote)?)
 }
 
 fn create_mock_attestation(paypal_client_id: &str, paypal_user_id: &str) -> String {
@@ -325,17 +326,21 @@ async fn get_userinfo(access_token: &str) -> Result<PayPalUserInfo, Box<dyn std:
 // ============================================================================
 
 async fn fetch_secret_from_dstack() -> Result<String, Box<dyn std::error::Error>> {
-    info!("Checking for PAYPAL_SECRET in environment...");
+    use dstack_sdk::tappd_client::TappdClient;
     
+    info!("Fetching encryption public key from dstack guest agent...");
+    let client = TappdClient::new(None);
+    
+    // We can use derive_key to get a unique secret for this instance
+    // or read an encrypted environment variable.
+    // For now, we'll try to get it from the environment.
     if let Ok(secret) = std::env::var("PAYPAL_SECRET") {
         return Ok(secret);
     }
     
-    // In production OCI, secrets should be fetched from OCI Vault 
-    // or passed via instance metadata (encrypted).
-    // For this minimal demo, we'll use a placeholder if missing.
-    warn!("PAYPAL_SECRET not found. Using placeholder.");
-    Ok("placeholder-secret-from-oci-native".to_string())
+    // Fallback: derive a key (this wouldn't be the real paypal secret unless it was pre-shared)
+    let key_resp = client.derive_key("paypal-client-secret").await?;
+    Ok(key_resp.key)
 }
 
 // ============================================================================

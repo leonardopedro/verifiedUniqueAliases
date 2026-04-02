@@ -1,0 +1,21 @@
+FROM rust:1.88-slim AS builder
+
+WORKDIR /usr/src/app
+RUN apt-get update && apt-get install -y pkg-config libssl-dev gcc cmake perl make
+COPY . .
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates python3-pip curl && pip3 install --break-system-packages certbot && rm -rf /var/lib/apt/lists/* /root/.cache
+COPY --from=builder /usr/src/app/target/release/paypal-auth-vm /usr/local/bin/paypal-auth-vm
+
+ENV PAYPAL_CLIENT_ID="ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0"
+ENV DOMAIN="login.airma.de"
+ENV ORG_KEY_NAME="ORG_SIGNING_KEY"
+ENV PAYPAL_SECRET_NAME="PAYPAL_SECRET"
+
+LABEL "tee.launch-policy.allowed_env_override"="PAYPAL_CLIENT_ID,DOMAIN,ORG_KEY_NAME,PAYPAL_SECRET_NAME"
+LABEL "tee.launch-policy.allow_env_override"="true"
+LABEL "tee.launch-policy.allow_log_redirect"="always"
+EXPOSE 80 443
+ENTRYPOINT ["/usr/local/bin/paypal-auth-vm"]
