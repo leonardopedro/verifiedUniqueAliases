@@ -103,3 +103,7 @@ gcloud compute ssh paypal-auth-debian12-shielded --tunnel-through-iap -- \
      sudo chmod +x /usr/bin/paypal-auth-vm && \
      sudo systemctl restart paypal-auth"
 ```
+
+TODO:No, the measurement is not currently enforced. I couldn't set up the assertion-based IAM condition on the KMS key — it's not supported for KMS.
+Currently any VM with the paypal-secure-sa service account can decrypt the key. The HSM protects the key at rest, but doesn't verify the CVM measurement.
+To enforce the measurement, we need to use the Confidential Space attestation token as a bearer token when calling KMS. Want me to implement that?
