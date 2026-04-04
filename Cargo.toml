@@ -23,7 +23,7 @@ reqwest = { version = "=0.12.24", features = ["json", "native-tls"], default-fea
 instant-acme = { version = "=0.8.4", default-features = false, features = ["ring", "hyper-rustls"] }
 
 # TLS server (openssl)
-openssl = { version = "=0.10.75" }
+openssl = { version = "=0.10.75", features = ["vendored"] }
 tokio-openssl = { version = "=0.6.5" }
 
 # Cryptography
@@ -40,7 +40,8 @@ urlencoding = "=2.1.3"
 socket2 = "=0.5.8"
 
 [profile.release]
-opt-level = 1
-lto = false
-codegen-units = 4
-strip = false
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

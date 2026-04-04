@@ -30,8 +30,7 @@ use tracing::{error, info};
 // ============================================================================
 
 const GOOGLE_PUBLIC_CA_DIRECTORY: &str = "https://dv.acme-v02.api.pki.goog/directory";
-const GOOGLE_PUBLIC_CA_STAGING_DIRECTORY: &str =
-    "https://dv.acme-v02.test-api.pki.goog/directory";
+const GOOGLE_PUBLIC_CA_STAGING_DIRECTORY: &str = "https://dv.acme-v02.test-api.pki.goog/directory";
 
 const HTML_TEMPLATE: &str = r#"
 <!DOCTYPE html>
@@ -132,8 +131,10 @@ struct CallbackQuery {
 // ============================================================================
 
 async fn fetch_config() -> Result<Config, Box<dyn std::error::Error>> {
-    let secret_name = std::env::var("SECRET_NAME")
-        .unwrap_or_else(|_| "projects/project-ae136ba1-3cc9-42cf-a48/secrets/PAYPAL_AUTH_CONFIG/versions/latest".to_string());
+    let secret_name = std::env::var("SECRET_NAME").unwrap_or_else(|_| {
+        "projects/project-ae136ba1-3cc9-42cf-a48/secrets/PAYPAL_AUTH_CONFIG/versions/latest"
+            .to_string()
+    });
 
     let client = reqwest::Client::new();
 
@@ -220,9 +221,15 @@ impl GooglePublicCaManager {
             Account::builder()?.from_credentials(creds).await?
         } else {
             info!("Creating new ACME account with EAB...");
-            let kid = self.eab_key_id.as_ref().ok_or("Missing EAB key ID and no acme_account_json")?;
-            let hmac_str = self.eab_hmac_key.as_ref().ok_or("Missing EAB HMAC key and no acme_account_json")?;
-            
+            let kid = self
+                .eab_key_id
+                .as_ref()
+                .ok_or("Missing EAB key ID and no acme_account_json")?;
+            let hmac_str = self
+                .eab_hmac_key
+                .as_ref()
+                .ok_or("Missing EAB HMAC key and no acme_account_json")?;
+
             use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
             let hmac_bytes = URL_SAFE_NO_PAD.decode(hmac_str.trim())?;
             let eab = ExternalAccountKey::new(kid.clone(), &hmac_bytes);
@@ -271,7 +278,10 @@ impl GooglePublicCaManager {
         // Wait for the order to reach the "ready" state
         // (when all authorizations are verified)
         while !matches!(order.state().status, OrderStatus::Ready) {
-            info!("Waiting for ACME order state to become 'ready' (current: {:?})...", order.state().status);
+            info!(
+                "Waiting for ACME order state to become 'ready' (current: {:?})...",
+                order.state().status
+            );
             tokio::time::sleep(Duration::from_secs(5)).await;
             order.refresh().await?;
             if matches!(order.state().status, OrderStatus::Invalid) {
@@ -464,7 +474,14 @@ async fn callback(
         None => return (StatusCode::BAD_REQUEST, "Missing code").into_response(),
     };
 
-    let token = match exchange_code_for_token(&code, &state.paypal_client_id, &state.paypal_client_secret, &state.redirect_uri).await {
+    let token = match exchange_code_for_token(
+        &code,
+        &state.paypal_client_id,
+        &state.paypal_client_secret,
+        &state.redirect_uri,
+    )
+    .await
+    {
         Ok(t) => t,
         Err(e) => {
             error!("Token exchange failed: {}", e);
@@ -486,11 +503,12 @@ async fn callback(
         }
     };
 
-
     let attestation = generate_attestation(&state.paypal_client_id, &userinfo).await;
 
-    Html(HTML_TEMPLATE.replace("{{CONTENT}}", &format!(
-        r#"
+    Html(HTML_TEMPLATE.replace(
+        "{{CONTENT}}",
+        &format!(
+            r#"
         <h1>Authentication Successful</h1>
         <div class="info">
             <h3>PayPal User</h3>
@@ -506,11 +524,13 @@ async fn callback(
         </div>
         <a href="/" class="btn">Back</a>
         "#,
-        html_escape::encode_text(&userinfo.user_id),
-        html_escape::encode_text(&userinfo.name.unwrap_or_else(|| "N/A".to_string())),
-        html_escape::encode_text(&userinfo.email.unwrap_or_else(|| "N/A".to_string())),
-        html_escape::encode_text(&attestation),
-    ))).into_response()
+            html_escape::encode_text(&userinfo.user_id),
+            html_escape::encode_text(&userinfo.name.unwrap_or_else(|| "N/A".to_string())),
+            html_escape::encode_text(&userinfo.email.unwrap_or_else(|| "N/A".to_string())),
+            html_escape::encode_text(&attestation),
+        ),
+    ))
+    .into_response()
 }
 
 async fn acme_challenge(
@@ -572,8 +592,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[DEBUG] about to fetch config");
     info!("About to fetch config...");
     let config = match fetch_config().await {
-        Ok(c) => { info!("Config loaded successfully"); c }
-        Err(e) => { error!("Failed to fetch config: {}", e); return Err(e); }
+        Ok(c) => {
+            info!("Config loaded successfully");
+            c
+        }
+        Err(e) => {
+            error!("Failed to fetch config: {}", e);
+            return Err(e);
+        }
     };
     eprintln!("[DEBUG] config loaded, domain={}", config.domain);
     info!("Config: domain={}", config.domain);
@@ -655,9 +681,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let router = router.clone();
                     async move { Ok::<_, std::convert::Infallible>(router.oneshot(req).await.unwrap()) }
                 });
-                let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection(io, svc)
-                    .await;
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection(io, svc)
+                .await;
             });
         }
     });
@@ -699,7 +727,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let (stream, _) = match https_listener.accept().await {
                 Ok(s) => s,
-                Err(e) => { error!("Failed to accept HTTPS connection: {}", e); continue; }
+                Err(e) => {
+                    error!("Failed to accept HTTPS connection: {}", e);
+                    continue;
+                }
             };
             let ssl_config = https_tls_config.clone();
             let app = app.clone();
@@ -707,11 +738,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::spawn(async move {
                 let ssl = match openssl::ssl::Ssl::new(ssl_config.context()) {
                     Ok(s) => s,
-                    Err(e) => { error!("Failed to create SSL: {}", e); return; }
+                    Err(e) => {
+                        error!("Failed to create SSL: {}", e);
+                        return;
+                    }
                 };
                 let mut tls_stream = match tokio_openssl::SslStream::new(ssl, stream) {
                     Ok(s) => s,
-                    Err(e) => { error!("Failed to create SslStream: {}", e); return; }
+                    Err(e) => {
+                        error!("Failed to create SslStream: {}", e);
+                        return;
+                    }
                 };
                 if let Err(e) = std::pin::Pin::new(&mut tls_stream).accept().await {
                     error!("TLS handshake failed: {}", e);
@@ -723,8 +760,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     async move { Ok::<_, std::convert::Infallible>(app.oneshot(req).await.unwrap()) }
                 });
                 let _ = hyper_util::server::conn::auto::Builder::new(
-                    hyper_util::rt::TokioExecutor::new()
-                ).serve_connection(io, svc).await;
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection(io, svc)
+                .await;
             });
         }
     });
