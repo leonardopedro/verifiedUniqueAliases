@@ -1,16 +1,35 @@
-FROM rust:1.88-slim AS builder
+# Builder: use debian:12-slim directly + rustup to install Rust.
+# This keeps glibc at 2.36 (matching distroless/cc-debian12),
+# avoiding the "GLIBC_2.38 not found" crash caused by rust:slim-bookworm
+# which ships a newer Bookworm snapshot with glibc 2.38.
+FROM debian:12-slim AS builder
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    pkg-config \
+    libssl-dev \
+    gcc \
+    cmake \
+    perl \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain 1.88.0 --profile minimal --no-modify-path
+
 WORKDIR /usr/src/app
-RUN apt-get update && apt-get install -y pkg-config libssl-dev gcc cmake perl make
 COPY . .
 RUN cargo build --release
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates curl libssl3 libgcc-s1 libzstd1 && rm -rf /var/lib/apt/lists/*
+FROM gcr.io/distroless/cc-debian12
 COPY --from=builder /usr/src/app/target/release/paypal-auth-vm /usr/local/bin/paypal-auth-vm
-COPY --chmod=755 entrypoint.sh /entrypoint.sh
 
 LABEL "tee.launch_policy.allow_env_override"="SECRET_NAME,RUST_LOG"
 LABEL "tee.launch_policy.log_redirect"="always"
 EXPOSE 443
 EXPOSE 80
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/paypal-auth-vm"]
