@@ -22,7 +22,7 @@ gcloud compute instances delete paypal-auth-vm --zone=${LOCATION}-a --quiet 2>/d
 
 gcloud compute instances create paypal-auth-vm \
     --zone ${LOCATION}-a \
-    --machine-type n2d-standard-2 \
+    --machine-type n2d-highcpu-2 \
     --confidential-compute-type=SEV_SNP \
     --maintenance-policy TERMINATE \
     --image-family confidential-space \
