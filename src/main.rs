@@ -29,6 +29,116 @@ use tracing::{error, info};
 // CONSTANTS
 // ============================================================================
 
+mod tpm {
+    use tokio::process::Command;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Clone)]
+    pub struct SealedData {
+        pub pub_blob: String,
+        pub priv_blob: String,
+    }
+
+    async fn run_cmd(cmd: &str, args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let output = Command::new(cmd).args(args).output().await?;
+        if !output.status.success() {
+            return Err(format!("{} failed: {}", cmd, String::from_utf8_lossy(&output.stderr)).into());
+        }
+        Ok(output.stdout)
+    }
+
+    pub async fn seal_dek(dek: &[u8], pcrs: &str) -> Result<SealedData, Box<dyn std::error::Error>> {
+        tokio::fs::write("/tmp/dek.plain", dek).await?;
+        run_cmd("tpm2_createpolicy", &["--policy-pcr", "-l", &format!("sha256:{}", pcrs), "-L", "/tmp/policy.digest"]).await?;
+        run_cmd("tpm2_createprimary", &["-c", "/tmp/primary.ctx"]).await?;
+        run_cmd("tpm2_create", &[
+            "-C", "/tmp/primary.ctx",
+            "-r", "/tmp/dek.priv",
+            "-u", "/tmp/dek.pub",
+            "-i", "/tmp/dek.plain",
+            "-L", "/tmp/policy.digest",
+        ]).await?;
+        let pub_b = tokio::fs::read("/tmp/dek.pub").await?;
+        let priv_b = tokio::fs::read("/tmp/dek.priv").await?;
+        Ok(SealedData {
+            pub_blob: STANDARD.encode(pub_b),
+            priv_blob: STANDARD.encode(priv_b),
+        })
+    }
+
+    pub async fn unseal_dek(sealed: &SealedData, pcrs: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let pub_b = STANDARD.decode(&sealed.pub_blob)?;
+        let priv_b = STANDARD.decode(&sealed.priv_blob)?;
+        tokio::fs::write("/tmp/dek.pub", pub_b).await?;
+        tokio::fs::write("/tmp/dek.priv", priv_b).await?;
+        run_cmd("tpm2_createprimary", &["-c", "/tmp/primary.ctx"]).await?;
+        run_cmd("tpm2_load", &[
+            "-C", "/tmp/primary.ctx",
+            "-u", "/tmp/dek.pub",
+            "-r", "/tmp/dek.priv",
+            "-c", "/tmp/dek.ctx",
+        ]).await?;
+        let dek = run_cmd("tpm2_unseal", &[
+            "-c", "/tmp/dek.ctx",
+            "-p", &format!("pcr:sha256:{}", pcrs)
+        ]).await?;
+        Ok(dek)
+    }
+
+    pub async fn quote(pcrs: &str, nonce_hex: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
+        run_cmd("tpm2_createprimary", &["-c", "/tmp/primary.ctx"]).await?;
+        let _ = run_cmd("tpm2_createak", &[
+            "-C", "/tmp/primary.ctx",
+            "-c", "/tmp/ak.ctx",
+            "-G", "rsa",
+            "-s", "rsassa"
+        ]).await;
+        run_cmd("tpm2_quote", &[
+            "-c", "/tmp/ak.ctx",
+            "-l", &format!("sha256:{}", pcrs),
+            "-q", nonce_hex,
+            "-m", "/tmp/quote.msg",
+            "-s", "/tmp/quote.sig",
+            "-F", "plain"
+        ]).await?;
+        let msg = tokio::fs::read("/tmp/quote.msg").await?;
+        let sig = tokio::fs::read("/tmp/quote.sig").await?;
+        Ok((STANDARD.encode(msg), STANDARD.encode(sig)))
+    }
+}
+
+mod crypto {
+    use aes_gcm::{
+        aead::{Aead, AeadCore, KeyInit, OsRng},
+        Aes256Gcm, Key, Nonce,
+    };
+    use rand::Rng;
+
+    pub fn generate_dek() -> Vec<u8> {
+        let mut key = vec![0u8; 32];
+        rand::thread_rng().fill(&mut key[..]);
+        key
+    }
+
+    pub fn encrypt(dek: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+        let key = Key::<Aes256Gcm>::from_slice(dek);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 96-bits; 12 bytes
+        let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(|e| format!("AesGcm encrypt failed: {:?}", e))?;
+        Ok((nonce.to_vec(), ciphertext))
+    }
+
+    pub fn decrypt(dek: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let key = Key::<Aes256Gcm>::from_slice(dek);
+        let cipher = Aes256Gcm::new(key);
+        let nonce_arr = Nonce::from_slice(nonce);
+        let plaintext = cipher.decrypt(nonce_arr, ciphertext).map_err(|e| format!("AesGcm decrypt failed: {:?}", e))?;
+        Ok(plaintext)
+    }
+}
+
+
 const GOOGLE_PUBLIC_CA_DIRECTORY: &str = "https://dv.acme-v02.api.pki.goog/directory";
 const GOOGLE_PUBLIC_CA_STAGING_DIRECTORY: &str = "https://dv.acme-v02.test-api.pki.goog/directory";
 
@@ -199,6 +309,11 @@ impl GooglePublicCaManager {
     }
 
     async fn ensure_certificate(&self) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+        info!("Checking for cached TLS credentials in Vault...");
+        if let Some((cert, key)) = Self::fetch_cached_tls().await {
+            return Ok((cert, key));
+        }
+
         info!("Obtaining TLS certificate from Google Public CA...");
 
         let acme_url = if self.staging {
@@ -297,7 +412,102 @@ impl GooglePublicCaManager {
             .await?;
 
         info!("TLS certificate obtained (RAM only)");
+        Self::store_cached_tls(&cert_chain_pem.as_bytes(), &private_key_pem.as_bytes()).await;
         Ok((cert_chain_pem.into_bytes(), private_key_pem.into_bytes()))
+    }
+
+    async fn fetch_cached_tls() -> Option<(Vec<u8>, Vec<u8>)> {
+        let secret_name = std::env::var("TLS_CACHE_SECRET").ok()?;
+        let client = reqwest::Client::new();
+        let token_resp: serde_json::Value = client
+            .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
+            .header("Metadata-Flavor", "Google")
+            .send().await.ok()?.json().await.ok()?;
+        let access_token = token_resp["access_token"].as_str()?;
+        let url = format!("https://secretmanager.googleapis.com/v1/{}/versions/latest:access", secret_name);
+        
+        let secret_resp: serde_json::Value = client
+            .get(&url).bearer_auth(access_token).send().await.ok()?.json().await.ok()?;
+        let encoded = secret_resp["payload"]["data"].as_str()?;
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let wrapper_bytes = STANDARD.decode(encoded).ok()?;
+        let wrapper: serde_json::Value = serde_json::from_slice(&wrapper_bytes).ok()?;
+        
+        // Recover and unseal DEK from entire TPM measured-boot chain (0,2,4,7,8,9,15)
+        let sealed_dek: tpm::SealedData = serde_json::from_value(wrapper["sealed_dek"].clone()).ok()?;
+        info!("Unsealing DEK via vTPM chain (0,2,4,7,8,9,15)...");
+        let dek = match tpm::unseal_dek(&sealed_dek, "0,2,4,7,8,9,15").await {
+            Ok(d) => d,
+            Err(e) => {
+                error!("TPM Unseal failed, measurements likely changed! {}", e);
+                return None;
+            }
+        };
+
+        // Decrypt ciphertext using DEK
+        let nonce = STANDARD.decode(wrapper["nonce"].as_str()?).ok()?;
+        let ciphertext = STANDARD.decode(wrapper["ciphertext"].as_str()?).ok()?;
+        let plaintext = crypto::decrypt(&dek, &nonce, &ciphertext).ok()?;
+
+        let json: serde_json::Value = serde_json::from_slice(&plaintext).ok()?;
+        let cert = STANDARD.decode(json["cert"].as_str()?).ok()?;
+        let key = STANDARD.decode(json["key"].as_str()?).ok()?;
+        
+        info!("Successfully restored and unsealed TLS cache from Vault (using vTPM)");
+        Some((cert, key))
+    }
+
+    async fn store_cached_tls(cert: &[u8], key: &[u8]) {
+        if let Ok(secret_name) = std::env::var("TLS_CACHE_SECRET") {
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            
+            // Generate DEK, seal DEK, and encrypt payload
+            let dek = crypto::generate_dek();
+            let sealed_dek = match tpm::seal_dek(&dek, "0,2,4,7,8,9,15").await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Failed to seal DEK to vTPM chain: {}", e);
+                    return;
+                }
+            };
+
+            let payload_json = serde_json::json!({
+                "cert": STANDARD.encode(cert),
+                "key": STANDARD.encode(key)
+            }).to_string();
+
+            let (nonce, ciphertext) = match crypto::encrypt(&dek, payload_json.as_bytes()) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to encrypt TLS key with DEK: {}", e);
+                    return;
+                }
+            };
+            
+            let payload = serde_json::json!({
+                "sealed_dek": sealed_dek,
+                "nonce": STANDARD.encode(nonce),
+                "ciphertext": STANDARD.encode(ciphertext)
+            });
+            let payload_b64 = STANDARD.encode(payload.to_string());
+            
+            let client = reqwest::Client::new();
+            if let Ok(token_resp) = client
+                .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
+                .header("Metadata-Flavor", "Google")
+                .send().await {
+                if let Ok(json) = token_resp.json::<serde_json::Value>().await {
+                    if let Some(access_token) = json["access_token"].as_str() {
+                        let url = format!("https://secretmanager.googleapis.com/v1/{}:addVersion", secret_name);
+                        let _ = client.post(&url)
+                            .bearer_auth(access_token)
+                            .json(&serde_json::json!({ "payload": { "data": payload_b64 } }))
+                            .send().await;
+                        info!("Saved locally-encrypted TPM-sealed TLS cache back to Vault");
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -332,50 +542,28 @@ async fn generate_attestation(client_id: &str, userinfo: &PayPalUserInfo) -> Str
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let hash_b64 = STANDARD.encode(hash_bytes);
 
-    // 2. Request a hardware-rooted attestation token from the Local Attestation Service (LAS)
-    // In Confidential Space, the LAS runs on localhost:8081.
-    // We include the user data hash as a 'nonce' to bind it to the signed hardware identity.
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap_or_default();
-
-    let attestation_resp = client
-        .post("http://localhost:8081/v1/token")
-        .json(&serde_json::json!({
-            "nonce": hash_b64,
-        }))
-        .send()
-        .await;
-
-    match attestation_resp {
-        Ok(resp) if resp.status().is_success() => {
-            match resp.json::<serde_json::Value>().await {
-                Ok(json) => {
-                    // Return the signed OIDC token that includes:
-                    // - Hardware measurements (AMD SEV-SNP)
-                    // - Workload measurements (Docker hash)
-                    // - Our PayPal user info binding (in the 'nonce' claim)
-                    json["token"]
-                        .as_str()
-                        .unwrap_or("Error: No token in LAS response")
-                        .to_string()
-                }
-                Err(_) => "Error: Failed to parse LAS JSON".to_string(),
-            }
-        }
-        _ => {
-            // Fallback for local development or if LAS is not reachable
-            info!("Local Attestation Service not available, providing simulated report.");
+    // 2. Obtain a hardware-rooted attestation token directly from the vTPM for the entire boot chain
+    match tpm::quote("0,2,4,7,8,9,15", &hex::encode(hash_bytes)).await {
+        Ok((msg_b64, sig_b64)) => {
             serde_json::json!({
-                "SIMULATED_REPORT": true,
-                "note": "Hardware attestation is only available when running in a TEE (Confidential Space)",
+                "tpm_quote_msg": msg_b64,
+                "tpm_quote_sig": sig_b64,
+                "note": "Full Hardware-Rooted Measured Boot Quote (0,2,4,7,8,9,15)",
                 "bound_user_data": data,
                 "binding_hash": hash_b64,
-                "hw_platform": "AMD SEV-SNP (Simulated)",
+                "hw_platform": "vTPM Hardware Identity"
+            }).to_string()
+        }
+        Err(e) => {
+            error!("Failed to generate vTPM quote: {}", e);
+            serde_json::json!({
+                "SIMULATED_REPORT": true,
+                "note": "Hardware attestation failed",
+                "bound_user_data": data,
+                "binding_hash": hash_b64,
+                "error": e.to_string(),
                 "timestamp": chrono::Utc::now().to_rfc3339(),
-            })
-            .to_string()
+            }).to_string()
         }
     }
 }

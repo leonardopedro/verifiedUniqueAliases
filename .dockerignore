@@ -2,8 +2,6 @@ target/
 .git/
 .gitignore
 *.md
-deploy-*.sh
-build-*.sh
 test-repro/
 img/
 docker-output/
@@ -15,7 +13,6 @@ idx/
 .nix*
 shell.nix
 initramfs.nix
-dracut-*/
 initrd-root*/
 Vagrantfile
 verify_*

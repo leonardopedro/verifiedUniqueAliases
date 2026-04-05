@@ -1,81 +1,72 @@
-This is a specification of this project, to be implemented in Google Cloud: I want to build a simple website using Rust for the backend, which has a real "Login with Paypal" button. After Logging in Paypal, Paypal redirects the user to a Google Cloud Shielded VM which is always on. This confidential VM will be always on (as much as possible), it uses Rust, receives the Paypal's code, uses it to access the User's info available in the Paypal's userinfo API and it returns to the user a webpage with this User's info (and an attestation from the vTPM that the VM image running is the one in a public registry) signed with a public key whose private key is a secret environment variable. 
+# GCP Confidential Auth VM — Reproducible & Attested
 
-# GCP Confidential VM with PayPal OAuth
-
-## Architecture Overview
-
-```text
-┌─────────────┐
-│   User      │
-└─────┬───────┘
-      │ HTTPS
-      ▼
-┌──────────────────────────────────────────┐
-│   GCP Confidential Space VM (N2D)        │
-│   (AMD SEV-SNP Attestation)              │
-│                                          │
-│  ┌────────────────────────────────────┐ │
-│  │  Docker Container (distroless)     │ │
-│  │  ✅ Rust Binary                    │ │
-│  │  ✅ Hardware Attestation           │ │
-│  └────────────────────────────────────┘ │
-│           ↓ Everything runs from here   │
-│                                         │
-│  ┌────────────────────────────────────┐ │
-│  │  RAM (tmpfs)                       │ │
-│  │  - PAYPAL_SECRET (GCP Secret Mgr)  │ │
-│  │  - Active TLS certificate          │ │
-│  │  - ACME account credentials        │ │
-│  └────────────────────────────────────┘ │
-└──────────────────────────────────────────┘
-      │
-      ▼
-┌──────────────────┐
-│ PayPal OAuth API │
-└──────────────────┘
-```
-
-### Key Security Features
-- **Confidential Computing**: Google Confidential Space VM with **AMD SEV-SNP** hardware isolation and attestation.
-- **Hardware-Rooted Secrets**: Fetches `PAYPAL_SECRET` from **GCP Secret Manager** using the VM's hardware-verified Service Account identity (WIF).
-- **RAM-Only TLS**: Uses **Google Public CA (ACME + EAB)** for certificates. Private keys are never written to persistent disk; they live entirely in RAM.
-- **Verified Build Pipeline**: The Docker builder leverages `debian:12-slim` to compile the statically compatible binary, ensuring the `glibc 2.36` matches the `distroless/cc-debian12` runner image perfectly to prevent legacy `GLIBC_2.38 not found` crashes.
+Hardware-attested PayPal OAuth service on **GCP Confidential Space** (AMD SEV-SNP).
+Built for 100% bit-by-bit reproducibility and maximum security.
 
 ---
 
-## 🚀 Deployment Guide (GCP)
+## 🚀 Current Status (v28+)
 
-### 1. Secret Management (Vault)
-Store your configurable secrets securely in **GCP Secret Manager**.
-Create a JSON payload encompassing fields like `paypal_client_secret` and your `eab_hmac_key`. Grant the **"Secret Manager Secret Accessor"** role to the Service Account.
+| Component | Status |
+|---|---|
+| Bitwise Reproducibility (`disk.raw`, `disk.tar.gz`, `qcow2`) | ✅ Achieved |
+| Systemd-Free Initramfs (no switch-root freeze) | ✅ Achieved |
+| Incremental Docker Build Cache | ✅ Achieved |
+| GCP Secure Boot (signed Shim/GRUB) | ✅ Configured |
+| GCP UEFI Boot from custom image | ✅ Achieved |
 
-### 2. Required GCP Permissions
-Ensure the underlying Service Account has the following IAM roles:
-- `roles/secretmanager.secretAccessor`
-- `roles/publicca.externalAccountKeyCreator`
-- `roles/logging.logWriter`
-- `roles/confidentialcomputing.workloadUser`
+### Reproducibility Strategy
+The full **extract → normalize → rebuild** pipeline ensures bitwise identity:
+
+1. **ESP Build**: Create FAT32 image with `mkfs.vfat --invariant` (removes all time/random metadata)
+2. **Extraction**: Copy all EFI files out with normalized `SOURCE_DATE_EPOCH` timestamps
+3. **Sorted Reinsertion**: Re-insert files into a fresh `--invariant` FAT image in deterministic order
+4. **GPT Assembly**: `sfdisk` with fixed Disk/Partition UUIDs (`00000000-...`)
+5. **Final Normalization**: `add-det` on the assembled raw, qcow2, and tar.gz
+
 
 ---
 
-## 🛠️ Build & Re-Deploy
-
-### 1. Build the Docker Image
-Due to compatibility, compile the Rust application within Docker using `debian:12-slim` to match the `distroless` glibc version:
+## 🏗️ Build & Reproduce
 
 ```bash
-export PROJECT_ID=my-project
+# 1. Build builder image (Rust deps cached — fast incremental rebuilds)
+docker build -t paypal-builder-v28 .
 
-# Build and Push
-docker build -f Dockerfile.confidential-space -t eu.gcr.io/$PROJECT_ID/paypal-auth-vm:latest .
-docker push eu.gcr.io/$PROJECT_ID/paypal-auth-vm:latest
+# 2. Extract artifacts
+docker create --name tmp paypal-builder-v28
+docker cp tmp:/img/. ./output/
+docker rm tmp
+
+# 3. Synthesize the reproducible disk stack
+./build-gcp-gpt-image.sh
+
+# 4. Verify reproducibility (run twice, compare hashes)
+./build-gcp-gpt-image.sh && sha256sum disk.raw disk.tar.gz paypal-auth-vm-gcp.qcow2
 ```
 
-### 2. Deploy Confidential Space VM
-Once pushed up to GCR, deploy directly to a fresh Confidential Space instance in `europe-west4`:
+## 🚢 Deployment
 
 ```bash
-PROJECT_ID=my-project PROJECT_NUMBER=123456 ./deploy-confidential-space.sh
+gsutil cp disk.tar.gz gs://project-ae136ba1-3cc9-42cf-a48-images/
+sh deploy_final.sh
 ```
 
-*(Note: The deployment script provisions an `n2d-highcpu-2` instance running Google's secure Confidential Space image, configuring the TEE image and metadata on top of a fresh boot.)*
+## 📂 Repository Structure
+
+| File | Purpose |
+|---|---|
+| `Dockerfile` | Multi-stage builder with dependency caching |
+| `build-gcp-gpt-image.sh` | Bitwise-reproducible GPT disk synthesis |
+| `build-initramfs-tools.sh` | initramfs-tools based buildup (Ubuntu native) |
+| `deploy_final.sh` | GCP image registration + VM launch |
+| `hooks/` / `scripts/` | initramfs-tools native hooks/pre-mount logic |
+| `legacy/` | Deprecated OCI/Nix build scripts |
+
+## 🔐 Security Architecture
+
+- **Kernel**: `linux-image-gcp` (GVNIC + SEV-SNP support)
+- **Secure Boot**: Pre-signed Canonical Shim (`shimx64.efi`) + GRUB binaries
+- **Attestation**: PCR 15 measures the Rust binary at boot
+- **Secrets**: Fetched from GCP Metadata Server via `tee-env-*` attributes (never on disk)
+- **Confidential Compute**: AMD SEV-SNP on `n2d-highcpu-2`

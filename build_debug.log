@@ -1,0 +1,577 @@
+Emulate Docker CLI using podman. Create /etc/containers/nodocker to quiet msg.
+[1/2] STEP 1/17: FROM docker.io/library/ubuntu:25.10 AS builder
+[1/2] STEP 2/17: ENV DEBIAN_FRONTEND=noninteractive
+--> Using cache 6589c9f8ce64a5c38d20f0b1f72c7b6f67086fc35e1b9c7d839c6a4638a047b3
+--> 6589c9f8ce64
+[1/2] STEP 3/17: RUN apt-get update && apt-get install -y --no-install-recommends     dracut-core     dracut-network     linux-image-gcp     shim-signed     grub-efi-amd64-signed     tpm2-tools     curl     gcc     g++     make     python3     python3-pip     python3-venv     libarchive-tools     binutils     ca-certificates     zlib1g-dev     perl     iproute2     isc-dhcp-client     net-tools     systemd     && apt-get clean && rm -rf /var/lib/apt/lists/*
+--> Using cache 752fc150ea1dbbfb637c848aa1fcfa0a58ee885e028d1441f2fb7e2569f8f699
+--> 752fc150ea1d
+[1/2] STEP 4/17: RUN python3 -m venv /opt/diffoscope-venv     && /opt/diffoscope-venv/bin/pip install --upgrade pip     && /opt/diffoscope-venv/bin/pip install diffoscope
+--> Using cache 9899b2da911007cc3609d29462ad814c5e1c9fc3907b0e69e7e5d96a6b777bd3
+--> 9899b2da9110
+[1/2] STEP 5/17: ENV PATH="/opt/diffoscope-venv/bin:$PATH"
+--> Using cache afe3abfd2416a427baf9653bd7ed6b8f5749df968d897dea8305aab6d579120c
+--> afe3abfd2416
+[1/2] STEP 6/17: ARG RUST_VERSION=1.91.1
+--> Using cache e65b5e1b21d7309b64ce3d5369f42673752a672106a3c0dda954a2949a07ab87
+--> e65b5e1b21d7
+[1/2] STEP 7/17: ENV RUSTUP_HOME=/usr/local/rustup     CARGO_HOME=/usr/local/cargo     PATH=/usr/local/cargo/bin:$PATH
+--> Using cache 00ae435790988fb5a8a4de60a46b737393559d894c7a3c6b6807e54de2658f44
+--> 00ae43579098
+[1/2] STEP 8/17: RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs     | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal --no-modify-path     && . /usr/local/cargo/env     && export RUST_MIN_STACK=16777216     && cargo install -j 1 add-determinism     && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
+--> Using cache 10dd6d676caca2bce98acf15174aca2c38148783ac503f80afd9d0b3149712db
+--> 10dd6d676cac
+[1/2] STEP 9/17: WORKDIR /app
+--> Using cache 9e39cd51f42d2c532c95e793bf10e7d2fe6b4ae6daace310f87b4ee803f5150f
+--> 9e39cd51f42d
+[1/2] STEP 10/17: COPY . .
+--> acd4d948fd19
+[1/2] STEP 11/17: COPY dracut-module/99paypal-auth-vm /usr/lib/dracut/modules.d/99paypal-auth-vm
+--> 1e2743338456
+[1/2] STEP 12/17: RUN mkdir -p /etc/dracut.conf.d
+--> fe3d2bfa2931
+[1/2] STEP 13/17: COPY dracut.conf /etc/dracut.conf.d/99-paypal-auth.conf
+--> c6187a640147
+[1/2] STEP 14/17: RUN chmod +x ./build-initramfs-dracut.sh
+--> ecc9b6d8f36a
+[1/2] STEP 15/17: RUN sh -c ". /usr/local/cargo/env && ./build-initramfs-dracut.sh"
+🏗️  Building reproducible initramfs with Dracut...
+📦 Building Rust application for x86_64-unknown-linux-gnu...
+📋 Preparing local dracut module...
+🔧 Normalizing module with add-det and timestamps...
+Scanned 0 directories and 1 files,
+    processed 0 inodes,
+    0 modified (0 replaced + 0 rewritten),
+    0 unsupported format, 0 errors
+Scanned 0 directories and 1 files,
+    processed 0 inodes,
+    0 modified (0 replaced + 0 rewritten),
+    0 unsupported format, 0 errors
+Scanned 0 directories and 1 files,
+    processed 0 inodes,
+    0 modified (0 replaced + 0 rewritten),
+    0 unsupported format, 0 errors
+🔍 Debugging: Checking if module exists...
+✅ Module directory exists
+total 12
+drwxr-xr-x 1 root root   94 Apr  4 22:54 .
+drwxr-xr-x 1 root root   32 Apr  4 22:54 ..
+-rwxr-xr-x 1 root root 3545 Jan  1  2022 module-setup.sh
+-rwxr-xr-x 1 root root  971 Jan  1  2022 parse-paypal-auth.sh
+-rwxr-xr-x 1 root root  549 Jan  1  2022 start-app.sh
+📋 Available dracut modules:
+09console-setup
+10bash
+10dash
+10systemd
+10systemd-network-management
+10warpclock
+11fips
+11fips-crypto-policies
+11systemd-ac-power
+11systemd-ask-password
+11systemd-battery-check
+11systemd-bsod
+11systemd-coredump
+11systemd-creds
+11systemd-cryptsetup
+11systemd-hostnamed
+11systemd-initrd
+11systemd-integritysetup
+11systemd-journald
+11systemd-ldconfig
+🧪 Testing if dracut can see our module...
+paypal-auth-vm
+✅ Dracut sees the module!
+🔍 Checking module with dracut...
+dracut[I]: Detected docker container.
+dracut[I]: Executing: /usr/bin/dracut --list-modules
+console-setup
+bash
+dash
+systemd
+systemd-network-management
+warpclock
+fips
+fips-crypto-policies
+systemd-ac-power
+systemd-ask-password
+systemd-battery-check
+systemd-bsod
+systemd-coredump
+systemd-creds
+systemd-cryptsetup
+systemd-hostnamed
+systemd-initrd
+systemd-integritysetup
+systemd-journald
+systemd-ldconfig
+systemd-modules-load
+systemd-networkd
+systemd-pcrphase
+systemd-portabled
+systemd-pstore
+systemd-repart
+systemd-resolved
+systemd-sysctl
+🔨 Building initramfs with dracut...
+dracut[I]: Detected docker container.
+dracut[I]: Executing: /usr/bin/dracut --force --reproducible --gzip --omit " plymouth syslog firmware " --no-hostonly --no-hostonly-cmdline --nofscks --no-early-microcode --add paypal-auth-vm --kver 6.17.0-1010-gcp --fwdir /usr/lib/firmware --tmpdir /root/dracut-build initramfs-paypal-auth.img
+dracut[I]: *** Including module: network-legacy ***
+dracut[I]: *** Including module: network ***
+dracut[I]: *** Including module: net-lib ***
+dracut[I]: *** Including module: fs-lib ***
+dracut[I]: *** Including module: kernel-network-modules ***
+dracut[I]: *** Including module: udev-rules ***
+dracut[I]: *** Including module: initqueue ***
+dracut[I]: *** Including module: base ***
+dracut[I]: *** Including module: shutdown ***
+dracut[I]: *** Including module: paypal-auth-vm ***
+Building Rust application...
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded autocfg v1.5.0
+  Downloaded foreign-types-shared v0.1.1
+  Downloaded futures-task v0.3.32
+  Downloaded foreign-types v0.3.2
+  Downloaded rand_chacha v0.3.1
+  Downloaded potential_utf v0.1.5
+  Downloaded pem v3.0.6
+  Downloaded rcgen v0.14.7
+  Downloaded quote v1.0.45
+  Downloaded proc-macro2 v1.0.106
+  Downloaded urlencoding v2.1.3
+  Downloaded yoke-derive v0.8.2
+  Downloaded version_check v0.9.5
+  Downloaded universal-hash v0.5.1
+  Downloaded try-lock v0.2.5
+  Downloaded want v0.3.1
+  Downloaded tinystr v0.8.3
+  Downloaded zerofrom v0.1.7
+  Downloaded zerofrom-derive v0.1.7
+  Downloaded utf8_iter v1.0.4
+  Downloaded zerovec-derive v0.11.3
+  Downloaded tracing-log v0.2.0
+  Downloaded subtle v2.6.1
+  Downloaded thread_local v1.1.9
+  Downloaded writeable v0.6.2
+  Downloaded hex v0.4.3
+  Downloaded tokio-native-tls v0.3.1
+  Downloaded zeroize v1.8.2
+  Downloaded yoke v0.8.2
+  Downloaded rustls-platform-verifier v0.6.2
+  Downloaded unicode-ident v1.0.24
+  Downloaded yasna v0.5.2
+  Downloaded serde v1.0.228
+  Downloaded zerotrie v0.2.4
+  Downloaded x509-parser v0.18.1
+  Downloaded zerovec v0.11.6
+  Downloaded tokio-util v0.7.18
+  Downloaded fnv v1.0.7
+  Downloaded tower-http v0.6.7
+  Downloaded tracing-subscriber v0.3.22
+  Downloaded openssl-macros v0.1.1
+  Downloaded time v0.3.47
+  Downloaded vcpkg v0.2.15
+  Downloaded oid-registry v0.8.1
+  Downloaded syn v2.0.117
+  Downloaded zerocopy v0.8.48
+  Downloaded parking_lot_core v0.9.12
+  Downloaded rustls v0.23.27
+  Downloaded num-traits v0.2.19
+  Downloaded log v0.4.29
+  Downloaded instant-acme v0.8.4
+  Downloaded icu_provider v2.2.0
+  Downloaded futures-channel v0.3.32
+  Downloaded parking_lot v0.12.5
+  Downloaded once_cell v1.21.4
+  Downloaded matchit v0.8.4
+  Downloaded icu_properties v2.2.0
+  Downloaded litemap v0.8.2
+  Downloaded ipnet v2.12.0
+  Downloaded regex-automata v0.4.14
+  Downloaded openssl-sys v0.9.112
+  Downloaded minimal-lexical v0.2.1
+  Downloaded memchr v2.8.0
+  Downloaded hyper-util v0.1.18
+  Downloaded num-bigint v0.4.6
+  Downloaded axum v0.8.7
+  Downloaded nom v7.1.3
+  Downloaded idna v1.1.0
+  Downloaded iri-string v0.7.12
+  Downloaded icu_properties_data v2.2.0
+  Downloaded h2 v0.4.13
+  Downloaded futures-util v0.3.32
+  Downloaded tokio v1.48.0
+  Downloaded chrono v0.4.42
+  Downloaded aho-corasick v1.1.4
+  Downloaded aes-gcm v0.10.3
+  Downloaded openssl v0.10.75
+  Downloaded hyper v1.8.1
+  Downloaded hashbrown v0.16.1
+  Downloaded aes v0.8.4
+  Downloaded mio v1.2.0
+  Downloaded indexmap v2.13.0
+  Downloaded http v1.4.0
+  Downloaded asn1-rs v0.7.1
+  Downloaded icu_collections v2.2.0
+  Downloaded bitflags v2.11.0
+  Downloaded icu_normalizer_data v2.2.0
+  Downloaded icu_locale_core v2.2.0
+  Downloaded icu_normalizer v2.2.0
+  Downloaded der-parser v10.0.0
+  Downloaded bytes v1.11.1
+  Downloaded getrandom v0.2.17
+  Downloaded find-msvc-tools v0.1.9
+  Downloaded regex-syntax v0.8.10
+  Downloaded nu-ansi-term v0.50.3
+  Downloaded iana-time-zone v0.1.65
+  Downloaded hyper-rustls v0.27.7
+  Downloaded httparse v1.10.1
+  Downloaded deranged v0.5.8
+  Downloaded ctr v0.9.2
+  Downloaded num-integer v0.1.46
+  Downloaded native-tls v0.2.18
+  Downloaded matchers v0.2.0
+  Downloaded lock_api v0.4.14
+  Downloaded lazy_static v1.5.0
+  Downloaded http-body-util v0.1.3
+  Downloaded libc v0.2.184
+  Downloaded displaydoc v0.2.5
+  Downloaded digest v0.10.7
+  Downloaded cipher v0.4.4
+  Downloaded atomic-waker v1.1.2
+  Downloaded html-escape v0.2.13
+  Downloaded data-encoding v2.10.0
+  Downloaded cpufeatures v0.2.17
+  Downloaded cc v1.2.58
+  Downloaded async-trait v0.1.89
+  Downloaded ring v0.17.14
+  Downloaded num-conv v0.2.1
+  Downloaded serde_json v1.0.145
+  Downloaded reqwest v0.12.24
+  Downloaded itoa v1.0.18
+  Downloaded inout v0.1.4
+  Downloaded http-body v1.0.1
+  Downloaded tower v0.5.2
+  Downloaded aead v0.5.2
+  Downloaded rand v0.8.5
+  Downloaded openssl-probe v0.2.1
+  Downloaded url v2.5.8
+  Downloaded typenum v1.19.0
+  Downloaded rustls-webpki v0.103.10
+  Downloaded idna_adapter v1.2.1
+  Downloaded futures-sink v0.3.32
+  Downloaded opaque-debug v0.3.1
+  Downloaded socket2 v0.5.8
+  Downloaded serde_derive v1.0.228
+  Downloaded ryu v1.0.23
+  Downloaded asn1-rs-derive v0.6.0
+  Downloaded socket2 v0.6.3
+  Downloaded sharded-slab v0.1.7
+  Downloaded serde_core v1.0.228
+  Downloaded httpdate v1.0.3
+  Downloaded form_urlencoded v1.2.2
+  Downloaded tracing-core v0.1.36
+  Downloaded tracing v0.1.43
+  Downloaded signal-hook-registry v1.4.8
+  Downloaded rustls-pki-types v1.14.0
+  Downloaded generic-array v0.14.7
+  Downloaded sha2 v0.10.9
+  Downloaded polyval v0.6.2
+  Downloaded untrusted v0.9.0
+  Downloaded slab v0.4.12
+  Downloaded shlex v1.3.0
+  Downloaded serde_path_to_error v0.1.20
+  Downloaded pin-project-lite v0.2.17
+  Downloaded thiserror-impl v2.0.18
+  Downloaded thiserror v2.0.18
+  Downloaded crypto-common v0.1.7
+  Downloaded serde_urlencoded v0.7.1
+  Downloaded rusticata-macros v4.1.0
+  Downloaded cfg-if v1.0.4
+  Downloaded tracing-attributes v0.1.31
+  Downloaded time-macros v0.2.27
+  Downloaded percent-encoding v2.3.2
+  Downloaded utf8-width v0.1.8
+  Downloaded pin-utils v0.1.0
+  Downloaded hyper-tls v0.6.0
+  Downloaded mime v0.3.17
+  Downloaded smallvec v1.15.1
+  Downloaded rustls-native-certs v0.8.3
+  Downloaded errno v0.3.14
+  Downloaded tokio-openssl v0.6.5
+  Downloaded tower-service v0.3.3
+  Downloaded tokio-rustls v0.26.2
+  Downloaded pkg-config v0.3.32
+  Downloaded tokio-macros v2.6.1
+  Downloaded rand_core v0.6.4
+  Downloaded ghash v0.5.1
+  Downloaded sync_wrapper v1.0.2
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded scopeguard v1.2.0
+  Downloaded block-buffer v0.10.4
+  Downloaded tower-layer v0.3.3
+  Downloaded time-core v0.1.8
+  Downloaded synstructure v0.13.2
+  Downloaded futures-core v0.3.32
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded base64 v0.22.1
+  Downloaded axum-core v0.5.6
+  Downloaded powerfmt v0.2.0
+  Downloaded asn1-rs-impl v0.2.0
+  Downloaded equivalent v1.0.2
+  Downloaded openssl-src v300.5.5+3.5.5
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling syn v2.0.117
+   Compiling libc v0.2.184
+   Compiling cfg-if v1.0.4
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v1.3.0
+   Compiling cc v1.2.58
+   Compiling getrandom v0.2.17
+   Compiling smallvec v1.15.1
+   Compiling once_cell v1.21.4
+   Compiling pin-project-lite v0.2.17
+   Compiling bytes v1.11.1
+   Compiling parking_lot_core v0.9.12
+   Compiling synstructure v0.13.2
+   Compiling scopeguard v1.2.0
+   Compiling log v0.4.29
+   Compiling lock_api v0.4.14
+   Compiling errno v0.3.14
+   Compiling version_check v0.9.5
+   Compiling itoa v1.0.18
+   Compiling typenum v1.19.0
+   Compiling futures-core v0.3.32
+   Compiling generic-array v0.14.7
+   Compiling signal-hook-registry v1.4.8
+   Compiling parking_lot v0.12.5
+   Compiling zerofrom-derive v0.1.7
+   Compiling mio v1.2.0
+   Compiling socket2 v0.6.3
+   Compiling tokio-macros v2.6.1
+   Compiling tokio v1.48.0
+   Compiling zerofrom v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling tracing-core v0.1.36
+   Compiling stable_deref_trait v1.2.1
+   Compiling yoke v0.8.2
+   Compiling rand_core v0.6.4
+   Compiling tracing-attributes v0.1.31
+   Compiling tracing v0.1.43
+   Compiling http v1.4.0
+   Compiling openssl-src v300.5.5+3.5.5
+   Compiling zerovec-derive v0.11.3
+   Compiling pkg-config v0.3.32
+   Compiling vcpkg v0.2.15
+   Compiling openssl-sys v0.9.112
+   Compiling zerovec v0.11.6
+   Compiling displaydoc v0.2.5
+   Compiling slab v0.4.12
+   Compiling http-body v1.0.1
+   Compiling crypto-common v0.1.7
+   Compiling ring v0.17.14
+   Compiling zeroize v1.8.2
+   Compiling rustls-pki-types v1.14.0
+   Compiling tower-service v0.3.3
+   Compiling futures-sink v0.3.32
+   Compiling hashbrown v0.16.1
+   Compiling futures-task v0.3.32
+   Compiling equivalent v1.0.2
+   Compiling httparse v1.10.1
+   Compiling serde_core v1.0.228
+   Compiling percent-encoding v2.3.2
+   Compiling subtle v2.6.1
+   Compiling indexmap v2.13.0
+   Compiling futures-util v0.3.32
+   Compiling tokio-util v0.7.18
+   Compiling tinystr v0.8.3
+   Compiling litemap v0.8.2
+   Compiling writeable v0.6.2
+   Compiling atomic-waker v1.1.2
+   Compiling fnv v1.0.7
+   Compiling base64 v0.22.1
+   Compiling untrusted v0.9.0
+   Compiling openssl-probe v0.2.1
+   Compiling try-lock v0.2.5
+   Compiling want v0.3.1
+   Compiling h2 v0.4.13
+   Compiling icu_locale_core v2.2.0
+   Compiling zerotrie v0.2.4
+   Compiling potential_utf v0.1.5
+   Compiling futures-channel v0.3.32
+   Compiling pin-utils v0.1.0
+   Compiling icu_normalizer_data v2.2.0
+   Compiling openssl v0.10.75
+   Compiling httpdate v1.0.3
+   Compiling bitflags v2.11.0
+   Compiling icu_properties_data v2.2.0
+   Compiling foreign-types-shared v0.1.1
+   Compiling utf8_iter v1.0.4
+   Compiling icu_collections v2.2.0
+   Compiling foreign-types v0.3.2
+   Compiling hyper v1.8.1
+   Compiling icu_provider v2.2.0
+   Compiling openssl-macros v0.1.1
+   Compiling serde v1.0.228
+   Compiling rustls v0.23.27
+   Compiling ipnet v2.12.0
+   Compiling hyper-util v0.1.18
+   Compiling rustls-webpki v0.103.10
+   Compiling http-body-util v0.1.3
+   Compiling sync_wrapper v1.0.2
+   Compiling serde_derive v1.0.228
+   Compiling serde_json v1.0.145
+   Compiling tower-layer v0.3.3
+   Compiling powerfmt v0.2.0
+   Compiling zerocopy v0.8.48
+   Compiling ryu v1.0.23
+   Compiling native-tls v0.2.18
+   Compiling cpufeatures v0.2.17
+   Compiling deranged v0.5.8
+   Compiling icu_properties v2.2.0
+   Compiling icu_normalizer v2.2.0
+   Compiling form_urlencoded v1.2.2
+   Compiling inout v0.1.4
+   Compiling autocfg v1.5.0
+   Compiling num-conv v0.2.1
+   Compiling time-core v0.1.8
+   Compiling memchr v2.8.0
+   Compiling time v0.3.47
+   Compiling num-traits v0.2.19
+   Compiling cipher v0.4.4
+   Compiling idna_adapter v1.2.1
+   Compiling tower v0.5.2
+   Compiling rustls-native-certs v0.8.3
+   Compiling universal-hash v0.5.1
+   Compiling opaque-debug v0.3.1
+   Compiling regex-syntax v0.8.10
+   Compiling thiserror v2.0.18
+   Compiling regex-automata v0.4.14
+   Compiling polyval v0.6.2
+   Compiling rustls-platform-verifier v0.6.2
+   Compiling tokio-native-tls v0.3.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling idna v1.1.0
+   Compiling yasna v0.5.2
+   Compiling serde_urlencoded v0.7.1
+   Compiling tokio-rustls v0.26.2
+   Compiling pem v3.0.6
+   Compiling block-buffer v0.10.4
+   Compiling thiserror-impl v2.0.18
+   Compiling iri-string v0.7.12
+   Compiling lazy_static v1.5.0
+   Compiling mime v0.3.17
+   Compiling tokio-openssl v0.6.5
+   Compiling axum-core v0.5.6
+   Compiling sharded-slab v0.1.7
+   Compiling tower-http v0.6.7
+   Compiling digest v0.10.7
+   Compiling rcgen v0.14.7
+   Compiling hyper-rustls v0.27.7
+   Compiling url v2.5.8
+   Compiling rand_chacha v0.3.1
+   Compiling hyper-tls v0.6.0
+   Compiling ghash v0.5.1
+   Compiling matchers v0.2.0
+   Compiling aes v0.8.4
+   Compiling ctr v0.9.2
+   Compiling serde_path_to_error v0.1.20
+   Compiling aead v0.5.2
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.9
+   Compiling async-trait v0.1.89
+   Compiling iana-time-zone v0.1.65
+   Compiling nu-ansi-term v0.50.3
+   Compiling utf8-width v0.1.8
+   Compiling matchit v0.8.4
+   Compiling axum v0.8.7
+   Compiling html-escape v0.2.13
+   Compiling tracing-subscriber v0.3.22
+   Compiling chrono v0.4.42
+   Compiling instant-acme v0.8.4
+   Compiling aes-gcm v0.10.3
+   Compiling reqwest v0.12.24
+   Compiling rand v0.8.5
+   Compiling sha2 v0.10.9
+   Compiling socket2 v0.5.8
+   Compiling urlencoding v2.1.3
+   Compiling hex v0.4.3
+   Compiling paypal-auth-vm v0.1.0 (/app)
+warning: field `used_paypal_ids` is never read
+   --> src/main.rs:198:5
+    |
+194 | struct AppState {
+    |        -------- field in this struct
+...
+198 |     used_paypal_ids: Arc<RwLock<HashSet<String>>>,
+    |     ^^^^^^^^^^^^^^^
+    |
+    = note: `AppState` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `paypal-auth-vm` (bin "paypal-auth-vm") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 7m 01s
+Scanned 0 directories and 1 files,
+    processed 0 inodes,
+    0 modified (0 replaced + 0 rewritten),
+    0 unsupported format, 0 errors
+dracut[I]: *** Including modules done ***
+dracut[I]: *** Resolving executable dependencies ***
+dracut[I]: *** Resolving executable dependencies done ***
+dracut[I]: *** Store current command line parameters ***
+dracut[I]: *** Stripping files ***
+dracut[I]: *** Stripping files done ***
+dracut[I]: *** Creating image file '/app/initramfs-paypal-auth.img' ***
+dracut[I]: *** Hardlinking files ***
+dracut[I]: *** Hardlinking files done ***
+dracut[I]: *** Creating initramfs image file '/app/initramfs-paypal-auth.img' done ***
+🔧 Normalizing initramfs...
+   Decompressing...
+   Normalizing uncompressed archive with add-det...
+Scanned 0 directories and 1 files,
+    processed 0 inodes,
+    0 modified (0 replaced + 0 rewritten),
+    0 unsupported format, 0 errors
+   Recompressing with gzip -n...
+   Normalizing compressed archive stream with add-det...
+Scanned 0 directories and 1 files,
+    processed 0 inodes,
+    0 modified (0 replaced + 0 rewritten),
+    0 unsupported format, 0 errors
+✅ Normalization complete
+
+✅ Reproducible initramfs build complete!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 SHA256: 698e1f4decc980a81fef79e5c925a84e66c4e5760abae40a013b88198b2f664b
+📦 Size: 24M
+🔧 Built with dracut for reproducibility
+🎯 Target: x86_64-unknown-linux-gnu
+
+Files created:
+  • initramfs-paypal-auth.img - Initramfs image
+
+To verify reproducibility:
+  1. Build on another machine with same inputs
+  2. Compare SHA256 hashes - they should match!
+
+📝 Build manifest created: build-manifest.json
+
+Next steps:
+1. Upload initramfs-paypal-auth.img to OCI Object Storage
+2. Upload build-manifest.json for verification
+3. Anyone can rebuild with same inputs and verify hash matches
+--> d2de3140fb01
+[1/2] STEP 16/17: RUN mkdir /output &&     mv initramfs-paypal-auth.img /output/ &&     mv build-manifest.json /output/ &&     mv initramfs-paypal-auth.img.sha256 /output/ &&     cp /boot/vmlinuz-*gcp /output/vmlinuz &&     cp /usr/lib/shim/shimx64.efi.signed /output/shimx64.efi &&     cp /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed /output/grubx64.efi || echo "Bootloader not found"
+--> e07f3b63e6b2
+[1/2] STEP 17/17: WORKDIR /output
+--> 686502516649
+[2/2] STEP 1/2: FROM scratch AS export-stage
+[2/2] STEP 2/2: COPY --from=builder /output/ ./img/
+[2/2] COMMIT paypal-builder-v28
+--> a3aa2d0675ec
+Successfully tagged localhost/paypal-builder-v28:latest
+a3aa2d0675ec4be1a738027dd91e4e1f79631dd35f6d7ad10bf83695e75febf7

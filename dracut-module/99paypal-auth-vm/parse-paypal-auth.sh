@@ -3,38 +3,51 @@
 
 type getarg >/dev/null 2>&1 || . /lib/dracut-lib.sh
 
-# Fetch metadata from OCI
+# Fetch metadata from GCP
 fetch_metadata() {
-    local key=$1
-    curl -sf -H "Authorization: Bearer Oracle" \
-        "http://169.254.169.254/opc/v1/instance/metadata/$key"
+    key="$1"
+    curl -sf -H "Metadata-Flavor: Google" \
+        "http://metadata.google.internal/computeMetadata/v1/instance/attributes/${key}"
 }
 
-# Wait for network
-while ! curl -sf http://169.254.169.254/ >/dev/null 2>&1; do
-    echo "Waiting for metadata service..."
+# Ensure kernel modules for networking are loaded
+echo "Loading GCP Virtual NIC and Virtio drivers..."
+modprobe gve || true
+modprobe virtio_net || true
+udevadm settle
+
+# Wait for a real network interface to appear
+echo "Waiting for network interfaces to enumerate..."
+while ! ip link show | grep -v 'lo:' | grep -q 'state'; do
     sleep 1
 done
 
-# Export configuration
-# Here is what each variable is for:
-# PAYPAL_CLIENT_ID: The unique ID of the PayPal client. The app uses this ID to know exactly which client to fetch to get the PAYPAL_SECRET.
-# DOMAIN: The domain name (e.g., auth.example.com). The Rust app needs this to tell Let's Encrypt which domain it wants a certificate for.
-# SECRET_OCID: The unique ID of the secret in OCI Vault. The app uses this ID to know exactly which secret to fetch to get the PAYPAL_SECRET.
-# OCI_REGION: The cloud region (e.g., us-ashburn-1). The app needs this to connect to the correct OCI Vault endpoint.
-# Note: This one is actually fetched from a standard Oracle endpoint (opc/v2/instance/region), so you don't even need to provide it manually!
-# NOTIFICATION_TOPIC_ID: The ID for the OCI Notification system. This allows the app to send you an email alert if something goes wrong (like a failed login attempt).
-export PAYPAL_CLIENT_ID=$(fetch_metadata paypal_client_id)
-export DOMAIN=$(fetch_metadata domain)
-export SECRET_OCID=$(fetch_metadata secret_ocid)
-export OCI_REGION=$(curl -sf http://169.254.169.254/opc/v2/instance/region)
-export NOTIFICATION_TOPIC_ID=$(fetch_metadata notification_topic_id)
+# Ensure network interface is up (fallback if dracut network module failed to initialize it)
+echo "Bringing up network interfaces..."
+ip link
+for iface in $(ip link show | awk -F': ' '/^[0-9]+:/ {print $2}' | grep -v -e '^lo$'); do
+    echo "Initializing $iface..."
+    ip link set $iface up || true
+    dhclient $iface -timeout 10 || true
+done
+
+# Wait for network and metadata service
+while ! curl -sf -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/ >/dev/null 2>&1; do
+    echo "Waiting for GCP metadata service..."
+    sleep 1
+done
+
+# Export configuration (GCP-style via tee-env- attributes)
+SECRET_NAME=$(fetch_metadata "tee-env-SECRET_NAME")
+export SECRET_NAME
+TLS_CACHE_SECRET=$(fetch_metadata "tee-env-TLS_CACHE_SECRET")
+export TLS_CACHE_SECRET
+RUST_LOG=$(fetch_metadata "tee-env-RUST_LOG")
+export RUST_LOG
 
 # Persist for later stages
 {
-    echo "PAYPAL_CLIENT_ID=$PAYPAL_CLIENT_ID"
-    echo "DOMAIN=$DOMAIN"
-    echo "SECRET_OCID=$SECRET_OCID"
-    echo "OCI_REGION=$OCI_REGION"
-    echo "NOTIFICATION_TOPIC_ID=$NOTIFICATION_TOPIC_ID"
+    echo "SECRET_NAME=$SECRET_NAME"
+    echo "TLS_CACHE_SECRET=$TLS_CACHE_SECRET"
+    echo "RUST_LOG=${RUST_LOG:-info}"
 } > /run/paypal-auth.env
