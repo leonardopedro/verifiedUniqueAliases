@@ -9,32 +9,28 @@
   - Uses `mkfs.vfat --invariant` for deterministic ESP metadata.
   - Employs an **extract → normalize → rebuild** pipeline for the ESP image.
   - **Initramfs Reproducibility**: achieved via `SOURCE_DATE_EPOCH` + `zz-reproducible.sh` hook (removes `.random-seed`).
-  - Processed with `add-det` for final header normalization on all artifacts.
-- **Boot Isolation**: Migrated to `initramfs-tools` (native Ubuntu). Uses a custom `init-premount` script to bypass `systemd` and standard root-switching, keeping the enclave purely in RAM.
-- **Network Integrity**: Native GQI GVNIC support via `ipconfig` (klibc) in the initramfs environment.
+- **Native PID 1 Rust Integration**: The entire bootloader hands control directly to our Rust binary `/init` which synchronously mounts `/proc`, `/sys`, `/dev` via the `nix` crate. It bypasses `systemd` and any other fragile init scripts completely.
+- **Pure-Rust Early Boot Network**: Dropped all `klibc` dependencies. A custom Rust module broadcasts raw UDP DHCP tokens (bypassing the routing table using `libc::setsockopt` with `SO_BINDTODEVICE`), parses the binary lease, applies GCP `/32` gateway host-routes to establish standard GVE paths, and brings up the interface before the `tokio` runtime even starts.
+- **Native Kernel Logging**: Bypasses standard `eprint!`/`/dev/console` stdout and writes exact boot progress directly into the kernel ring buffer via `/dev/kmsg` for persistent GCP Serial Logs.
 - **Platform Integrity**: Validated for **Secure Boot** using pre-signed Canonical binaries.
-- **Build Efficiency**: Optimized Docker layers for incremental compilation and low-RAM compliance (`-j 1`).
+- **Attestation Framework Ready**: `initramfs-tools` hook integrates `tpm2-tools` into the RAM disk for dynamic fetching of GCP SecretManager encrypted payloads.
 
-## Build & Run Workflow
+## Hybrid Build Architecture
+To maintain exact EFI/Kernel Secure Boot signatures matching GCP infrastructure, disk synthesis cannot occur locally.
+1. **Local Compilation**: The Rust binary is compiled locally for `x86_64-unknown-linux-gnu` via standard Cargo.
+2. **Remote Synthesis**: The binary is `scp`'d to a GCP Confidential Build VM (`build-vm-paypal-n2d`), where `build-initramfs-tools.sh` and `build-gcp-gpt-image.sh` are executed. This ensures the correct `shimx64.efi` and `linux-image-gcp` packages from the target OS are utilized in the GPT image.
+3. **Deployment**: The resulting `disk.tar.gz` is retrieved locally and deployed via standard `gcloud` logic over the user's local credentials to ensure IAM permissions for GCS upload are valid.
 
-```bash
-# 1. Reproducible Artifact Build
-docker build -t paypal-builder-v28 .
-
-# 2. Disk Synthesis
-./build-gcp-gpt-image.sh
-
-# 3. GCP Deployment
-sh deploy_final.sh
-```
 
 ## Architecture Details
-- **Base OS**: Ubuntu 25.10 (Plucky Puffin)
+- **Base OS**: Ubuntu 25.10 (Plucky Puffin) components.
 - **Kernel**: `linux-image-gcp` (supporting GVNIC + SEV-SNP)
-- **Initramfs**: `initramfs-tools` (native Ubuntu, systemd omitted)
-- **Attestation**: Measures into PCR 15; secrets fetched via `tee-env-*` metadata.
+- **Initramfs Engine**: Standard `mkinitramfs` utilizing `copy_exec` directly into `DESTDIR/init`. We eliminated the entire post-processing unmkrd extraction block because the hook places the `paypal-auth-vm` binary natively. 
+- **Dependencies**: Uses `nix` and `libc` directly from Cargo to wrap Linux syscalls. Uses standard `iproute2` for network settings.
 
-## Security Guidelines
-- **Reproducibility is Mandatory**: Ensure all synthesis scripts maintain bitwise identity.
+## Security Guidelines for Future Developers
+- **Reproducibility is Mandatory**: Ensure any changes to the hook or build scripts maintain bitwise identity.
 - **Secrets Management**: No secrets on disk; RAM-only via GCP Metadata server.
-- **Attestation**: PCR 15 contains the hash of the immutable initramfs and binary.
+- **Next Steps**:
+  - Hook into `axum` routing for the precise OAuth callback URL endpoints.
+  - Test unsealing dynamic Secret Manager data securely utilizing the properly mounted `tpm2_unseal` binary during the early Tokio phases.

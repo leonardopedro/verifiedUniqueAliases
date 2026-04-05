@@ -4,6 +4,231 @@
 //! TLS: Google Public CA via ACME
 //! Runtime: GCP Confidential Space (AMD SEV-SNP)
 
+// ============================================================================
+// ENCLAVE INIT — PID 1 responsibilities: mounts, drivers, DHCP
+// Called before the Tokio runtime touches anything.
+// ============================================================================
+mod enclave_init {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::Ipv4Addr;
+
+    pub fn kmsg(msg: &str) {
+        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+            use std::io::Write;
+            let _ = writeln!(f, "<14>[INIT] {}", msg);
+        }
+        eprintln!("[INIT] {}", msg);
+    }
+
+    /// Mount essential kernel virtual filesystems.
+    pub fn mount_filesystems() {
+        fn mount_fs(source: &str, target: &str, fstype: &str) {
+            std::fs::create_dir_all(target).ok();
+            let src = std::ffi::CString::new(source).unwrap();
+            let tgt = std::ffi::CString::new(target).unwrap();
+            let fst = std::ffi::CString::new(fstype).unwrap();
+            let ret = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), 0, std::ptr::null()) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EBUSY) {
+                    kmsg(&format!("mount {} -> {}: {:?}", source, target, err));
+                }
+            }
+        }
+        mount_fs("devtmpfs", "/dev",  "devtmpfs"); // Mount /dev first so kmsg works!
+        kmsg("--- PAYPAL ENCLAVE NATIVE RUST BOOT ---");
+        mount_fs("proc",     "/proc", "proc");
+        mount_fs("sysfs",    "/sys",  "sysfs");
+        mount_fs("tmpfs",    "/tmp",  "tmpfs");
+        mount_fs("tmpfs",    "/run",  "tmpfs");
+        std::fs::create_dir_all("/dev/pts").ok();
+        kmsg("Filesystems mounted");
+    }
+
+    fn modprobe(module: &str) {
+        match std::process::Command::new("/sbin/modprobe").arg("-q").arg(module).status() {
+            Ok(s) => kmsg(&format!("modprobe {}: {}", module, s)),
+            Err(e) => kmsg(&format!("modprobe {} failed: {} (falling back to insmod?)", module, e)),
+        }
+        // Fallback: if modprobe is missing, maybe busybox or raw insmod works
+        if let Ok(paths) = std::fs::read_dir(format!("/lib/modules")) {
+            // Very primitive, just relies on the kernel matching it if modprobe itself is broken
+        }
+    }
+
+    fn find_interface() -> Option<String> {
+        std::fs::read_dir("/sys/class/net").ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .find(|n| n != "lo" && n != "dummy0")
+    }
+
+    fn read_mac(iface: &str) -> [u8; 6] {
+        let s = std::fs::read_to_string(format!("/sys/class/net/{}/address", iface))
+            .unwrap_or_default();
+        let mut mac = [0u8; 6];
+        for (i, p) in s.trim().split(':').enumerate().take(6) {
+            mac[i] = u8::from_str_radix(p, 16).unwrap_or(0);
+        }
+        mac
+    }
+
+    fn build_dhcp(xid: u32, mac: &[u8; 6], msg_type: u8, req_ip: Option<Ipv4Addr>) -> Vec<u8> {
+
+        let mut p = vec![0u8; 240];
+        p[0] = 1; p[1] = 1; p[2] = 6; p[10] = 0x80;
+        p[4..8].copy_from_slice(&xid.to_be_bytes());
+        p[28..34].copy_from_slice(mac);
+        p[236] = 99; p[237] = 130; p[238] = 83; p[239] = 99; // magic cookie
+        p.extend_from_slice(&[53, 1, msg_type]);
+        if let Some(ip) = req_ip {
+            p.extend_from_slice(&[50, 4]);
+            p.extend_from_slice(&ip.octets());
+        }
+        p.extend_from_slice(&[55, 3, 1, 3, 6]); // request subnet, router, dns
+        p.push(255);
+        p
+    }
+
+    struct Lease { ip: Ipv4Addr, prefix: u8, gw: Option<Ipv4Addr>, dns: Vec<Ipv4Addr> }
+
+    fn parse_lease(buf: &[u8]) -> Option<Lease> {
+        if buf.len() < 240 { return None; }
+        let ip = Ipv4Addr::new(buf[16], buf[17], buf[18], buf[19]);
+        let mut mask = Ipv4Addr::new(255, 255, 255, 0);
+        let mut gw = None;
+        let mut dns = Vec::new();
+        let mut i = 240;
+        while i < buf.len() {
+            match buf[i] {
+                255 => break,
+                0 => { i += 1; }
+                code => {
+                    if i + 1 >= buf.len() { break; }
+                    let len = buf[i+1] as usize;
+                    if i + 2 + len > buf.len() { break; }
+                    let v = &buf[i+2..i+2+len];
+                    match code {
+                        1 if len == 4 => mask = Ipv4Addr::new(v[0],v[1],v[2],v[3]),
+                        3 if len >= 4 => gw = Some(Ipv4Addr::new(v[0],v[1],v[2],v[3])),
+                        6 => for c in v.chunks(4) { if c.len()==4 { dns.push(Ipv4Addr::new(c[0],c[1],c[2],c[3])); } },
+                        _ => {}
+                    }
+                    i += 2 + len;
+                }
+            }
+        }
+        let prefix = mask.octets().iter().map(|b| b.count_ones()).sum::<u32>() as u8;
+        Some(Lease { ip, prefix, gw, dns })
+    }
+
+    fn apply_lease(iface: &str, lease: &Lease) {
+        use std::process::Command;
+        let cidr = format!("{}/{}", lease.ip, lease.prefix);
+        let _ = Command::new("/sbin/ip").args(["addr", "flush", "dev", iface]).status();
+        let _ = Command::new("/sbin/ip").args(["addr", "add", &cidr, "dev", iface]).status();
+        let _ = Command::new("/sbin/ip").args(["link", "set", iface, "up"]).status();
+        
+        if let Some(gw) = lease.gw {
+            // CRITICAL GCP FIX: GCP assigns /32 subnet masks. The gateway is technically outside 
+            // our subnet, so the kernel will reject a default route. We must add a direct 
+            // device-bound host route to the gateway first!
+            let _ = Command::new("/sbin/ip")
+                .args(["route", "add", &gw.to_string(), "dev", iface])
+                .status();
+
+            let _ = Command::new("/sbin/ip")
+                .args(["route", "add", "default", "via", &gw.to_string()])
+                .status();
+        }
+        
+        if !lease.dns.is_empty() {
+            std::fs::create_dir_all("/etc").ok();
+            let resolv: String = lease.dns.iter().map(|ip| format!("nameserver {}\n", ip)).collect();
+            std::fs::write("/etc/resolv.conf", resolv).ok();
+        }
+        kmsg(&format!("Network up: {} gw={:?}", cidr, lease.gw));
+    }
+
+    async fn dhcp(iface: &str) -> Result<Lease, Box<dyn std::error::Error>> {
+        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        sock.set_reuse_address(true)?;
+        sock.set_broadcast(true)?;
+        // CRITICAL FIX: Without an IP address, Linux refuses to route 255.255.255.255 broadcasts 
+        // with `ENETUNREACH` unless we explicitly pin the socket to the raw interface!
+        let ifname = std::ffi::CString::new(iface)?;
+        unsafe {
+            use std::os::unix::io::AsRawFd;
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                ifname.as_ptr() as *const libc::c_void,
+                ifname.as_bytes().len() as libc::socklen_t,
+            );
+        }
+        sock.bind(&std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 68).into())?;
+        sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+        let bc = std::net::SocketAddrV4::new(Ipv4Addr::BROADCAST, 67);
+        let mac = read_mac(iface);
+        let xid: u32 = 0xC0FFEE42;
+
+        sock.send_to(&build_dhcp(xid, &mac, 1, None), &bc.into())?;
+        kmsg("DHCP DISCOVER sent");
+
+        let mut buf = [std::mem::MaybeUninit::uninit(); 1024];
+        let (n, _) = sock.recv_from(&mut buf)?;
+        let mut recv_buf = [0u8; 1024];
+        for i in 0..n { recv_buf[i] = unsafe { buf[i].assume_init() }; }
+        let offered = Ipv4Addr::new(recv_buf[16], recv_buf[17], recv_buf[18], recv_buf[19]);
+        kmsg(&format!("DHCP OFFER: {}", offered));
+
+        sock.send_to(&build_dhcp(xid, &mac, 3, Some(offered)), &bc.into())?;
+        kmsg("DHCP REQUEST sent");
+
+        let (n, _) = sock.recv_from(&mut buf)?;
+        for i in 0..n { recv_buf[i] = unsafe { buf[i].assume_init() }; }
+        let lease = parse_lease(&recv_buf[..n]).ok_or("Bad DHCP ACK")?;
+        kmsg(&format!("DHCP ACK: ip={}", lease.ip));
+        Ok(lease)
+    }
+
+    /// Load drivers, wait for NIC, perform DHCP, apply lease.
+    pub async fn configure_network() -> Result<(), Box<dyn std::error::Error>> {
+        modprobe("gve");
+        modprobe("virtio_net");
+
+        kmsg("Waiting for network interface...");
+        let iface = {
+            let mut found = None;
+            for _ in 0..60 {
+                if let Some(i) = find_interface() { found = Some(i); break; }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            found.ok_or("No network interface after 30s")?
+        };
+        kmsg(&format!("Interface found: {}. Bringing interface UP...", iface));
+
+        // CRITICAL: We must bring the interface UP before we can broadcast UDP!
+        let _ = std::process::Command::new("/sbin/ip").args(["link", "set", &iface, "up"]).status();
+        
+        // Brief wait for PHY link state to stabilize
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let lease = dhcp(&iface).await?;
+        apply_lease(&iface, &lease);
+        Ok(())
+    }
+
+    pub fn poweroff() -> ! {
+        kmsg("FATAL: Initialization failed. Halting system to preserve serial logs...");
+        loop { 
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
+}
+
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -762,9 +987,36 @@ async fn load_tls_config(
 // MAIN
 // ============================================================================
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("[DEBUG] main() started");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("====================================================");
+    eprintln!("PAYPAL AUTH VM STARTING AT {}", chrono::Utc::now());
+    eprintln!("====================================================");
+    
+    // 1. PID 1 RESPONSIBILITIES: Mount filesystems BEFORE anything else!
+    enclave_init::mount_filesystems();
+
+    // 2. Initialize the Tokio runtime now that the environment is sane
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    // 3. Configure network (DHCP) from within the async runtime
+    rt.block_on(async {
+        if let Err(e) = enclave_init::configure_network().await {
+            eprintln!("[FATAL] Network config failed: {}", e);
+            enclave_init::poweroff();
+        }
+
+        async_main().await
+    })
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
+    
+    // Attempt to force immediate flush
+    use std::io::Write;
+    std::io::stderr().flush()?;
+    std::io::stdout().flush()?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
