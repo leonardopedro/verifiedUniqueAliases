@@ -1,0 +1,50 @@
+#!/bin/sh
+set -e
+
+PREREQ=""
+prereqs() {
+    echo "$PREREQ"
+}
+
+case $1 in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+# Copy the Rust binary
+copy_exec ./target/x86_64-unknown-linux-gnu/release/paypal-auth-vm /bin/paypal-auth-vm
+
+# Copy TPM2 tools (we need them for attestation)
+copy_exec /usr/bin/tpm2_pcrextend /usr/bin/tpm2_pcrextend
+copy_exec /usr/bin/tpm2_createprimary /usr/bin/tpm2_createprimary
+copy_exec /usr/bin/tpm2_create /usr/bin/tpm2_create
+copy_exec /usr/bin/tpm2_load /usr/bin/tpm2_load
+copy_exec /usr/bin/tpm2_unseal /usr/bin/tpm2_unseal
+copy_exec /usr/bin/tpm2_quote /usr/bin/tpm2_quote
+copy_exec /usr/bin/tpm2_createak /usr/bin/tpm2_createak
+
+# Copy other utilities
+copy_exec /usr/bin/curl /usr/bin/curl
+copy_exec /usr/bin/sha256sum /usr/bin/sha256sum
+copy_exec /usr/bin/awk /usr/bin/awk
+
+# Copy CA certificates (needed for ACME to talk to Google Public CA)
+mkdir -p "${DESTDIR}/etc/ssl/certs"
+cp -rL /etc/ssl/certs/* "${DESTDIR}/etc/ssl/certs/"
+if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+    cp /etc/ssl/certs/ca-certificates.crt "${DESTDIR}/etc/ssl/certs/ca-certificates.crt"
+fi
+
+# Copy OpenSSL config
+if [ -f /etc/ssl/openssl.cnf ]; then
+    mkdir -p "${DESTDIR}/etc/ssl"
+    cp /etc/ssl/openssl.cnf "${DESTDIR}/etc/ssl/openssl.cnf"
+fi
+
+# Create certificates and challenge directories
+mkdir -p "${DESTDIR}/run/certs"
+mkdir -p "${DESTDIR}/tmp/acme-challenge"
