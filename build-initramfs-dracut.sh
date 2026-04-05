@@ -70,14 +70,14 @@ sed -i "s|cd /app|cd $BUILD_DIR|g" \
 
 # Remove Docker-specific cargo env sourcing and inject correct PATH
 # We need to explicitly set PATH because dracut might sanitize the environment
-sed -i "s|source /usr/local/cargo/env|export PATH=\"/root/.cargo/bin:\$PATH\"|g" \
+sed -i "s|source /usr/local/cargo/env|export PATH=\"/usr/local/cargo/bin:\$PATH\"|g" \
     /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
 
 # Force absolute paths for cargo and add-det to be safe
 # Only replace if not already absolute path (to prevent duplication)
-sed -i "s| cargo build| /root/.cargo/bin/cargo build|g" \
+sed -i "s| cargo build| /usr/local/cargo/bin/cargo build|g" \
     /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
-sed -i "s| add-det | /root/.cargo/bin/add-det |g" \
+sed -i "s| add-det | /usr/local/cargo/bin/add-det |g" \
     /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
 
 #sed -i "s|x86_64-unknown-linux-musl|$BUILD_TARGET|g" \
@@ -85,14 +85,15 @@ sed -i "s| add-det | /root/.cargo/bin/add-det |g" \
 sed -i "s|x86_64-unknown-linux-gnu|$BUILD_TARGET|g" \
     /usr/lib/dracut/modules.d/99paypal-auth-vm/module-setup.sh
 
-# CRITICAL: Normalize module timestamps BEFORE dracut packages them
-echo "🔧 Normalizing module timestamps for reproducibility..."
-# Note: Binary timestamps are normalized inside module-setup.sh during install()
+# CRITICAL: Normalize module timestamps and remove non-deterministic metadata BEFORE dracut packages them
+echo "🔧 Normalizing module with add-det and timestamps..."
+# Use add-det to remove any build-time leakage in script headers or binaries inside the module
+find /usr/lib/dracut/modules.d/99paypal-auth-vm -type f -exec add-det {} \;
+# Reset timestamps for consistent cpio hashing
 find /usr/lib/dracut/modules.d/99paypal-auth-vm -type f -exec touch -d "@${SOURCE_DATE_EPOCH}" {} \;
 
 # Debug: Verify module exists
 echo "🔍 Debugging: Checking if module exists..."
-ls -la /usr/lib/dracut/modules.d/ | grep paypal || echo "❌ paypal module directory not found!"
 if [ -d /usr/lib/dracut/modules.d/99paypal-auth-vm ]; then
     echo "✅ Module directory exists"
     ls -la /usr/lib/dracut/modules.d/99paypal-auth-vm/
@@ -117,7 +118,7 @@ dracut --list-modules 2>&1 | head -30
 # Build initramfs with reproducibility flags
 echo "🔨 Building initramfs with dracut..."
 
-KERNEL_VERSION=$(find /lib/modules -maxdepth 1 -type d -name "[0-9]*" | xargs basename)
+KERNEL_VERSION=$(find /lib/modules -maxdepth 1 -type d -name "[0-9]*" -exec basename {} \;)
 OUTPUT_FILE="initramfs-paypal-auth.img"
 
 # Create the temporary directory for dracut
@@ -127,6 +128,23 @@ mkdir -p "$HOME/dracut-build"
 #cp dracut.conf /etc/dracut.conf.d/force-no-hostonly.conf
 
 
+
+# Map required modules for GCP using find
+GVE_KO=$(find /lib/modules/$KERNEL_VERSION -name "gve.ko*" | head -1)
+VIRTIO_NET_KO=$(find /lib/modules/$KERNEL_VERSION -name "virtio_net.ko*" | head -1)
+VIRTIO_BLK_KO=$(find /lib/modules/$KERNEL_VERSION -name "virtio_blk.ko*" | head -1)
+VIRTIO_PCI_KO=$(find /lib/modules/$KERNEL_VERSION -name "virtio_pci.ko*" | head -1)
+
+if [ -z "$GVE_KO" ] || [ -z "$VIRTIO_NET_KO" ]; then
+    echo "❌ ERROR: Could not find required kernel modules for GCP (gve or virtio)!"
+    echo "Check /lib/modules/$KERNEL_VERSION"
+    exit 1
+fi
+printf "✅ Found modules:\n  gve: %s\n  virtio: %s\n" "$GVE_KO" "$VIRTIO_NET_KO"
+
+# Ensure kernel module dependencies are fully generated for dracut
+echo "🔧 Re-generating module dependencies for $KERNEL_VERSION..."
+depmod -a "$KERNEL_VERSION"
 
 # Build with reproducibility flags
 # --reproducible: Use SOURCE_DATE_EPOCH for timestamps
@@ -139,15 +157,30 @@ mkdir -p "$HOME/dracut-build"
 # --add: Explicitly include our custom module
 # Note: We explicitly set compression to gzip for reproducibility
 dracut \
+    -v \
     --force \
     --reproducible \
     --gzip \
-    --omit " dash plymouth syslog firmware " \
+    --omit " systemd systemd-networkd plymouth syslog " \
     --no-hostonly \
     --no-hostonly-cmdline \
     --nofscks \
     --no-early-microcode \
     --add "paypal-auth-vm" \
+    --add-drivers "virtio virtio_net virtio_blk virtio_pci gve" \
+    --include "$GVE_KO" "$GVE_KO" \
+    --include "$VIRTIO_NET_KO" "$VIRTIO_NET_KO" \
+    --include "$VIRTIO_BLK_KO" "$VIRTIO_BLK_KO" \
+    --include "$VIRTIO_PCI_KO" "$VIRTIO_PCI_KO" \
+    --include "/lib/modules/$KERNEL_VERSION/modules.dep" "/lib/modules/$KERNEL_VERSION/modules.dep" \
+    --include "/lib/modules/$KERNEL_VERSION/modules.dep.bin" "/lib/modules/$KERNEL_VERSION/modules.dep.bin" \
+    --include "/lib/modules/$KERNEL_VERSION/modules.alias" "/lib/modules/$KERNEL_VERSION/modules.alias" \
+    --include "/lib/modules/$KERNEL_VERSION/modules.alias.bin" "/lib/modules/$KERNEL_VERSION/modules.alias.bin" \
+    --include "/lib/modules/$KERNEL_VERSION/modules.symbols" "/lib/modules/$KERNEL_VERSION/modules.symbols" \
+    --include "/lib/modules/$KERNEL_VERSION/modules.symbols.bin" "/lib/modules/$KERNEL_VERSION/modules.symbols.bin" \
+    --include "/lib/modules/$KERNEL_VERSION/modules.builtin" "/lib/modules/$KERNEL_VERSION/modules.builtin" \
+    --include "/lib/modules/$KERNEL_VERSION/modules.builtin.bin" "/lib/modules/$KERNEL_VERSION/modules.builtin.bin" \
+    --include "/lib/modules/$KERNEL_VERSION/modules.softdep" "/lib/modules/$KERNEL_VERSION/modules.softdep" \
     --kver "$KERNEL_VERSION" \
     --fwdir "/usr/lib/firmware" \
     --tmpdir "$HOME/dracut-build" \
@@ -162,20 +195,21 @@ set -o pipefail
 
 echo "🔧 Normalizing initramfs..."
 if command -v gzip >/dev/null && command -v add-det &> /dev/null; then
-    # 1. Decompress
+    # 1. Decompress (dracut might have produced a multi-cpio archive)
     echo "   Decompressing..."
     gzip -d -c "$OUTPUT_FILE" > "$OUTPUT_FILE.uncompressed"
     
-    # 2. Normalize uncompressed cpio archive
+    # 2. Normalize uncompressed cpio archive(s)
+    # add-det handles cpio format specifically to ensure deterministic entry order and metadata
     echo "   Normalizing uncompressed archive with add-det..."
     add-det "$OUTPUT_FILE.uncompressed"
     
-    # 3. Recompress with deterministic gzip
+    # 3. Recompress with deterministic gzip (-n -9)
     echo "   Recompressing with gzip -n..."
     gzip -n -9 < "$OUTPUT_FILE.uncompressed" > "$OUTPUT_FILE.tmp"
     
-    # 4. Normalize compressed archive
-    echo "   Normalizing compressed archive with add-det..."
+    # 4. Final normalization of the compressed stream
+    echo "   Normalizing compressed archive stream with add-det..."
     add-det "$OUTPUT_FILE.tmp"
     
     # Replace original
