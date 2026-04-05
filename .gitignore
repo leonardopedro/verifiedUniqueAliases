@@ -26,6 +26,7 @@ legacy/
 *.tmp
 *.sha256
 
+add-det
 # GCP Synthesis Intermediate Files
 .mtoolsrc
 grub.cfg

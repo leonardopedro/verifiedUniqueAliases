@@ -4,10 +4,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Update and install minimal build dependencies for a measured initramfs
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    dracut-core \
-    dracut-network \
+    initramfs-tools \
     linux-image-gcp \
-    linux-modules-extra-gcp \
     shim-signed \
     grub-efi-amd64-signed \
     tpm2-tools \
@@ -51,8 +49,6 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
-# Provide the exact same RUSTFLAGS and profile variables as module-setup.sh uses!
-# If these don't match, Cargo's fingerprint will change and it will recompile everything.
 ENV RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C strip=symbols" \
     CARGO_PROFILE_RELEASE_LTO=true \
     CARGO_PROFILE_RELEASE_OPT_LEVEL=2
@@ -60,12 +56,13 @@ RUN cargo build --release -j 1 --target x86_64-unknown-linux-gnu && rm -rf src
 
 # --- Actual build ---
 COPY src ./src
-COPY dracut-module ./dracut-module
-COPY build-initramfs-dracut.sh dracut.conf ./
-RUN chmod +x build-initramfs-dracut.sh
+COPY hooks ./hooks
+COPY scripts ./scripts
+COPY build-initramfs-tools.sh ./build-initramfs-tools.sh
+RUN chmod +x build-initramfs-tools.sh hooks/* scripts/init-premount/*
 
 # Build the real application and initramfs
-RUN sh -c ". /usr/local/cargo/env && ./build-initramfs-dracut.sh"
+RUN sh -c ". /usr/local/cargo/env && ./build-initramfs-tools.sh"
 
 # Extract minimal OS artifacts
 RUN mkdir /output && \

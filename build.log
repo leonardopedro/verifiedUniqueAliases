@@ -1,25 +1,72 @@
-💿 Assembling GCP-Optimized Reproducible Image Stack...
-🔨 Formatting EFI System Partition (FAT32)...
-mkfs.fat 4.2 (2021-01-31)
-📦 Populating ESP via mtools...
-Copying BOOTX64.EFI
-Copying grubx64.efi
-Copying vmlinuz
-Copying initrd.img
-Copying grub.cfg
-🔄 Normalizing ESP: extract → sort → rebuild...
-mkfs.fat 4.2 (2021-01-31)
-Copying BOOTX64.EFI
-Copying grubx64.efi
-Copying grub.cfg
-Copying initrd.img
-Copying vmlinuz
-🏗️  Constructing GPT disk with fixed UUIDs using sgdisk...
-🔍 Final normalization of RAW disk...
-🔄 Converting to QCOW2...
-📦 Packaging to disk.tar.gz (deterministic)...
+[1/2] STEP 1/21: FROM docker.io/library/ubuntu:25.10 AS builder
+[1/2] STEP 2/21: ENV DEBIAN_FRONTEND=noninteractive
+--> Using cache 6589c9f8ce64a5c38d20f0b1f72c7b6f67086fc35e1b9c7d839c6a4638a047b3
+--> 6589c9f8ce64
+[1/2] STEP 3/21: RUN apt-get update && apt-get install -y --no-install-recommends     initramfs-tools     linux-image-gcp     shim-signed     grub-efi-amd64-signed     tpm2-tools     curl     gcc     g++     make     python3     python3-pip     python3-venv     libarchive-tools     binutils     ca-certificates     zlib1g-dev     perl     iproute2     isc-dhcp-client     net-tools     && apt-get clean && rm -rf /var/lib/apt/lists/*
+--> Using cache 41ba032d77a9cb2f5d18229cd263a2c76e98ee92d4d7eee53e4d42851cfac811
+--> 41ba032d77a9
+[1/2] STEP 4/21: RUN python3 -m venv /opt/diffoscope-venv     && /opt/diffoscope-venv/bin/pip install --upgrade pip     && /opt/diffoscope-venv/bin/pip install diffoscope
+--> Using cache 1fad776d02c8519fb9aac8a244ae7df927b9befb637dd76038d51f848e6bda95
+--> 1fad776d02c8
+[1/2] STEP 5/21: ENV PATH="/opt/diffoscope-venv/bin:$PATH"
+--> Using cache da200aa280192bde32dc60588efc1f2f1636235a0d47b6449c5ca3e88c3895c9
+--> da200aa28019
+[1/2] STEP 6/21: ARG RUST_VERSION=1.91.1
+--> Using cache 8a0ed89960d3a2955657cf9c538182c45abf931a55d135f8faae75e9fb56d1ac
+--> 8a0ed89960d3
+[1/2] STEP 7/21: ENV RUSTUP_HOME=/usr/local/rustup     CARGO_HOME=/usr/local/cargo     PATH=/usr/local/cargo/bin:$PATH
+--> Using cache c1312e85c38638485f2af72a4aa05d058cf10392bde6932cae882391611f2151
+--> c1312e85c386
+[1/2] STEP 8/21: RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs     | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal --no-modify-path     && . /usr/local/cargo/env     && export RUST_MIN_STACK=16777216     && cargo install -j 1 add-determinism     && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
+--> Using cache d499e6848ac14a996e0074ed5275d4ee0774597e6e6ce4c4aec487f4d8d3dff2
+--> d499e6848ac1
+[1/2] STEP 9/21: WORKDIR /app
+--> Using cache dc6ff3466127859bb45935ba39c2bff2ff22ec92f93934f7368d473c90b2fc63
+--> dc6ff3466127
+[1/2] STEP 10/21: COPY Cargo.toml Cargo.lock ./
+--> Using cache ea602f62832432c99dcd92585ea794902f389de2eb45b0d962bb4dc276200988
+--> ea602f628324
+[1/2] STEP 11/21: RUN mkdir src && echo "fn main() {}" > src/main.rs
+--> Using cache 7a809275ebb71a23f1c8c9afd27cb287bce2735e9a6db1ab6f8c27013b562937
+--> 7a809275ebb7
+[1/2] STEP 12/21: ENV RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C strip=symbols"     CARGO_PROFILE_RELEASE_LTO=true     CARGO_PROFILE_RELEASE_OPT_LEVEL=2
+--> Using cache c3ad9a051e73be447f25fd60d92ae5c875c6a2200e53f0be4a12c9b4cc823a24
+--> c3ad9a051e73
+[1/2] STEP 13/21: RUN cargo build --release -j 1 --target x86_64-unknown-linux-gnu && rm -rf src
+--> Using cache 6d3e58f89b6488ab262b63728323c771efa163758fc50a2d81094e46ff3880d8
+--> 6d3e58f89b64
+[1/2] STEP 14/21: COPY src ./src
+--> Using cache 5ca4a5f9a94a52a54b7500cc3b22acbeeb195f3480afeab80ff781577bbf6274
+--> 5ca4a5f9a94a
+[1/2] STEP 15/21: COPY hooks ./hooks
+--> Using cache e090a0d9daa6db668db2fa8863ddecb079fec739903897fb5b6427da4e977589
+--> e090a0d9daa6
+[1/2] STEP 16/21: COPY scripts ./scripts
+--> Using cache 9e6b4bfbf308e0299dd50fe66c82b1196747ca64418bcba9719e12b3db8fde19
+--> 9e6b4bfbf308
+[1/2] STEP 17/21: COPY build-initramfs-tools.sh ./build-initramfs-tools.sh
+--> Using cache 46b9a190cbedce025c8ad9745821c83c7159a2f0bdabe90b134f6e3d3a62b5cb
+--> 46b9a190cbed
+[1/2] STEP 18/21: RUN chmod +x build-initramfs-tools.sh hooks/* scripts/init-premount/*
+--> Using cache c5fdeab04c4936cf6ef7c31b5ef77cd183aa5e30e553d2786d3b21682a02d2d6
+--> c5fdeab04c49
+[1/2] STEP 19/21: RUN sh -c ". /usr/local/cargo/env && ./build-initramfs-tools.sh"
+🏗️  Building reproducible initramfs with initramfs-tools...
+📦 Building Rust application for x86_64-unknown-linux-gnu...
+   Compiling paypal-auth-vm v0.1.0 (/app)
+    Finished `release` profile [optimized] target(s) in 33.42s
+Scanned 0 directories and 1 files,
+    processed 0 inodes,
+    0 modified (0 replaced + 0 rewritten),
+    0 unsupported format, 0 errors
+📋 Configuring initramfs-tools...
+🔨 Running mkinitramfs...
+W: No zstd in /usr/bin:/sbin:/bin, using gzip
++ PREREQ=
++ prereqs
++ echo 
++ exit 0
+🔧 Normalizing initramfs...
 
-✅ Synthesis Complete.
-b6af4f87a1a177c212e799c5039f649628db550ddeee7b62feec6672fb8eda66  disk.raw
-9df4dd8787f5e85ae47f7ec7375624cc113063f53acb0cac241124fe055d7653  disk.tar.gz
-185b92f1e808cc5ef0193732b6c5532f4ea9ac337ddc0ddb0a171bb6537f4adc  paypal-auth-vm-gcp.qcow2
+gzip: initramfs-paypal-auth.img: not in gzip format
+Error: building at STEP "RUN sh -c ". /usr/local/cargo/env && ./build-initramfs-tools.sh"": while running runtime: exit status 1
