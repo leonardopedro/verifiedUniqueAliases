@@ -1,7 +1,7 @@
 set -e
 PROJECT="project-ae136ba1-3cc9-42cf-a48"
 ZONE="europe-west4-a"
-VERSION="v49"
+VERSION="v59"
 
 echo "=== Deploying with build VM disk image ==="
 
