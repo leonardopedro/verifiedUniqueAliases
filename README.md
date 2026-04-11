@@ -12,8 +12,9 @@ Built for 100% bit-by-bit reproducibility and maximum security.
 | Bitwise Reproducibility (`disk.raw`, `disk.tar.gz`, `qcow2`) | ✅ Achieved |
 | Native PID 1 Rust Launcher & Boot Isolation | ✅ Achieved |
 | Native Rust DHCP / Network Management | ✅ Achieved |
-| GCP Secure Boot (signed Shim/GRUB) | ✅ Achieved |
-| GCP UEFI Boot from custom image | ✅ Achieved |
+| Hardware-Rooted Attestation (vTPM Quote / PCR 15) | ✅ Achieved |
+| TPM-Sealed TLS Cache Recovery | ✅ Achieved |
+| PayPal OAuth Sandbox/Success Flow | ✅ Achieved |
 
 ### Architectural Breakthrough: Native PID 1 Rust Integration
 The service takes complete control of the OS from the very first instruction. It runs perfectly isolated on GCP Confidential Space without any shell dependencies:

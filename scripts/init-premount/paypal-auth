@@ -70,8 +70,9 @@ export TLS_CACHE_SECRET
 export RUST_LOG="${RUST_LOG:-debug}"
 
 # 5. Measure the binary into PCR 15 before execution (attested boot)
-if [ -f /bin/paypal-auth-vm ]; then
-    BIN_HASH=$(sha256sum /bin/paypal-auth-vm | awk '{print $1}')
+# The binary is at /usr/bin/paypal-auth-vm (where copy_exec placed it)
+if [ -f /init ]; then
+    BIN_HASH=$(sha256sum /init | awk '{print $1}')
     echo "Attesting binary (hash: $BIN_HASH) into vTPM PCR 15..."
     if [ -c /dev/tpm0 ]; then
         tpm2_pcrextend 15:sha256=$BIN_HASH || echo "tpm2_pcrextend failed!"
@@ -79,20 +80,12 @@ if [ -f /bin/paypal-auth-vm ]; then
         echo "ERROR: Cannot attest binary, /dev/tpm0 missing"
     fi
 else
-    echo "ERROR: Binary /bin/paypal-auth-vm not found!"
+    echo "ERROR: Binary /usr/bin/paypal-auth-vm not found!"
 fi
 
-# 6. Final checks before execution
-echo "Final checks before exec..."
-ls -l /bin/paypal-auth-vm
-ldd /bin/paypal-auth-vm || echo "ldd failed (normal if static)"
+# 6. Final checks
+export RUST_LOG="${RUST_LOG:-debug}"
 
-# 7. Execute the application
-echo "Executing /bin/paypal-auth-vm..."
-# We use 'exec' to replace the init process, ensuring the enclave is purely in RAM.
-# We do NOT redirect to /dev/kmsg here to keep stderr on the console for debugging.
-exec /bin/paypal-auth-vm
-
-# If we reach here, exec failed
-echo "CRITICAL: exec /bin/paypal-auth-vm failed!"
-sleep 3600
+# 7. The initramfs-tools /init script will continue and eventually exec our Rust binary
+# which is at /init (symlink to /usr/bin/paypal-auth-vm)
+echo "Setup complete. The Rust binary at /init will be executed as PID 1."
