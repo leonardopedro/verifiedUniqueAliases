@@ -3,7 +3,7 @@ FROM docker.io/library/ubuntu:25.10 AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Update and install minimal build dependencies for a measured initramfs
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && apt-get install -y --no-install-recommends \
     initramfs-tools \
     linux-image-gcp \
     shim-signed \
@@ -24,6 +24,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     isc-dhcp-client \
     net-tools \
+    sudo \
+    mtools \
+    dosfstools \
+    fdisk \
+    gdisk \
+    qemu-utils \
+    pkg-config \
+    libssl-dev \
+    file \
+    zstd \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Setup diffoscope for reproducibility checks
@@ -59,21 +69,24 @@ COPY src ./src
 COPY hooks ./hooks
 COPY scripts ./scripts
 COPY build-initramfs-tools.sh ./build-initramfs-tools.sh
-RUN chmod +x build-initramfs-tools.sh hooks/* scripts/init-premount/*
+COPY build-gcp-gpt-image.sh ./build-gcp-gpt-image.sh
+RUN chmod +x build-initramfs-tools.sh build-gcp-gpt-image.sh hooks/* scripts/init-premount/*
 
 # Build the real application and initramfs
 RUN sh -c ". /usr/local/cargo/env && ./build-initramfs-tools.sh"
 
-# Extract minimal OS artifacts
-RUN mkdir /output && \
-    mv initramfs-paypal-auth.img /output/ && \
-    mv build-manifest.json /output/ && \
-    mv initramfs-paypal-auth.img.sha256 /output/ && \
-    cp /boot/vmlinuz-*gcp /output/vmlinuz && \
-    cp /usr/lib/shim/shimx64.efi.signed /output/shimx64.efi && \
-    cp /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed /output/grubx64.efi || echo "Bootloader not found"
+# Extract minimal OS artifacts to root for GPT script
+RUN cp /boot/vmlinuz-*gcp ./output/vmlinuz && \
+    cp $(find /usr/lib/shim/ -name 'shimx64.efi.signed' 2>/dev/null | head -1) ./output/shimx64.efi && \
+    cp $(find /usr/lib/grub/ -name 'grubx64.efi.signed' 2>/dev/null | head -1) ./output/grubx64.efi || echo "Bootloader not found"
 
-WORKDIR /output
+# Run the generic GPT image synthesizer exactly as it runs in the cloud
+RUN ./build-gcp-gpt-image.sh
+
+# Extract minimal OS artifacts
+RUN mkdir /final_export && cp disk.tar.gz /final_export/ && cp disk.raw /final_export/ && cp output/initramfs-paypal-auth.img /final_export/
+
+WORKDIR /final_export
 
 FROM scratch AS export-stage
-COPY --from=builder /output/ ./img/
+COPY --from=builder /final_export/ ./img/

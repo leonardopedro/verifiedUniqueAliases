@@ -29,9 +29,10 @@ if [ ! -c /dev/tpm0 ]; then
 fi
 
 # 2. Bring up the network via ipconfig (klibc)
-# -t 60: Increase wait time for DHCP
-echo "Bringing up network via eth0 (DHCP)..."
-ipconfig -t 60 eth0
+# -t 60:# Bring up network
+echo "Bringing up network (any interface)..."
+# Use 'any' to handle dynamic interface names (eth0/ens3/enp0s1)
+ipconfig -t 60 any
 
 # 3. Wait for GCP Metadata service to become available
 echo "Waiting for GCP metadata service (http://metadata.google.internal)..."

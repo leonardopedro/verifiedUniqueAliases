@@ -35,7 +35,7 @@ touch -d "@$SOURCE_DATE_EPOCH" "$KERNEL" "$INITRD" "$SHIM" "$GRUB"
 # PHASE 1: Build the ESP partition image
 # ==============================================================================
 echo "🔨 Formatting EFI System Partition (FAT32)..."
-truncate -s 128M $ESP_IMAGE
+truncate -s 256M $ESP_IMAGE
 # --invariant: replaces all random/time-based values with constants
 mkfs.vfat -F 32 -i 12345678 --invariant -n "EFI" $ESP_IMAGE
 
@@ -73,7 +73,7 @@ echo "🔄 Normalizing ESP: extract → sort → rebuild..."
 
 # Create a fresh, normalized ESP image
 ESP_NORM="esp_norm.img"
-truncate -s 128M $ESP_NORM
+truncate -s 256M $ESP_NORM
 mkfs.vfat -F 32 -i 12345678 --invariant -n "EFI" $ESP_NORM
 
 # Extract all files from esp.img to a temp dir (sorted order)
@@ -114,11 +114,11 @@ rm -rf "$ESP_MOUNT"
 echo "🏗️  Constructing GPT disk with fixed UUIDs using sgdisk..."
 dd if=/dev/zero of=$RAW_IMAGE bs=1M count=256 status=none
 
-# 128MiB ESP = 131072 sectors of 512 bytes. We create a partition starting at sector 2048 (1MiB offset)
-# with size 262144 sectors (128MiB), type ef00 (EFI System), and fixed GUIDs.
+# ~200MiB ESP starting at sector 2048 (1MiB offset)
+# with size 409600 sectors (~200MiB), type ef00 (EFI System), and fixed GUIDs.
 sgdisk --clear -g \
        --disk-guid=00000000-0000-0000-0000-000000000001 \
-       --new=1:2048:264191 \
+       --new=1:2048:411647 \
        --typecode=1:ef00 \
        --partition-guid=1:00000000-0000-0000-0000-000000000002 \
        --change-name=1:"EFI System Partition" \
