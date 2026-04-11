@@ -18,6 +18,8 @@ if [ -f "/app/target/$BUILD_TARGET/release/paypal-auth-vm" ]; then
     BIN_PATH="/app/target/$BUILD_TARGET/release/paypal-auth-vm"
 elif [ -f "./target/$BUILD_TARGET/release/paypal-auth-vm" ]; then
     BIN_PATH="./target/$BUILD_TARGET/release/paypal-auth-vm"
+elif [ -f "/home/leo/paypal-auth-vm-bin" ]; then
+    BIN_PATH="/home/leo/paypal-auth-vm-bin"
 elif [ -f "$HOME/paypal-auth-vm-bin" ]; then
     BIN_PATH="$HOME/paypal-auth-vm-bin"
 else

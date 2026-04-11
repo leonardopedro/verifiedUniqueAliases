@@ -73,9 +73,9 @@ sh deploy_final.sh
 
 Now that the lowest-level OS bootstrapping, driver loading, network routing, and Secure Boot attestation are perfectly solved, the task switches fully to higher-level service logic:
 
-1. **Attestation & TLS**: Implement logic using the bundled `tpm2_...` tools. The hook copies them into the RAM disk. They must be used by the Rust environment to request ACME TLS certificates and handle caching.
-2. **OAuth Flow**: Complete the PayPal OAuth user experience handled via `axum`. Manage redirect mechanisms properly.
-3. **Secret Manager Hookup**: The service receives the GCP Secret Manager path via `tee-env-SECRET_NAME`. Retrieve the `PAYPAL_AUTH_CONFIG` payload correctly and deserialize it.
+1. **Verify TLS caching**: Test the persistent recovery of TLS configuration upon a host reboot locally/in GCP.
+2. **Official Migration**: Finalize the official domain migration to the production environment after fully confirming v59.
+3. **Periodic Auto-Renewal**: Implement periodic TLS certificate renewal logic to poll/renew without restarting.
 
 ## 📂 Repository Structure
 
