@@ -1,7 +1,7 @@
 set -e
 PROJECT="REDACTED_GCP_PROJECT"
 ZONE="europe-west4-a"
-VERSION="v49"
+VERSION="v59"
 
 echo "=== Deploying with build VM disk image ==="
 

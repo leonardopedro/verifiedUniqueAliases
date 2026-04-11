@@ -189,8 +189,7 @@ mod tpm {
     pub async fn quote(pcrs: &str, nonce_hex: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
         // Try handles 0x81010001 (standard Persistent AK location)
         let _ = run_cmd("tpm2_getcap", &["handles-persistent"]).await;
-        let output = run_cmd("tpm2_readpublic", &["-c", "0x81010001"]).await;
-        let ak_handle = if output.is_ok() { "0x81010001" } else { "0x81010002" };
+        let ak_handle = if run_cmd("tpm2_readpublic", &["-c", "0x81010001"]).await.is_ok() { "0x81010001" } else { "0x81010002" };
         
         run_cmd("tpm2_quote", &[
             "-c", ak_handle,
@@ -712,34 +711,37 @@ async fn login(State(state): State<Arc<AppState>>) -> Redirect {
 }
 
 async fn callback(
-    State(state): State<Arc<AppState>>,
-    req: axum::extract::Request,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<AppState>>,
 ) -> AppResp {
-    // Parse query string from the URI — avoids Query<> + State<> Handler impl conflict in Axum 0.8
-    let query_str = req.uri().query().unwrap_or("").to_string();
-    let params: std::collections::HashMap<String, String> =
-        serde_urlencoded::from_str(&query_str).unwrap_or_default();
+    let query = CallbackQuery {
+        code: params.get("code").cloned(),
+        error: params.get("error").cloned(),
+    };
 
-    if let Some(error) = params.get("error") {
-        return Html(HTML_TEMPLATE.replace("{{CONTENT}}", &format!(
+    if let Some(error) = query.error {
+        return axum::response::Html(HTML_TEMPLATE.replace("{{CONTENT}}", &format!(
             r#"<div class="error"><h2>Error</h2><p>{}</p></div><a href="/" class="btn">Back</a>"#,
-            html_escape::encode_text(error)
+            html_escape::encode_text(&error)
         ))).into_response();
     }
 
-    let code = match params.get("code") {
-        Some(c) => c.clone(),
-        None => return (StatusCode::BAD_REQUEST, "Missing code").into_response(),
+    let code = match query.code {
+        Some(c) => c,
+        None => return (axum::http::StatusCode::BAD_REQUEST, "Missing code").into_response(),
     };
 
     let token = match exchange_code_for_token(
-        &code, &state.paypal_client_id, &state.paypal_client_secret,
-        &state.redirect_uri, state.staging,
+        &code,
+        &state.paypal_client_id,
+        &state.paypal_client_secret,
+        &state.redirect_uri,
+        state.staging,
     ).await {
         Ok(t) => t,
         Err(e) => {
-            error!("Token exchange failed: {}", e);
-            return Html(HTML_TEMPLATE.replace("{{CONTENT}}", &format!(
+            tracing::error!("Token exchange failed: {}", e);
+            return axum::response::Html(HTML_TEMPLATE.replace("{{CONTENT}}", &format!(
                 r#"<div class="error"><h2>Token Exchange Failed</h2><p>{}</p></div><a href="/" class="btn">Back</a>"#,
                 html_escape::encode_text(&e.to_string())
             ))).into_response();
@@ -749,8 +751,8 @@ async fn callback(
     let userinfo = match get_userinfo(&token.access_token, state.staging).await {
         Ok(u) => u,
         Err(e) => {
-            error!("Userinfo failed: {}", e);
-            return Html(HTML_TEMPLATE.replace("{{CONTENT}}", &format!(
+            tracing::error!("Userinfo failed: {}", e);
+            return axum::response::Html(HTML_TEMPLATE.replace("{{CONTENT}}", &format!(
                 r#"<div class="error"><h2>User Info Failed</h2><p>{}</p></div><a href="/" class="btn">Back</a>"#,
                 html_escape::encode_text(&e.to_string())
             ))).into_response();
@@ -759,7 +761,7 @@ async fn callback(
 
     let attestation = generate_attestation(&state.paypal_client_id, &userinfo).await;
 
-    Html(HTML_TEMPLATE.replace(
+    axum::response::Html(HTML_TEMPLATE.replace(
         "{{CONTENT}}",
         &format!(
             r#"
@@ -786,13 +788,7 @@ async fn callback(
     )).into_response()
 }
 
-            html_escape::encode_text(&userinfo.user_id),
-            html_escape::encode_text(&userinfo.name.unwrap_or_else(|| "N/A".to_string())),
-            html_escape::encode_text(&userinfo.email.unwrap_or_else(|| "N/A".to_string())),
-            html_escape::encode_text(&attestation),
-        ),
-    )).into_response()
-}
+
 
 
 async fn acme_challenge(

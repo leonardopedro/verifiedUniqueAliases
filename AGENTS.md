@@ -31,10 +31,12 @@ To maintain exact EFI/Kernel Secure Boot signatures matching GCP infrastructure,
 - **Initramfs Engine**: Standard `mkinitramfs` utilizing `copy_exec` directly into `DESTDIR/init`. We eliminated the entire post-processing unmkrd extraction block because the hook places the `paypal-auth-vm` binary natively. 
 - **Dependencies**: Uses `nix` and `libc` directly from Cargo to wrap Linux syscalls. Uses standard `iproute2` for network settings.
 
+  - **Axum 0.8 Compatibility**: Replaced buggy macro-expansions. Critical insight: `Handler` traits were mysteriously failing due to a `!Send` future leaking from the `tpm2_quote` attestation boundary. Non-send types (like `Box<dyn std::error::Error>`) cannot be held across an `.await` boundary in any synchronous macro expansion within handlers.
+
 ## Security Guidelines for Future Developers
 - **Reproducibility is Mandatory**: Ensure any changes to the hook or build scripts maintain bitwise identity.
 - **Secrets Management**: No secrets on disk; RAM-only via GCP Metadata server.
 - **Next Steps**:
-  - Test the **TLS persistent recovery** upon host reboot to ensure TPM unsealing is stable.
-  - Finalize official domain migration to production environment after confirming v59 stability.
+  - Test the **TLS persistent recovery** upon host reboot locally/GCP to ensure TPM unsealing is stable.
+  - Finalize official domain migration to production environment after confirming v59.
   - Implement periodic TLS certificate renewal logic (auto-restart or polling).
