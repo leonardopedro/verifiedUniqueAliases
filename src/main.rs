@@ -140,7 +140,11 @@ mod tpm {
     }
 
     async fn run_cmd(cmd: &str, args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let output = Command::new(cmd).args(args).output().await?;
+        let output = Command::new(cmd)
+            .args(args)
+            .env("TCTI", "device:/dev/tpm0")
+            .output()
+            .await?;
         if !output.status.success() {
             return Err(format!("{} failed: {}", cmd, String::from_utf8_lossy(&output.stderr)).into());
         }

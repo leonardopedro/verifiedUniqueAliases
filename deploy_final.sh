@@ -40,6 +40,6 @@ gcloud compute instances create paypal-auth-vm-${VERSION} \
     --scopes=cloud-platform \
     --tags http-server,https-server \
     --shielded-secure-boot \
-    --metadata=tee-env-SECRET_NAME=projects/project-ae136ba1-3cc9-42cf-a48/secrets/PAYPAL_AUTH_CONFIG/versions/latest,tee-env-TLS_CACHE_SECRET=projects/project-ae136ba1-3cc9-42cf-a48/secrets/PAYPAL_TLS_CACHE,tee-env-RUST_LOG=trace --quiet
+    --metadata=tee-env-SECRET_NAME=projects/project-ae136ba1-3cc9-42cf-a48/secrets/PAYPAL_AUTH_CONFIG/versions/latest,tee-env-TLS_CACHE_SECRET=projects/project-ae136ba1-3cc9-42cf-a48/secrets/PAYPAL_TLS_CACHE,tee-env-FORCE_SANDBOX=true,tee-env-RUST_LOG=trace --quiet
 
 echo "Done!"

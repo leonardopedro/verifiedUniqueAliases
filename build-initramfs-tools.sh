@@ -141,6 +141,14 @@ copy_bin_and_deps "insmod"
 copy_bin_and_deps "curl"
 copy_bin_and_deps "sha256sum"
 
+echo "  Adding TSS2 TCTI libraries (for dynamic loading)..."
+for lib in libtss2-tcti-device.so.0 libtss2-tctildr.so.0 libtss2-mu.so.0 libtss2-esys.so.0 libtss2-sys.so.0 libtss2-rc.so.0; do
+    lib_path=$(find /lib /usr/lib /lib/x86_64-linux-gnu -name "$lib" -print -quit 2>/dev/null || true)
+    if [ -n "$lib_path" ]; then
+        copy_bin_and_deps "$lib_path"
+    fi
+done
+
 # Ensure /sbin/ symlinks exist for tools our Rust binary expects at /sbin/*
 # Ubuntu 25.10 merged /sbin -> /usr/sbin, but our init binary uses /sbin paths
 echo "  Creating /sbin compatibility symlinks..."
