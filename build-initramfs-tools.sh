@@ -12,44 +12,35 @@ BUILD_TARGET="x86_64-unknown-linux-gnu"
 OUTPUT_DIR="$(pwd)/output"
 OUTPUT_FILE="${OUTPUT_DIR}/initramfs-paypal-auth.img"
 STAGING_DIR="/tmp/initramfs_staging"
+BIN_PATH="$(pwd)/paypal-auth-vm-bin"
 
-# 1. Determine Rust binary location
-if [ -f "/app/target/$BUILD_TARGET/release/paypal-auth-vm" ]; then
-    BIN_PATH="/app/target/$BUILD_TARGET/release/paypal-auth-vm"
-elif [ -f "./target/$BUILD_TARGET/release/paypal-auth-vm" ]; then
-    BIN_PATH="./target/$BUILD_TARGET/release/paypal-auth-vm"
-elif [ -f "/home/leo/paypal-auth-vm-bin" ]; then
-    BIN_PATH="/home/leo/paypal-auth-vm-bin"
-elif [ -f "$HOME/paypal-auth-vm-bin" ]; then
-    BIN_PATH="$HOME/paypal-auth-vm-bin"
-else
-    echo "❌ ERROR: No pre-built Rust binary found at any expected location!"
-    exit 1
-fi
+echo "✅ Using pre-built binary: $BIN_PATH"
 
 echo "✅ Using pre-built binary: $BIN_PATH"
 chmod +x "$BIN_PATH"
 
 # 2. Prepare build environment
 mkdir -p "$OUTPUT_DIR"
-sudo rm -rf "$STAGING_DIR"
+rm -rf "$STAGING_DIR"
 mkdir -p "$STAGING_DIR"
 
-# 3. Build base initramfs (to easily gather kernel modules)
-KERNEL_VERSION=$(ls -1 /lib/modules | sort -rV | head -n 1)
+# In Debian, the kernel is in /boot/vmlinuz-*-cloud-amd64
+KERNEL_FILE=$(ls /boot/vmlinuz-*-cloud-amd64 | sort -V | tail -n 1)
+# The modules are in /lib/modules/
+KERNEL_VERSION=$(basename "$KERNEL_FILE" | sed 's/vmlinuz-//')
 echo "🔍 Using kernel version: $KERNEL_VERSION"
 
 # Workarounds for Ubuntu mkinitramfs hook warnings
-sudo touch /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
-sudo chmod 644 /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
+touch /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
+chmod 644 /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
 
 # Force inclusion of GCP network modules in the base image
-echo "gve" | sudo tee -a /etc/initramfs-tools/modules >/dev/null
-echo "virtio_net" | sudo tee -a /etc/initramfs-tools/modules >/dev/null
+echo "gve" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "virtio_net" | tee -a /etc/initramfs-tools/modules >/dev/null
 
 echo "🔨 Generating base mkinitramfs..."
 BASE_IMG="/tmp/base-initrd.img"
-sudo mkinitramfs -o "$BASE_IMG" "$KERNEL_VERSION"
+mkinitramfs -o "$BASE_IMG" "$KERNEL_VERSION"
 
 # 4. Extract base initramfs
 echo "📦 Extracting base image..."
@@ -187,6 +178,8 @@ done
 echo "⚙️  Applying network and security configs..."
 mkdir -p etc/ssl/certs
 cp /etc/ssl/certs/ca-certificates.crt etc/ssl/certs/
+# Create standard symlinks for OpenSSL/Reqwest discovery
+ln -sf certs/ca-certificates.crt etc/ssl/cert.pem
 
 echo "hosts: files dns" > etc/nsswitch.conf
 echo "127.0.0.1 localhost" > etc/hosts
@@ -194,10 +187,10 @@ echo "127.0.0.1 localhost" > etc/hosts
 # 9. Ensure critical device nodes exist
 echo "🛠️  Creating essential device nodes..."
 mkdir -p dev
-sudo mknod -m 600 dev/console c 5 1 2>/dev/null || true
-sudo mknod -m 666 dev/null c 1 3 2>/dev/null || true
-sudo mknod -m 666 dev/random c 1 8 2>/dev/null || true
-sudo mknod -m 666 dev/urandom c 1 9 2>/dev/null || true
+mknod -m 600 dev/console c 5 1 2>/dev/null || true
+mknod -m 666 dev/null c 1 3 2>/dev/null || true
+mknod -m 666 dev/random c 1 8 2>/dev/null || true
+mknod -m 666 dev/urandom c 1 9 2>/dev/null || true
 
 # 9b. Ensure kernel modules are discoverable by modprobe
 # On Ubuntu 25.10, modules live at /usr/lib/modules/ but modprobe
@@ -256,9 +249,9 @@ find . -print0 | cpio --null --quiet -o -H newc | gzip -9 > "$OUTPUT_FILE"
 
 # Clean up
 cd /
-sudo rm -rf "$STAGING_DIR"
-sudo rm -f "$BASE_IMG"
-sudo chown "$(whoami):$(whoami)" "$OUTPUT_FILE"
+rm -rf "$STAGING_DIR"
+rm -f "$BASE_IMG"
+chown "$(whoami):$(whoami)" "$OUTPUT_FILE"
 
 # 11. Generate manifest and SHA256
 cd "$OUTPUT_DIR"
@@ -279,3 +272,8 @@ EOF
 
 echo "✅ Build complete! SHA256: $HASH"
 echo "🚀 Output ready at: $OUTPUT_FILE"
+# Extract kernel, shim, and grub for GPT image builder
+cp "$KERNEL_FILE" "$OUTPUT_DIR/vmlinuz"
+# Find shim and grub
+cp /usr/lib/shim/shimx64.efi.signed "$OUTPUT_DIR/shimx64.efi" || true
+cp /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed "$OUTPUT_DIR/grubx64.efi" || true
