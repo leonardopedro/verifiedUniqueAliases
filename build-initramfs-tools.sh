@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set -exuo pipefail
 
 echo "🏗️  Building robust reproducible initramfs for GCP Confidential Space..."
 
@@ -91,29 +91,40 @@ copy_bin_and_deps() {
     local real_bin
     real_bin=$(readlink -f "$bin_path")
     mkdir -p ".$(dirname "$real_bin")"
-    cp -pn "$real_bin" ".${real_bin}"
+    
+    # Use --update=none on newer cp versions, fallback to -n
+    if cp --help | grep -q "update=none"; then
+        cp -p --update=none "$real_bin" ".${real_bin}"
+    else
+        cp -pn "$real_bin" ".${real_bin}"
+    fi
 
     # If the binary was a symlink, recreate the symlink in staging
     if [ "$bin_path" != "$real_bin" ]; then
         mkdir -p ".$(dirname "$bin_path")"
-        ln -sf "$real_bin" ".${bin_path}"
+        # Create RELATIVE symlink for stability
+        (cd ".$(dirname "$bin_path")" && ln -sf "$(real_bin=$(readlink -f "$real_bin"); python3 -c "import os; print(os.path.relpath('$real_bin', '$(dirname "$bin_path")'))")" "$(basename "$bin_path")")
     fi
 
     # 2. Resolve and copy all shared libraries via ldd
+    # If the binary is static, ldd will return 'not a dynamic executable' and the loop won't run.
     ldd "$real_bin" 2>/dev/null | awk '/=>/ {print $3} /ld-linux/ {print $1}' | grep '^/' | while read -r lib; do
-        if [ -f "$lib" ]; then
-            local real_lib
-            real_lib=$(readlink -f "$lib")
+        [ -f "$lib" ] || continue
+        local real_lib
+        real_lib=$(readlink -f "$lib")
 
-            # Copy real library
-            mkdir -p ".$(dirname "$real_lib")"
+        # Copy real library
+        mkdir -p ".$(dirname "$real_lib")"
+        if cp --help | grep -q "update=none"; then
+            cp -p --update=none "$real_lib" ".${real_lib}" 2>/dev/null || true
+        else
             cp -pn "$real_lib" ".${real_lib}" 2>/dev/null || true
+        fi
 
-            # Recreate symlink (e.g., libc.so.6 -> libc-2.31.so)
-            if [ "$lib" != "$real_lib" ]; then
-                mkdir -p ".$(dirname "$lib")"
-                ln -sf "$real_lib" ".${lib}"
-            fi
+        # Recreate symlink (e.g., libc.so.6 -> libc-2.31.so)
+        if [ "$lib" != "$real_lib" ]; then
+            mkdir -p ".$(dirname "$lib")"
+            (cd ".$(dirname "$lib")" && ln -sf "$(real_lib=$(readlink -f "$real_lib"); python3 -c "import os; print(os.path.relpath('$real_lib', '$(dirname "$lib")'))")" "$(basename "$lib")")
         fi
     done
 }
