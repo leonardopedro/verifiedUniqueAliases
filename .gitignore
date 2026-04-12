@@ -3,6 +3,7 @@ target/
 **/*.rs.bk
 
 # Build Artifacts & Disk Images
+.idx/
 output/
 img/
 initrd-root*/
@@ -46,3 +47,5 @@ run-initramfs-build.sh
 .vscode/
 **/mutants.out*/
 *.pdb
+
+repomix-output.xml
