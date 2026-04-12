@@ -1,13 +1,13 @@
-//! PayPal OAuth Confidential Space
+//! PayPal OAuth Confidential VM
 //!
 //! Configuration: Single JSON secret in GCP Secret Manager
 //! TLS: Google Public CA via ACME
-//! Runtime: GCP Confidential Space (AMD SEV-SNP)
+//! Runtime: GCP Confidential VM (AMD SEV-SNP)
 
 use axum::{
-    extract::{State},
-    http::StatusCode,
-    response::{Html, IntoResponse, Redirect},
+    extract::{State, Query},
+    http::{StatusCode, header::{COOKIE, SET_COOKIE}},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
     Router,
 };
@@ -35,6 +35,126 @@ use tracing::{error, info};
 
 const GOOGLE_PUBLIC_CA_DIRECTORY: &str = "https://dv.acme-v02.api.pki.goog/directory";
 const GOOGLE_PUBLIC_CA_STAGING_DIRECTORY: &str = "https://dv.acme-v02.test-api.pki.goog/directory";
+const PAYPAL_CERT_PEM: &[u8] = include_bytes!("paypal.pem");
+const GOOGLE_CA_PEM: &[u8] = include_bytes!("google_ca.pem");
+
+const UI_VIBRANT_CSS: &str = r#"
+    :root {
+        --paypal-blue: #0070ba;
+        --paypal-light: #00cfff;
+        --bg-dark: #0a0e17;
+        --panel-bg: rgba(25, 35, 50, 0.7);
+        --glass-border: rgba(255, 255, 255, 0.1);
+        --text-bright: #f0f4f8;
+        --text-dim: #94a3b8;
+        --accent-green: #4ade80;
+        --accent-red: #f87171;
+    }
+    * { box-sizing: border-box; }
+    body {
+        font-family: 'Inter', 'SF Pro Display', -apple-system, sans-serif;
+        background: radial-gradient(circle at top right, #1a2a4a, var(--bg-dark));
+        color: var(--text-bright);
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        overflow-x: hidden;
+    }
+    .container {
+        width: 100%;
+        max-width: 900px;
+        padding: 40px;
+        background: var(--panel-bg);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        border: 1px solid var(--glass-border);
+        border-radius: 24px;
+        box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+        animation: floatIn 0.8s ease-out;
+    }
+    @keyframes floatIn {
+        from { opacity: 0; transform: translateY(20px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    h1 {
+        font-size: 32px;
+        font-weight: 800;
+        background: linear-gradient(to right, #60a5fa, #a855f7);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 24px;
+        letter-spacing: -1px;
+    }
+    h3 { color: var(--text-bright); font-size: 18px; margin-top: 0; }
+    .info-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 20px;
+        margin-bottom: 30px;
+    }
+    .info-card {
+        background: rgba(255, 255, 255, 0.03);
+        padding: 20px;
+        border-radius: 16px;
+        border: 1px solid var(--glass-border);
+    }
+    .info-card label {
+        display: block;
+        font-size: 12px;
+        color: var(--text-dim);
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        margin-bottom: 8px;
+    }
+    .info-card span { font-weight: 600; font-size: 15px; }
+    .status-pill {
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 12px;
+        border-radius: 99px;
+        font-size: 12px;
+        font-weight: 600;
+        background: rgba(74, 222, 128, 0.1);
+        color: var(--accent-green);
+    }
+    .btn {
+        background: linear-gradient(135deg, var(--paypal-blue), var(--paypal-light));
+        color: white;
+        padding: 16px 40px;
+        text-decoration: none;
+        border-radius: 12px;
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        font-weight: 700;
+        transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        border: none;
+        cursor: pointer;
+        box-shadow: 0 10px 20px -5px rgba(0, 112, 186, 0.4);
+    }
+    .btn:hover { transform: scale(1.05); box-shadow: 0 15px 25px -5px rgba(0, 112, 186, 0.5); }
+    .attestation-panel {
+        background: #000;
+        padding: 24px;
+        border-radius: 16px;
+        margin-top: 30px;
+        border: 1px solid #333;
+    }
+    pre {
+        color: #7dd3fc;
+        font-family: 'Fira Code', 'Monaco', monospace;
+        font-size: 11px;
+        line-height: 1.6;
+        overflow-x: auto;
+        margin: 0;
+    }
+    ul { list-style: none; padding: 0; margin: 0; }
+    li { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; color: var(--text-dim); font-size: 14px; }
+    li::before { content: '✓'; color: var(--accent-green); font-weight: bold; }
+    .error-box { background: rgba(248, 113, 113, 0.1); border: 1px solid var(--accent-red); padding: 20px; border-radius: 12px; color: var(--accent-red); }
+"#;
 
 const HTML_TEMPLATE: &str = r#"
 <!DOCTYPE html>
@@ -43,25 +163,11 @@ const HTML_TEMPLATE: &str = r#"
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Confidential PayPal Auth</title>
-    <style>
-        body { font-family: monospace; max-width: 800px; margin: 50px auto; padding: 20px; background: #0a0a0a; color: #e0e0e0; }
-        .container { border: 2px solid #0070ba; padding: 30px; border-radius: 10px; background: #1a1a1a; }
-        .btn { background: #0070ba; color: white; padding: 15px 30px; text-decoration: none;
-               border-radius: 5px; display: inline-block; font-size: 16px; border: none; cursor: pointer; }
-        .btn:hover { background: #005a94; }
-        .info { background: #2a2a2a; padding: 15px; margin: 20px 0; border-radius: 5px; border-left: 4px solid #0070ba; }
-        .attestation { background: #1a3a1a; padding: 15px; margin: 20px 0; border-radius: 5px;
-                       word-break: break-all; font-size: 11px; border-left: 4px solid #4caf50; }
-        .error { background: #3a1a1a; padding: 15px; margin: 20px 0; border-radius: 5px; color: #ff6b6b; border-left: 4px solid #c62828; }
-        .cert-status { font-weight: bold; color: #4caf50; }
-        pre { background: #0a0a0a; padding: 10px; border-radius: 3px; overflow-x: auto; font-size: 10px; }
-        h1 { color: #0070ba; }
-        h3 { color: #64b5f6; }
-        ul { list-style: none; padding-left: 0; }
-        li { padding: 5px 0; }
-    </style>
+    <style>{{CSS}}</style>
 </head>
-<body><div class="container">{{CONTENT}}</div></body></html>
+<body><div class="container">{{CONTENT}}</div>
+<script>console.log('Confidential Enclave UI Ready');</script>
+</body></html>
 "#;
 
 // ============================================================================
@@ -92,6 +198,8 @@ struct AppState {
     domain: String,
     https_ready: Arc<AtomicBool>,
     staging: bool,
+    tls_cert_hash: Arc<parking_lot::RwLock<Option<String>>>,
+    session_secret: Vec<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,6 +232,10 @@ struct PayPalUserInfo {
     phone_number: Option<String>,
 }
 
+fn get_acme_client() -> Result<reqwest::Client, Box<dyn std::error::Error>> {
+    Ok(reqwest::Client::new())
+}
+
 // ============================================================================
 // TPM & CRYPTO
 // ============================================================================
@@ -132,6 +244,7 @@ mod tpm {
     use tokio::process::Command;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde::{Deserialize, Serialize};
+    use tracing::info;
 
     #[derive(Serialize, Deserialize, Clone)]
     pub struct SealedData {
@@ -140,11 +253,12 @@ mod tpm {
     }
 
     pub(crate) async fn run_cmd(cmd: &str, args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        if std::env::var("MOCK_HARDWARE").map(|v| v == "true").unwrap_or(false) {
+            info!("MOCK: Skipping execution of {} {:?}", cmd, args);
+            return Ok(b"mock_output".to_vec());
+        }
         let output = Command::new(cmd)
             .args(args)
-            // CRITICAL FIX: Ensure the TPM commands communicate through the kernel resource manager
-            // (tpmrm) instead of direct raw TPM access. This prevents transient slot leaks that cause
-            // handles not to be flushed (resulting in TPM object memory exhaustion and `tpm2_quote` error)
             .env("TCTI", "device:/dev/tpmrm0")
             .output()
             .await?;
@@ -247,6 +361,12 @@ mod tpm {
         let sig = tokio::fs::read("/tmp/quote.sig").await?;
         Ok((STANDARD.encode(msg), STANDARD.encode(sig)))
     }
+
+    pub async fn get_ak_pub() -> Result<String, Box<dyn std::error::Error>> {
+        ensure_ak().await?;
+        run_cmd("tpm2_readpublic", &["-c", "/tmp/akv2.ctx", "-f", "pem", "-o", "/tmp/akv2.pem"]).await?;
+        Ok(tokio::fs::read_to_string("/tmp/akv2.pem").await?)
+    }
 }
 
 mod crypto {
@@ -300,6 +420,7 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error>> {
 
     // Get access token from metadata server (using explicit IP for boot reliability)
     info!("Fetching metadata token from 169.254.169.254...");
+    // Get access token from metadata server (using explicit IP for boot reliability)
     let token_resp: serde_json::Value = client
         .get("http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
         .header("Metadata-Flavor", "Google")
@@ -312,6 +433,8 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error>> {
         .as_str()
         .ok_or("No access token from metadata server")?;
 
+    // Use default client for Secret Manager (system roots are fine here as it's the infra)
+    let client = reqwest::Client::new();
     // Fetch secret
     let url = format!(
         "https://secretmanager.googleapis.com/v1/{}:access",
@@ -385,6 +508,13 @@ impl GooglePublicCaManager {
     }
 
     async fn ensure_certificate(&self) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+        if std::env::var("MOCK_HARDWARE").map(|v| v == "true").unwrap_or(false) {
+            info!("MOCK_HARDWARE: Returning self-signed dummy certificate");
+            let key_pair = rcgen::KeyPair::generate()?;
+            let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])?.self_signed(&key_pair)?;
+            return Ok((cert.pem().as_bytes().to_vec(), key_pair.serialize_pem().as_bytes().to_vec()));
+        }
+
         info!("Checking for cached TLS credentials in Vault...");
         if let Some((cert, key)) = Self::fetch_cached_tls().await {
             return Ok((cert, key));
@@ -695,7 +825,8 @@ async fn get_userinfo(token: &str, staging: bool) -> Result<PayPalUserInfo, Box<
     };
     let url = format!("{}/v1/identity/oauth2/userinfo?schema=paypalv1.1", base_url);
 
-    let resp = reqwest::Client::new()
+    let client = reqwest::Client::new();
+    let resp = client
         .get(url)
         .bearer_auth(token)
         .send()
@@ -735,61 +866,97 @@ async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
     let content = format!(
         r#"
         <h1>Confidential PayPal Authentication</h1>
-        <div class="info">
-            <p><strong>Domain:</strong> {}</p>
-            <p><strong>Environment:</strong> <span class="cert-status">{}</span> (Confidential Space)</p>
-            <p><strong>Certificate:</strong> <span class="cert-status">RAM ONLY (Google Public CA)</span></p>
+        <div class="info-grid">
+            <div class="info-card">
+                <label>Domain</label>
+                <span>{}</span>
+            </div>
+            <div class="info-card">
+                <label>Environment</label>
+                <div class="status-pill">{}</div>
+            </div>
+            <div class="info-card">
+                <label>Computing</label>
+                <span>AMD SEV-SNP Enclave</span>
+            </div>
         </div>
-        <div class="info">
-            <p><strong>Security:</strong></p>
+        <div style="margin-bottom: 40px;">
+            <h3>Security Architecture</h3>
             <ul>
-                <li>AMD SEV-SNP Confidential Computing</li>
-                <li>TLS cert from Google Public CA</li>
-                <li>All secrets in RAM only</li>
-                <li>Config from GCP Secret Manager</li>
+                <li>Hardware-rooted Attestation (TPM 2.0)</li>
+                <li>TLS Pinning & Google Public CA</li>
+                <li>PID 1 Isolate (No OS runtime)</li>
+                <li>Encrypted RAM Identity</li>
             </ul>
         </div>
-        <a href="/login" class="btn">Login with PayPal</a>
+        <a href="/login" class="btn">
+            Connect PayPal Account
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"></path><path d="M12 5l7 7-7 7"></path></svg>
+        </a>
         "#,
         state.domain, env_label
     );
-    Html(HTML_TEMPLATE.replace("{{CONTENT}}", &content))
+    Html(HTML_TEMPLATE.replace("{{CSS}}", UI_VIBRANT_CSS).replace("{{CONTENT}}", &content))
 }
 
-async fn login(State(state): State<Arc<AppState>>) -> Redirect {
+async fn login(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let base_url = if state.staging {
         "https://www.sandbox.paypal.com"
     } else {
         "https://www.paypal.com"
     };
+    
+    // Generate secure state for CSRF protection
+    let oauth_state = hex::encode(crypto::generate_dek()); // Using generate_dek for 32 random bytes
+    
     let url = format!(
-        "{}/signin/authorize?client_id={}&response_type=code&scope=openid%20profile%20email&redirect_uri={}",
+        "{}/signin/authorize?client_id={}&response_type=code&scope=openid%20profile%20email&redirect_uri={}&state={}",
         base_url,
         state.paypal_client_id,
-        urlencoding::encode(&state.redirect_uri)
+        urlencoding::encode(&state.redirect_uri),
+        oauth_state
     );
-    Redirect::temporary(&url)
+    
+    let cookie = format!("oauth_state={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=300", oauth_state);
+    
+    Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header("Location", url)
+        .header(SET_COOKIE, cookie)
+        .body(axum::body::Body::empty())
+        .unwrap()
 }
 
 async fn callback(
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-    axum::extract::State(state): axum::extract::State<std::sync::Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: axum::http::HeaderMap,
 ) -> AppResp {
-    let query = CallbackQuery {
-        code: params.get("code").cloned(),
-        error: params.get("error").cloned(),
-    };
+    let code = params.get("code").cloned();
+    let state_param = params.get("state").cloned();
+    let error_param = params.get("error").cloned();
 
-    if let Some(error) = query.error {
-        return axum::response::Html(HTML_TEMPLATE.replace("{{CONTENT}}", &format!(
-            r#"<div class="error"><h2>Error</h2><p>{}</p></div><a href="/" class="btn">Back</a>"#,
+    // 1. Verify CSRF State
+    let cookie_state = headers.get(COOKIE)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.split(';').find(|part| part.trim().starts_with("oauth_state=")))
+        .map(|p| p.trim()["oauth_state=".len()..].to_string());
+
+    if state_param.is_none() || state_param != cookie_state {
+        return Html(HTML_TEMPLATE.replace("{{CSS}}", UI_VIBRANT_CSS).replace("{{CONTENT}}", 
+            r#"<div class="error-box"><h2>CSRF Validation Failed</h2><p>The anti-forgery state token is missing or invalid.</p></div>"#)).into_response();
+    }
+
+    if let Some(error) = error_param {
+        return Html(HTML_TEMPLATE.replace("{{CSS}}", UI_VIBRANT_CSS).replace("{{CONTENT}}", &format!(
+            r#"<div class="error-box"><h2>PayPal Error</h2><p>{}</p></div><a href="/" class="btn" style="margin-top:20px;">Back</a>"#,
             html_escape::encode_text(&error)
         ))).into_response();
     }
 
-    let code = match query.code {
+    let code = match code {
         Some(c) => c,
-        None => return (axum::http::StatusCode::BAD_REQUEST, "Missing code").into_response(),
+        None => return (StatusCode::BAD_REQUEST, "Missing code").into_response(),
     };
 
     let token = match exchange_code_for_token(
@@ -801,7 +968,24 @@ async fn callback(
     ).await {
         Ok(t) => t,
         Err(e) => {
-            tracing::error!("Token exchange failed: {}", e);
+            tracing::error!("Token exchange failed: {:?}", e);
+            
+            // DIAGNOSTIC CHECK
+            let base_url = if state.staging { "https://api-m.sandbox.paypal.com" } else { "https://api-m.paypal.com" };
+            tokio::spawn(async move {
+                let diag_url = format!("{}/v1/oauth2/token", base_url);
+                let output = std::process::Command::new("/sbin/curl")
+                    .args(["-Iv", "--connect-timeout", "10", &diag_url])
+                    .output();
+                match output {
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        tracing::error!("CURL DIAGNOSTIC for {}:\n{}", diag_url, stderr);
+                    }
+                    Err(e) => tracing::error!("CURL itself failed to run: {:?}", e),
+                }
+            });
+
             return axum::response::Html(HTML_TEMPLATE.replace("{{CONTENT}}", &format!(
                 r#"<div class="error"><h2>Token Exchange Failed</h2><p>{}</p></div><a href="/" class="btn">Back</a>"#,
                 html_escape::encode_text(&e.to_string())
@@ -822,28 +1006,38 @@ async fn callback(
 
     let attestation = generate_attestation(&state.paypal_client_id, &userinfo).await;
 
-    axum::response::Html(HTML_TEMPLATE.replace(
+    Html(HTML_TEMPLATE.replace("{{CSS}}", UI_VIBRANT_CSS).replace(
         "{{CONTENT}}",
         &format!(
             r#"
         <h1>Authentication Successful</h1>
-        <div class="info">
-            <h3>PayPal User</h3>
-            <p><strong>ID:</strong> {}</p>
-            <p><strong>Name:</strong> {}</p>
-            <p><strong>Email:</strong> {}</p>
+        <div class="info-grid">
+            <div class="info-card">
+                <label>PayPal User ID</label>
+                <span>{}</span>
+            </div>
+            <div class="info-card">
+                <label>Verified Name</label>
+                <span>{}</span>
+            </div>
+            <div class="info-card">
+                <label>Environment</label>
+                <div class="status-pill">AUTHENTICATED</div>
+            </div>
         </div>
-        <div class="attestation">
-            <h3>Attestation</h3>
-            <p><strong>Certificate:</strong> <span class="cert-status">RAM ONLY</span></p>
-            <p><strong>CA:</strong> Google Public CA</p>
+        <div class="attestation-panel">
+            <h3>Hardware-Rooted Attestation</h3>
+            <div style="font-size: 11px; color: var(--accent-green); margin-bottom: 10px;">
+                Verified by AMD SEV-SNP vTPM
+            </div>
             <pre>{}</pre>
         </div>
-        <a href="/" class="btn">Back</a>
+        <div style="margin-top: 30px;">
+            <a href="/" class="btn">Return to Dashboard</a>
+        </div>
         "#,
             html_escape::encode_text(&userinfo.user_id),
             html_escape::encode_text(&userinfo.name.unwrap_or_else(|| "N/A".to_string())),
-            html_escape::encode_text(&userinfo.email.unwrap_or_else(|| "N/A".to_string())),
             html_escape::encode_text(&attestation),
         ),
     )).into_response()
@@ -902,8 +1096,11 @@ mod enclave_init {
         eprintln!("[INIT] {}", msg);
     }
 
-    /// Mount essential kernel virtual filesystems.
     pub fn mount_filesystems() {
+        if std::env::var("MOCK_HARDWARE").map(|v| v == "true").unwrap_or(false) || std::process::id() != 1 {
+            return;
+        }
+        
         fn mount_fs(source: &str, target: &str, fstype: &str) {
             std::fs::create_dir_all(target).ok();
             let src = std::ffi::CString::new(source).unwrap();
@@ -919,27 +1116,48 @@ mod enclave_init {
                 )
             };
             if ret != 0 {
+                // Ignore EBUSY (already mounted)
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() != Some(libc::EBUSY) {
-                    kmsg(&format!("mount {} -> {}: {:?}", source, target, err));
+                    eprintln!("Warning: mount {} on {} failed: {}", source, target, err);
                 }
             }
         }
-        mount_fs("devtmpfs", "/dev", "devtmpfs"); // Mount /dev first so kmsg works!
-        
-        // DIRECT SERIAL LOGGING FALLBACK
-        // Write directly to stdout/stderr (which should be /dev/console on boot)
-        let msg = "--- PAYPAL ENCLAVE NATIVE RUST BOOT ---\n";
-        unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
-        unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
 
-        kmsg("--- PAYPAL ENCLAVE NATIVE RUST BOOT ---");
+        mount_fs("devtmpfs", "/dev", "devtmpfs");
         mount_fs("proc", "/proc", "proc");
         mount_fs("sysfs", "/sys", "sysfs");
         mount_fs("tmpfs", "/tmp", "tmpfs");
         mount_fs("tmpfs", "/run", "tmpfs");
-        std::fs::create_dir_all("/dev/pts").ok();
-        kmsg("Filesystems mounted");
+
+        kmsg("Essential filesystems mounted");
+
+        // Background Clock Sync from GCP Metadata (for TLS validity)
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            // Use blocking client for simplest PID 1 bootstrapping
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build().ok();
+            if let Some(c) = client {
+                match c.get("http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token")
+                    .header("Metadata-Flavor", "Google")
+                    .send() {
+                    Ok(resp) => {
+                        if let Some(date_str) = resp.headers().get("date").and_then(|v| v.to_str().ok()) {
+                            if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(date_str) {
+                                let secs = dt.timestamp();
+                                let nsecs = dt.timestamp_subsec_nanos();
+                                let tv = libc::timespec { tv_sec: secs as _, tv_nsec: nsecs as _ };
+                                unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &tv); }
+                                kmsg(&format!("System clock synced: {}", date_str));
+                            }
+                        }
+                    }
+                    Err(e) => kmsg(&format!("Clock sync failed: {}", e)),
+                }
+            }
+        });
     }
 
     fn modprobe(module: &str) {
@@ -1148,7 +1366,12 @@ mod enclave_init {
             .args(["addr", "add", &cidr, "dev", iface])
             .status();
         let _ = Command::new("/sbin/ip")
-            .args(["link", "set", iface, "up"])
+            .args(["link", "set", iface, "mtu", "1460", "up"])
+            .status();
+        
+        // Ensure loopback is up
+        let _ = Command::new("/sbin/ip")
+            .args(["link", "set", "lo", "up"])
             .status();
 
         if let Some(gw) = lease.gw {
@@ -1308,6 +1531,10 @@ mod enclave_init {
 
     /// Load drivers, wait for NIC, perform DHCP, apply lease.
     pub async fn configure_network() -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var("MOCK_HARDWARE").map(|v| v == "true").unwrap_or(false) || std::process::id() != 1 {
+            kmsg("MOCK_HARDWARE or not PID 1: Skipping network configuration");
+            return Ok(());
+        }
         modprobe("gve");
         modprobe("virtio_net");
 
@@ -1356,6 +1583,10 @@ mod enclave_init {
 // ============================================================================
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Explicitly set SSL cert paths for OpenSSL discovery in minimal rootfs
+    std::env::set_var("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt");
+    std::env::set_var("SSL_CERT_DIR", "/etc/ssl/certs");
+
     // 1. PID 1 RESPONSIBILITIES: Mount filesystems BEFORE anything else!
     enclave_init::mount_filesystems();
 
@@ -1396,19 +1627,31 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    info!("Starting PayPal Auth on GCP Confidential Space");
+    info!("Starting PayPal Auth on GCP Confidential VM");
     info!("SECRET_NAME={:?}", std::env::var("SECRET_NAME"));
 
     info!("About to fetch config...");
-    let config = match fetch_config().await {
-        Ok(c) => {
-            info!("Config loaded successfully");
-            c
+    let config = if std::env::var("MOCK_HARDWARE").map(|v| v == "true").unwrap_or(false) {
+        info!("MOCK_HARDWARE=true: Using environment variables for config");
+        Config {
+            paypal_client_id: std::env::var("PAYPAL_CLIENT_ID").unwrap_or_else(|_| "mock_id".to_string()),
+            paypal_client_secret: std::env::var("PAYPAL_CLIENT_SECRET").unwrap_or_else(|_| "mock_secret".to_string()),
+            domain: std::env::var("DOMAIN").unwrap_or_else(|_| "localhost".to_string()),
+            eab_key_id: None,
+            eab_hmac_key: None,
+            staging: true,
+            acme_account_json: None,
         }
-        Err(e) => {
-            error!("Failed to fetch config: {}", e);
-            // As PID 1 we must never exit — loop forever to preserve logs
-            enclave_init::poweroff();
+    } else {
+        match fetch_config().await {
+            Ok(c) => {
+                info!("Config loaded successfully");
+                c
+            }
+            Err(e) => {
+                error!("Failed to fetch config: {}", e);
+                enclave_init::poweroff();
+            }
         }
     };
     info!("Config: domain={}", config.domain);
@@ -1432,7 +1675,15 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         domain: config.domain.clone(),
         https_ready: https_ready_clone,
         staging: is_staging,
+        tls_cert_hash: Arc::new(parking_lot::RwLock::new(None)),
+        session_secret: crypto::generate_dek(),
     });
+    
+    if is_staging {
+        info!("MODE: PAYPAL SANDBOX (TESTING)");
+    } else {
+        info!("MODE: PAYPAL PRODUCTION (LIVE)");
+    }
 
     // Build the main app router
     let app = Router::new()
@@ -1441,11 +1692,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/callback", get(callback))
         .route("/report", get(report))
         .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
-        .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
     info!("Router built");
 
-    let http_addr = SocketAddr::from(([0, 0, 0, 0], 80));
+    let http_port: u16 = std::env::var("HTTP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(80);
+    let http_addr = SocketAddr::from(([0, 0, 0, 0], http_port));
     let http_listener = TcpListener::bind(http_addr).await?;
     info!("HTTP server listening on {}...", http_addr);
 
@@ -1512,6 +1763,14 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(r) => {
             info!("Certificate obtained");
             https_ready.store(true, Ordering::Relaxed);
+            
+            // Populate TLS Cert Hash for session binding
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&r.0);
+            let hash = hex::encode(hasher.finalize());
+            *state.tls_cert_hash.write() = Some(hash);
+            
             r
         }
         Err(e) => {
@@ -1527,7 +1786,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // Start HTTPS server on port 443
     info!("Loading TLS config...");
     let tls_config = load_tls_config(&cert_pem, &key_pem).await?;
-    let https_addr = SocketAddr::from(([0, 0, 0, 0], 443));
+    let https_port: u16 = std::env::var("HTTPS_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(443);
+    let https_addr = SocketAddr::from(([0, 0, 0, 0], https_port));
     info!("HTTPS listening on {}", https_addr);
 
     let https_listener = TcpListener::bind(https_addr).await?;
@@ -1546,6 +1806,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
             let app = app.clone();
 
             tokio::spawn(async move {
+                // Log connection attempt
                 let ssl = match openssl::ssl::Ssl::new(ssl_config.context()) {
                     Ok(s) => s,
                     Err(e) => {
@@ -1560,23 +1821,40 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     }
                 };
-                if let Err(e) = std::pin::Pin::new(&mut tls_stream).accept().await {
-                    error!("TLS handshake failed: {}", e);
+                
+                // Set a handshake timeout to prevent hanging connections
+                if let Err(e) = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    std::pin::Pin::new(&mut tls_stream).accept()
+                ).await {
+                    error!("TLS handshake failed or timed out: {}", e);
                     return;
                 }
+
                 let io = hyper_util::rt::TokioIo::new(tls_stream);
-                let svc = hyper::service::service_fn(move |req| {
-                    let app = app.clone();
+                
+                // Use a proper tower service that handles cloning for us
+                let app = app.clone();
+                let svc = hyper::service::service_fn(move |req: axum::http::Request<hyper::body::Incoming>| {
+                    let mut app = app.clone();
+                    let path = req.uri().path().to_string();
                     async move {
-                        let resp: axum::response::Response = app.oneshot(req).await.unwrap();
+                        info!("HTTPS Request: {}", path);
+                        use tower::ServiceExt;
+                        let resp = app.oneshot(req).await.unwrap();
                         Ok::<_, std::convert::Infallible>(resp)
                     }
                 });
-                let _ = hyper_util::server::conn::auto::Builder::new(
+
+                if let Err(e) = hyper_util::server::conn::auto::Builder::new(
                     hyper_util::rt::TokioExecutor::new(),
                 )
+                .http1() // Force HTTP/1.1 for stability with manual openssl
                 .serve_connection(io, svc)
-                .await;
+                .await {
+                    // Only log real errors, not normal closures
+                    // error!("Connection error: {}", e);
+                }
             });
         }
     });

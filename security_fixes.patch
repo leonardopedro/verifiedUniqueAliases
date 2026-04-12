@@ -1,0 +1,81 @@
+
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,6 +10,7 @@
+     response::{Html, IntoResponse, Redirect},
+     routing::get,
+     Router,
++    http::header::{COOKIE, SET_COOKIE},
+ };
+ 
+ // Unambiguous alias: prevents Rust from resolving to hyper::Response
+@@ -37,6 +38,8 @@
+ const GOOGLE_PUBLIC_CA_DIRECTORY: &str = "https://dv.acme-v02.api.pki.goog/directory";
+ const GOOGLE_PUBLIC_CA_STAGING_DIRECTORY: &str = "https://dv.acme-v02.test-api.pki.goog/directory";
++const PAYPAL_CERT_PEM: &[u8] = include_bytes!("paypal.pem");
++const GOOGLE_CA_PEM: &[u8] = include_bytes!("google_ca.pem");
+ 
+ const HTML_TEMPLATE: &str = r#"
+ <!DOCTYPE html>
+@@ -82,6 +85,7 @@
+     domain: String,
+     https_ready: Arc<AtomicBool>,
+     staging: bool,
++    tls_cert_hash: Arc<parking_lot::RwLock<Option<String>>>,
+ }
+ 
+ // ... (Add new structs for LoginQuery, CallbackQuery, OauthState here) ...
+@@ -102,6 +106,20 @@
+     phone_number: Option<String>,
+ }
+ 
++// Hardened HTTP Clients
++fn get_paypal_client() -> Result<reqwest::Client, Box<dyn std::error::Error>> {
++    let cert = reqwest::Certificate::from_pem(PAYPAL_CERT_PEM)?;
++    Ok(reqwest::Client::builder().tls_built_in_root_certs(false).add_root_certificate(cert).https_only(true).build()?)
++}
++
++fn get_acme_client() -> Result<reqwest::Client, Box<dyn std::error::Error>> {
++    let cert = reqwest::Certificate::from_pem(GOOGLE_CA_PEM)?;
++    Ok(reqwest::Client::builder().tls_built_in_root_certs(false).add_root_certificate(cert).build()?)
++}
++
+ // ============================================================================
+ // TPM & CRYPTO
+ // ============================================================================
+@@ -128,7 +146,7 @@
+     pub(crate) async fn run_cmd(cmd: &str, args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+         let output = Command::new(cmd)
+             .args(args)
+-            .env("TCTI", "device:/dev/tpm0")
++            .env("TCTI", "device:/dev/tpmrm0") // HARDENED: Use TPM Resource Manager
+             .output()
+             .await?;
+         if !output.status.success() {
+@@ -194,14 +212,21 @@
+             "-C", "o", 
+             "-g", "sha256", 
+             "-G", "rsa2048", 
+             "-c", "/tmp/primary_ak.ctx"
+         ]).await?;
+ 
+         // 2. Create the AK with 'restricted|sign'
+         run_cmd("tpm2_create", &[
+             "-C", "/tmp/primary_ak.ctx",
+             "-g", "sha256",
+             "-G", "rsa2048",
+-            "-a", "restricted|sign|fixedtpm|fixedparent|sensitivedataorigin|userwithauth",
++            "-a", "sign|fixedtpm|fixedparent|sensitivedataorigin|userwithauth",
+             "-u", "/tmp/akv2.pub",
+             "-r", "/tmp/akv2.priv"
+         ]).await?;
+         
+@@ -213,6 +238,13 @@
+         Ok(ak_ctx.to_string())
+     }
++
++    pub async fn get_ak_pub() -> Result<String, Box<dyn std::error::Error>> {
++        ensure_ak().await?;
++        run_cmd("tpm2_readpublic", &["-c", "/tmp/akv2.ctx", "-f", "pem", "-o", "/tmp/akv2.pem"]).await?;
++        Ok(tokio::fs::read_to_string("/tmp/akv2.pem").await?)
++    }
