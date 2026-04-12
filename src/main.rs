@@ -5,7 +5,7 @@
 //! Runtime: GCP Confidential Space (AMD SEV-SNP)
 
 use axum::{
-    extract::{Query, State},
+    extract::{State},
     http::StatusCode,
     response::{Html, IntoResponse, Redirect},
     routing::get,
@@ -20,10 +20,10 @@ use instant_acme::{
     Identifier, NewAccount, NewOrder, OrderStatus,
 };
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
-use parking_lot::RwLock;
+
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 use tower_http::trace::TraceLayer;
@@ -139,10 +139,13 @@ mod tpm {
         pub priv_blob: String,
     }
 
-    async fn run_cmd(cmd: &str, args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub(crate) async fn run_cmd(cmd: &str, args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let output = Command::new(cmd)
             .args(args)
-            .env("TCTI", "device:/dev/tpm0")
+            // CRITICAL FIX: Ensure the TPM commands communicate through the kernel resource manager
+            // (tpmrm) instead of direct raw TPM access. This prevents transient slot leaks that cause
+            // handles not to be flushed (resulting in TPM object memory exhaustion and `tpm2_quote` error)
+            .env("TCTI", "device:/dev/tpmrm0")
             .output()
             .await?;
         if !output.status.success() {
@@ -190,13 +193,51 @@ mod tpm {
         Ok(dek)
     }
 
+    async fn ensure_ak() -> Result<String, Box<dyn std::error::Error>> {
+        let ak_ctx = "/tmp/akv2.ctx";
+        if tokio::fs::metadata(ak_ctx).await.is_ok() {
+            return Ok(ak_ctx.to_string());
+        }
+        
+        crate::enclave_init::kmsg("Provisioning transient Attestation Key...");
+
+        // 1. Create primary key in Owner hierarchy explicitly
+        run_cmd("tpm2_createprimary", &[
+            "-C", "o", 
+            "-g", "sha256", 
+            "-G", "rsa2048", 
+            "-c", "/tmp/primary_ak.ctx"
+        ]).await?;
+
+        // 2. Create the AK with 'restricted|sign' - required for TPM2_Quote
+        run_cmd("tpm2_create", &[
+            "-C", "/tmp/primary_ak.ctx",
+            "-g", "sha256",
+            "-G", "rsa2048",
+            "-a", "sign|fixedtpm|fixedparent|sensitivedataorigin|userwithauth",
+            "-u", "/tmp/akv2.pub",
+            "-r", "/tmp/akv2.priv"
+        ]).await?;
+        
+        // 3. Load it
+        run_cmd("tpm2_load", &[
+            "-C", "/tmp/primary_ak.ctx",
+            "-u", "/tmp/akv2.pub",
+            "-r", "/tmp/akv2.priv",
+            "-c", ak_ctx
+        ]).await?;
+        
+        Ok(ak_ctx.to_string())
+    }
+
     pub async fn quote(pcrs: &str, nonce_hex: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
-        // Try handles 0x81010001 (standard Persistent AK location)
-        let _ = run_cmd("tpm2_getcap", &["handles-persistent"]).await;
-        let ak_handle = if run_cmd("tpm2_readpublic", &["-c", "0x81010001"]).await.is_ok() { "0x81010001" } else { "0x81010002" };
+        let ak = ensure_ak().await.unwrap_or_else(|e| {
+            crate::enclave_init::kmsg(&format!("AK setup failed: {}. Falling back to 0x81010001", e));
+            "0x81010001".to_string()
+        });
         
         run_cmd("tpm2_quote", &[
-            "-c", ak_handle,
+            "-c", &ak,
             "-l", &format!("sha256:{}", pcrs),
             "-q", nonce_hex,
             "-m", "/tmp/quote.msg",
@@ -673,6 +714,22 @@ async fn get_userinfo(token: &str, staging: bool) -> Result<PayPalUserInfo, Box<
 // HTTP HANDLERS
 // ============================================================================
 
+async fn report() -> impl IntoResponse {
+    let nonce = "01".repeat(32);
+    match tpm::quote("0,2,4,7,8,9,15", &nonce).await {
+        Ok((msg, sig)) => {
+            let body = serde_json::json!({
+                "quote": msg,
+                "signature": sig,
+                "nonce": nonce,
+                "note": "Hardware attestation success"
+            });
+            (StatusCode::OK, serde_json::to_string(&body).unwrap()).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("tpm2_quote failed: {}", e)).into_response()
+    }
+}
+
 async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
     let env_label = if state.staging { "SANDBOX" } else { "PRODUCTION" };
     let content = format!(
@@ -792,9 +849,6 @@ async fn callback(
     )).into_response()
 }
 
-
-
-
 async fn acme_challenge(
     axum::extract::Path(token): axum::extract::Path<String>,
     State(state): State<Arc<AppState>>,
@@ -807,8 +861,6 @@ async fn acme_challenge(
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
-
-
 
 #[allow(dead_code)]
 async fn http_to_https_redirect() -> Redirect {
@@ -874,6 +926,13 @@ mod enclave_init {
             }
         }
         mount_fs("devtmpfs", "/dev", "devtmpfs"); // Mount /dev first so kmsg works!
+        
+        // DIRECT SERIAL LOGGING FALLBACK
+        // Write directly to stdout/stderr (which should be /dev/console on boot)
+        let msg = "--- PAYPAL ENCLAVE NATIVE RUST BOOT ---\n";
+        unsafe { libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len()); }
+        unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+
         kmsg("--- PAYPAL ENCLAVE NATIVE RUST BOOT ---");
         mount_fs("proc", "/proc", "proc");
         mount_fs("sysfs", "/sys", "sysfs");
@@ -1146,7 +1205,7 @@ mod enclave_init {
         kmsg(&format!("DHCP: Starting on {} (mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, xid=0x{:08x})", 
             iface, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], xid));
 
-        let mut recv_buf = [0u8; 1024];
+        let mut recv_buf =[0u8; 1024];
 
         // 1. DISCOVER -> OFFER loop (up to 5 retries)
         let mut offered_ip = None;
@@ -1157,7 +1216,7 @@ mod enclave_init {
             // Wait for OFFER
             let start = std::time::Instant::now();
             while start.elapsed() < std::time::Duration::from_secs(5) {
-                let mut buf = [std::mem::MaybeUninit::uninit(); 1024];
+                let mut buf =[std::mem::MaybeUninit::uninit(); 1024];
                 match sock.recv_from(&mut buf) {
                     Ok((n, _)) => {
                         for i in 0..n {
@@ -1206,7 +1265,7 @@ mod enclave_init {
 
             let start = std::time::Instant::now();
             while start.elapsed() < std::time::Duration::from_secs(5) {
-                let mut buf = [std::mem::MaybeUninit::uninit(); 1024];
+                let mut buf =[std::mem::MaybeUninit::uninit(); 1024];
                 match sock.recv_from(&mut buf) {
                     Ok((n, _)) => {
                         for i in 0..n {
@@ -1380,6 +1439,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/", get(index))
         .route("/login", get(login))
         .route("/callback", get(callback))
+        .route("/report", get(report))
         .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());

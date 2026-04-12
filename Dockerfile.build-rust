@@ -29,22 +29,15 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
-
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-
-ENV RUSTFLAGS="-C target-cpu=generic -C codegen-units=1 -C strip=symbols" \
-    CARGO_PROFILE_RELEASE_LTO=true \
-    CARGO_PROFILE_RELEASE_OPT_LEVEL=2
-
-RUN cargo build --release --target x86_64-unknown-linux-gnu && rm -rf src
-
 COPY src ./src
 
-RUN . /usr/local/cargo/env && \
-    cargo build --release --target x86_64-unknown-linux-gnu
+ENV RUSTFLAGS="-C target-cpu=generic"
 
-RUN chmod +x target/x86_64-unknown-linux-gnu/release/paypal-auth-vm && \
-    cp target/x86_64-unknown-linux-gnu/release/paypal-auth-vm /paypal-auth-vm-bin
+RUN . /usr/local/cargo/env && \
+    cargo build --release --target x86_64-unknown-linux-gnu && \
+    ls -lh target/x86_64-unknown-linux-gnu/release/paypal-auth-vm
+
+RUN cp target/x86_64-unknown-linux-gnu/release/paypal-auth-vm /paypal-auth-vm-bin
 
 FROM scratch
 COPY --from=builder /paypal-auth-vm-bin /paypal-auth-vm-bin
