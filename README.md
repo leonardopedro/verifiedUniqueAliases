@@ -4,7 +4,7 @@ Hardware-attested PayPal OAuth service on **GCP Confidential Space** (AMD SEV-SN
 Built for 100% bit-by-bit reproducibility and maximum security.
 
 ---
-## 🚀 Current Status (v59-final)
+## 🚀 Current Status (v60)
 
 | Component | Status |
 |---|---|
@@ -14,6 +14,7 @@ Built for 100% bit-by-bit reproducibility and maximum security.
 | Hardened Attestation (TPM Resource Management) | ✅ Achieved |
 | TPM-Sealed TLS Cache Persistence | ✅ Achieved |
 | PayPal OAuth Sandbox Flow | ✅ Achieved |
+| End-to-End Automated Deployment | ✅ Achieved (v60) |
 
 ### Architectural Breakthrough: Native PID 1 Rust Integration
 The service takes complete control of the OS from the very first instruction. It runs perfectly isolated on GCP Confidential Space without any classic `/sbin/init` or shell requirements:
@@ -33,32 +34,42 @@ Initially planned as `musl` static, the project successfully transitioned to `gl
 
 ## 🏗️ Build Architecture & Workflow
 
-To maintain exact EFI/Kernel Secure Boot signatures matching GCP infrastructure, the build process is split:
+The project has moved from a hybrid manual build to a fully containerized, reproducible synthesis pipeline.
 
-1. **Phase 1: Local Docker Build**: The Rust binary is compiled inside a controlled Docker environment (`Dockerfile.build-rust`) targeting `x86_64-unknown-linux-gnu`.
-2. **Phase 2: Remote Synthesis**: The binary is `scp`'d to a GCP build VM (`build-vm-paypal-n2d`) where `build-initramfs-tools.sh` and `build-gcp-gpt-image.sh` are executed. This ensures the correct `shimx64.efi`, `grubx64.efi` and kernel are utilized for the GPT image.
+### 1. Unified Containerized Build (Recommended)
+The entire OS synthesis—including the Rust binary compilation, initramfs generation, and GPT disk construction—is performed inside a multi-stage Docker environment. This ensures that the resulting `disk.tar.gz` is bitwise identical regardless of the host OS.
 
-### Build Commands:
 ```bash
-# 1. Build and extract binary
-docker build -f Dockerfile.build-rust -t paypal-auth-vm-builder .
-docker create --name tmp_bin paypal-auth-vm-builder
-docker cp tmp_bin:/paypal-auth-vm-bin ./paypal-auth-vm-bin-local
-docker rm tmp_bin
+# Build the disk image entirely within Docker
+docker build -f Dockerfile.repro -t paypal-auth-vm-repro .
 
-# 2. Upload and Remote Build
-gcloud compute scp paypal-auth-vm-bin-local build-vm-paypal-n2d:~/paypal-auth-vm-bin
-gcloud compute scp build-initramfs-tools.sh build-gcp-gpt-image.sh build-vm-paypal-n2d:~/
-gcloud compute ssh build-vm-paypal-n2d --command="sudo ./build-initramfs-tools.sh && sudo ./build-gcp-gpt-image.sh"
+# Extract the reproducible artifact
+docker create --name tmp_disk paypal-auth-vm-repro
+docker cp tmp_disk:/disk.tar.gz ./disk.tar.gz
+docker rm tmp_disk
 ```
+
+### 2. Automated Deployment: `deploy-gcp.sh`
+The `deploy-gcp.sh` script automates the full lifecycle for v60+:
+1.  **Local Build**: Invokes the `Dockerfile.repro` pipeline.
+2.  **Cloud Upload**: Transfers the bit-perfect `disk.tar.gz` to Google Cloud Storage.
+3.  **Image Registration**: Creates a custom GCP image with `SEV_SNP_CAPABLE` and `GVNIC` flags.
+4.  **Enclave Launch**: Provisions the Confidential N2D instance with the correct TPM metadata and sealed secret bindings.
+
+```bash
+./deploy-gcp.sh
+```
+
+---
 
 ## 📂 Repository Structure
 
 | File | Purpose |
 |---|---|
 | `src/main.rs` | Core Rust logic (PID 1 handler + Axum web logic + TPM operations) |
+| `deploy-gcp.sh` | **(v60)** End-to-end deployment automation (Build -> Upload -> Launch) |
 | `hooks/paypal-auth` | `initramfs-tools` hook that bundles the Rust app as `/init` |
-| `Dockerfile.build-rust` | Reproducible glibc-based Rust build environment |
+| `Dockerfile.repro` | **(v60)** Multi-stage build for 100% bitwise-reproducible disk images |
 | `build-gcp-gpt-image.sh` | Deterministic GPT disk synthesis (Normalization pipeline) |
-| `build-initramfs-tools.sh` | Initramfs synthesis using native Ubuntu tooling |
-| `AGENTS.md` | Detailed implementation state, hardware-rooting details, and GCP image registration + VM launch |
+| `build-initramfs-tools.sh` | Initramfs synthesis using native Debian/Ubuntu tooling |
+| `AGENTS.md` | Detailed implementation state and security architecture guidelines |
