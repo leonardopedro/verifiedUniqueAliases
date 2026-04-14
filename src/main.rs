@@ -1400,6 +1400,99 @@ mod enclave_init {
         kmsg(&format!("Network up: {} gw={:?}", cidr, lease.gw));
     }
 
+    pub fn apply_network_limits() {
+        use std::process::Command;
+        use std::net::ToSocketAddrs;
+
+        let chains = [
+            "INPUT", "OUTPUT",
+            "CHECK_GLOBAL_OUT", "POST_GLOBAL_OUT",
+            "CHECK_IP_OUT", "CHECK_IP_IN"
+        ];
+
+        for chain in &chains {
+            let _ = Command::new("iptables").args(["-F", chain]).status();
+        }
+        for chain in &["CHECK_GLOBAL_OUT", "POST_GLOBAL_OUT", "CHECK_IP_OUT", "CHECK_IP_IN"] {
+            let _ = Command::new("iptables").args(["-X", chain]).status();
+        }
+
+        let _ = Command::new("iptables").args(["-P", "INPUT", "DROP"]).status();
+        let _ = Command::new("iptables").args(["-P", "OUTPUT", "DROP"]).status();
+
+        let _ = Command::new("iptables").args(["-A", "INPUT", "-i", "lo", "-j", "ACCEPT"]).status();
+        let _ = Command::new("iptables").args(["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"]).status();
+
+        let _ = Command::new("iptables").args(["-N", "CHECK_GLOBAL_OUT"]).status();
+        let _ = Command::new("iptables").args(["-N", "POST_GLOBAL_OUT"]).status();
+        let _ = Command::new("iptables").args(["-N", "CHECK_IP_OUT"]).status();
+        let _ = Command::new("iptables").args(["-N", "CHECK_IP_IN"]).status();
+
+        let mut paypal_ips = Vec::new();
+        let paypal_domains = ["api-m.paypal.com:443", "api-m.sandbox.paypal.com:443"];
+
+        for domain in paypal_domains.iter() {
+            match domain.to_socket_addrs() {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        paypal_ips.push(addr.ip().to_string());
+                    }
+                }
+                Err(e) => kmsg(&format!("WARNING: Failed to resolve {}: {}", domain, e)),
+            }
+        }
+
+        for ip in &paypal_ips {
+            let _ = Command::new("iptables").args(["-A", "INPUT", "-s", ip, "-j", "ACCEPT"]).status();
+        }
+        let _ = Command::new("iptables").args(["-A", "INPUT", "-j", "CHECK_IP_IN"]).status();
+
+        let _ = Command::new("iptables").args([
+            "-A", "CHECK_IP_IN",
+            "-m", "hashlimit",
+            "--hashlimit-mode", "srcip",
+            "--hashlimit-name", "in_per_ip",
+            "--hashlimit-upto", "5mb/hour",
+            "--hashlimit-burst", "5mb",
+            "-j", "ACCEPT"
+        ]).status();
+
+        let _ = Command::new("iptables").args(["-A", "OUTPUT", "-j", "CHECK_GLOBAL_OUT"]).status();
+
+        let _ = Command::new("iptables").args([
+            "-A", "CHECK_GLOBAL_OUT",
+            "-m", "hashlimit",
+            "--hashlimit-name", "global_out",
+            "--hashlimit-upto", "250mb/hour",
+            "--hashlimit-burst", "10mb",
+            "-j", "POST_GLOBAL_OUT"
+        ]).status();
+
+        for ip in &paypal_ips {
+            let _ = Command::new("iptables").args(["-A", "POST_GLOBAL_OUT", "-d", ip, "-j", "ACCEPT"]).status();
+        }
+        let _ = Command::new("iptables").args(["-A", "POST_GLOBAL_OUT", "-j", "CHECK_IP_OUT"]).status();
+
+        let _ = Command::new("iptables").args([
+            "-A", "CHECK_IP_OUT",
+            "-m", "hashlimit",
+            "--hashlimit-mode", "dstip",
+            "--hashlimit-name", "out_per_ip",
+            "--hashlimit-upto", "5mb/hour",
+            "--hashlimit-burst", "5mb",
+            "-j", "ACCEPT"
+        ]).status();
+
+        let _ = Command::new("iptables").args([
+            "-A", "INPUT", "-m", "limit", "--limit", "1/min", "-j", "LOG", "--log-prefix", "INGRESS_DROP: "
+        ]).status();
+        let _ = Command::new("iptables").args([
+            "-A", "OUTPUT", "-m", "limit", "--limit", "1/min", "-j", "LOG", "--log-prefix", "EGRESS_DROP: "
+        ]).status();
+
+        kmsg("Network limits configured: Global 250MB/hr -> PayPal Bypass -> Per-IP 5MB/hr");
+    }
+
     async fn dhcp(iface: &str) -> Result<Lease, Box<dyn std::error::Error>> {
         let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         sock.set_reuse_address(true)?;
@@ -1565,6 +1658,7 @@ mod enclave_init {
 
         let lease = dhcp(&iface).await?;
         apply_lease(&iface, &lease);
+        apply_network_limits();
         Ok(())
     }
 
