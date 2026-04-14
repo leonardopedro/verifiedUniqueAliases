@@ -1,6 +1,6 @@
 # GCP Confidential Auth VM — Reproducible & Attested
 
-Hardware-attested PayPal OAuth service on **GCP Confidential Space** (AMD SEV-SNP).
+Hardware-attested PayPal OAuth service on **GCP Confidential VM** (AMD SEV-SNP).
 Built for 100% bit-by-bit reproducibility and maximum security.
 
 ---
@@ -17,7 +17,7 @@ Built for 100% bit-by-bit reproducibility and maximum security.
 | End-to-End Automated Deployment | ✅ Achieved (v60) |
 
 ### Architectural Breakthrough: Native PID 1 Rust Integration
-The service takes complete control of the OS from the very first instruction. It runs perfectly isolated on GCP Confidential Space without any classic `/sbin/init` or shell requirements:
+The service takes complete control of the OS from the very first instruction. It runs perfectly isolated on GCP Confidential VM without any classic `/sbin/init` or shell requirements:
 - **No `systemd` or standard shell scripts**: Control is handed from the bootloader directly to our Rust binary.
 - **Bootstrapping**: Rust uses the `nix` crate to natively mount `/proc`, `/sys`, and `/dev`.
 - **Drivers**: Performs `modprobe` for the `gve` (GCP Virtual Ethernet) and `virtio_net` drivers.
