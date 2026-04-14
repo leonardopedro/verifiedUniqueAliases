@@ -1,7 +1,7 @@
 # AGENTS.md - Status Guidelines for GCP Confidential Auth VM
 
 ## Project Overview
-`paypal-auth-vm` is a hardware-attested Rust service on **GCP Confidential Space** (AMD SEV-SNP). It provides a secure bridge for PayPal OAuth tokens, ensuring the integrity of the computing environment before secrets are accessible.
+`paypal-auth-vm` is a hardware-attested Rust service on **GCP Confidential VM** (AMD SEV-SNP). It provides a secure bridge for PayPal OAuth tokens, ensuring the integrity of the computing environment before secrets are accessible.
 
 ### 🏆 Current Accomplishments (v60)
 - **Bitwise Reproducibility**: Achieved across the entire disk image stack (`disk.raw`, `disk.tar.gz`, `qcow2`). Using deterministic normalization of the EFI System Partition (ESP) and fixed GPT UUIDs.

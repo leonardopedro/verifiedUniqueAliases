@@ -1,7 +1,7 @@
 #!/bin/bash
 set -exuo pipefail
 
-echo "🏗️  Building robust reproducible initramfs for GCP Confidential Space..."
+echo "🏗️  Building robust reproducible initramfs for GCP Confidential VM..."
 
 # Set reproducible build environment
 export SOURCE_DATE_EPOCH=1712260800
