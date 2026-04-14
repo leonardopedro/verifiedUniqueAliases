@@ -1445,7 +1445,26 @@ mod enclave_init {
         for ip in &paypal_ips {
             let _ = Command::new("iptables").args(["-A", "INPUT", "-s", ip, "-j", "ACCEPT"]).status();
         }
-        let _ = Command::new("iptables").args(["-A", "INPUT", "-j", "CHECK_IP_IN"]).status();
+
+        let _ = Command::new("iptables").args([
+            "-A", "INPUT",
+            "-p", "tcp", "--syn",
+            "-m", "connlimit",
+            "--connlimit-above", "1000",
+            "--connlimit-mask", "0",
+            "-j", "REJECT", "--reject-with", "tcp-reset"
+        ]).status();
+
+        let _ = Command::new("iptables").args([
+            "-A", "INPUT",
+            "-p", "tcp", "--syn",
+            "-m", "connlimit",
+            "--connlimit-above", "30",
+            "--connlimit-mask", "32",
+            "-j", "REJECT", "--reject-with", "tcp-reset"
+        ]).status();
+
+        let _ = Command::new("iptables").args(["-A", "INPUT", "-p", "tcp", "--syn", "-j", "CHECK_IP_IN"]).status();
 
         let _ = Command::new("iptables").args([
             "-A", "CHECK_IP_IN",
@@ -1490,7 +1509,7 @@ mod enclave_init {
             "-A", "OUTPUT", "-m", "limit", "--limit", "1/min", "-j", "LOG", "--log-prefix", "EGRESS_DROP: "
         ]).status();
 
-        kmsg("Network limits configured: Global 250MB/hr -> PayPal Bypass -> Per-IP 5MB/hr");
+        kmsg("Network limits: conn(1000 global, 30/IP) + global 250MB/hr -> PayPal Bypass -> per-IP 5MB/hr");
     }
 
     async fn dhcp(iface: &str) -> Result<Lease, Box<dyn std::error::Error>> {
