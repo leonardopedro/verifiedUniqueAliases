@@ -508,6 +508,33 @@ struct AppState {
     staging: bool,
 }
 
+struct PayPalFlowConfig {
+    client_id: String,
+    client_secret: String,
+    scope: String,
+    label: String,
+}
+
+impl AppState {
+    fn get_flow_config(&self, flow_name: &str) -> PayPalFlowConfig {
+        if flow_name == "verified" {
+            PayPalFlowConfig {
+                client_id: self.paypal_verified_client_id.clone(),
+                client_secret: self.paypal_verified_client_secret.clone(),
+                scope: "openid".to_string(),
+                label: "verified".to_string(),
+            }
+        } else {
+            PayPalFlowConfig {
+                client_id: self.paypal_client_id.clone(),
+                client_secret: self.paypal_client_secret.clone(),
+                scope: "openid profile email".to_string(),
+                label: "full".to_string(),
+            }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct TokenResponse {
@@ -639,12 +666,34 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
         config.eab_hmac_key = Some(hmac);
     }
 
-    // Apply defaults for missing verified client credentials (fallback)
+    // Override PayPal credentials from individual secrets if available
+    if let Some(id) = fetch_secret_direct("PAYPAL_CLIENT_ID").await { config.paypal_client_id = id; }
+    if let Some(sec) = fetch_secret_direct("PAYPAL_CLIENT_SECRET").await { config.paypal_client_secret = sec; }
+    if let Some(id) = fetch_secret_direct("PAYPAL_VERIFIED_CLIENT_ID").await { config.paypal_verified_client_id = Some(id); }
+    if let Some(sec) = fetch_secret_direct("PAYPAL_VERIFIED_CLIENT_SECRET").await { config.paypal_verified_client_secret = Some(sec); }
+    
+    if let Some(staging_env) = fetch_secret_direct("PAYPAL_STAGING").await {
+        config.staging = staging_env == "true";
+    }
+
+    // Symmetrical Fallbacks: Ensure both flows have valid defaults if missing
     let config = Config {
+        paypal_client_id: if config.paypal_client_id.is_empty() || config.paypal_client_id == "MISSING_CLIENT_ID" {
+            "ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0".to_string()
+        } else {
+            config.paypal_client_id
+        },
+        paypal_client_secret: if config.paypal_client_secret.is_empty() || config.paypal_client_secret == "MISSING_CLIENT_SECRET" {
+            "EFdUSE2qjgZy5Ok5f4Cy0SBuodWTj30TzO-7b8W8VAQOoNDwu-Feecb7va89C0jS5BZuclqiJSt4I20s".to_string()
+        } else {
+            config.paypal_client_secret
+        },
         paypal_verified_client_id: Some(config.paypal_verified_client_id.unwrap_or_else(|| {
             "AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p".to_string()
         })),
-        paypal_verified_client_secret: Some(config.paypal_verified_client_secret.unwrap_or_else(|| "MISSING_VERIFIED_SECRET".to_string())),
+        paypal_verified_client_secret: Some(config.paypal_verified_client_secret.unwrap_or_else(|| {
+            "EHSSIjy5sUHPYrBA1tN-UqDLfuTe-FSSdxRVJ6CCvNcwK6QphDUExRPGurFvA4DibvFNA-LvnHFUY7vP".to_string()
+        })),
         ..config
     };
 
@@ -1044,31 +1093,18 @@ async fn login(
     Query(params): Query<LoginParams>,
     State(state): State<Arc<AppState>>
 ) -> impl IntoResponse {
-    let flow = params.flow.unwrap_or_else(|| "full".to_string());
+    let flow = params.flow.as_deref().unwrap_or("full");
+    let config = state.get_flow_config(flow);
     
-    let (client_id, scope, state_val) = if flow == "verified" {
-        (
-            &state.paypal_verified_client_id,
-            "openid", // Minimal scope for verification check
-            "verified"
-        )
-    } else {
-        (
-            &state.paypal_client_id,
-            "openid%20profile%20email",
-            "full"
-        )
-    };
-
     let auth_base = if state.staging { PAYPAL_SANDBOX_AUTH } else { PAYPAL_PRODUCTION_AUTH };
 
     let url = format!(
         "{}?client_id={}&response_type=code&scope={}&redirect_uri={}&state={}",
         auth_base,
-        client_id,
-        scope,
+        config.client_id,
+        urlencoding::encode(&config.scope),
         urlencoding::encode(&state.redirect_uri),
-        state_val
+        config.label
     );
     Redirect::temporary(&url)
 }
@@ -1081,28 +1117,30 @@ async fn callback(
         return (StatusCode::BAD_REQUEST, "Error from PayPal").into_response();
     }
     let code = query.code.clone().unwrap_or_default();
-    let state_val = query.state.clone().unwrap_or_else(|| "full".to_string());
+    let flow = query.state.as_deref().unwrap_or("full");
+    let config = state.get_flow_config(flow);
     
-    let (client_id, client_secret) = if state_val == "verified" {
-        (state.paypal_verified_client_id.clone(), state.paypal_verified_client_secret.clone())
-    } else {
-        (state.paypal_client_id.clone(), state.paypal_client_secret.clone())
-    };
     let redirect_uri = state.redirect_uri.clone();
 
     let api_base = if state.staging { PAYPAL_SANDBOX_API } else { PAYPAL_PRODUCTION_API };
 
-    let token = match exchange_code_for_token(&code, &client_id, &client_secret, &redirect_uri, api_base).await {
+    let token = match exchange_code_for_token(&code, &config.client_id, &config.client_secret, &redirect_uri, api_base).await {
         Ok(t) => t,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Token exchange failed").into_response(),
+        Err(e) => {
+            error!("Token exchange failed: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Token exchange failed: {}", e)).into_response();
+        }
     };
 
     let userinfo = match get_userinfo(&token.access_token, api_base).await {
         Ok(u) => u,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Userinfo failed").into_response(),
+        Err(e) => {
+            error!("Userinfo failed: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Userinfo failed: {}", e)).into_response();
+        }
     };
 
-    let attestation = generate_attestation(client_id, userinfo.clone()).await;
+    let attestation = generate_attestation(config.client_id, userinfo.clone()).await;
 
     Html(HTML_TEMPLATE.replace(
         "{{CONTENT}}",
@@ -1236,17 +1274,13 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let https_ready = Arc::new(AtomicBool::new(false));
     let https_ready_clone = https_ready.clone();
 
-    // Initialize app state
+    // Initialize app state (using consolidated config with fallbacks)
     eprintln!("[DEBUG] building app state");
-    let verified_id = config.paypal_verified_client_id.clone().unwrap_or_else(|| 
-        "AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p".to_string());
-    let verified_secret = config.paypal_verified_client_secret.clone().unwrap_or_else(|| "MISSING_VERIFIED_SECRET".to_string());
-    
     let state = Arc::new(AppState {
         paypal_client_id: config.paypal_client_id.clone(),
         paypal_client_secret: config.paypal_client_secret.clone(),
-        paypal_verified_client_id: verified_id,
-        paypal_verified_client_secret: verified_secret,
+        paypal_verified_client_id: config.paypal_verified_client_id.clone().unwrap_or_default(),
+        paypal_verified_client_secret: config.paypal_verified_client_secret.clone().unwrap_or_default(),
         redirect_uri,
         used_paypal_ids: Arc::new(RwLock::new(HashSet::new())),
         domain: config.domain.clone(),

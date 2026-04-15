@@ -22,6 +22,22 @@ echo "✅ Configuration Loaded:"
 echo "   - Project: $PROJECT_ID"
 echo "   - Target VM: $VM_NAME ($STATIC_IP)"
 
+# --- Phase 0: External Account Binding (EAB) Rotation ---
+echo ""
+echo "🏗️  [0/3] Rotating Google Public CA EAB Keys..."
+EAB_JSON=$(gcloud publicca external-account-keys create --project="${PROJECT_ID}" --format="json" --quiet)
+EAB_KID=$(echo "$EAB_JSON" | grep '"keyId"' | cut -d'"' -f4)
+EAB_HMAC=$(echo "$EAB_JSON" | grep '"b64MacKey"' | cut -d'"' -f4)
+
+if [[ -n "$EAB_KID" && -n "$EAB_HMAC" ]]; then
+    echo "   - New Key ID: $EAB_KID"
+    echo -n "$EAB_KID" | gcloud secrets versions add "EAB_KEY_ID" --project="${PROJECT_ID}" --data-file=- --quiet
+    echo -n "$EAB_HMAC" | gcloud secrets versions add "EAB_HMAC_KEY" --project="${PROJECT_ID}" --data-file=- --quiet
+    echo "✅ EAB Secrets Updated."
+else
+    echo "⚠️  Failed to rotate EAB keys. Using existing secrets..."
+fi
+
 # --- Phase 1: Local Docker Source Build & Disk Synthesis ---
 echo ""
 echo "📦 [1/6] Building reproducing Rust binary and Disk locally..."

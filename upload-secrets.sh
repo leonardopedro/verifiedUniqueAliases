@@ -172,14 +172,32 @@ PAYPAL_CLIENT_SECRET=${PAYPAL_CLIENT_SECRET:-$DEFAULT_PAYPAL_SEC}
 PAYPAL_VERIFIED_CLIENT_ID=${INPUT_VERIFIED_ID:-${DEFAULT_VERIFIED_ID:-$PAYPAL_VERIFIED_CLIENT_ID}}
 VERIFIED_SECRET=${VERIFIED_SECRET:-$DEFAULT_VERIFIED_SEC}
 
-# Cleanup inputs: strip quotes and field names if pasted accidentally
-DOMAIN=$(echo "$DOMAIN" | tr -d '"'\'' ')
-PAYPAL_CLIENT_ID=$(echo "$PAYPAL_CLIENT_ID" | sed 's/keyId: //g' | tr -d '"'\'' ')
-PAYPAL_CLIENT_SECRET=$(echo "$PAYPAL_CLIENT_SECRET" | tr -d '"'\'' ')
-PAYPAL_VERIFIED_CLIENT_ID=$(echo "$PAYPAL_VERIFIED_CLIENT_ID" | tr -d '"'\'' ')
-VERIFIED_SECRET=$(echo "$VERIFIED_SECRET" | tr -d '"'\'' ')
-EAB_KEY_ID=$(echo "$EAB_KEY_ID" | sed 's/keyId: //g' | tr -d '"'\'' ')
-EAB_HMAC_KEY=$(echo "$EAB_HMAC_KEY" | sed 's/b64MacKey: //g' | tr -d '"'\'' ')
+# Cleanup inputs: strip quotes, whitespace, and potential duplications
+clean_input() {
+    local val="$1"
+    # Remove quotes, spaces, and specific prefixes
+    val=$(echo "$val" | sed 's/keyId: //g' | sed 's/b64MacKey: //g' | tr -d '"'\'' ')
+    # Check for duplication: if string is long and starts with its second half
+    local len=${#val}
+    if (( len > 40 && len % 2 == 0 )); then
+        local half=$(( len / 2 ))
+        local first=${val:0:half}
+        local second=${val:half}
+        if [[ "$first" == "$second" ]]; then
+            warn "Detected and fixed duplicated input for value (repeated twice)."
+            val="$first"
+        fi
+    fi
+    echo "$val"
+}
+
+DOMAIN=$(clean_input "$DOMAIN")
+PAYPAL_CLIENT_ID=$(clean_input "$PAYPAL_CLIENT_ID")
+PAYPAL_CLIENT_SECRET=$(clean_input "$PAYPAL_CLIENT_SECRET")
+PAYPAL_VERIFIED_CLIENT_ID=$(clean_input "$PAYPAL_VERIFIED_CLIENT_ID")
+VERIFIED_SECRET=$(clean_input "$VERIFIED_SECRET")
+EAB_KEY_ID=$(clean_input "$EAB_KEY_ID")
+EAB_HMAC_KEY=$(clean_input "$EAB_HMAC_KEY")
 
 PAYLOAD=$(cat <<EOF
 {
