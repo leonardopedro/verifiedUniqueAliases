@@ -236,9 +236,8 @@ use axum::{
     routing::get,
     Router,
 };
-use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, ChallengeType, ExternalAccountKey,
-    Identifier, NewAccount, NewOrder, OrderStatus,
+use acme2_eab::{
+    gen_rsa_private_key, AccountBuilder, AuthorizationStatus, DirectoryBuilder, OrderBuilder, Csr,
 };
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use parking_lot::RwLock;
@@ -437,7 +436,11 @@ mod crypto {
 
 
 const GOOGLE_PUBLIC_CA_DIRECTORY: &str = "https://dv.acme-v02.api.pki.goog/directory";
-const GOOGLE_PUBLIC_CA_STAGING_DIRECTORY: &str = "https://dv.acme-v02.test-api.pki.goog/directory";
+
+const PAYPAL_PRODUCTION_API: &str = "https://api-m.paypal.com";
+const PAYPAL_SANDBOX_API: &str = "https://api-m.sandbox.paypal.com";
+const PAYPAL_PRODUCTION_AUTH: &str = "https://www.paypal.com/signin/authorize";
+const PAYPAL_SANDBOX_AUTH: &str = "https://www.sandbox.paypal.com/signin/authorize";
 
 const HTML_TEMPLATE: &str = r#"
 <!DOCTYPE html>
@@ -502,6 +505,7 @@ struct AppState {
     used_paypal_ids: Arc<RwLock<HashSet<String>>>,
     domain: String,
     https_ready: Arc<AtomicBool>,
+    staging: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -544,6 +548,23 @@ struct CallbackQuery {
 // ============================================================================
 // GCP SECRET MANAGER
 // ============================================================================
+
+async fn fetch_secret_direct(secret_id: &str) -> Option<String> {
+    let client = reqwest::Client::new();
+    let token_resp: serde_json::Value = client
+        .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
+        .header("Metadata-Flavor", "Google")
+        .send().await.ok()?.json().await.ok()?;
+    let access_token = token_resp["access_token"].as_str()?;
+    
+    let project_id = "project-ae136ba1-3cc9-42cf-a48";
+    let url = format!("https://secretmanager.googleapis.com/v1/projects/{}/secrets/{}/versions/latest:access", project_id, secret_id);
+    let secret_resp: serde_json::Value = client
+        .get(&url).bearer_auth(access_token).send().await.ok()?.json().await.ok()?;
+    let encoded = secret_resp["payload"]["data"].as_str()?;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    String::from_utf8(STANDARD.decode(encoded).ok()?).ok()
+}
 
 async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
     // Priority 1: Check for environment variables (KeePassXC / Local development support)
@@ -608,7 +629,15 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
 
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let json_str = String::from_utf8(STANDARD.decode(encoded)?)?;
-    let config: Config = serde_json::from_str(&json_str)?;
+    let mut config: Config = serde_json::from_str(&json_str)?;
+
+    // Override EAB keys from secrets if available (allows rotation without config update)
+    let eab_key_id_secret = fetch_secret_direct("EAB_KEY_ID").await;
+    let eab_hmac_secret = fetch_secret_direct("EAB_HMAC_KEY").await;
+    if let (Some(kid), Some(hmac)) = (eab_key_id_secret, eab_hmac_secret) {
+        config.eab_key_id = Some(kid);
+        config.eab_hmac_key = Some(hmac);
+    }
 
     // Apply defaults for missing verified client credentials (fallback)
     let config = Config {
@@ -630,7 +659,9 @@ struct GooglePublicCaManager {
     domain: String,
     eab_key_id: Option<String>,
     eab_hmac_key: Option<String>,
-    staging: bool,
+    // NOTE: `staging` is intentionally absent here.
+    // The `staging` flag in the Vault secret controls PayPal Sandbox mode only.
+    // ACME/TLS certificates always use the Google Public CA PRODUCTION endpoint.
     acme_account_json: Option<String>,
 }
 
@@ -640,7 +671,6 @@ impl GooglePublicCaManager {
             domain: config.domain.clone(),
             eab_key_id: config.eab_key_id.clone(),
             eab_hmac_key: config.eab_hmac_key.clone(),
-            staging: config.staging,
             acme_account_json: config.acme_account_json.clone(),
         }
     }
@@ -653,104 +683,128 @@ impl GooglePublicCaManager {
 
         info!("Obtaining TLS certificate from Google Public CA...");
 
-        let acme_url = if self.staging {
-            GOOGLE_PUBLIC_CA_STAGING_DIRECTORY
-        } else {
-            GOOGLE_PUBLIC_CA_DIRECTORY
-        };
+        // ACME always uses the production endpoint.
+        // The `staging` flag in the Vault is for PayPal Sandbox only and does NOT affect TLS.
+        let acme_url = GOOGLE_PUBLIC_CA_DIRECTORY;
+        info!("Using Google Public CA PRODUCTION (TLS is always production)");
 
-        // Try restoring existing ACME account from tmpfs, then from config JSON, then fallback to EAB
         let account_path = "/tmp/acme-account.json";
         let account = if let Ok(data) = tokio::fs::read_to_string(account_path).await {
             info!("Restoring ACME account from tmpfs...");
-            let creds: AccountCredentials = serde_json::from_str(&data)?;
-            Account::builder()?.from_credentials(creds).await?
-        } else if let Some(ref json) = self.acme_account_json {
-            info!("Restoring ACME account from configured JSON...");
-            let creds: AccountCredentials = serde_json::from_str(json)?;
-            // Cache it to tmpfs for next renewal in this boot
-            let _ = tokio::fs::write(account_path, json).await;
-            Account::builder()?.from_credentials(creds).await?
+            let dir = DirectoryBuilder::new(acme_url.to_string()).build().await?;
+            let priv_key_pem = data.trim();
+            let priv_pem = openssl::pkey::PKey::private_key_from_pem(priv_key_pem.as_bytes())?;
+            let mut builder = AccountBuilder::new(dir);
+            builder.private_key(priv_pem);
+            builder.build().await?
         } else {
             info!("Creating new ACME account with EAB...");
             let kid = self
                 .eab_key_id
                 .as_ref()
-                .ok_or("Missing EAB key ID and no acme_account_json")?;
+                .ok_or("Missing EAB key ID")?;
             let hmac_str = self
                 .eab_hmac_key
                 .as_ref()
-                .ok_or("Missing EAB HMAC key and no acme_account_json")?;
+                .ok_or("Missing EAB HMAC key")?;
+
+            info!("EAB Key ID being used: {}", kid);
+            info!("EAB HMAC key string length: {}", hmac_str.trim().len());
 
             use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-            let hmac_bytes = URL_SAFE_NO_PAD.decode(hmac_str.trim())?;
-            let eab = ExternalAccountKey::new(kid.clone(), &hmac_bytes);
-            let (account, creds) = Account::builder()?
-                .create(
-                    &NewAccount {
-                        contact: &[&format!("mailto:admin@{}", self.domain)],
-                        terms_of_service_agreed: true,
-                        only_return_existing: false,
-                    },
-                    acme_url.to_owned(),
-                    Some(&eab),
-                )
-                .await?;
-            if let Ok(json) = serde_json::to_string(&creds) {
-                let _ = tokio::fs::write(account_path, json).await;
+            // Google's b64MacKey is base64 URL-encoded (no padding)
+            let hmac_bytes = URL_SAFE_NO_PAD.decode(hmac_str.trim()).map_err(|e| format!("EAB HMAC decode failed: {}", e))?;
+            
+            info!("EAB HMAC final bytes length: {}", hmac_bytes.len());
+            let hmac_pkey = openssl::pkey::PKey::hmac(&hmac_bytes)?;
+
+            let dir = DirectoryBuilder::new(acme_url.to_string()).build().await?;
+            let mut builder = AccountBuilder::new(dir);
+            builder.contact(vec![format!("mailto:admin@{}", self.domain)]);
+            builder.terms_of_service_agreed(true);
+            builder.external_account_binding(kid.clone(), hmac_pkey);
+            let account = builder.build().await?;
+
+            if let Ok(priv_pem) = account.private_key().private_key_to_pem_pkcs8() {
+                let _ = tokio::fs::write(account_path, priv_pem).await;
             }
             account
         };
 
-        // Create order and process challenges
-        let identifier = Identifier::Dns(self.domain.clone());
-        let mut order = account.new_order(&NewOrder::new(&[identifier])).await?;
-        let mut authorizations = order.authorizations();
+        info!("Creating ACME order for domain: {}", self.domain);
+        let mut order_builder = OrderBuilder::new(account);
+        order_builder.add_dns_identifier(self.domain.clone());
+        let mut order = order_builder.build().await?;
 
-        while let Some(result) = authorizations.next().await {
-            let mut authz = result?;
-            if matches!(authz.status, AuthorizationStatus::Valid) {
+        info!("Processing ACME authorizations...");
+        let authorizations = order.authorizations().await?;
+        for auth in authorizations {
+            if matches!(auth.status, AuthorizationStatus::Valid) {
                 continue;
             }
-            let mut challenge = authz
-                .challenge(ChallengeType::Http01)
-                .ok_or("No HTTP-01 challenge found")?;
+            let mut challenge = auth
+                .challenges
+                .iter()
+                .find(|c| c.r#type == "http-01")
+                .ok_or("No HTTP-01 challenge found")?
+                .clone();
 
             let challenge_dir = "/tmp/acme-challenge";
             tokio::fs::create_dir_all(challenge_dir).await?;
+            let token = challenge.token.as_ref().ok_or("Missing token")?;
+            let token_filename = token.replace("/", "_");
+            let key_auth = challenge.key_authorization()?.ok_or("Missing key authorization")?;
             tokio::fs::write(
-                format!("{}/{}", challenge_dir, challenge.token),
-                challenge.key_authorization().as_str(),
+                format!("{}/{}", challenge_dir, token_filename),
+                key_auth.as_bytes(),
             )
             .await?;
 
-            challenge.set_ready().await?;
+            info!("Triggering ACME challenge for token: {}", token_filename);
+            
+            info!("Requesting ACME server to validate challenge...");
+            challenge.validate().await?;
+            
+            info!("Waiting for ACME challenge to complete...");
+            challenge.wait_done(Duration::from_secs(5), 72).await?;
+            info!("Challenge completed for token: {}", token_filename);
         }
 
-        // Wait for the order to reach the "ready" state
-        // (when all authorizations are verified)
-        while !matches!(order.state().status, OrderStatus::Ready) {
-            info!(
-                "Waiting for ACME order state to become 'ready' (current: {:?})...",
-                order.state().status
-            );
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            order.refresh().await?;
-            if matches!(order.state().status, OrderStatus::Invalid) {
-                return Err("ACME order reached invalid state".into());
+        info!("Waiting for ACME order to become ready...");
+        order = order.wait_ready(Duration::from_secs(5), 72).await?;
+
+        info!("ACME order ready, finalizing certificate...");
+        let pkey = gen_rsa_private_key(4096)?;
+        let key_pem = pkey.private_key_to_pem_pkcs8()?;
+        let order = order.finalize(Csr::Automatic(pkey)).await?;
+
+        info!("Polling for certificate issuance...");
+        let order = order.wait_done(Duration::from_secs(5), 144).await?;
+
+        info!("Downloading certificate...");
+        let cert_result = order.certificate().await;
+        match cert_result {
+            Ok(Some(cert)) => {
+                info!("Certificate issued!");
+                let mut cert_chain_str = String::new();
+                for c in cert {
+                    if let Ok(pem) = c.to_pem() {
+                        cert_chain_str.push_str(std::str::from_utf8(&pem).unwrap_or(""));
+                        cert_chain_str.push('\n');
+                    }
+                }
+
+                info!("TLS certificate obtained (RAM only)");
+                Self::store_cached_tls(cert_chain_str.as_bytes(), &key_pem).await;
+                return Ok((cert_chain_str.into_bytes(), key_pem));
+            }
+            Ok(None) => {
+                return Err("Certificate not available after wait_done".into());
+            }
+            Err(e) => {
+                return Err(format!("Error downloading certificate: {:?}", e).into());
             }
         }
-
-        info!("ACME order is ready, finalizing...");
-
-        let private_key_pem = order.finalize().await?;
-        let cert_chain_pem: String = order
-            .poll_certificate(&instant_acme::RetryPolicy::default())
-            .await?;
-
-        info!("TLS certificate obtained (RAM only)");
-        Self::store_cached_tls(&cert_chain_pem.as_bytes(), &private_key_pem.as_bytes()).await;
-        Ok((cert_chain_pem.into_bytes(), private_key_pem.into_bytes()))
     }
 
     async fn fetch_cached_tls() -> Option<(Vec<u8>, Vec<u8>)> {
@@ -918,9 +972,11 @@ async fn exchange_code_for_token(
     client_id: &str,
     client_secret: &str,
     redirect_uri: &str,
+    api_base: &str,
 ) -> Result<TokenResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!("{}/v1/oauth2/token", api_base);
     let resp = reqwest::Client::new()
-        .post("https://api-m.sandbox.paypal.com/v1/oauth2/token")
+        .post(&url)
         .basic_auth(client_id, Some(client_secret))
         .form(&[
             ("grant_type", "authorization_code"),
@@ -936,9 +992,10 @@ async fn exchange_code_for_token(
     Ok(resp.json().await?)
 }
 
-async fn get_userinfo(token: &str) -> Result<PayPalUserInfo, Box<dyn std::error::Error + Send + Sync>> {
+async fn get_userinfo(token: &str, api_base: &str) -> Result<PayPalUserInfo, Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!("{}/v1/identity/oauth2/userinfo?schema=paypalv1.1", api_base);
     let resp = reqwest::Client::new()
-        .get("https://api-m.sandbox.paypal.com/v1/identity/oauth2/userinfo?schema=paypalv1.1")
+        .get(&url)
         .bearer_auth(token)
         .send()
         .await?;
@@ -1003,8 +1060,11 @@ async fn login(
         )
     };
 
+    let auth_base = if state.staging { PAYPAL_SANDBOX_AUTH } else { PAYPAL_PRODUCTION_AUTH };
+
     let url = format!(
-        "https://www.sandbox.paypal.com/signin/authorize?client_id={}&response_type=code&scope={}&redirect_uri={}&state={}",
+        "{}?client_id={}&response_type=code&scope={}&redirect_uri={}&state={}",
+        auth_base,
         client_id,
         scope,
         urlencoding::encode(&state.redirect_uri),
@@ -1030,12 +1090,14 @@ async fn callback(
     };
     let redirect_uri = state.redirect_uri.clone();
 
-    let token = match exchange_code_for_token(&code, &client_id, &client_secret, &redirect_uri).await {
+    let api_base = if state.staging { PAYPAL_SANDBOX_API } else { PAYPAL_PRODUCTION_API };
+
+    let token = match exchange_code_for_token(&code, &client_id, &client_secret, &redirect_uri, api_base).await {
         Ok(t) => t,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Token exchange failed").into_response(),
     };
 
-    let userinfo = match get_userinfo(&token.access_token).await {
+    let userinfo = match get_userinfo(&token.access_token, api_base).await {
         Ok(u) => u,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Userinfo failed").into_response(),
     };
@@ -1189,6 +1251,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         used_paypal_ids: Arc::new(RwLock::new(HashSet::new())),
         domain: config.domain.clone(),
         https_ready: https_ready_clone,
+        staging: config.staging,
     });
 
     // Build the main app router

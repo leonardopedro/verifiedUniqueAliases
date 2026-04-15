@@ -1,112 +1,209 @@
-#!/bin/bash
-# upload-secrets.sh - Upload secrets from KeePassXC to GCP Secret Manager
-# Usage: 
-#   ./upload-secrets.sh --kdbx /path/to/keepassxc.kdbx --entry paypal-old --entry-verified paypal-verified --domain yourdomain.com
-#
-# Options:
-#   --kdbx              Path to KeePassXC database
-#   --entry             Entry name for full PayPal credentials
-#   --entry-verified    Entry name for verified-only PayPal credentials  
-#   --domain            Your domain
-#   --staging           Set to "true" for sandbox mode
-
 set -eo pipefail
 
+info() {
+    echo -e "\033[0;32m[INFO]\033[0m $*"
+}
+
+warn() {
+    echo -e "\033[0;33m[WARN]\033[0m $*"
+}
+
+error() {
+    echo -e "\033[0;31m[ERROR]\033[0m $*"
+}
+
 PROJECT_ID="project-ae136ba1-3cc9-42cf-a48"
-SECRET_NAME="PAYPAL_AUTH_CONFIG"
-
-# Parse arguments
-KDBX=""
-ENTRY_OLD=""
-ENTRY_VERIFIED=""
-DOMAIN=""
-STAGING="false"
-
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --kdbx) KDBX="$2"; shift 2;;
-        --entry) ENTRY_OLD="$2"; shift 2;;
-        --entry-verified) ENTRY_VERIFIED="$2"; shift 2;;
-        --domain) DOMAIN="$2"; shift 2;;
-        --staging) STAGING="$2"; shift 2;;
-        *) echo "Unknown option: $1"; exit 1;;
-    esac
-done
-
-# Validate required args
-if [[ -z "$KDBX" ]] || [[ -z "$ENTRY_OLD" ]] || [[ -z "$ENTRY_VERIFIED" ]] || [[ -z "$DOMAIN" ]]; then
-    echo "Error: Missing required arguments"
-    echo "Usage: $0 --kdbx <db> --entry <old-entry> --entry-verified <verified-entry> --domain <domain> [--staging true]"
-    exit 1
-fi
 
 echo "============================================================"
-echo "🔐 Pulling secrets from KeePassXC and uploading to GCP"
+echo "🔐 Vault Manager: PayPal & Google CA Secrets"
 echo "============================================================"
+echo "Project: $PROJECT_ID"
+echo ""
 
-# Function to get secret from KeePassXC (requires database to be opened in KeePassXC or using key file)
-get_secret() {
-    local db="$1"
-    local entry="$2"
-    local attr="$3"
-    
-    # Try with environment variable for password if set
-    if [[ -n "$KEEPASSXC_PASSWORD" ]]; then
-        echo "$KEEPASSXC_PASSWORD" | keepassxc-cli show -a "$attr" "$db" "$entry" 2>/dev/null || echo ""
+# Helper to check if a secret exists
+secret_exists() {
+    gcloud secrets describe "$1" --project="$PROJECT_ID" &>/dev/null
+}
+
+# Helper to get current secret value (optional, requires jq)
+get_current_secret() {
+    if command -v jq &>/dev/null; then
+        gcloud secrets versions access latest --secret="$1" --project="$PROJECT_ID" 2>/dev/null | jq . || echo "{}"
     else
-        # Use stdin for password - will prompt if needed
-        keepassxc-cli show -a "$attr" "$db" "$entry" 2>/dev/null || echo ""
+        echo "{}"
     fi
 }
 
-# Pull secrets from KeePassXC
-echo "📂 Reading from KeePassXC database: $KDBX"
+# Helper to generate and return EAB keys as JSON
+generate_eab_keys() {
+    info "🏗️  Auto-generating fresh Google Public CA EAB Keys..."
+    # Use quiet and specifically extract the JSON block skipping headers
+    gcloud publicca external-account-keys create --project="$PROJECT_ID" --format="json" --quiet | sed -n '/^{/,$p'
+}
 
-# Get old PayPal credentials
-PAYPAL_CLIENT_ID=$(get_secret "$KDBX" "$ENTRY_OLD" "client_id")
-PAYPAL_CLIENT_SECRET=$(get_secret "$KDBX" "$ENTRY_OLD" "client_secret")
+# Ask which mode to configure
+echo "What do you want to do?"
+echo "  1) Configure Staging"
+echo "  2) Configure Production"
+echo "  3) Switch Active Mode (Stage/Prod)"
+echo "  4) Generate Google Public CA EAB Keys (Manual)"
+read -p "Choice (1-4): " CHOICE
 
-# Get verified PayPal credentials  
-PAYPAL_VERIFIED_CLIENT_SECRET=$(get_secret "$KDBX" "$ENTRY_VERIFIED" "client_secret")
+PAYPAL_VERIFIED_CLIENT_ID="AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p"
 
-# Validate we got the secrets
-if [[ -z "$PAYPAL_CLIENT_ID" ]] || [[ -z "$PAYPAL_CLIENT_SECRET" ]] || [[ -z "$PAYPAL_VERIFIED_CLIENT_SECRET" ]]; then
-    echo "Error: Failed to retrieve one or more secrets from KeePassXC"
-    echo "Make sure:"
-    echo "  1. KeePassXC is running with the database unlocked"
-    echo "  2. Entries have the required attributes (client_id, client_secret)"
-    echo "  3. Or set KEEPASSXC_PASSWORD environment variable"
+if [[ "$CHOICE" == "4" ]]; then
+    echo "🏗️  Generating Google Public CA EAB Keys..."
+    EAB_OUTPUT=$(gcloud publicca external-account-keys create --project="$PROJECT_ID" --format="json")
+    echo "Successfully generated keys:"
+    echo "$EAB_OUTPUT"
+    echo ""
+    echo "Save these values! They can only be shown once."
+    exit 0
+fi
+
+if [[ "$CHOICE" == "3" ]]; then
+    echo "--- Switch Active Mode ---"
+    echo "  1) Staging"
+    echo "  2) Production"
+    read -p "Active Mode: " MODE_CHOICE
+    if [[ "$MODE_CHOICE" == "1" ]]; then
+        MODE_PAYLOAD='{"active_mode": "staging"}'
+    else
+        MODE_PAYLOAD='{"active_mode": "production"}'
+    fi
+    if secret_exists "PAYPAL_AUTH_MODE"; then
+        echo -n "$MODE_PAYLOAD" | gcloud secrets versions add "PAYPAL_AUTH_MODE" --project="$PROJECT_ID" --data-file=-
+    else
+        echo -n "$MODE_PAYLOAD" | gcloud secrets create "PAYPAL_AUTH_MODE" --project="$PROJECT_ID" --data-file=-
+    fi
+    echo "✅ Active mode updated"
+    # Don't exit here, fall through to the reset at the end
+    SHOULD_RESET=true
+fi
+
+# Skip configuration prompts if we already did Choice 3
+if [[ "$SHOULD_RESET" != "true" ]]; then
+
+# ==================== CONFIGURATION BLOCKS ====================
+
+if [[ "$CHOICE" == "1" ]]; then
+    SECRET="PAYPAL_AUTH_STAGING"
+    IS_STAGING="true"
+    echo "--- Staging Configuration ---"
+elif [[ "$CHOICE" == "2" ]]; then
+    SECRET="PAYPAL_AUTH_PRODUCTION"
+    IS_STAGING="false"
+    echo "--- Production Configuration ---"
+else
+    echo "Invalid choice"
     exit 1
 fi
 
-echo "✅ Retrieved secrets from KeePassXC"
+# Try to load existing values
+CURRENT_JSON=$(get_current_secret "$SECRET")
 
-# Verified client ID is fixed
-PAYPAL_VERIFIED_CLIENT_ID="AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p"
+# Helper to extract value from JSON
+extract_val() {
+    local key="$1"
+    if command -v jq &>/dev/null; then
+        echo "$CURRENT_JSON" | jq -r ".$key // \"\""
+    else
+        echo "$CURRENT_JSON" | grep -oP "\"$key\":\s*\"\K[^\"]+" || echo ""
+    fi
+}
 
-# Create JSON payload
+# Load current values as defaults
+DEFAULT_DOMAIN=$(extract_val "domain")
+DEFAULT_PAYPAL_ID=$(extract_val "paypal_client_id")
+DEFAULT_PAYPAL_SEC=$(extract_val "paypal_client_secret")
+DEFAULT_VERIFIED_ID=$(extract_val "paypal_verified_client_id")
+DEFAULT_VERIFIED_SEC=$(extract_val "paypal_verified_client_secret")
+DEFAULT_EAB_ID=$(extract_val "eab_key_id")
+DEFAULT_EAB_SEC=$(extract_val "eab_hmac_key")
+
+read -p "Domain (default: $DEFAULT_DOMAIN): " DOMAIN
+read -p "PayPal Client ID (default: $DEFAULT_PAYPAL_ID): " PAYPAL_CLIENT_ID
+read -p "PayPal Client Secret (default: $DEFAULT_PAYPAL_SEC): " PAYPAL_CLIENT_SECRET
+read -p "Verified App Client ID (default: ${DEFAULT_VERIFIED_ID:-$PAYPAL_VERIFIED_CLIENT_ID}): " INPUT_VERIFIED_ID
+read -p "Verified App Client Secret (default: $DEFAULT_VERIFIED_SEC): " VERIFIED_SECRET
+echo ""
+read -p "🔄 Do you want to generate FRESH Google CA EAB keys? (y/N): " ROTATE_EAB
+echo ""
+
+# Logic for EAB Generation/Retention
+if [[ "$ROTATE_EAB" =~ ^[Yy]$ ]] || [[ -z "$DEFAULT_EAB_ID" && -z "$EAB_KEY_ID" ]]; then
+    info "🏗️  Auto-generating fresh Google Public CA EAB Keys..."
+    # Get raw values tab-separated: keyId then b64MacKey
+    EAB_VALUES=$(gcloud publicca external-account-keys create --project="$PROJECT_ID" --format="value(keyId,b64MacKey)" --quiet 2>/dev/null)
+    EAB_KEY_ID=$(echo "$EAB_VALUES" | awk '{print $1}')
+    EAB_HMAC_KEY=$(echo "$EAB_VALUES" | awk '{print $2}')
+    
+    if [[ -z "$EAB_KEY_ID" ]]; then
+        error "Failed to generate EAB keys. Please check gcloud permissions."
+        exit 1
+    fi
+    echo "✨ Detected New Key ID: $EAB_KEY_ID"
+    # Show only first 10 and last 10 of HMAC for verification
+    HMAC_LEN=${#EAB_HMAC_KEY}
+    HMAC_START=${EAB_HMAC_KEY:0:10}
+    HMAC_END=${EAB_HMAC_KEY:HMAC_LEN-10:10}
+    echo "✨ Detected New HMAC: ${HMAC_START}...${HMAC_END}"
+else
+    # Prompt for manual entry or Enter to keep existing
+    read -p "Google CA EAB Key ID (default: $DEFAULT_EAB_ID): " INPUT_EAB_ID
+    read -p "Google CA EAB HMAC Key (default: $DEFAULT_EAB_SEC): " INPUT_EAB_SEC
+    EAB_KEY_ID=${INPUT_EAB_ID:-$DEFAULT_EAB_ID}
+    EAB_HMAC_KEY=${INPUT_EAB_SEC:-$DEFAULT_EAB_SEC}
+fi
+
+echo ""
+echo "📝 Final check before upload to $SECRET:"
+echo "   - Domain: $DOMAIN"
+echo "   - EAB ID: $EAB_KEY_ID"
+echo "   - Mode  : $([[ "$IS_STAGING" == "true" ]] && echo "Staging/Sandbox" || echo "Production")"
+echo ""
+
+# Use defaults for other fields if empty
+
+# Use defaults for other fields if empty
+DOMAIN=${DOMAIN:-$DEFAULT_DOMAIN}
+PAYPAL_CLIENT_ID=${PAYPAL_CLIENT_ID:-$DEFAULT_PAYPAL_ID}
+PAYPAL_CLIENT_SECRET=${PAYPAL_CLIENT_SECRET:-$DEFAULT_PAYPAL_SEC}
+PAYPAL_VERIFIED_CLIENT_ID=${INPUT_VERIFIED_ID:-${DEFAULT_VERIFIED_ID:-$PAYPAL_VERIFIED_CLIENT_ID}}
+VERIFIED_SECRET=${VERIFIED_SECRET:-$DEFAULT_VERIFIED_SEC}
+
+# Cleanup inputs: strip quotes and field names if pasted accidentally
+DOMAIN=$(echo "$DOMAIN" | tr -d '"'\'' ')
+PAYPAL_CLIENT_ID=$(echo "$PAYPAL_CLIENT_ID" | sed 's/keyId: //g' | tr -d '"'\'' ')
+PAYPAL_CLIENT_SECRET=$(echo "$PAYPAL_CLIENT_SECRET" | tr -d '"'\'' ')
+PAYPAL_VERIFIED_CLIENT_ID=$(echo "$PAYPAL_VERIFIED_CLIENT_ID" | tr -d '"'\'' ')
+VERIFIED_SECRET=$(echo "$VERIFIED_SECRET" | tr -d '"'\'' ')
+EAB_KEY_ID=$(echo "$EAB_KEY_ID" | sed 's/keyId: //g' | tr -d '"'\'' ')
+EAB_HMAC_KEY=$(echo "$EAB_HMAC_KEY" | sed 's/b64MacKey: //g' | tr -d '"'\'' ')
+
 PAYLOAD=$(cat <<EOF
 {
+  "staging": $IS_STAGING,
+  "domain": "$DOMAIN",
   "paypal_client_id": "$PAYPAL_CLIENT_ID",
   "paypal_client_secret": "$PAYPAL_CLIENT_SECRET",
   "paypal_verified_client_id": "$PAYPAL_VERIFIED_CLIENT_ID",
-  "paypal_verified_client_secret": "$PAYPAL_VERIFIED_CLIENT_SECRET",
-  "domain": "$DOMAIN",
-  "staging": $STAGING
+  "paypal_verified_client_secret": "$VERIFIED_SECRET",
+  "eab_key_id": "$EAB_KEY_ID",
+  "eab_hmac_key": "$EAB_HMAC_KEY"
 }
 EOF
 )
 
-echo "📝 Uploading to GCP Secret Manager..."
-
-# Upload to GCP
-if gcloud secrets describe "$SECRET_NAME" --project="$PROJECT_ID" &>/dev/null; then
-    echo -n "$PAYLOAD" | gcloud secrets versions add "$SECRET_NAME" --project="$PROJECT_ID" --data-file=-
+if secret_exists "$SECRET"; then
+    echo -n "$PAYLOAD" | gcloud secrets versions add "$SECRET" --project="$PROJECT_ID" --data-file=-
 else
-    echo -n "$PAYLOAD" | gcloud secrets create "$SECRET_NAME" --project="$PROJECT_ID" --data-file=-
+    echo -n "$PAYLOAD" | gcloud secrets create "$SECRET" --project="$PROJECT_ID" --data-file=-
 fi
+fi # End of SHOULD_RESET=false block
 
-echo "============================================================"
-echo "✅ Secrets uploaded to GCP Secret Manager"
-echo "   Secret: projects/$PROJECT_ID/secrets/$SECRET_NAME/versions/latest"
-echo "============================================================"
+echo "✅ $SECRET updated."
+
+info "🔄 Restarting VM to apply changes in 3s..."
+sleep 3
+gcloud compute instances reset paypal-auth-vm-v60 --project="$PROJECT_ID" --zone=europe-west4-a
