@@ -21,7 +21,7 @@ serde_urlencoded = "0.7"
 reqwest = { version = "=0.12.24", features = ["json", "native-tls", "blocking"], default-features = false }
 
 # ACME (Google Public CA)
-instant-acme = { version = "=0.8.4", default-features = false, features = ["ring", "hyper-rustls"] }
+acme2-eab = "0.5"
 
 # TLS server (openssl)
 openssl = "0.10"
