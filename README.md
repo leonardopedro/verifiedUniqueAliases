@@ -13,7 +13,8 @@ Built for 100% bit-by-bit reproducibility and maximum security.
 | Glibc-based Runtime stability | ✅ Achieved |
 | Hardened Attestation (TPM Resource Management) | ✅ Achieved |
 | TPM-Sealed TLS Cache Persistence | ✅ Achieved |
-| PayPal OAuth Sandbox Flow | ✅ Achieved |
+| Unified PayPal OAuth Flow | ✅ Achieved (v60) |
+| Automated EAB Key Rotation | ✅ Achieved (v60) |
 | End-to-End Automated Deployment | ✅ Achieved (v60) |
 
 ### Architectural Breakthrough: Native PID 1 Rust Integration
