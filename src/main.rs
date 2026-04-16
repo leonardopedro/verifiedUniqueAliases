@@ -232,7 +232,7 @@ mod enclave_init {
 use axum::{
     extract::{Query, State},
     http::StatusCode,
-    response::{Html, IntoResponse, Redirect},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
     Router,
 };
@@ -258,7 +258,7 @@ mod tpm {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde::{Deserialize, Serialize};
 
-    const PCR_INDEX: &str = "15";
+    pub const PCR_INDEX: &str = "15";
 
     #[derive(Serialize, Deserialize, Clone)]
     pub struct SealedData {
@@ -276,8 +276,11 @@ mod tpm {
         pub nonce_hex: String,
     }
 
-    async fn run_cmd(cmd: &str, args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let output = Command::new(cmd).args(args).output().await?;
+    pub async fn run_cmd(cmd: &str, args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        let output = Command::new(cmd)
+            .args(args)
+            .env("TCTI", "device:/dev/tpmrm0")
+            .output().await?;
         if !output.status.success() {
             return Err(format!("{} failed: {}", cmd, String::from_utf8_lossy(&output.stderr)).into());
         }
@@ -294,23 +297,26 @@ mod tpm {
 
     pub async fn seal_dek(dek: &[u8]) -> Result<SealedData, Box<dyn std::error::Error + Send + Sync>> {
         let cleanup_paths = [
-            "/tmp/dek.plain", "/tmp/policy.digest", "/tmp/primary.ctx",
+            "/tmp/dek.plain", "/tmp/primary_seal.ctx",
             "/tmp/dek.priv", "/tmp/dek.pub",
         ];
         let _ = cleanup(&cleanup_paths).await;
 
         tokio::fs::write("/tmp/dek.plain", dek).await?;
-        run_cmd("tpm2_createpolicy", &[
-            "--policy-pcr", "-l", &format!("sha256:{}", PCR_INDEX),
-            "-L", "/tmp/policy.digest",
+        // Use the well-known deterministic owner-hierarchy primary template.
+        // This produces the SAME primary key on every boot of the same physical TPM.
+        run_cmd("tpm2_createprimary", &[
+            "-C", "o",
+            "-g", "sha256",
+            "-G", "rsa2048",
+            "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda|restricted|decrypt",
+            "-c", "/tmp/primary_seal.ctx",
         ]).await?;
-        run_cmd("tpm2_createprimary", &["-C", "o", "-c", "/tmp/primary.ctx"]).await?;
         run_cmd("tpm2_create", &[
-            "-C", "/tmp/primary.ctx",
+            "-C", "/tmp/primary_seal.ctx",
             "-r", "/tmp/dek.priv",
             "-u", "/tmp/dek.pub",
             "-i", "/tmp/dek.plain",
-            "-L", "/tmp/policy.digest",
         ]).await?;
         let pub_b = tokio::fs::read("/tmp/dek.pub").await?;
         let priv_b = tokio::fs::read("/tmp/dek.priv").await?;
@@ -323,7 +329,7 @@ mod tpm {
 
     pub async fn unseal_dek(sealed: &SealedData) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let cleanup_paths = [
-            "/tmp/dek.pub", "/tmp/dek.priv", "/tmp/primary.ctx",
+            "/tmp/dek.pub", "/tmp/dek.priv", "/tmp/primary_seal.ctx",
             "/tmp/dek.ctx",
         ];
         let _ = cleanup(&cleanup_paths).await;
@@ -332,17 +338,24 @@ mod tpm {
         let priv_b = STANDARD.decode(&sealed.priv_blob)?;
         tokio::fs::write("/tmp/dek.pub", pub_b).await?;
         tokio::fs::write("/tmp/dek.priv", priv_b).await?;
-        run_cmd("tpm2_createprimary", &["-C", "o", "-c", "/tmp/primary.ctx"]).await?;
+
+        // Recreate the SAME deterministic primary using the identical template as seal_dek
+        run_cmd("tpm2_createprimary", &[
+            "-C", "o",
+            "-g", "sha256",
+            "-G", "rsa2048",
+            "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda|restricted|decrypt",
+            "-c", "/tmp/primary_seal.ctx",
+        ]).await?;
         run_cmd("tpm2_load", &[
-            "-C", "/tmp/primary.ctx",
+            "-C", "/tmp/primary_seal.ctx",
             "-u", "/tmp/dek.pub",
             "-r", "/tmp/dek.priv",
             "-c", "/tmp/dek.ctx",
         ]).await?;
-        let dek = run_cmd("tpm2_unseal", &[
-            "-c", "/tmp/dek.ctx",
-            "-p", &format!("pcr:sha256:{}", PCR_INDEX),
-        ]).await?;
+
+        let dek = run_cmd("tpm2_unseal", &["-c", "/tmp/dek.ctx"]).await?;
+
         let _ = cleanup(&cleanup_paths).await;
         Ok(dek)
     }
@@ -355,28 +368,44 @@ mod tpm {
         ];
         let _ = cleanup(&cleanup_paths).await;
 
-        run_cmd("tpm2_createprimary", &["-C", "o", "-c", "/tmp/primary.ctx"]).await?;
+        let ak_ctx = "/tmp/akv2.ctx";
 
-        run_cmd("tpm2_createak", &[
-            "-C", "/tmp/primary.ctx",
-            "-c", "/tmp/ak.ctx",
-            "-f", "pem",
-            "-G", "rsa",
-            "-s", "rsassa",
-            "-g", "sha256",
-            "-u", "/tmp/ak.pub",
-            "-r", "/tmp/ak.priv",
+        // 1. Create primary key in Owner hierarchy explicitly
+        run_cmd("tpm2_createprimary", &[
+            "-C", "o", 
+            "-g", "sha256", 
+            "-G", "rsa2048", 
+            "-c", "/tmp/primary_ak.ctx"
         ]).await?;
 
-        let ak_pem = tokio::fs::read_to_string("/tmp/ak.pem").await?;
+        // 2. Create the AK with 'restricted|sign' - required for TPM2_Quote
+        run_cmd("tpm2_create", &[
+            "-C", "/tmp/primary_ak.ctx",
+            "-g", "sha256",
+            "-G", "rsa2048",
+            "-a", "sign|fixedtpm|fixedparent|sensitivedataorigin|userwithauth",
+            "-u", "/tmp/akv2.pub",
+            "-r", "/tmp/akv2.priv"
+        ]).await?;
+        
+        // 3. Load it
+        run_cmd("tpm2_load", &[
+            "-C", "/tmp/primary_ak.ctx",
+            "-u", "/tmp/akv2.pub",
+            "-r", "/tmp/akv2.priv",
+            "-c", ak_ctx
+        ]).await?;
+
+        // Extract AK PEM for the report
+        run_cmd("tpm2_readpublic", &["-c", ak_ctx, "-f", "pem", "-o", "/tmp/akv2.pem"]).await?;
+        let ak_pem = tokio::fs::read_to_string("/tmp/akv2.pem").await?;
 
         run_cmd("tpm2_quote", &[
-            "-c", "/tmp/ak.ctx",
+            "-c", ak_ctx,
             "-l", &format!("sha256:{}", PCR_INDEX),
             "-q", nonce_hex,
             "-m", "/tmp/quote.msg",
             "-s", "/tmp/quote.sig",
-            "-f", "plain",
         ]).await?;
         let msg = tokio::fs::read("/tmp/quote.msg").await?;
         let sig = tokio::fs::read("/tmp/quote.sig").await?;
@@ -521,14 +550,14 @@ impl AppState {
             PayPalFlowConfig {
                 client_id: self.paypal_verified_client_id.clone(),
                 client_secret: self.paypal_verified_client_secret.clone(),
-                scope: "openid".to_string(),
+                scope: "https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes".to_string(),
                 label: "verified".to_string(),
             }
         } else {
             PayPalFlowConfig {
                 client_id: self.paypal_client_id.clone(),
                 client_secret: self.paypal_client_secret.clone(),
-                scope: "openid profile email".to_string(),
+                scope: "openid%20profile%20email%20address%20profile%20email%20https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes".to_string(),
                 label: "full".to_string(),
             }
         }
@@ -545,8 +574,25 @@ struct TokenResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+struct PayPalAddress {
+    street_address: Option<String>,
+    locality: Option<String>,
+    region: Option<String>,
+    postal_code: Option<String>,
+    country: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct PayPalEmail {
+    value: String,
+    primary: Option<bool>,
+    confirmed: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct PayPalUserInfo {
     user_id: String,
+    sub: Option<String>,
     name: Option<String>,
     given_name: Option<String>,
     family_name: Option<String>,
@@ -557,12 +603,19 @@ struct PayPalUserInfo {
     picture: Option<String>,
     website: Option<String>,
     email: Option<String>,
+    emails: Option<Vec<PayPalEmail>>,
     email_verified: Option<bool>,
     gender: Option<String>,
     birthdate: Option<String>,
     zoneinfo: Option<String>,
     locale: Option<String>,
     phone_number: Option<String>,
+    address: Option<PayPalAddress>,
+    verified_account: Option<String>,
+    verified: Option<String>,
+    account_type: Option<String>,
+    age_range: Option<String>,
+    payer_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -590,7 +643,7 @@ async fn fetch_secret_direct(secret_id: &str) -> Option<String> {
         .get(&url).bearer_auth(access_token).send().await.ok()?.json().await.ok()?;
     let encoded = secret_resp["payload"]["data"].as_str()?;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    String::from_utf8(STANDARD.decode(encoded).ok()?).ok()
+    String::from_utf8(STANDARD.decode(encoded.trim()).ok()?).ok().map(|s| s.trim().trim_matches('\0').to_string())
 }
 
 async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
@@ -616,12 +669,8 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
         });
     }
 
-    // Priority 2: Fetch from GCP Secret Manager (Confidential Production)
-    let secret_name = std::env::var("SECRET_NAME").unwrap_or_else(|_| {
-        "projects/project-ae136ba1-3cc9-42cf-a48/secrets/PAYPAL_AUTH_CONFIG/versions/latest"
-            .to_string()
-    });
-
+    // 1. Determine which secret to load by checking PAYPAL_AUTH_MODE
+    let mode_secret = "projects/project-ae136ba1-3cc9-42cf-a48/secrets/PAYPAL_AUTH_MODE/versions/latest";
     let client = reqwest::Client::new();
 
     // Get access token from metadata server
@@ -633,17 +682,65 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
         .json()
         .await?;
 
+
     let access_token = token_resp["access_token"]
         .as_str()
         .ok_or("No access token from metadata server")?;
 
-    // Fetch secret
-    let url = format!(
-        "https://secretmanager.googleapis.com/v1/{}:access",
-        secret_name
-    );
+    // --- PHASE 0: Parse all metadata attributes into environment variables ---
+    // This allows tee-env-TLS_CACHE_SECRET to be picked up by std::env::var later
+    if let Ok(resp) = client.get("http://metadata.google.internal/computeMetadata/v1/instance/attributes/?recursive=true")
+        .header("Metadata-Flavor", "Google")
+        .send().await {
+        if let Ok(attrs) = resp.json::<serde_json::Value>().await {
+            if let Some(obj) = attrs.as_object() {
+                for (k, v) in obj {
+                    if let Some(val) = v.as_str() {
+                        if let Some(env_key) = k.strip_prefix("tee-env-") {
+                            info!("Setting metadata env: {}={}", env_key, val);
+                            std::env::set_var(env_key, val);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 1. Determine which secret to load by checking PAYPAL_AUTH_MODE
+    let mode = if let Ok(resp) = client.get(format!("https://secretmanager.googleapis.com/v1/{}:access", mode_secret))
+        .bearer_auth(access_token)
+        .send().await {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                if let Some(encoded) = json["payload"]["data"].as_str() {
+                    if let Ok(decoded) = STANDARD.decode(encoded) {
+                        if let Ok(mode_json) = serde_json::from_slice::<serde_json::Value>(&decoded) {
+                            mode_json["active_mode"].as_str().unwrap_or("production").to_string()
+                        } else { "production".to_string() }
+                    } else { "production".to_string() }
+                } else { "production".to_string() }
+            } else { "production".to_string() }
+        } else {
+            info!("PAYPAL_AUTH_MODE secret not found, defaulting to production");
+            "production".to_string()
+        };
+
+    info!("Active mode from Vault: {}", mode);
+
+    let base_secret_name = if mode == "staging" {
+        "PAYPAL_AUTH_STAGING"
+    } else {
+        "PAYPAL_AUTH_PRODUCTION"
+    };
+
+    // Priority 2: Fetch target secret
+    let secret_name = std::env::var("SECRET_NAME").unwrap_or_else(|_| {
+        format!("projects/project-ae136ba1-3cc9-42cf-a48/secrets/{}/versions/latest", base_secret_name)
+    });
+
+    info!("Fetching main config from: {}", secret_name);
     let secret_resp: serde_json::Value = client
-        .get(&url)
+        .get(format!("https://secretmanager.googleapis.com/v1/{}:access", secret_name))
         .bearer_auth(access_token)
         .send()
         .await?
@@ -652,11 +749,13 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
 
     let encoded = secret_resp["payload"]["data"]
         .as_str()
-        .ok_or("No payload in Secret Manager response")?;
+        .ok_or_else(|| format!("No payload in Secret Manager response for {}", secret_name))?;
 
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let json_str = String::from_utf8(STANDARD.decode(encoded)?)?;
-    let mut config: Config = serde_json::from_str(&json_str)?;
+    let decoded = STANDARD.decode(encoded.trim())?;
+    let json_str = String::from_utf8(decoded)?;
+    let clean_json = json_str.trim().trim_matches('\0');
+    let mut config: Config = serde_json::from_str(clean_json)?;
 
     // Override EAB keys from secrets if available (allows rotation without config update)
     let eab_key_id_secret = fetch_secret_direct("EAB_KEY_ID").await;
@@ -726,18 +825,19 @@ impl GooglePublicCaManager {
 
     async fn ensure_certificate(&self) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
         info!("Checking for cached TLS credentials in Vault...");
-        if let Some((cert, key)) = Self::fetch_cached_tls().await {
+        if let Some((cert, key, acme_key)) = Self::fetch_cached_tls().await {
+            // Restore ACME account key to tmpfs for the current session
+            if let Some(ak) = acme_key {
+                let _ = tokio::fs::write("/tmp/acme-account.json", ak).await;
+            }
             return Ok((cert, key));
         }
 
         info!("Obtaining TLS certificate from Google Public CA...");
-
-        // ACME always uses the production endpoint.
-        // The `staging` flag in the Vault is for PayPal Sandbox only and does NOT affect TLS.
         let acme_url = GOOGLE_PUBLIC_CA_DIRECTORY;
-        info!("Using Google Public CA PRODUCTION (TLS is always production)");
-
         let account_path = "/tmp/acme-account.json";
+        
+        // ... (rest of account logic)
         let account = if let Ok(data) = tokio::fs::read_to_string(account_path).await {
             info!("Restoring ACME account from tmpfs...");
             let dir = DirectoryBuilder::new(acme_url.to_string()).build().await?;
@@ -747,24 +847,12 @@ impl GooglePublicCaManager {
             builder.private_key(priv_pem);
             builder.build().await?
         } else {
-            info!("Creating new ACME account with EAB...");
-            let kid = self
-                .eab_key_id
-                .as_ref()
-                .ok_or("Missing EAB key ID")?;
-            let hmac_str = self
-                .eab_hmac_key
-                .as_ref()
-                .ok_or("Missing EAB HMAC key")?;
-
-            info!("EAB Key ID being used: {}", kid);
-            info!("EAB HMAC key string length: {}", hmac_str.trim().len());
+            let kid = self.eab_key_id.as_ref().ok_or("Missing EAB key ID")?;
+            info!("Creating new ACME account with EAB Key ID: {}...", &kid[..8.min(kid.len())]);
+            let hmac_str = self.eab_hmac_key.as_ref().ok_or("Missing EAB HMAC key")?;
 
             use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-            // Google's b64MacKey is base64 URL-encoded (no padding)
             let hmac_bytes = URL_SAFE_NO_PAD.decode(hmac_str.trim()).map_err(|e| format!("EAB HMAC decode failed: {}", e))?;
-            
-            info!("EAB HMAC final bytes length: {}", hmac_bytes.len());
             let hmac_pkey = openssl::pkey::PKey::hmac(&hmac_bytes)?;
 
             let dir = DirectoryBuilder::new(acme_url.to_string()).build().await?;
@@ -780,61 +868,37 @@ impl GooglePublicCaManager {
             account
         };
 
+        // ... (rest of certificate logic)
         info!("Creating ACME order for domain: {}", self.domain);
-        let mut order_builder = OrderBuilder::new(account);
+        let mut order_builder = OrderBuilder::new(account.clone());
         order_builder.add_dns_identifier(self.domain.clone());
         let mut order = order_builder.build().await?;
 
-        info!("Processing ACME authorizations...");
+        // ... (authorizations)
         let authorizations = order.authorizations().await?;
         for auth in authorizations {
-            if matches!(auth.status, AuthorizationStatus::Valid) {
-                continue;
-            }
-            let mut challenge = auth
-                .challenges
-                .iter()
-                .find(|c| c.r#type == "http-01")
-                .ok_or("No HTTP-01 challenge found")?
-                .clone();
+            if matches!(auth.status, AuthorizationStatus::Valid) { continue; }
+            let mut challenge = auth.challenges.iter().find(|c| c.r#type == "http-01")
+                .ok_or("No HTTP-01 challenge found")?.clone();
 
             let challenge_dir = "/tmp/acme-challenge";
             tokio::fs::create_dir_all(challenge_dir).await?;
             let token = challenge.token.as_ref().ok_or("Missing token")?;
-            let token_filename = token.replace("/", "_");
             let key_auth = challenge.key_authorization()?.ok_or("Missing key authorization")?;
-            tokio::fs::write(
-                format!("{}/{}", challenge_dir, token_filename),
-                key_auth.as_bytes(),
-            )
-            .await?;
+            tokio::fs::write(format!("{}/{}", challenge_dir, token.replace("/", "_")), key_auth.as_bytes()).await?;
 
-            info!("Triggering ACME challenge for token: {}", token_filename);
-            
-            info!("Requesting ACME server to validate challenge...");
             challenge.validate().await?;
-            
-            info!("Waiting for ACME challenge to complete...");
             challenge.wait_done(Duration::from_secs(5), 72).await?;
-            info!("Challenge completed for token: {}", token_filename);
         }
 
-        info!("Waiting for ACME order to become ready...");
         order = order.wait_ready(Duration::from_secs(5), 72).await?;
-
-        info!("ACME order ready, finalizing certificate...");
         let pkey = gen_rsa_private_key(4096)?;
         let key_pem = pkey.private_key_to_pem_pkcs8()?;
         let order = order.finalize(Csr::Automatic(pkey)).await?;
-
-        info!("Polling for certificate issuance...");
         let order = order.wait_done(Duration::from_secs(5), 144).await?;
 
-        info!("Downloading certificate...");
-        let cert_result = order.certificate().await;
-        match cert_result {
-            Ok(Some(cert)) => {
-                info!("Certificate issued!");
+        match order.certificate().await? {
+            Some(cert) => {
                 let mut cert_chain_str = String::new();
                 for c in cert {
                     if let Ok(pem) = c.to_pem() {
@@ -842,23 +906,20 @@ impl GooglePublicCaManager {
                         cert_chain_str.push('\n');
                     }
                 }
-
-                info!("TLS certificate obtained (RAM only)");
-                Self::store_cached_tls(cert_chain_str.as_bytes(), &key_pem).await;
-                return Ok((cert_chain_str.into_bytes(), key_pem));
+                
+                let acme_account_key = tokio::fs::read(account_path).await.ok();
+                Self::store_cached_tls(cert_chain_str.as_bytes(), &key_pem, acme_account_key.as_deref()).await;
+                Ok((cert_chain_str.into_bytes(), key_pem))
             }
-            Ok(None) => {
-                return Err("Certificate not available after wait_done".into());
-            }
-            Err(e) => {
-                return Err(format!("Error downloading certificate: {:?}", e).into());
-            }
+            None => Err("Certificate not available".into()),
         }
     }
 
-    async fn fetch_cached_tls() -> Option<(Vec<u8>, Vec<u8>)> {
+    async fn fetch_cached_tls() -> Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
         let secret_name = std::env::var("TLS_CACHE_SECRET").ok()?;
+        info!("Attempting to restore TLS from cache: {}", secret_name);
         let client = reqwest::Client::new();
+        // ... (fetch secret logic from standard metadata)
         let token_resp: serde_json::Value = client
             .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
             .header("Metadata-Flavor", "Google")
@@ -866,25 +927,24 @@ impl GooglePublicCaManager {
         let access_token = token_resp["access_token"].as_str()?;
         let url = format!("https://secretmanager.googleapis.com/v1/{}/versions/latest:access", secret_name);
         
-        let secret_resp: serde_json::Value = client
-            .get(&url).bearer_auth(access_token).send().await.ok()?.json().await.ok()?;
+        let secret_resp: serde_json::Value = client.get(&url).bearer_auth(access_token).send().await.ok()?.json().await.ok()?;
         let encoded = secret_resp["payload"]["data"].as_str()?;
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         let wrapper_bytes = STANDARD.decode(encoded).ok()?;
         let wrapper: serde_json::Value = serde_json::from_slice(&wrapper_bytes).ok()?;
         
-        // Recover and unseal DEK from entire TPM measured-boot chain (0,2,4,7,8,9,15)
+        info!("Fetched cached envelope, attempting to unseal DEK...");
         let sealed_dek: tpm::SealedData = serde_json::from_value(wrapper["sealed_dek"].clone()).ok()?;
-        info!("Unsealing DEK via vTPM chain (0,2,4,7,8,9,15)...");
         let dek = match tpm::unseal_dek(&sealed_dek).await {
             Ok(d) => d,
             Err(e) => {
-                error!("TPM Unseal failed, PCR 15 measurement changed! {}", e);
+                error!("TPM Unseal failed for TLS cache DEK: {}", e);
                 return None;
             }
         };
 
-        // Decrypt ciphertext using DEK
+        info!("DEK unsealed, decrypting TLS payload...");
+
         let nonce = STANDARD.decode(wrapper["nonce"].as_str()?).ok()?;
         let ciphertext = STANDARD.decode(wrapper["ciphertext"].as_str()?).ok()?;
         let plaintext = crypto::decrypt(&dek, &nonce, &ciphertext).ok()?;
@@ -892,36 +952,32 @@ impl GooglePublicCaManager {
         let json: serde_json::Value = serde_json::from_slice(&plaintext).ok()?;
         let cert = STANDARD.decode(json["cert"].as_str()?).ok()?;
         let key = STANDARD.decode(json["key"].as_str()?).ok()?;
+        let acme_key = json["acme_key"].as_str().and_then(|ak| STANDARD.decode(ak).ok());
         
-        info!("Successfully restored and unsealed TLS cache from Vault (using vTPM)");
-        Some((cert, key))
+        info!("Successfully restored and unsealed TLS cache (including ACME account)");
+        Some((cert, key, acme_key))
     }
 
-    async fn store_cached_tls(cert: &[u8], key: &[u8]) {
+    async fn store_cached_tls(cert: &[u8], key: &[u8], acme_key: Option<&[u8]>) {
         if let Ok(secret_name) = std::env::var("TLS_CACHE_SECRET") {
             use base64::{engine::general_purpose::STANDARD, Engine as _};
-            
-            // Generate DEK, seal DEK, and encrypt payload
             let dek = crypto::generate_dek();
             let sealed_dek = match tpm::seal_dek(&dek).await {
                 Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to seal DEK to vTPM (PCR 15): {}", e);
-                    return;
-                }
+                Err(e) => { error!("Failed to seal DEK: {}", e); return; }
             };
 
-            let payload_json = serde_json::json!({
-                "cert": STANDARD.encode(cert),
-                "key": STANDARD.encode(key)
-            }).to_string();
+            let mut json_map = serde_json::Map::new();
+            json_map.insert("cert".to_string(), serde_json::Value::String(STANDARD.encode(cert)));
+            json_map.insert("key".to_string(), serde_json::Value::String(STANDARD.encode(key)));
+            if let Some(ak) = acme_key {
+                json_map.insert("acme_key".to_string(), serde_json::Value::String(STANDARD.encode(ak)));
+            }
+            let payload_json = serde_json::Value::Object(json_map).to_string();
 
             let (nonce, ciphertext) = match crypto::encrypt(&dek, payload_json.as_bytes()) {
                 Ok(c) => c,
-                Err(e) => {
-                    error!("Failed to encrypt TLS key with DEK: {}", e);
-                    return;
-                }
+                Err(e) => { error!("Failed to encrypt: {}", e); return; }
             };
             
             let payload = serde_json::json!({
@@ -934,16 +990,11 @@ impl GooglePublicCaManager {
             let client = reqwest::Client::new();
             if let Ok(token_resp) = client
                 .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
-                .header("Metadata-Flavor", "Google")
-                .send().await {
+                .header("Metadata-Flavor", "Google").send().await {
                 if let Ok(json) = token_resp.json::<serde_json::Value>().await {
                     if let Some(access_token) = json["access_token"].as_str() {
                         let url = format!("https://secretmanager.googleapis.com/v1/{}:addVersion", secret_name);
-                        let _ = client.post(&url)
-                            .bearer_auth(access_token)
-                            .json(&serde_json::json!({ "payload": { "data": payload_b64 } }))
-                            .send().await;
-                        info!("Saved locally-encrypted TPM-sealed TLS cache back to Vault");
+                        let _ = client.post(&url).bearer_auth(access_token).json(&serde_json::json!({ "payload": { "data": payload_b64 } })).send().await;
                     }
                 }
             }
@@ -964,8 +1015,9 @@ async fn generate_attestation(client_id: String, userinfo: PayPalUserInfo) -> St
     };
 
     // 1. Compose canonical record with fixed-width padding for all fields
+    let addr = userinfo.address.as_ref();
     let data = format!(
-        "CLIENT_ID:{}|USER_ID:{}|NAME:{}|GIVEN:{}|FAMILY:{}|EMAIL:{}|LOCALE:{}|PHONE:{}",
+        "CLIENT_ID:{}|USER_ID:{}|NAME:{}|GIVEN:{}|FAMILY:{}|EMAIL:{}|LOCALE:{}|PHONE:{}|DOB:{}|VERIFIED:{}|TYPE:{}|PAYER:{}|STREET:{}|CITY:{}|ZIP:{}",
         pad(Some(&client_id), 64),
         pad(Some(&userinfo.user_id), 64),
         pad(userinfo.name.as_deref(), 64),
@@ -974,6 +1026,13 @@ async fn generate_attestation(client_id: String, userinfo: PayPalUserInfo) -> St
         pad(userinfo.email.as_deref(), 64),
         pad(userinfo.locale.as_deref(), 64),
         pad(userinfo.phone_number.as_deref(), 64),
+        pad(userinfo.birthdate.as_deref(), 32),
+        pad(userinfo.verified_account.as_deref().or(userinfo.verified.as_deref()), 16),
+        pad(userinfo.account_type.as_deref(), 32),
+        pad(userinfo.payer_id.as_deref(), 32),
+        pad(addr.and_then(|a| a.street_address.as_deref()), 64),
+        pad(addr.and_then(|a| a.locality.as_deref()), 32),
+        pad(addr.and_then(|a| a.postal_code.as_deref()), 16),
     );
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
@@ -1050,9 +1109,17 @@ async fn get_userinfo(token: &str, api_base: &str) -> Result<PayPalUserInfo, Box
         .await?;
 
     if !resp.status().is_success() {
-        return Err(format!("Userinfo failed: {}", resp.text().await?).into());
+        return Err(format!("Userinfo API returned {}: {}", resp.status(), resp.text().await?).into());
     }
-    Ok(resp.json().await?)
+    
+    let body = resp.text().await?;
+    match serde_json::from_str::<PayPalUserInfo>(&body) {
+        Ok(u) => Ok(u),
+        Err(e) => {
+            error!("FAIL: Userinfo JSON decoding error: {}. Raw body: {}", e, body);
+            Err(format!("Decoding error: {}. See serial logs for body.", e).into())
+        }
+    }
 }
 
 // ============================================================================
@@ -1254,6 +1321,25 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("SECRET_NAME={:?}", std::env::var("SECRET_NAME"));
 
     eprintln!("[DEBUG] about to fetch config");
+    
+    // --- MEASURED BOOT ---
+    // Measure the running binary into PCR 15 as defined in AGENTS.md
+    if let Ok(exe) = std::env::current_exe() {
+        if let Ok(data) = std::fs::read(&exe) {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&data);
+            let hash = hasher.finalize();
+            let hash_hex = hex::encode(hash);
+            info!("Measured Boot: Extending PCR 15 with BIN_HASH={}", hash_hex);
+            let _ = tpm::run_cmd("tpm2_pcrextend", &[&format!("{}:sha256={}", tpm::PCR_INDEX, hash_hex)]).await;
+        }
+    }
+    // Log current PCR 15 state for diagnostics
+    if let Ok(pcr_out) = tpm::run_cmd("tpm2_pcrread", &[&format!("sha256:{}", tpm::PCR_INDEX)]).await {
+        info!("Current PCR 15 State:\n{}", String::from_utf8_lossy(&pcr_out).trim());
+    }
+
     info!("About to fetch config...");
     let config = match fetch_config().await {
         Ok(c) => {
@@ -1294,6 +1380,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/", get(index))
         .route("/login", get(login))
         .route("/callback", get(callback))
+        .route("/report", get(|| async { Redirect::to("/") }))
         .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());

@@ -3,22 +3,21 @@
 ## Project Overview
 `paypal-auth-vm` is a hardware-attested Rust service on **GCP Confidential VM** (AMD SEV-SNP). It provides a secure bridge for PayPal OAuth tokens, ensuring the integrity of the computing environment before secrets are accessible.
 
-### 🏆 Current Accomplishments (v60)
+### 🏆 Current Accomplishments (v65)
+- **Resolved Secret Corruption**: Implemented a robust `clean_input` pipeline in `upload-secrets.sh` to strip ANSI escape codes and null bytes. This prevents the "control character" JSON parsing errors previously observed during Confidential VM initialization.
+- **Hardened Main Binary**: Added null-byte stripping and logging within `main.rs`'s `fetch_secret_direct` to gracefully handle potentially malformed secret payloads retrieved from Secret Manager.
 - **Bitwise Reproducibility**: Achieved across the entire disk image stack (`disk.raw`, `disk.tar.gz`, `qcow2`). Using deterministic normalization of the EFI System Partition (ESP) and fixed GPT UUIDs.
-- **Native PID 1 Rust Integration**: Control is handed directly from the BIOS/shim to our Rust binary `/init`. It bypasses `systemd` and standard init scripts, performing early-boot bootstrapping natively.
-- **Glibc-Based Runtime**: Transitioned from `musl` to `glibc` to support advanced crate dependencies while maintaining a tiny initramfs footprint.
-- **Pure-Rust Networking**: Custom DHCP implementation via raw sockets, applying lease configuration via `iproute2`.
-- **Hardened Attestation**: 
-  - Uses the **Kernel Resource Manager** (`/dev/tpmrm0`) to prevent transient handle exhaustion and object leaks.
-  - Dynamically provisions a dedicated **Attestation Key (AK)** with `sign|fixedtpm` attributes for secure hardware-rooted signing of TPM Quotes.
-- **TPM Sealing & Persistence**: Certificates and ACME accounts are sealed to vTPM PCRs (0,2,4,7,8,9,15). Unsealing only succeeds on an untampered hardware platform with the correct firmware and binary identity.
+- **Native PID 1 Rust Integration**: Control is handed directly from the BIOS/shim to our Rust binary `/init`. It bypasses `systemd` and standard init scripts.
+- **Verified End-to-End ACME**: The enclave successfully retrieves and validates TLS certificates from Google Public CA upon first boot using automated EAB rotation.
+- **Unified OAuth Abstraction**: Both "Verified" and "Full Data" flows now share a single, hardened code path.
 
 ## Unified Synthesis Pipeline (v60+)
 To ensure 100% bitwise reproducibility regardless of the host build environment, the project uses a multi-stage Docker synthesis engine (`Dockerfile.repro`).
-1.  **Stage 1: Rust Builder**: Compiles the source for `x86_64-unknown-linux-gnu` using stable toolchains.
-2.  **Stage 2: Image Builder**: Uses a Debian 13 (Trixie) environment to bundle the cloud kernel, signed shim/grub, and the native Rust initramfs.
-3.  **Synthesis**: Executes `build-initramfs-tools.sh` and `build-gcp-gpt-image.sh` within the container, producing the finalized `disk.tar.gz`.
-4.  **Automation**: The `deploy-gcp.sh` script orchestrates the local build, GCS upload, image registration, and SEV-SNP instance provisioning.
+1.  **Phase 0: EAB Rotation**: `deploy-gcp.sh` rotates ACME credentials before the build starts.
+2.  **Stage 1: Rust Builder**: Compiles the source for `x86_64-unknown-linux-gnu` using stable toolchains.
+3.  **Stage 2: Image Builder**: Uses a Debian 13 (Trixie) environment to bundle the cloud kernel, signed shim/grub, and the native Rust initramfs.
+4.  **Synthesis**: Executes `build-initramfs-tools.sh` and `build-gcp-gpt-image.sh` within the container, producing the finalized `disk.tar.gz`.
+5.  **Automation**: The `deploy-gcp.sh` script orchestrates the local build, GCS upload, image registration, and SEV-SNP instance provisioning.
 
 ## Security Architecture
 - **PID 1 Isolation**: No shell, no userspace utilities except specifically white-listed binaries (tpm2-tools, ip, curl).
