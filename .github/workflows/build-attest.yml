@@ -23,11 +23,7 @@ jobs:
 
       - name: Extract artifacts
         run: |
-          docker rm -f tmp 2>/dev/null || true
-          docker create --name tmp paypal-auth-vm
-          docker cp tmp:/disk.tar.gz ./disk.tar.gz
-          docker cp tmp:/initramfs-paypal-auth.img ./initramfs.img
-          docker rm tmp
+          docker run --rm paypal-auth-vm tar -cf - /disk.tar.gz /initramfs-paypal-auth.img | tar -xf -
 
       - name: Compute hashes
         id: hash
