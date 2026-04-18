@@ -20,12 +20,14 @@ jobs:
 
       - name: Build reproducibly
         run: |
-          docker build -f Dockerfile.repro -t paypal-auth-vm .
+          docker build -f Dockerfile.repro -t paypal-auth-vm . 2>&1 | tee build.log
+          cat build.log
           docker rm -f tmp_disk 2>/dev/null || true
           docker create --name tmp_disk paypal-auth-vm
           docker cp tmp_disk:/disk.tar.gz ./disk.tar.gz
           docker cp tmp_disk:/initramfs-paypal-auth.img ./initramfs.img
           docker rm tmp_disk
+          ls -la *.tar.gz *.img 2>/dev/null || true
 
       - name: Compute hashes
         id: hash
