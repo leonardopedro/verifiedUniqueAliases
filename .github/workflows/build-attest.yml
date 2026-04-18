@@ -19,24 +19,15 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Build container
-        run: |
-          docker builder prune -f
-          docker build --no-cache -f Dockerfile.repro -t paypal-auth-vm . 2>&1 | tee build.log
-          cat build.log
+        run: docker build --target image-builder -f Dockerfile.repro -t paypal-auth-vm .
 
       - name: Extract artifacts
         run: |
-          echo "Creating container..."
           docker rm -f tmp 2>/dev/null || true
           docker create --name tmp paypal-auth-vm
-          echo "Listing files..."
-          docker exec tmp ls -la /
-          echo "Copying disk.tar.gz..."
-          docker cp tmp:/disk.tar.gz ./disk.tar.gz || echo "disk.tar.gz not found"
-          echo "Copying initramfs..."
-          docker cp tmp:/initramfs-paypal-auth.img ./initramfs.img || echo "initramfs not found"
+          docker cp tmp:/disk.tar.gz ./disk.tar.gz
+          docker cp tmp:/initramfs-paypal-auth.img ./initramfs.img
           docker rm tmp
-          ls -la *.tar.gz *.img || echo "No artifacts found"
 
       - name: Compute hashes
         id: hash

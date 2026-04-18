@@ -19,7 +19,7 @@ COPY Cargo.toml Cargo.lock ./
 
 ENV RUSTFLAGS="-C target-cpu=generic"
 
-# ── Layer 1: compile ALL dependencies (cached unless Cargo.toml/lock changes) ──
+# Layer 1: compile dependencies
 RUN . /usr/local/cargo/env && \
     set -euo pipefail && \
     mkdir -p src && \
@@ -29,8 +29,7 @@ RUN . /usr/local/cargo/env && \
           target/x86_64-unknown-linux-gnu/release/paypal_auth_vm* \
           target/x86_64-unknown-linux-gnu/release/deps/paypal-auth-vm*
 
-
-# ── Layer 2: compile only our crate (fast rebuild on src/ changes) ──
+# Layer 2: compile our crate
 COPY src ./src
 RUN . /usr/local/cargo/env && \
     set -euo pipefail && \
@@ -44,25 +43,24 @@ ENV SOURCE_DATE_EPOCH=1712260800
 ENV TZ=UTC
 ENV LC_ALL=C.UTF-8
 
-# Install the Debian cloud kernel and build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates gcc g++ make pkg-config libssl-dev \
     cpio xz-utils zstd qemu-utils mtools gdisk binutils initramfs-tools \
     linux-image-cloud-amd64 shim-signed grub-efi-amd64-signed \
-    tpm2-tools iproute2 kmod python3 file dosfstools \
+    tpm2-tools iproute2 kmod python3 file dosfstools bash \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY --from=rust-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin
 
-# Copy our robust synthesis scripts
 COPY build-initramfs-tools.sh build-gcp-gpt-image.sh ./
 
-# Execute the synthesis completely inside the container
 RUN chmod +x build-initramfs-tools.sh build-gcp-gpt-image.sh && \
     ./build-initramfs-tools.sh && \
-    ./build-gcp-gpt-image.sh && \
-    cp /build/disk.tar.gz / && \
-    cp /build/output/initramfs-paypal-auth.img /
+    ./build-gcp-gpt-image.sh
 
-CMD ["bash"]
+# Copy artifacts to root for easy extraction
+RUN cp /build/disk.tar.gz /disk.tar.gz && \
+    cp /build/output/initramfs-paypal-auth.img /initramfs-paypal-auth.img
+
+CMD ["/bin/bash"]
