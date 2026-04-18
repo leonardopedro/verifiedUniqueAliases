@@ -18,12 +18,13 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build container
-        run: docker build --target image-builder -f Dockerfile.repro -t paypal-auth-vm .
-
-      - name: Extract artifacts
+      - name: Build and extract artifacts
         run: |
-          docker run --rm paypal-auth-vm tar -cf - /disk.tar.gz /initramfs-paypal-auth.img | tar -xf -
+          docker build --target image-builder -f Dockerfile.repro -t paypal-auth-vm .
+          CONTAINER_ID=$(docker create paypal-auth-vm)
+          docker cp $CONTAINER_ID:/disk.tar.gz ./disk.tar.gz
+          docker cp $CONTAINER_ID:/initramfs-paypal-auth.img ./initramfs.img
+          docker rm $CONTAINER_ID
 
       - name: Compute hashes
         id: hash
