@@ -65,3 +65,4 @@ RUN chmod +x build-initramfs-tools.sh build-gcp-gpt-image.sh && \
 
 FROM scratch
 COPY --from=image-builder /build/disk.tar.gz /disk.tar.gz
+COPY --from=image-builder /build/output/initramfs-paypal-auth.img /initramfs-paypal-auth.img
