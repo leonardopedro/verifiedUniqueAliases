@@ -18,18 +18,24 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build VM image
+      - name: Build container
         run: |
-          chmod +x ./build-vm-image.sh
-          ./build-vm-image.sh
+          docker build -f Dockerfile.repro -t paypal-auth-vm .
+
+      - name: Extract artifacts
+        run: |
+          docker rm -f tmp 2>/dev/null || true
+          docker create --name tmp paypal-auth-vm
+          docker cp tmp:/disk.tar.gz ./disk.tar.gz
+          docker cp tmp:/initramfs-paypal-auth.img ./initramfs.img
+          docker rm tmp
+          ls -la *.tar.gz *.img
 
       - name: Compute hashes
         id: hash
         run: |
           DISK_SHA=$(sha256sum disk.tar.gz | cut -d' ' -f1)
           INITRD_SHA=$(sha256sum initramfs.img | cut -d' ' -f1)
-          echo "disk-sha256:$DISK_SHA"
-          echo "initrd-sha256:$INITRD_SHA"
           echo "disk-sha256=$DISK_SHA" >> $GITHUB_OUTPUT
           echo "initrd-sha256=$INITRD_SHA" >> $GITHUB_OUTPUT
 
