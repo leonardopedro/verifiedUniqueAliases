@@ -1,0 +1,61 @@
+name: Build VM Image and Attest
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build reproducibly
+        run: |
+          docker build -f Dockerfile.repro -t paypal-auth-vm .
+          docker rm -f tmp_disk 2>/dev/null || true
+          docker create --name tmp_disk paypal-auth-vm
+          docker cp tmp_disk:/disk.tar.gz ./disk.tar.gz
+          docker cp tmp_disk:/output/initramfs-paypal-auth.img ./initramfs.img
+          docker rm tmp_disk
+
+      - name: Compute hashes
+        id: hash
+        run: |
+          DISK_SHA=$(sha256sum disk.tar.gz | cut -d' ' -f1)
+          INITRD_SHA=$(sha256sum initramfs.img | cut -d' ' -f1)
+          echo "disk-sha256:$DISK_SHA"
+          echo "initrd-sha256:$INITRD_SHA"
+          echo "disk-sha256=$DISK_SHA" >> $GITHUB_OUTPUT
+          echo "initrd-sha256=$INITRD_SHA" >> $GITHUB_OUTPUT
+
+      - name: Attest disk.tar.gz
+        uses: actions/attest@v2
+        with:
+          subject-name: VM disk image
+          subject-digest: sha256:${{ steps.hash.outputs.disk-sha256 }}
+          push-to-blob: false
+
+      - name: Attest initramfs
+        uses: actions/attest@v2
+        with:
+          subject-name: initramfs image
+          subject-digest: sha256:${{ steps.hash.outputs.initrd-sha256 }}
+          push-to-blob: false
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-artifacts
+          path: |
+            disk.tar.gz
+            initramfs.img
+          retention-days: 7
