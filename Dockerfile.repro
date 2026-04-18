@@ -61,12 +61,8 @@ COPY build-initramfs-tools.sh build-gcp-gpt-image.sh ./
 # Execute the synthesis completely inside the container
 RUN chmod +x build-initramfs-tools.sh build-gcp-gpt-image.sh && \
     ./build-initramfs-tools.sh && \
-    ./build-gcp-gpt-image.sh
+    ./build-gcp-gpt-image.sh && \
+    cp /build/disk.tar.gz / && \
+    cp /build/output/initramfs-paypal-auth.img /
 
-FROM image-builder AS exporter
-WORKDIR /export
-RUN cp /build/disk.tar.gz /build/output/initramfs-paypal-auth.img ./
-
-FROM scratch
-COPY --from=exporter /export/disk.tar.gz /disk.tar.gz
-COPY --from=exporter /export/initramfs-paypal-auth.img /initramfs-paypal-auth.img
+CMD ["bash"]
