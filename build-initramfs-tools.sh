@@ -277,6 +277,21 @@ echo "✅ Build complete! SHA256: $HASH"
 echo "🚀 Output ready at: $OUTPUT_FILE"
 # Extract kernel, shim, and grub for GPT image builder
 cp "$KERNEL_FILE" "$OUTPUT_DIR/vmlinuz"
-# Find shim and grub
-cp /usr/lib/shim/shimx64.efi.signed "$OUTPUT_DIR/shimx64.efi" || true
-cp /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed "$OUTPUT_DIR/grubx64.efi" || true
+
+# Find shim and grub more robustly in Debian 13
+SHIM_SRC=$(find /usr/lib/shim -name "shimx64.efi.signed" -print -quit 2>/dev/null || find /usr/lib/shim -name "shimx64.efi" -print -quit 2>/dev/null || true)
+GRUB_SRC=$(find /usr/lib/grub -name "grubx64.efi.signed" -print -quit 2>/dev/null || find /usr/lib/grub -name "grubx64.efi" -print -quit 2>/dev/null || true)
+
+if [ -n "$SHIM_SRC" ]; then
+    echo "  Found shim at $SHIM_SRC"
+    cp "$SHIM_SRC" "$OUTPUT_DIR/shimx64.efi"
+else
+    echo "  ⚠️ Warning: shimx64.efi.signed not found!"
+fi
+
+if [ -n "$GRUB_SRC" ]; then
+    echo "  Found grub at $GRUB_SRC"
+    cp "$GRUB_SRC" "$OUTPUT_DIR/grubx64.efi"
+else
+    echo "  ⚠️ Warning: grubx64.efi.signed not found!"
+fi

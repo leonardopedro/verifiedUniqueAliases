@@ -20,32 +20,24 @@ jobs:
 
       - name: Build and extract artifacts
         run: |
-          docker build --target image-builder -f Dockerfile.repro -t paypal-auth-vm .
+          docker build --load --target image-builder -f Dockerfile.repro -t paypal-auth-vm .
           CONTAINER_ID=$(docker create paypal-auth-vm)
           docker cp $CONTAINER_ID:/disk.tar.gz ./disk.tar.gz
           docker cp $CONTAINER_ID:/initramfs-paypal-auth.img ./initramfs.img
           docker rm $CONTAINER_ID
 
-      - name: Compute hashes
-        id: hash
-        run: |
-          DISK_SHA=$(sha256sum disk.tar.gz | cut -d' ' -f1)
-          INITRD_SHA=$(sha256sum initramfs.img | cut -d' ' -f1)
-          echo "disk-sha256=$DISK_SHA" >> $GITHUB_OUTPUT
-          echo "initrd-sha256=$INITRD_SHA" >> $GITHUB_OUTPUT
-
       - name: Attest disk.tar.gz
         uses: actions/attest@v2
         with:
           subject-name: VM disk image
-          subject-digest: sha256:${{ steps.hash.outputs.disk-sha256 }}
+          subject-path: disk.tar.gz
           push-to-blob: false
 
       - name: Attest initramfs
         uses: actions/attest@v2
         with:
           subject-name: initramfs image
-          subject-digest: sha256:${{ steps.hash.outputs.initrd-sha256 }}
+          subject-path: initramfs.img
           push-to-blob: false
 
       - name: Upload artifacts
