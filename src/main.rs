@@ -242,12 +242,15 @@ use acme2_eab::{
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
+use std::sync::atomic::{AtomicBool, Ordering, AtomicU64};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
+use tokio::sync::Semaphore;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
+use std::collections::HashMap;
+use std::net::IpAddr;
 
 // ============================================================================
 // CONSTANTS
@@ -464,6 +467,10 @@ mod crypto {
 }
 
 
+const MAX_TRACKED_IPS: usize = 1000;
+const MAX_CONCURRENT_CONNECTIONS: usize = 50;
+const GLOBAL_EGRESS_BYTES_PER_HOUR: u64 = 512 * 1024 * 1024; // 512 MB
+const IP_EGRESS_BYTES_PER_HOUR: u64 = 25 * 1024 * 1024;     // 25 MB
 const GOOGLE_PUBLIC_CA_DIRECTORY: &str = "https://dv.acme-v02.api.pki.goog/directory";
 
 const PAYPAL_PRODUCTION_API: &str = "https://api-m.paypal.com";
@@ -494,9 +501,55 @@ const HTML_TEMPLATE: &str = r#"
         h3 { color: #64b5f6; }
         ul { list-style: none; padding-left: 0; }
         li { padding: 5px 0; }
+        .footer { margin-top: 30px; text-align: center; font-size: 12px; color: #888; border-top: 1px solid #333; padding-top: 15px; }
+        .footer a { color: #64b5f6; text-decoration: none; margin: 0 10px; }
+        .document-content h2 { color: #64b5f6; margin-top: 25px; border-bottom: 1px solid #333; padding-bottom: 5px; }
+        .document-content p { line-height: 1.6; }
     </style>
 </head>
 <body><div class="container">{{CONTENT}}</div></body></html>
+"#;
+
+const PRIVACY_POLICY: &str = r#"
+    <div class="document-content">
+        <h1 id="privacy-policy">Privacy Policy & Data Security</h1>
+        <p>This service is an experimental, open-source project maintained by Leonardo Pedro.</p>
+        
+        <h2 id="security-assurance">1. Data Security & Integrity</h2>
+        <p>I have performed amateur-level testing and amateur-level code audits to identify potential data leak vectors. As of the latest release, <strong>I have found no evidence of data leaks or vulnerabilities</strong>. However, given the experimental nature of this service, I cannot offer any absolute guarantee that the system is free of flaws or leaks.</p>
+        
+        <h2 id="shared-responsibility">2. Shared Responsibility Model</h2>
+        <p>This service is offered for free with the understanding that security is a collective effort. By using this service, you agree to assume the responsibility of <strong>verifying the remote attestation</strong>. You are encouraged to inspect the hardware quotes and binary identity to confirm you are running the intended code.</p>
+        
+        <h2 id="reporting-vulnerabilities">3. Reporting Vulnerabilities</h2>
+        <p>The risks and responsibilities are shared by all users. If you discover a security flaw or vulnerability, you are expected to alert me immediately by opening an issue at: <br>
+        <a href="https://github.com/leonardopedro/verifiedUniqueAliases/issues" target="_blank" style="color:#64b5f6;">github.com/leonardopedro/verifiedUniqueAliases/issues</a>.<br>
+        Your reports allow me to correct or minimize issues for the benefit of the entire community.</p>
+        
+        <h2 id="data-handling">4. Data Handling</h2>
+        <p>All evidence so far suggests that this service operates in encrypted RAM (AMD SEV-SNP),  it does not utilize persistent databases for user profiles and your data exists only for the duration of the session required to perform the OAuth flow and generate your attestation report. But it is up to the user (you) to verify this is so in the remote attestation.</p>
+        <div class="footer"><a href="/">Back to Home</a></div>
+    </div>
+"#;
+
+const USER_AGREEMENT: &str = r#"
+    <div class="document-content">
+        <h1 id="user-agreement">User Agreement</h1>
+        <p>By using this experimental service, you accept the following terms and conditions.</p>
+        
+        <h2 id="as-is">1. "AS IS" Provision</h2>
+        <p>This service is a free, experimental demonstration of a bitwise-reproducible, self-attesting enclave built on Google Cloud Confidential VM. It is provided <strong>"AS IS", WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND</strong>, consistent with the Apache 2.0 License.</p>
+        
+        <h2 id="verification">2. User Responsibility & Verification</h2>
+        <p>The core philosophy of this project is verifiable trust. Users are responsible for verifying the hardware attestation provided by the AMD SEV-SNP enclave. You acknowledge that you use this service at your own risk.</p>
+        
+        <h2 id="community-reporting">3. Community Security</h2>
+        <p>You agree to report any potential security issues or flaws at <a href="https://github.com/leonardopedro/verifiedUniqueAliases/issues" target="_blank" style="color:#64b5f6;">github.com/leonardopedro/verifiedUniqueAliases/issues</a>. This collaborative approach allows us to minimize risks for everyone. You acknowledge that vulnerabilities may exist despite best efforts.</p>
+        
+        <h2 id="liability">4. Limitation of Liability</h2>
+        <p>To the maximum extent permitted by applicable law, I (Leonardo Pedro) shall not be liable for any direct, indirect, incidental, or consequential damages resulting from the use of this service.</p>
+        <div class="footer"><a href="/">Back to Home</a></div>
+    </div>
 "#;
 
 // ============================================================================
@@ -540,6 +593,12 @@ struct AppState {
     // v69: For inclusion in remote attestation
     tls_cert_pem: Arc<RwLock<Option<String>>>,
     attestation_signing_key: Option<String>,
+    // v70: DDoS Protection for IP tracking
+    ip_stats: Arc<RwLock<HashMap<IpAddr, u64>>>,
+    global_egress_bytes: Arc<AtomicU64>,
+    last_limit_reset: Arc<RwLock<Instant>>,
+    // v71: Concurrency Control
+    connection_semaphore: Arc<Semaphore>,
 }
 
 struct PayPalFlowConfig {
@@ -566,6 +625,47 @@ impl AppState {
                 label: "full".to_string(),
             }
         }
+    }
+
+    fn record_egress_data(&self, ip: IpAddr, bytes: u64) -> Result<(), StatusCode> {
+        let now = Instant::now();
+        
+        let mut stats = self.ip_stats.write();
+        let mut reset = self.last_limit_reset.write();
+        
+        // Reset counters if hour passed
+        if now.duration_since(*reset) > Duration::from_secs(3600) {
+            info!("Egress data counters reset (1 hour interval reached)");
+            *reset = now;
+            self.global_egress_bytes.store(0, Ordering::Relaxed);
+            stats.clear();
+        }
+        drop(reset); 
+
+        // 1. Global Data Limit Check
+        let current_global = self.global_egress_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if current_global + bytes >= GLOBAL_EGRESS_BYTES_PER_HOUR {
+            error!("Global data limit reached ({}/{} bytes)", current_global, GLOBAL_EGRESS_BYTES_PER_HOUR);
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        // 2. Per-IP Data Limit Check
+        let ip_bytes = if let Some(count) = stats.get_mut(&ip) {
+            *count += bytes;
+            *count
+        } else if stats.len() < MAX_TRACKED_IPS {
+            stats.insert(ip, bytes);
+            bytes
+        } else {
+            0
+        };
+
+        if ip_bytes > IP_EGRESS_BYTES_PER_HOUR && ip_bytes != 0 {
+            error!("IP bandwidth limit reached for {}: ({}/{} bytes)", ip, ip_bytes, IP_EGRESS_BYTES_PER_HOUR);
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        Ok(())
     }
 }
 
@@ -651,6 +751,8 @@ async fn fetch_secret_direct(secret_id: &str) -> Option<String> {
     String::from_utf8(STANDARD.decode(encoded.trim()).ok()?).ok().map(|s| s.trim().trim_matches('\0').to_string())
 }
 
+
+
 async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
     // Priority 1: Check for environment variables (KeePassXC / Local development support)
     if let (Ok(p_id), Ok(p_sec), Ok(pv_id), Ok(pv_sec), Ok(dom)) = (
@@ -731,6 +833,9 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
             "production".to_string()
         };
 
+    // v70: Store which mode we are in for later
+    std::env::set_var("ACTIVE_MODE", &mode);
+
     info!("Active mode from Vault: {}", mode);
 
     let base_secret_name = if mode == "staging" {
@@ -761,6 +866,11 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
     let decoded = STANDARD.decode(encoded.trim())?;
     let json_str = String::from_utf8(decoded)?;
     let clean_json = json_str.trim().trim_matches('\0');
+
+    // v70: Save bootstrap config for later persistence
+    let _ = std::fs::write("/tmp/bootstrap_config.json", clean_json);
+    let _ = std::fs::write("/tmp/bootstrap_secret_id.txt", base_secret_name);
+
     let mut config: Config = serde_json::from_str(clean_json)?;
 
     // Override EAB keys from secrets if available (allows rotation without config update)
@@ -1045,8 +1155,9 @@ async fn generate_attestation(
     let now = chrono::Utc::now();
     let timestamp_ms = now.timestamp_millis() as u64;
 
-    // 2. Hash the full PayPal user profile JSON
-    let paypal_json = serde_json::to_string(&userinfo).unwrap_or_default();
+    // 2. Convert userinfo to a sorted Value and hash its alphabetical representation
+    let userinfo_val = serde_json::to_value(&userinfo).expect("Failed to value-ize userinfo");
+    let paypal_json = serde_json::to_string(&userinfo_val).expect("Failed to serialize userinfo");
     let mut hasher = Sha256::new();
     hasher.update(paypal_json.as_bytes());
     let paypal_hash = hex::encode(hasher.finalize());
@@ -1054,33 +1165,36 @@ async fn generate_attestation(
     // 3. Obtain hardware attestation quote (PCR 15 base)
     // Nonce is the hash of the user data to ensure 1-to-1 binding
     let tpm_report = tpm::quote(&paypal_hash).await.expect("TPM quote failed");
+    let tpm_val = serde_json::to_value(&tpm_report).expect("Failed to value-ize tpm_report");
 
     // 4. Resolve current TLS certificate
     let cert_pem = state.tls_cert_pem.read().clone().unwrap_or_else(|| "UNSET_DURING_STARTUP".to_string());
     
     // 5. Construct the full signed payload
+    // All components are converted to Values (which use BTreeMap/sorted order)
     let payload = serde_json::json!({
-        "paypal_user_info": userinfo,
+        "paypal_user_info": userinfo_val,
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "paypal_client_id_full": state.paypal_client_id,
-            "paypal_client_id_verified": state.paypal_verified_client_id,
+            "paypal_client_id_full": &state.paypal_client_id,
+            "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
-            "domain": state.domain,
+            "domain": &state.domain,
         },
         "session_context": {
             "clicked_button_label": clicked_button_label,
-            "tls_certificate_pem": cert_pem,
+            "tls_certificate_pem": &cert_pem,
         },
-        "hardware_level_attestation": tpm_report,
+        "hardware_level_attestation": tpm_val,
     });
 
-    let payload_str = serde_json::to_string_pretty(&payload).unwrap();
+    // v70: We use Compact JSON for the signature to ensure deterministic verification (Canonical-lite)
+    let payload_compact = serde_json::to_string(&payload).expect("Failed to serialize compact payload");
     
     // 6. Sign everything using the enclave-bound asymmetric key
     let signature = if let Some(key) = &state.attestation_signing_key {
-        sign_payload(&payload_str, key)
+        sign_payload(&payload_compact, key)
     } else {
         "UNSIGNED_KEY_MISSING".to_string()
     };
@@ -1149,18 +1263,23 @@ async fn get_userinfo(token: &str, api_base: &str) -> Result<PayPalUserInfo, Box
     }
 }
 
+
+
 // ============================================================================
 // HTTP HANDLERS
 // ============================================================================
 
-async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn index(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+) -> Response {
     let content = format!(
         r#"
         <h1>Confidential PayPal Authentication</h1>
         <div class="info">
             <p><strong>Domain:</strong> {}</p>
-            <p><strong>Certificate:</strong> <span class="cert-status">RAM ONLY (Google Public CA)</span></p>
-            <p><strong>Environment:</strong> GCP Confidential VM (AMD SEV-SNP)</p>
+            <p><strong>Status:</strong> <span class="cert-status">v71 Hardened (AMD SEV-SNP)</span></p>
+            <p><strong>Certificate:</strong> RAM ONLY (Google Public CA)</p>
         </div>
         <div class="info">
             <p><strong>Verified Candidate Login (Recommended First):</strong></p>
@@ -1172,10 +1291,38 @@ async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             <p>Asks for standard profile and email data for full application functionality.</p>
             <a href="/login?flow=full" class="btn">Login with PayPal (Full Data)</a>
         </div>
+        <div class="footer">
+            <a href="/privacy#privacy-policy">Privacy Policy</a> |
+            <a href="/terms#user-agreement">User Agreement</a>
+        </div>
         "#,
         state.domain
     );
-    Html(HTML_TEMPLATE.replace("{{CONTENT}}", &content))
+    let html = HTML_TEMPLATE.replace("{{CONTENT}}", &content);
+    if let Err(status) = state.record_egress_data(addr.ip(), html.len() as u64) {
+        return status.into_response();
+    }
+    Html(html).into_response()
+}
+
+async fn privacy(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(status) = state.record_egress_data(addr.ip(), PRIVACY_POLICY.len() as u64) {
+        return status.into_response();
+    }
+    Html(HTML_TEMPLATE.replace("{{CONTENT}}", PRIVACY_POLICY)).into_response()
+}
+
+async fn terms(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(status) = state.record_egress_data(addr.ip(), USER_AGREEMENT.len() as u64) {
+        return status.into_response();
+    }
+    Html(HTML_TEMPLATE.replace("{{CONTENT}}", USER_AGREEMENT)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1185,8 +1332,12 @@ struct LoginParams {
 
 async fn login(
     Query(params): Query<LoginParams>,
-    State(state): State<Arc<AppState>>
-) -> impl IntoResponse {
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(status) = state.record_egress_data(addr.ip(), 500 /* Estimated redir size */) {
+        return status.into_response();
+    }
     let flow = params.flow.as_deref().unwrap_or("full");
     let config = state.get_flow_config(flow);
     
@@ -1200,13 +1351,14 @@ async fn login(
         urlencoding::encode(&state.redirect_uri),
         config.label
     );
-    Redirect::temporary(&url)
+    Redirect::temporary(&url).into_response()
 }
 
 async fn callback(
     Query(query): Query<CallbackQuery>,
     State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+) -> Response {
     if let Some(_error) = query.error {
         return (StatusCode::BAD_REQUEST, "Error from PayPal").into_response();
     }
@@ -1239,7 +1391,7 @@ async fn callback(
     // Show all userinfo data as formatted JSON
     let userinfo_full_json = serde_json::to_string_pretty(&userinfo).unwrap();
 
-    Html(HTML_TEMPLATE.replace(
+    let html = HTML_TEMPLATE.replace(
         "{{CONTENT}}",
         &format!(
             r#"
@@ -1253,16 +1405,37 @@ async fn callback(
             <p><strong>Certificate Authority:</strong> Google Public CA</p>
             <p><strong>Enclave Mode:</strong> {}</p>
             <p><strong>Hashed & Signed Evidence:</strong></p>
-            <pre>{}</pre>
+            <pre id="raw_report">{}</pre>
         </div>
-        <a href="/" class="btn">Back</a>
+        <button onclick="downloadReport()" class="btn" style="background:#4caf50; margin-right: 10px;">Download Attestation Report (.json)</button>
+        <a href="/" class="btn" style="background: #333;">Back</a>
+
+        <script>
+            function downloadReport() {{
+                const data = document.getElementById('raw_report').innerText;
+                const blob = new Blob([data], {{ type: 'application/json' }});
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.style.display = 'none';
+                a.href = url;
+                a.download = 'attestation_report.json';
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+            }}
+        </script>
         "#,
             html_escape::encode_text(&userinfo_full_json),
             if state.staging { "Confidential Sandbox" } else { "Confidential Production" },
             html_escape::encode_text(&attestation),
         ),
-    ))
-    .into_response()
+    );
+    
+    if let Err(status) = state.record_egress_data(addr.ip(), html.len() as u64) {
+        return status.into_response();
+    }
+
+    Html(html).into_response()
 }
 
 async fn acme_challenge(
@@ -1345,7 +1518,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     eprintln!("[DEBUG] tracing initialized");
-    info!("Starting PayPal Auth on GCP Confidential VM");
+    info!("Starting PayPal Auth on GCP Confidential VM (v71 Hardened)");
     info!("SECRET_NAME={:?}", std::env::var("SECRET_NAME"));
 
     eprintln!("[DEBUG] about to fetch config");
@@ -1393,10 +1566,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Attestation signing key loaded from Vault");
         Some(key)
     } else {
-        info!("Attestation signing key missing in Vault, generating ephemeral RSA 4096 key...");
+        info!("Attestation signing key missing in Vault, generating ephemeral RAM-ONLY RSA 4096 key...");
         acme2_eab::gen_rsa_private_key(4096).ok().map(|k| {
             let pem = String::from_utf8(k.private_key_to_pem_pkcs8().expect("Failed to convert key to PEM")).unwrap();
-            info!("--- NEW ATTESTATION SIGNING KEY GENERATED ---");
+            info!("--- EPHEMERAL RSA KEY GENERATED (RAM ONLY) ---");
             info!("{}", pem);
             info!("----------------------------------------------");
             pem
@@ -1417,6 +1590,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         staging: config.staging,
         tls_cert_pem: Arc::new(RwLock::new(None)),
         attestation_signing_key,
+        ip_stats: Arc::new(RwLock::new(HashMap::new())),
+        global_egress_bytes: Arc::new(AtomicU64::new(0)),
+        last_limit_reset: Arc::new(RwLock::new(Instant::now())),
+        connection_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
     });
 
     // Build the main app router
@@ -1425,6 +1602,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/", get(index))
         .route("/login", get(login))
         .route("/callback", get(callback))
+        .route("/privacy", get(privacy))
+        .route("/terms", get(terms))
         .route("/report", get(|| async { Redirect::to("/") }))
         .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
         .layer(TraceLayer::new_for_http())
@@ -1463,9 +1642,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .with_state(state.clone());
 
+    let state_for_http = state.clone();
     let http_handle = tokio::spawn(async move {
         loop {
-            let (stream, _) = match http_listener.accept().await {
+            let (stream, addr) = match http_listener.accept().await {
                 Ok(s) => s,
                 Err(e) => {
                     error!("Failed to accept HTTP connection: {}", e);
@@ -1473,11 +1653,20 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             };
             let router = http_router.clone();
+            let semaphore = state_for_http.connection_semaphore.clone();
 
             tokio::spawn(async move {
+                let _permit = match semaphore.try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        error!("Concurrency limit reached (HTTP)");
+                        return;
+                    }
+                };
                 let io = hyper_util::rt::TokioIo::new(stream);
-                let svc = hyper::service::service_fn(move |req| {
+                let svc = hyper::service::service_fn(move |mut req| {
                     let router = router.clone();
+                    req.extensions_mut().insert(axum::extract::ConnectInfo(addr));
                     async move { Ok::<_, std::convert::Infallible>(router.oneshot(req).await.unwrap()) }
                 });
                 let _ = hyper_util::server::conn::auto::Builder::new(
@@ -1523,9 +1712,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let https_listener = TcpListener::bind(https_addr).await?;
     let https_tls_config = tls_config.clone();
 
+    let state_for_https = state.clone();
     let https_handle = tokio::spawn(async move {
         loop {
-            let (stream, _) = match https_listener.accept().await {
+            let (stream, addr) = match https_listener.accept().await {
                 Ok(s) => s,
                 Err(e) => {
                     error!("Failed to accept HTTPS connection: {}", e);
@@ -1534,8 +1724,16 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             };
             let ssl_config = https_tls_config.clone();
             let app = app.clone();
+            let semaphore = state_for_https.connection_semaphore.clone();
 
             tokio::spawn(async move {
+                let _permit = match semaphore.try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        error!("Concurrency limit reached (HTTPS)");
+                        return;
+                    }
+                };
                 let ssl = match openssl::ssl::Ssl::new(ssl_config.context()) {
                     Ok(s) => s,
                     Err(e) => {
@@ -1555,8 +1753,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     return;
                 }
                 let io = hyper_util::rt::TokioIo::new(tls_stream);
-                let svc = hyper::service::service_fn(move |req| {
+                let svc = hyper::service::service_fn(move |mut req| {
                     let app = app.clone();
+                    req.extensions_mut().insert(axum::extract::ConnectInfo(addr));
                     async move { Ok::<_, std::convert::Infallible>(app.oneshot(req).await.unwrap()) }
                 });
                 let _ = hyper_util::server::conn::auto::Builder::new(
