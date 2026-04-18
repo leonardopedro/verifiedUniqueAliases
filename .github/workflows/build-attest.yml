@@ -20,7 +20,7 @@ jobs:
 
       - name: Build container
         run: |
-          docker build -f Dockerfile.repro -t paypal-auth-vm .
+          docker build --no-cache -f Dockerfile.repro -t paypal-auth-vm .
 
       - name: Extract artifacts
         run: |
