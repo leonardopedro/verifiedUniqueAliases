@@ -11,7 +11,8 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal --no-modify-path \
     && . /usr/local/cargo/env \
     && export RUST_MIN_STACK=16777216 \
-    && cargo install -j 1 --root /usr --locked add-determinism \
+    && cargo install -j 1 --locked add-determinism \
+    && cp /usr/local/cargo/bin/add-determinism /add-determinism-bin \
     && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
 
 WORKDIR /app
@@ -52,7 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 COPY --from=rust-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin
-COPY --from=rust-builder /usr/bin/add-determinism /usr/bin/add-determinism
+COPY --from=rust-builder /add-determinism-bin /usr/bin/add-determinism
 
 COPY build-initramfs-tools.sh build-gcp-gpt-image.sh ./
 
