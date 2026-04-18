@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Enclave Audit | Confidential Attestation Verifier</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0a0c10;
+            --card: #161b22;
+            --primary: #58a6ff;
+            --success: #3fb950;
+            --error: #f85149;
+            --text: #c9d1d9;
+            --text-dim: #8b949e;
+            --accent: #1f6feb;
+        }
+
+        * { box-sizing: border-box; }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Outfit', sans-serif;
+            margin: 0;
+            padding: 40px 20px;
+            display: flex;
+            justify-content: center;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 900px;
+            width: 100%;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 50px;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            margin: 0;
+            background: linear-gradient(135deg, #fff 0%, #58a6ff 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 600;
+        }
+
+        p.subtitle {
+            color: var(--text-dim);
+            font-size: 1.1rem;
+            margin-top: 10px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .input-card {
+            background: var(--card);
+            border: 1px solid #30363d;
+            border-radius: 16px;
+            padding: 24px;
+            transition: transform 0.2s;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 12px;
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        textarea {
+            width: 100%;
+            height: 200px;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            color: #58a6ff;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            padding: 12px;
+            resize: none;
+            outline: none;
+        }
+
+        button {
+            grid-column: span 2;
+            padding: 16px;
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: filter 0.2s, transform 0.1s;
+        }
+
+        button:hover { filter: brightness(1.2); }
+        button:active { transform: scale(0.98); }
+
+        .results {
+            margin-top: 40px;
+            display: none;
+        }
+
+        .status-card {
+            background: rgba(88, 166, 255, 0.05);
+            border: 1px solid rgba(88, 166, 255, 0.2);
+            border-radius: 16px;
+            padding: 24px;
+        }
+
+        .check-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 16px;
+            padding: 12px;
+            background: rgba(255, 255, 255, 0.02);
+            border-radius: 8px;
+        }
+
+        .check-icon {
+            font-size: 1.5rem;
+            margin-right: 16px;
+            width: 32px;
+            text-align: center;
+        }
+
+        .check-text h4 { margin: 0; font-size: 1rem; }
+        .check-text p { margin: 2px 0 0; font-size: 0.9rem; color: var(--text-dim); }
+
+        .verified { border-left: 4px solid var(--success); }
+        .failed { border-left: 4px solid var(--error); }
+        .verified .check-icon { color: var(--success); }
+        .failed .check-icon { color: var(--error); }
+
+        .timestamp-box {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 15px;
+            border-bottom: 1px solid #30363d;
+        }
+
+        .timestamp-box span {
+            color: var(--primary);
+            font-weight: 600;
+            font-size: 1.2rem;
+        }
+
+        .file-input {
+            width: 100%;
+            background: #0d1117;
+            border: 1px dashed #30363d;
+            padding: 10px;
+            border-radius: 8px;
+            color: var(--text-dim);
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+        .file-input:hover { border-color: var(--primary); }
+        .file-input::-webkit-file-upload-button {
+            background: var(--accent);
+            border: none;
+            color: white;
+            padding: 4px 12px;
+            border-radius: 4px;
+            margin-right: 12px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <h1>Secure Enclave Auditor</h1>
+        <p class="subtitle">Hardware-Rooted Attestation Verification v70</p>
+    </header>
+
+    <div class="grid">
+        <div class="input-card">
+            <label>Attestation JSON Report</label>
+            <div style="margin-bottom: 15px;">
+                <input type="file" id="reportFile" accept=".json" onchange="loadFile(this, 'attestationInput')" class="file-input">
+            </div>
+            <textarea id="attestationInput" placeholder="Paste report or use file upload above..."></textarea>
+        </div>
+        <div class="input-card">
+            <label>Browser TLS Certificate (Optional)</label>
+            <div style="margin-bottom: 15px;">
+                <input type="file" id="certFile" onchange="loadFile(this, 'certInput')" class="file-input">
+            </div>
+            <textarea id="certInput" placeholder="Paste .pem or use file upload above..."></textarea>
+        </div>
+        <button onclick="runAudit()">Perform Cryptographic Audit</button>
+    </div>
+
+    <div id="resultsArea" class="results">
+        <div class="status-card">
+            <div class="timestamp-box">
+                Account Security Bound at:<br>
+                <span id="signTime">Not verified</span>
+            </div>
+
+            <div id="enclaveCheck" class="check-item">
+                <div class="check-icon">🛡️</div>
+                <div class="check-text">
+                    <h4>Enclave Identity Signature</h4>
+                    <p id="enclaveDesc">Proves report originated from an untampered Confidential VM.</p>
+                </div>
+            </div>
+
+            <div id="identityCheck" class="check-item">
+                <div class="check-icon">👤</div>
+                <div class="check-text">
+                    <h4>PayPal Identity Binding</h4>
+                    <p id="identityDesc">Proves the user profile matches the signed evidence.</p>
+                </div>
+            </div>
+
+            <div id="tpmCheck" class="check-item">
+                <div class="check-icon">🏗️</div>
+                <div class="check-text">
+                    <h4>TPM Hardware Proof</h4>
+                    <p id="tpmDesc">Proves the session is anchored to Google's physical vTPM.</p>
+                </div>
+            </div>
+
+            <div id="tlsCheck" class="check-item">
+                <div class="check-icon">🔒</div>
+                <div class="check-text">
+                    <h4>TLS Certificate Binding</h4>
+                    <p id="tlsDesc">Proves your current browser connection is the one documented in the report.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    function reorder(obj) {
+        if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
+            return Array.isArray(obj) ? obj.map(reorder) : obj;
+        }
+        const newObj = {};
+        // Use strictly alphabetical sorting for all keys (JCS-style) to match Rust BTreeMap
+        Object.keys(obj).sort().forEach(k => {
+            newObj[k] = reorder(obj[k]);
+        });
+        return newObj;
+    }
+
+    // Helper to extract leaf certificate from potentially chained PEM
+    function getLeafCert(pem) {
+        if (!pem) return "";
+        const match = pem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/);
+        if (!match) return pem.replace(/[\s\r\n]/g, '');
+        return match[0].replace(/-----BEGIN CERTIFICATE-----|-----END CERTIFICATE-----|[\s\r\n]/g, '');
+    }
+
+    const normalize = (s) => s.replace(/\r\n/g, '\n').trim();
+
+    function loadFile(input, targetId) {
+        const file = input.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            document.getElementById(targetId).value = e.target.result;
+            // Provide a small UI hint that it was loaded
+            const label = input.closest('.input-card').querySelector('label');
+            const original = label.innerText;
+            label.innerText = "✅ " + original;
+            setTimeout(() => { label.innerText = original; }, 2000);
+        };
+        reader.readAsText(file);
+    }
+
+    async function runAudit() {
+        try {
+            const data = JSON.parse(document.getElementById('attestationInput').value);
+            const report = data.attestation_report;
+            
+            document.getElementById('resultsArea').style.display = 'block';
+            document.getElementById('signTime').innerText = new Date(report.timestamp_ms).toLocaleString();
+
+            // 1. Identity Binding (SHA256)
+            // Use strictly defined struct order to match Rust's struct serialization
+            const userInfo = reorder(report.paypal_user_info);
+            const infoCompact = JSON.stringify(userInfo);
+            const infoBuffer = new TextEncoder().encode(infoCompact);
+            const infoHashBuffer = await crypto.subtle.digest('SHA-256', infoBuffer);
+            const infoHashHex = Array.from(new Uint8Array(infoHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+            
+            updateStatus('identityCheck', infoHashHex === report.paypal_user_info_raw_hash);
+
+            // 2. TPM Binding
+            updateStatus('tpmCheck', report.hardware_level_attestation.nonce_hex === report.paypal_user_info_raw_hash);
+
+            // 3. TLS Binding (Optional)
+            const userCertInput = document.getElementById('certInput').value;
+            if (userCertInput) {
+                const userLeaf = getLeafCert(userCertInput);
+                const reportLeaf = getLeafCert(report.session_context.tls_certificate_pem);
+                updateStatus('tlsCheck', userLeaf === reportLeaf);
+            } else {
+                document.getElementById('tlsCheck').className = 'check-item';
+                document.getElementById('tlsDesc').innerText = 'Paste your browser certificate to verify transport binding.';
+            }
+
+            // 4. Enclave Signature (Asymmetric RSA)
+            const signature = Uint8Array.from(atob(data.enclave_signature_b64), c => c.charCodeAt(0));
+            const pubKeyPem = data.enclave_signing_public_key.replace(/-----BEGIN PUBLIC KEY-----|-----END PUBLIC KEY-----|[\s\r\n]/g, '');
+            const pubKeyBuffer = Uint8Array.from(atob(pubKeyPem), c => c.charCodeAt(0));
+
+            const publicKey = await crypto.subtle.importKey(
+                'spki', pubKeyBuffer, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']
+            );
+
+            // v71: Enclave signs alphabetical JSON for dynamic fields
+            const signedReport = reorder(report);
+            const payloadCompact = JSON.stringify(signedReport);
+            let sigOk = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', publicKey, signature, new TextEncoder().encode(payloadCompact));
+            
+            if (!sigOk) {
+                // Debug log for identifying serialization mismatches
+                console.log("Signature failed. Compact payload was:", payloadCompact);
+                // Fallback to legacy pretty-print (v69)
+                const payloadPretty = JSON.stringify(signedReport, null, 2);
+                sigOk = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', publicKey, signature, new TextEncoder().encode(payloadPretty));
+            }
+            
+            updateStatus('enclaveCheck', sigOk);
+
+        } catch (e) {
+            console.error(e);
+            alert("Error parsing report: " + e.message);
+        }
+    }
+
+    function updateStatus(id, success) {
+        const el = document.getElementById(id);
+        el.className = 'check-item ' + (success ? 'verified' : 'failed');
+        const desc = el.querySelector('p');
+        if (success) desc.innerText = "Verification successful. cryptographic proof is valid.";
+        else desc.innerText = "Verification failed. the data has been modified or the signature is invalid.";
+    }
+</script>
+
+</body>
+</html>

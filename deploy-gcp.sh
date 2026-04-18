@@ -38,6 +38,31 @@ else
     echo "⚠️  Failed to rotate EAB keys. Using existing secrets..."
 fi
 
+# --- Phase 0.5: Attestation Key Provisioning ---
+echo ""
+echo "🔑 [0.5/3] Checking Attestation Signing Keys..."
+for MODE in "PRODUCTION" "STAGING"; do
+    SECRET_ID="PAYPAL_AUTH_${MODE}"
+    # Fetch current config
+    JSON=$(gcloud secrets versions access latest --secret="$SECRET_ID" --project="$PROJECT_ID" --quiet 2>/dev/null || echo "{}")
+    # Simple check for the key field
+    if ! echo "$JSON" | grep -q '"attestation_signing_key"'; then
+        echo "   - $SECRET_ID: Key missing. Generating RSA 4096 (PKCS#8)..."
+        # Generate RSA Key and convert to PKCS#8
+        RSA_KEY=$(openssl genrsa 4096 2>/dev/null)
+        PEM=$(echo "$RSA_KEY" | openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt 2>/dev/null)
+        
+        # Use python to safely inject the key into JSON
+        UPDATED_JSON=$(python3 -c "import json, sys; d=json.loads(sys.argv[1]); d['attestation_signing_key']=sys.argv[2]; print(json.dumps(d))" "$JSON" "$PEM")
+        
+        # Update Secret Manager
+        echo -n "$UPDATED_JSON" | gcloud secrets versions add "$SECRET_ID" --project="$PROJECT_ID" --data-file=- --quiet
+        echo "   ✅ $SECRET_ID updated with new persistent signing key."
+    else
+        echo "   ✅ $SECRET_ID: Signature key already exists."
+    fi
+done
+
 # --- Phase 1: Local Docker Source Build & Disk Synthesis ---
 echo ""
 echo "📦 [1/6] Building reproducing Rust binary and Disk locally..."
