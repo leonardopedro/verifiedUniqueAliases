@@ -134,8 +134,8 @@ dd if=$ESP_IMAGE of=$RAW_IMAGE bs=1M seek=1 conv=notrunc status=none
 echo "🔍 Final normalization of RAW disk..."
 touch -d "@$SOURCE_DATE_EPOCH" "$RAW_IMAGE"
 
-if command -v add-determinism >/dev/null; then
-    add-determinism "$RAW_IMAGE"
+if command -v add-det >/dev/null; then
+    add-det "$RAW_IMAGE"
 fi
 
 # ==============================================================================
@@ -144,8 +144,8 @@ fi
 echo "🔄 Converting to QCOW2..."
 rm -f $IMAGE_NAME
 qemu-img convert -f raw -O qcow2 $RAW_IMAGE $IMAGE_NAME
-if command -v add-determinism >/dev/null; then
-    add-determinism "$IMAGE_NAME"
+if command -v add-det >/dev/null; then
+    add-det "$IMAGE_NAME"
 fi
 
 echo "📦 Packaging to disk.tar.gz (deterministic)..."
@@ -155,8 +155,8 @@ tar --owner=0 --group=0 --numeric-owner \
     --sort=name \
     -czf "$TAR_IMAGE" "$RAW_IMAGE"
 
-if command -v add-determinism >/dev/null; then
-    add-determinism "$TAR_IMAGE"
+if command -v add-det >/dev/null; then
+    add-det "$TAR_IMAGE"
 fi
 
 # Cleanup
