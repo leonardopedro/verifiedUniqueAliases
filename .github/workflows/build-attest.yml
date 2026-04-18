@@ -23,8 +23,8 @@ jobs:
           docker build -f Dockerfile.repro -t paypal-auth-vm .
           docker rm -f tmp_disk 2>/dev/null || true
           docker create --name tmp_disk paypal-auth-vm
-          docker cp tmp_disk:/disk.tar.gz ./disk.tar.gz
-          docker cp tmp_disk:/output/initramfs-paypal-auth.img ./initramfs.img
+          docker cp tmp_disk:/build/disk.tar.gz ./disk.tar.gz
+          docker cp tmp_disk:/build/output/initramfs-paypal-auth.img ./initramfs.img
           docker rm tmp_disk
 
       - name: Compute hashes
