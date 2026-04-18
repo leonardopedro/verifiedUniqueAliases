@@ -507,7 +507,6 @@ const HTML_TEMPLATE: &str = r#"
 struct Config {
     paypal_client_id: String,
     paypal_client_secret: String,
-    // v61: Add credentials for the "Verified Only" low-privilege button
     #[serde(default)]
     paypal_verified_client_id: Option<String>,
     #[serde(default)]
@@ -518,6 +517,9 @@ struct Config {
     #[serde(default)]
     staging: bool,
     acme_account_json: Option<String>,
+    // v69: Asymmetric key for signing the attestation payload
+    #[serde(default)]
+    attestation_signing_key: Option<String>,
 }
 
 // ============================================================================
@@ -535,6 +537,9 @@ struct AppState {
     domain: String,
     https_ready: Arc<AtomicBool>,
     staging: bool,
+    // v69: For inclusion in remote attestation
+    tls_cert_pem: Arc<RwLock<Option<String>>>,
+    attestation_signing_key: Option<String>,
 }
 
 struct PayPalFlowConfig {
@@ -666,6 +671,7 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
             eab_hmac_key: std::env::var("EAB_HMAC_KEY").ok(),
             staging: std::env::var("STAGING").map(|s| s == "true").unwrap_or(false),
             acme_account_json: std::env::var("ACME_ACCOUNT_JSON").ok(),
+            attestation_signing_key: std::env::var("ATTESTATION_SIGNING_KEY").ok(),
         });
     }
 
@@ -1006,69 +1012,90 @@ impl GooglePublicCaManager {
 // ATTESTATION
 // ============================================================================
 
-async fn generate_attestation(client_id: String, userinfo: PayPalUserInfo) -> String {
-    use sha2::{Digest, Sha256};
+fn sign_payload(payload: &str, private_key_pem: &str) -> String {
+    use openssl::pkey::PKey;
+    use openssl::sign::Signer;
+    use openssl::hash::MessageDigest;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
 
-    let pad = |s: Option<&str>, len: usize| {
-        let base = s.unwrap_or("N/A");
-        format!("{:_<width$}", &base[..base.len().min(len)], width = len)
+    let pkey = PKey::private_key_from_pem(private_key_pem.as_bytes()).expect("Invalid private key");
+    let mut signer = Signer::new(MessageDigest::sha256(), &pkey).expect("Failed to create signer");
+    signer.update(payload.as_bytes()).expect("Failed to update signer");
+    let signature = signer.sign_to_vec().expect("Failed to sign");
+    STANDARD.encode(signature)
+}
+
+fn extract_pub_key(private_key_pem: &str) -> String {
+    use openssl::pkey::PKey;
+    let pkey = PKey::private_key_from_pem(private_key_pem.as_bytes()).ok();
+    pkey.and_then(|k| k.public_key_to_pem().ok())
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| "N/A".to_string())
+}
+
+async fn generate_attestation(
+    state: &AppState,
+    clicked_button_label: String,
+    userinfo: PayPalUserInfo,
+) -> String {
+    use sha2::{Digest, Sha256};
+    
+    // 1. Get current time with ms precision
+    let now = chrono::Utc::now();
+    let timestamp_ms = now.timestamp_millis() as u64;
+
+    // 2. Hash the full PayPal user profile JSON
+    let paypal_json = serde_json::to_string(&userinfo).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(paypal_json.as_bytes());
+    let paypal_hash = hex::encode(hasher.finalize());
+
+    // 3. Obtain hardware attestation quote (PCR 15 base)
+    // Nonce is the hash of the user data to ensure 1-to-1 binding
+    let tpm_report = tpm::quote(&paypal_hash).await.expect("TPM quote failed");
+
+    // 4. Resolve current TLS certificate
+    let cert_pem = state.tls_cert_pem.read().clone().unwrap_or_else(|| "UNSET_DURING_STARTUP".to_string());
+    
+    // 5. Construct the full signed payload
+    let payload = serde_json::json!({
+        "paypal_user_info": userinfo,
+        "paypal_user_info_raw_hash": paypal_hash,
+        "timestamp_ms": timestamp_ms,
+        "enclave_config": {
+            "paypal_client_id_full": state.paypal_client_id,
+            "paypal_client_id_verified": state.paypal_verified_client_id,
+            "staging_mode": if state.staging { "sandbox" } else { "production" },
+            "domain": state.domain,
+        },
+        "session_context": {
+            "clicked_button_label": clicked_button_label,
+            "tls_certificate_pem": cert_pem,
+        },
+        "hardware_level_attestation": tpm_report,
+    });
+
+    let payload_str = serde_json::to_string_pretty(&payload).unwrap();
+    
+    // 6. Sign everything using the enclave-bound asymmetric key
+    let signature = if let Some(key) = &state.attestation_signing_key {
+        sign_payload(&payload_str, key)
+    } else {
+        "UNSIGNED_KEY_MISSING".to_string()
     };
 
-    // 1. Compose canonical record with fixed-width padding for all fields
-    let addr = userinfo.address.as_ref();
-    let data = format!(
-        "CLIENT_ID:{}|USER_ID:{}|NAME:{}|GIVEN:{}|FAMILY:{}|EMAIL:{}|LOCALE:{}|PHONE:{}|DOB:{}|VERIFIED:{}|TYPE:{}|PAYER:{}|STREET:{}|CITY:{}|ZIP:{}",
-        pad(Some(&client_id), 64),
-        pad(Some(&userinfo.user_id), 64),
-        pad(userinfo.name.as_deref(), 64),
-        pad(userinfo.given_name.as_deref(), 64),
-        pad(userinfo.family_name.as_deref(), 64),
-        pad(userinfo.email.as_deref(), 64),
-        pad(userinfo.locale.as_deref(), 64),
-        pad(userinfo.phone_number.as_deref(), 64),
-        pad(userinfo.birthdate.as_deref(), 32),
-        pad(userinfo.verified_account.as_deref().or(userinfo.verified.as_deref()), 16),
-        pad(userinfo.account_type.as_deref(), 32),
-        pad(userinfo.payer_id.as_deref(), 32),
-        pad(addr.and_then(|a| a.street_address.as_deref()), 64),
-        pad(addr.and_then(|a| a.locality.as_deref()), 32),
-        pad(addr.and_then(|a| a.postal_code.as_deref()), 16),
-    );
-    let mut hasher = Sha256::new();
-    hasher.update(data.as_bytes());
-    let hash_bytes = hasher.finalize();
-
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let hash_b64 = STANDARD.encode(hash_bytes);
-
-    // 2. Obtain a hardware-rooted attestation token directly from the vTPM for the entire boot chain
-    match tpm::quote(&hex::encode(hash_bytes)).await {
-        Ok(attest) => {
-            serde_json::json!({
-                "tpm_quote_msg": attest.tpm_quote_msg,
-                "tpm_quote_sig": attest.tpm_quote_sig,
-                "ak_pub_pem": attest.ak_pub_pem,
-                "ek_cert": attest.ek_cert,
-                "pcrs": attest.pcrs,
-                "nonce_hex": attest.nonce_hex,
-                "bound_user_data": data,
-                "binding_hash": hash_b64,
-                "hw_platform": "AMD SEV-SNP + vTPM (PCR 15)",
-                "verification": "Submit to GCP Verify Attestation API or verify AK signature against ak_pub_pem"
-            }).to_string()
+    let full_report = serde_json::json!({
+        "attestation_report": payload,
+        "enclave_signature_b64": signature,
+        "enclave_signing_public_key": if let Some(key) = &state.attestation_signing_key {
+            extract_pub_key(key)
+        } else {
+            "N/A".to_string()
         }
-        Err(e) => {
-            error!("Failed to generate vTPM quote: {}", e);
-            serde_json::json!({
-                "SIMULATED_REPORT": true,
-                "error": "Hardware attestation failed",
-                "bound_user_data": data,
-                "binding_hash": hash_b64,
-                "detail": e.to_string(),
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }).to_string()
-        }
-    }
+    });
+
+    serde_json::to_string_pretty(&full_report).unwrap()
 }
 
 // ============================================================================
@@ -1207,7 +1234,10 @@ async fn callback(
         }
     };
 
-    let attestation = generate_attestation(config.client_id, userinfo.clone()).await;
+    let attestation = generate_attestation(&state, config.label.clone(), userinfo.clone()).await;
+
+    // Show all userinfo data as formatted JSON
+    let userinfo_full_json = serde_json::to_string_pretty(&userinfo).unwrap();
 
     Html(HTML_TEMPLATE.replace(
         "{{CONTENT}}",
@@ -1215,22 +1245,20 @@ async fn callback(
             r#"
         <h1>Authentication Successful</h1>
         <div class="info">
-            <h3>PayPal User</h3>
-            <p><strong>ID:</strong> {}</p>
-            <p><strong>Name:</strong> {}</p>
-            <p><strong>Email:</strong> {}</p>
+            <h3>Verified PayPal User Profile</h3>
+            <pre>{}</pre>
         </div>
         <div class="attestation">
-            <h3>Attestation</h3>
-            <p><strong>Certificate:</strong> <span class="cert-status">RAM ONLY</span></p>
-            <p><strong>CA:</strong> Google Public CA</p>
+            <h3>Hardware-Attested Enclave Report</h3>
+            <p><strong>Certificate Authority:</strong> Google Public CA</p>
+            <p><strong>Enclave Mode:</strong> {}</p>
+            <p><strong>Hashed & Signed Evidence:</strong></p>
             <pre>{}</pre>
         </div>
         <a href="/" class="btn">Back</a>
         "#,
-            html_escape::encode_text(&userinfo.user_id),
-            html_escape::encode_text(&userinfo.name.unwrap_or_else(|| "N/A".to_string())),
-            html_escape::encode_text(&userinfo.email.unwrap_or_else(|| "N/A".to_string())),
+            html_escape::encode_text(&userinfo_full_json),
+            if state.staging { "Confidential Sandbox" } else { "Confidential Production" },
             html_escape::encode_text(&attestation),
         ),
     ))
@@ -1360,7 +1388,22 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let https_ready = Arc::new(AtomicBool::new(false));
     let https_ready_clone = https_ready.clone();
 
-    // Initialize app state (using consolidated config with fallbacks)
+    // v69: Attestation Signing Key handling (cloned to avoid partial move of config)
+    let attestation_signing_key = if let Some(key) = config.attestation_signing_key.clone() {
+        info!("Attestation signing key loaded from Vault");
+        Some(key)
+    } else {
+        info!("Attestation signing key missing in Vault, generating ephemeral RSA 4096 key...");
+        acme2_eab::gen_rsa_private_key(4096).ok().map(|k| {
+            let pem = String::from_utf8(k.private_key_to_pem_pkcs8().expect("Failed to convert key to PEM")).unwrap();
+            info!("--- NEW ATTESTATION SIGNING KEY GENERATED ---");
+            info!("{}", pem);
+            info!("----------------------------------------------");
+            pem
+        })
+    };
+
+    // Initialize app state
     eprintln!("[DEBUG] building app state");
     let state = Arc::new(AppState {
         paypal_client_id: config.paypal_client_id.clone(),
@@ -1372,6 +1415,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         domain: config.domain.clone(),
         https_ready: https_ready_clone,
         staging: config.staging,
+        tls_cert_pem: Arc::new(RwLock::new(None)),
+        attestation_signing_key,
     });
 
     // Build the main app router
@@ -1452,6 +1497,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(r) => {
             info!("Certificate obtained");
             https_ready.store(true, Ordering::Relaxed);
+            *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&r.0).to_string());
             r
         }
         Err(e) => {
