@@ -50,8 +50,8 @@ if [[ -z "$PAYPAL_CLIENT_ID" ]] || [[ -z "$PAYPAL_CLIENT_SECRET" ]] || [[ -z "$P
     exit 1
 fi
 
-# Verified client ID is fixed
-PAYPAL_VERIFIED_CLIENT_ID="AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p"
+# TODO: Set via environment variable
+PAYPAL_VERIFIED_CLIENT_ID=""
 
 echo ""
 echo "📝 Uploading to GCP Secret Manager..."
@@ -165,8 +165,8 @@ echo "✅ Retrieved secrets from KeePassXC"
 echo "   Old App: client_id + client_secret"
 echo "   Verified App: client_secret only (client_id is fixed)"
 
-# Verified client ID is fixed
-PAYPAL_VERIFIED_CLIENT_ID="AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p"
+# TODO: Set via environment variable
+PAYPAL_VERIFIED_CLIENT_ID=""
 
 # Create JSON payload (hide secrets in output)
 echo "📝 Payload prepared, uploading to GCP Secret Manager..."

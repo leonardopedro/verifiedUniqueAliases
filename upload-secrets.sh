@@ -57,8 +57,9 @@ echo "  3) Switch Active Mode (Stage/Prod)"
 echo "  4) Generate Google Public CA EAB Keys (Manual Display)"
 read -p "Choice (1-4): " CHOICE
 
-PAYPAL_VERIFIED_CLIENT_ID="AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p"
-PAYPAL_VERIFIED_CLIENT_SECRET="EHSSIjy5sUHPYrBA1tN-UqDLfuTe-FSSdxRVJ6CCvNcwK6QphDUExRPGurFvA4DibvFNA-LvnHFUY7vP"
+# TODO: Set these via environment variables or user input
+PAYPAL_VERIFIED_CLIENT_ID=""
+PAYPAL_VERIFIED_CLIENT_SECRET=""
 
 if [[ "$CHOICE" == "4" ]]; then
     info "🏗️  Generating Google Public CA EAB Keys..."
@@ -142,8 +143,8 @@ EAB_SEC_DEF=${EXT_EAB_SEC:-$JSON_EAB_SEC}
 read -p "Domain (default: ${DEFAULT_DOMAIN:-login.airma.de}): " DOMAIN
 read -p "PayPal Client ID (default: $DEFAULT_PAYPAL_ID): " PAYPAL_CLIENT_ID
 read -p "PayPal Client Secret (default: $DEFAULT_PAYPAL_SEC): " PAYPAL_CLIENT_SECRET
-read -p "Verified App Client ID (default: ${DEFAULT_VERIFIED_ID:-$PAYPAL_VERIFIED_CLIENT_ID}): " INPUT_VERIFIED_ID
-read -p "Verified App Client Secret (default: ${DEFAULT_VERIFIED_SEC:-$PAYPAL_VERIFIED_CLIENT_SECRET}): " VERIFIED_SECRET
+read -p "Verified App Client ID: " INPUT_VERIFIED_ID
+read -sp "Verified App Client Secret: " VERIFIED_SECRET
 echo ""
 read -p "🔄 Do you want to generate FRESH Google CA EAB keys now? (y/N): " ROTATE_EAB
 echo ""
