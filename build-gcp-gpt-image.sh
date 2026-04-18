@@ -35,7 +35,7 @@ touch -d "@$SOURCE_DATE_EPOCH" "$KERNEL" "$INITRD" "$SHIM" "$GRUB"
 # PHASE 1: Build the ESP partition image
 # ==============================================================================
 echo "🔨 Formatting EFI System Partition (FAT32)..."
-truncate -s 256M $ESP_IMAGE
+truncate -s 512M $ESP_IMAGE
 # --invariant: replaces all random/time-based values with constants
 mkfs.vfat -F 32 -i 12345678 --invariant -n "EFI" $ESP_IMAGE
 
@@ -73,7 +73,7 @@ echo "🔄 Normalizing ESP: extract → sort → rebuild..."
 
 # Create a fresh, normalized ESP image
 ESP_NORM="esp_norm.img"
-truncate -s 256M $ESP_NORM
+truncate -s 512M $ESP_NORM
 mkfs.vfat -F 32 -i 12345678 --invariant -n "EFI" $ESP_NORM
 
 # Extract all files from esp.img to a temp dir (sorted order)
@@ -112,13 +112,14 @@ rm -rf "$ESP_MOUNT"
 # Use sgdisk with explicit fixed UUIDs for a deterministic GPT header and Protective MBR
 # ==============================================================================
 echo "🏗️  Constructing GPT disk with fixed UUIDs using sgdisk..."
-dd if=/dev/zero of=$RAW_IMAGE bs=1M count=256 status=none
+# Create 1GB image to be safe
+dd if=/dev/zero of=$RAW_IMAGE bs=1M count=1024 status=none
 
-# ~200MiB ESP starting at sector 2048 (1MiB offset)
-# with size 409600 sectors (~200MiB), type ef00 (EFI System), and fixed GUIDs.
+# ~512MiB ESP starting at sector 2048 (1MiB offset)
+# with size 1048576 sectors (512MiB), type ef00 (EFI System), and fixed GUIDs.
 sgdisk --clear -g \
        --disk-guid=00000000-0000-0000-0000-000000000001 \
-       --new=1:2048:411647 \
+       --new=1:2048:1050623 \
        --typecode=1:ef00 \
        --partition-guid=1:00000000-0000-0000-0000-000000000002 \
        --change-name=1:"EFI System Partition" \
@@ -133,8 +134,8 @@ dd if=$ESP_IMAGE of=$RAW_IMAGE bs=1M seek=1 conv=notrunc status=none
 echo "🔍 Final normalization of RAW disk..."
 touch -d "@$SOURCE_DATE_EPOCH" "$RAW_IMAGE"
 
-if command -v add-det >/dev/null; then
-    add-det "$RAW_IMAGE"
+if command -v add-determinism >/dev/null; then
+    add-determinism "$RAW_IMAGE"
 fi
 
 # ==============================================================================
@@ -143,8 +144,8 @@ fi
 echo "🔄 Converting to QCOW2..."
 rm -f $IMAGE_NAME
 qemu-img convert -f raw -O qcow2 $RAW_IMAGE $IMAGE_NAME
-if command -v add-det >/dev/null; then
-    add-det "$IMAGE_NAME"
+if command -v add-determinism >/dev/null; then
+    add-determinism "$IMAGE_NAME"
 fi
 
 echo "📦 Packaging to disk.tar.gz (deterministic)..."
@@ -154,8 +155,8 @@ tar --owner=0 --group=0 --numeric-owner \
     --sort=name \
     -czf "$TAR_IMAGE" "$RAW_IMAGE"
 
-if command -v add-det >/dev/null; then
-    add-det "$TAR_IMAGE"
+if command -v add-determinism >/dev/null; then
+    add-determinism "$TAR_IMAGE"
 fi
 
 # Cleanup
