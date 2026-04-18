@@ -52,6 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 COPY --from=rust-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin
+COPY --from=rust-builder /usr/local/cargo/bin/add-determinism /usr/bin/add-determinism
 
 COPY build-initramfs-tools.sh build-gcp-gpt-image.sh ./
 
