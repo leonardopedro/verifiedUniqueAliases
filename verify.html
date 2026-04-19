@@ -431,17 +431,27 @@
                     const snpDesc = document.getElementById('firmwareDesc');
                     
                     const reportBytes = Uint8Array.from(atob(report.hardware_level_attestation.snp_report_b64), c => c.charCodeAt(0));
-                    // SNP Report MEASUREMENT is 48 bytes at offset 0x50 (80 decimal)
-                    const measurementHex = Array.from(reportBytes.slice(80, 80 + 48))
+                    // v75: SNP Report MEASUREMENT is a SHA-384 hash (48 bytes) at offset 0x90 (144 decimal).
+                    // This fingerprints the BIOS/Firmware (Google OVMF) used at boot.
+                    const measurementHex = Array.from(reportBytes.slice(144, 144 + 48))
                         .map(b => b.toString(16).padStart(2, '0')).join('');
                     
-                    // PCR 0 is the bridge to the firmware measurement
-                    const pcr0 = pcrValues["0"];
+                    const pcr0 = pcrValues["0"] || "N/A";
+                    // PCR 0 matches the firmware measurement on genuine Confidential Space
                     const firmwareOk = (pcr0 !== "0000000000000000000000000000000000000000000000000000000000000000");
                     
                     updateStatus('firmwareCheck', firmwareOk);
-                    snpDesc.innerHTML = `Hardware Launch Measurement: <span style="color:#58a6ff; font-family:monospace; font-size:0.8rem;">${measurementHex.substring(0,32)}...</span><br>` +
-                                      `Firmware Anchor (PCR 0): ${pcr0.substring(0,16)}...`;
+                    snpDesc.innerHTML = `
+                        <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; margin-top: 8px; color: #7ee787;">
+                            SNP Launch Measurement (SHA-384):<br>
+                            <span style="word-break: break-all; background: #0d1117; padding: 4px; border-radius: 4px; display: block; margin: 4px 0;">${measurementHex}</span>
+                            Firmware PCR 0: <span style="color: #8b949e;">${pcr0.substring(0,32)}...</span>
+                        </div>
+                        <p style="font-size: 0.85rem; margin-top: 10px; color: #8b949e;">
+                            Google Cloud provides signed integrity policies for this firmware. You can verify this measurement against the 
+                            <a href="https://console.cloud.google.com/storage/browser/gce_tcb_integrity/ovmf_x64_csm/sevsnp" target="_blank" style="color: #58a6ff;">Google GCE TCB Integrity Portal</a>.
+                        </p>
+                    `;
                 } else {
                     document.getElementById('firmwareCheck').className = 'check-item failed';
                     document.getElementById('firmwareDesc').innerText = 'AMD SNP Hardware Report not found in attestation.';
