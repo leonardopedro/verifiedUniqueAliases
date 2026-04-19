@@ -1690,16 +1690,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let manifest_hash = Sha256::digest(manifest_json.as_bytes());
         let hash_hex = hex::encode(manifest_hash);
         
-        kmsg(&format!("Anchoring manifest ({} files) in PCR 15: {}", boot_manifest.len(), hash_hex));
+        enclave_init::kmsg(&format!("Anchoring manifest ({} files) in PCR 15: {}", boot_manifest.len(), hash_hex));
         let _ = std::process::Command::new("tpm2_pcrextend")
             .args(["15:sha256=".to_string() + &hash_hex])
             .status();
     }
 
     if std::path::Path::new("/dev/sev-guest").exists() {
-        kmsg("Hardware interface /dev/sev-guest is PRESENT (likely built-in)");
+        enclave_init::kmsg("Hardware interface /dev/sev-guest is PRESENT (likely built-in)");
     } else {
-        kmsg("Hardware interface /dev/sev-guest is MISSING");
+        enclave_init::kmsg("Hardware interface /dev/sev-guest is MISSING");
     }
 
     // 2. Initialize the Tokio runtime now that the environment is sane
