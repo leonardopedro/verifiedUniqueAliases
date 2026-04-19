@@ -246,6 +246,9 @@ if [ -n "$KERNEL_VER" ] && [ -d "./usr/lib/modules/$KERNEL_VER" ]; then
     fi
 fi
 
+# Ensure all files in staging have a fixed timestamp for bitwise reproducibility
+find . -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+
 # 10. Repack the initramfs
 echo "📦 Repacking initramfs..."
 find . | sort | cpio -o -H newc -R 0:0 --quiet | zstd -T0 -19 -f -o "$OUTPUT_FILE"
