@@ -39,6 +39,8 @@ echo "gve" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "virtio_net" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "virtio_scsi" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "virtio_blk" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "nvme" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "nvme_core" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "sev_guest" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "sev-guest" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "vfat" | tee -a /etc/initramfs-tools/modules >/dev/null
