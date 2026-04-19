@@ -387,9 +387,11 @@
                     const bundle = data.attestations[0].bundle;
                     const payload = JSON.parse(atob(bundle.dsseEnvelope ? bundle.dsseEnvelope.payload : bundle.payload));
                     // Try multiple SLSA / GitHub paths
-                    runId = (payload.invocation && payload.invocation.metadata && payload.invocation.metadata.id) ||
+                    runId = (payload.predicate && payload.predicate.runDetails && payload.predicate.runDetails.metadata && payload.predicate.runDetails.metadata.invocationId) ||
+                            (payload.invocation && payload.invocation.metadata && payload.invocation.metadata.id) ||
                             (payload.invocation && payload.invocation.uri) ||
                             (payload.buildConfig && payload.buildConfig.env && payload.buildConfig.env.GITHUB_RUN_ID) ||
+                            (payload.predicate && payload.predicate.invocation && payload.predicate.invocation.environment && payload.predicate.invocation.environment.github_run_id) ||
                             "External";
                 } catch(e) {
                     console.warn(`Failed to parse attestation payload for ${name}:`, e);
@@ -429,8 +431,11 @@
                 const manifestHashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(manifestJson));
                 const manifestHash = Array.from(new Uint8Array(manifestHashBuffer)).map(b => b.toString(16).padStart(2,'0')).join('');
                 
-                const hardwareMatch = (pcrValues["15"] === manifestHash);
-                results.push(hardwareMatch ? "✅ Hardware: PCR 15 bound to Manifest Anchor" : `❌ Hardware: PCR 15 MISMATCH (Got: ${pcrValues["15"] ? pcrValues["15"].substring(0,8) : 'N/A'}...)`);
+                const pcr15_raw = pcrValues["15"] || "";
+                const pcr15_clean = pcr15_raw.replace(/^0x/i, '').toLowerCase();
+
+                const hardwareMatch = (pcr15_clean === manifestHash) && (manifestHash.length > 0);
+                results.push(hardwareMatch ? "✅ Hardware: PCR 15 bound to Manifest Anchor" : `❌ Hardware: PCR 15 MISMATCH (Got: ${pcr15_clean ? pcr15_clean.substring(0,8) : 'N/A'}...) vs ${manifestHash.substring(0,8)}... (Raw PCKs: ${JSON.stringify(pcrValues)})`);
 
                 const allOk = bin.success && ker.success && init.success && cfg.success && hardwareMatch && consistent;
                 updateStatus('githubCheck', allOk);
@@ -447,9 +452,10 @@
                     const measurementHex = Array.from(reportBytes.slice(144, 144 + 48))
                         .map(b => b.toString(16).padStart(2, '0')).join('');
                     
-                    const pcr0 = pcrValues["0"] || "N/A";
+                    const pcr0_raw = pcrValues["0"] || "N/A";
+                    const pcr0 = pcr0_raw.replace(/^0x/i, '').toLowerCase();
                     // PCR 0 matches the firmware measurement on genuine Confidential Space
-                    const firmwareOk = (pcr0 !== "0000000000000000000000000000000000000000000000000000000000000000");
+                    const firmwareOk = (pcr0 !== "0000000000000000000000000000000000000000000000000000000000000000") && pcr0.length > 0;
                     
                     updateStatus('firmwareCheck', firmwareOk);
                     snpDesc.innerHTML = `
