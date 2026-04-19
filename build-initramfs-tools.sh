@@ -259,14 +259,54 @@ fi
 # Use -depth to ensure parent directories are touched AFTER their children
 find . -depth -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
-# 10. Repack the initramfs
-echo "📦 Repacking initramfs..."
-find . | sort | cpio -o -H newc -R 0:0 --reproducible --quiet | zstd -T1 -19 -f -o "$OUTPUT_FILE"
+# Use a custom Python normalizer to eliminate OverlayFS nlink/inode divergence between Docker and Podman
+cat << 'EOF' > /tmp/normalize_cpio.py
+import sys
 
-# Apply add-det to the final initramfs image as well
-if command -v add-det > /dev/null; then
-    add-det "$OUTPUT_FILE" 2>/dev/null || true
-fi
+def normalize(in_path, out_path, epoch):
+    with open(in_path, 'rb') as f:
+        data = bytearray(f.read())
+    
+    pos = 0
+    ino = 1
+    while pos < len(data):
+        hdr = data[pos:pos+110]
+        if len(hdr) < 110 or hdr[:6] != b'070701':
+            break
+            
+        namesize = int(hdr[94:102], 16)
+        filesize = int(hdr[54:62], 16)
+        
+        # Override fields: inode, uid, gid, nlink, mtime, dev/rdev
+        data[pos+6:pos+14]   = f"{ino:08x}".encode('ascii')       # ino
+        data[pos+22:pos+30]  = b"00000000"                        # uid
+        data[pos+30:pos+38]  = b"00000000"                        # gid
+        data[pos+38:pos+46]  = b"00000001"                        # nlink
+        data[pos+46:pos+54]  = f"{epoch:08x}".encode('ascii')     # mtime
+        data[pos+62:pos+70]  = b"00000000"                        # devmajor
+        data[pos+70:pos+78]  = b"00000000"                        # devminor
+        data[pos+78:pos+86]  = b"00000000"                        # rdevmajor
+        data[pos+86:pos+94]  = b"00000000"                        # rdevminor
+        
+        name_pad = (namesize + 110 + 3) // 4 * 4 - namesize - 110
+        file_pad = (filesize + 3) // 4 * 4 - filesize
+        pos += 110 + namesize + name_pad + filesize + file_pad
+        ino += 1
+
+    with open(out_path, 'wb') as f:
+        f.write(data)
+
+if __name__ == '__main__':
+    normalize(sys.argv[1], sys.argv[2], int(sys.argv[3]))
+EOF
+
+# 10. Repack the initramfs
+echo "📦 Repacking initramfs (with CPIO header normalization)..."
+find . | sort | cpio -o -H newc -R 0:0 --quiet > /tmp/initramfs-raw.cpio
+python3 /tmp/normalize_cpio.py /tmp/initramfs-raw.cpio /tmp/initramfs-norm.cpio "$SOURCE_DATE_EPOCH"
+zstd -T1 -19 -f --no-progress /tmp/initramfs-norm.cpio -o "$OUTPUT_FILE"
+rm -f /tmp/initramfs-raw.cpio /tmp/initramfs-norm.cpio /tmp/normalize_cpio.py
+
 
 # Clean up
 cd /
