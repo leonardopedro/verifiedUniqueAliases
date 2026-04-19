@@ -26,8 +26,11 @@ mod enclave_init {
         modprobe("virtio_net");
         modprobe("virtio_scsi");
         modprobe("virtio_blk");
+        modprobe("virtio_pci");
         modprobe("sev_guest");
         modprobe("sev-guest");
+        modprobe("coco_guest");
+        modprobe("amd_tsm");
         modprobe("vfat");
         modprobe("nls_cp437");
         modprobe("nls_ascii");
@@ -358,7 +361,7 @@ mod tpm {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde::{Deserialize, Serialize};
 
-    pub const PCR_SELECTION: &str = "0,4,8,9,15";
+    pub const PCR_SELECTION: &str = "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15";
 
     #[derive(Serialize, Deserialize, Clone)]
     pub struct SealedData {
@@ -1358,7 +1361,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v84-master",
+            "version": "v85-master",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
