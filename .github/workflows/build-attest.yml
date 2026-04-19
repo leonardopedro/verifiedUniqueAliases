@@ -23,16 +23,16 @@ jobs:
           docker build --no-cache --load --target image-builder -f Dockerfile.repro -t paypal-auth-vm .
           CONTAINER_ID=$(docker create paypal-auth-vm)
           docker cp $CONTAINER_ID:/build/paypal-auth-vm-bin ./paypal-auth-vm.bin
+          docker cp $CONTAINER_ID:/build/output/vmlinuz ./vmlinuz
+          docker cp $CONTAINER_ID:/build/output/initramfs-paypal-auth.img ./initramfs.img
+          docker cp $CONTAINER_ID:/build/output/shimx64.efi ./shimx64.efi
+          docker cp $CONTAINER_ID:/build/output/grubx64.efi ./grubx64.efi
           docker cp $CONTAINER_ID:/disk.tar.gz ./disk.tar.gz
-          docker cp $CONTAINER_ID:/initramfs-paypal-auth.img ./initramfs.img
           docker cp $CONTAINER_ID:/packages.txt ./packages.txt
           docker rm $CONTAINER_ID
           echo "==== ARTIFACT HASHES ===="
-          sha256sum paypal-auth-vm.bin disk.tar.gz initramfs.img
+          sha256sum paypal-auth-vm.bin vmlinuz initramfs.img shimx64.efi grubx64.efi disk.tar.gz
           echo "========================="
-          echo "==== PACKAGE MANIFEST ===="
-          cat packages.txt
-          echo "=========================="
 
       - name: Attest Enclave Binary
         uses: actions/attest-build-provenance@v2
@@ -40,17 +40,31 @@ jobs:
           subject-name: Enclave Binary
           subject-path: paypal-auth-vm.bin
 
-      - name: Attest disk.tar.gz
+      - name: Attest Kernel
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: VM disk image
-          subject-path: disk.tar.gz
+          subject-name: Linux Kernel
+          subject-path: vmlinuz
 
-      - name: Attest initramfs
+      - name: Attest Initrd
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: initramfs image
+          subject-name: Initramfs
           subject-path: initramfs.img
+
+      - name: Attest Bootloader
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: EFI Bootloader
+          subject-path: |
+            shimx64.efi
+            grubx64.efi
+
+      - name: Attest VM Disk Image
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: VM Disk Image
+          subject-path: disk.tar.gz
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -59,4 +73,5 @@ jobs:
           path: |
             disk.tar.gz
             initramfs.img
+            vmlinuz
           retention-days: 7
