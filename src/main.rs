@@ -21,6 +21,15 @@ mod enclave_init {
     }
 
     /// Mount essential kernel virtual filesystems.
+    pub fn load_drivers() {
+        modprobe("gve");
+        modprobe("virtio_net");
+        modprobe("sev-guest");
+        modprobe("vfat");
+        modprobe("nls_cp437");
+        modprobe("nls_ascii");
+    }
+
     pub fn mount_filesystems() {
         fn mount_fs(source: &str, target: &str, fstype: &str) {
             std::fs::create_dir_all(target).ok();
@@ -244,13 +253,6 @@ mod enclave_init {
 
     /// Load drivers, wait for NIC, perform DHCP, apply lease.
     pub async fn configure_network() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        modprobe("gve");
-        modprobe("virtio_net");
-        modprobe("sev-guest");
-        modprobe("vfat");
-        modprobe("nls_cp437");
-        modprobe("nls_ascii");
-
         kmsg("Waiting for network interface...");
         let iface = {
             let mut found = None;
@@ -1627,7 +1629,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("PAYPAL AUTH VM STARTING AT {}", chrono::Utc::now());
     eprintln!("====================================================");
     
-    // 1. PID 1 RESPONSIBILITIES: Mount filesystems BEFORE anything else!
+    // 1. PID 1 RESPONSIBILITIES: Load drivers and mount filesystems BEFORE anything else!
+    enclave_init::load_drivers();
     enclave_init::mount_filesystems();
     let boot_manifest = enclave_init::measure_boot_components();
 
