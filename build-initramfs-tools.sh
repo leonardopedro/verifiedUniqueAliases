@@ -259,6 +259,12 @@ fi
 # Use -depth to ensure parent directories are touched AFTER their children
 find . -depth -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
+# Ensure no extracted device nodes persist in the staging directory.
+# Docker preserves device nodes via cpio, but rootless Podman silently drops them because mknod fails.
+# Since our custom init unconditionally mounts devtmpfs on boot, we don't need any pre-seeded devices,
+# and clearing them out guarantees file-level sync between Podman and Docker.
+rm -rf dev/*
+
 # Use a custom Python normalizer to eliminate OverlayFS nlink/inode divergence between Docker and Podman
 cat << 'EOF' > /tmp/normalize_cpio.py
 import sys
