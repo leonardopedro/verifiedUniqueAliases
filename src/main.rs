@@ -68,10 +68,19 @@ mod enclave_init {
         let mount_point = "/tmp/esp";
         let _ = std::fs::create_dir_all(mount_point);
         
-        // GCP specific: The ESP is first partition on the boot disk
-        // We try both /dev/sda1 and /dev/vda1
-        let _ = std::process::Command::new("/bin/mount").args(["-o", "ro", "/dev/sda1", mount_point]).status();
-        let _ = std::process::Command::new("/bin/mount").args(["-o", "ro", "/dev/vda1", mount_point]).status();
+        // Helper to mount with libc directly for robustness
+        fn mount_device(source: &str, target: &str) -> bool {
+            let src = std::ffi::CString::new(source).unwrap();
+            let tgt = std::ffi::CString::new(target).unwrap();
+            let fst = std::ffi::CString::new("vfat").unwrap();
+            let ret = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), libc::MS_RDONLY, std::ptr::null()) };
+            ret == 0
+        }
+
+        // Try common boot device paths on GCP
+        if !mount_device("/dev/sda1", mount_point) {
+            mount_device("/dev/vda1", mount_point);
+        }
 
         fn hash_recursive(dir: &str, mount_point: &str, manifest: &mut std::collections::HashMap<String, String>) {
             if let Ok(entries) = std::fs::read_dir(dir) {
@@ -99,7 +108,8 @@ mod enclave_init {
         }
         hash_recursive(mount_point, mount_point, &mut manifest);
         
-        let _ = std::process::Command::new("/bin/umount").arg(mount_point).status();
+        let tgt = std::ffi::CString::new(mount_point).unwrap();
+        unsafe { libc::umount(tgt.as_ptr()); }
         manifest
     }
 
@@ -1629,9 +1639,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("PAYPAL AUTH VM STARTING AT {}", chrono::Utc::now());
     eprintln!("====================================================");
     
-    // 1. PID 1 RESPONSIBILITIES: Load drivers and mount filesystems BEFORE anything else!
-    enclave_init::load_drivers();
+    // 1. PID 1 RESPONSIBILITIES: Mount filesystems FIRST!
     enclave_init::mount_filesystems();
+    // 2. Now load drivers (requires /sys, /proc)
+    enclave_init::load_drivers();
+    // 3. Finally measure boot components
     let boot_manifest = enclave_init::measure_boot_components();
 
     // 2. Initialize the Tokio runtime now that the environment is sane
