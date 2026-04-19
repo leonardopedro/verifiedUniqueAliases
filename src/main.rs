@@ -42,7 +42,29 @@ mod enclave_init {
         mount_fs("tmpfs",    "/tmp",  "tmpfs");
         mount_fs("tmpfs",    "/run",  "tmpfs");
         std::fs::create_dir_all("/dev/pts").ok();
+
+        // 9. Mount EFI partition to measure the boot chain
+        std::fs::create_dir_all("/boot/efi").ok();
+        // GCP standard is sda1, VirtIO is vda1.
+        mount_fs("/dev/sda1", "/boot/efi", "vfat");
+        mount_fs("/dev/vda1", "/boot/efi", "vfat");
+
         kmsg("Filesystems mounted");
+    }
+
+    pub fn measure_boot_components() -> (String, String) {
+        use sha2::{Digest, Sha256};
+        fn hash(p: &str) -> String {
+            match std::fs::read(p) {
+                Ok(d) => {
+                    let mut hasher = Sha256::new();
+                    hasher.update(&d);
+                    hex::encode(hasher.finalize())
+                }
+                Err(_) => "NOT_FOUND".to_string()
+            }
+        }
+        (hash("/boot/efi/vmlinuz"), hash("/boot/efi/initrd.img"))
     }
 
     fn modprobe(module: &str) {
@@ -617,6 +639,8 @@ struct AppState {
     last_limit_reset: Arc<RwLock<Instant>>,
     // v71: Concurrency Control
     connection_semaphore: Arc<Semaphore>,
+    boot_kernel_hash: String,
+    boot_initrd_hash: String,
 }
 
 struct PayPalFlowConfig {
@@ -1180,6 +1204,14 @@ async fn generate_attestation(
     hasher.update(paypal_json.as_bytes());
     let paypal_hash = hex::encode(hasher.finalize());
 
+    // 2.5 Software Hash Check (Self-measure)
+    let bin_path = "/init"; 
+    let mut bin_hasher = Sha256::new();
+    if let Ok(data) = std::fs::read(bin_path) {
+        bin_hasher.update(&data);
+    }
+    let binary_self_hash = hex::encode(bin_hasher.finalize());
+
     // 3. Obtain hardware attestation quote (PCR 15 base)
     // Nonce is the hash of the user data to ensure 1-to-1 binding
     let tpm_report = tpm::quote(&paypal_hash).await.expect("TPM quote failed");
@@ -1199,6 +1231,11 @@ async fn generate_attestation(
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
             "domain": &state.domain,
+            "boot_measurements": {
+                "kernel_sha256": &state.boot_kernel_hash,
+                "initrd_sha256": &state.boot_initrd_hash,
+                "binary_sha256": &binary_self_hash,
+            }
         },
         "session_context": {
             "clicked_button_label": clicked_button_label,
@@ -1504,6 +1541,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     
     // 1. PID 1 RESPONSIBILITIES: Mount filesystems BEFORE anything else!
     enclave_init::mount_filesystems();
+    let (kernel_h, initrd_h) = enclave_init::measure_boot_components();
 
     // 2. Initialize the Tokio runtime now that the environment is sane
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1612,6 +1650,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         global_egress_bytes: Arc::new(AtomicU64::new(0)),
         last_limit_reset: Arc::new(RwLock::new(Instant::now())),
         connection_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
+        boot_kernel_hash: kernel_h,
+        boot_initrd_hash: initrd_h,
     });
 
     // Build the main app router
