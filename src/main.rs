@@ -372,6 +372,7 @@ use std::net::IpAddr;
 
 mod tpm {
     use tokio::process::Command;
+    use tracing::{error, info};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde::{Deserialize, Serialize};
 
@@ -564,10 +565,10 @@ mod tpm {
         let msg = tokio::fs::read(&quote_msg).await?;
         let sig = tokio::fs::read(&quote_sig).await?;
 
-        let pcr_out = match run_cmd("tpm2_pcrread", &[&format!("sha256:{}", PCR_SELECTION)]).await {
+        let pcr_out = match run_cmd("tpm2", &["pcrread", &format!("sha256:{}", PCR_SELECTION)]).await {
             Ok(out) => out,
             Err(e) => {
-                error!("TPM pcrread FAILED: {}", e);
+                error!("TPM tpm2 pcrread FAILED: {}", e);
                 vec![]
             }
         };
@@ -599,8 +600,8 @@ mod tpm {
         };
 
         // 5. Hardware SNP Report (Firmware / Launch Measurement)
-        let _ = std::process::Command::new("sh").arg("-c").arg("tpm2_getcap handles-nv-index > /dev/kmsg 2>&1; tpm2_nvreadpublic > /dev/kmsg 2>&1; tpm2_pcrread > /dev/kmsg 2>&1;").status();
-        let snp_report_b64 = match run_cmd("tpm2_nvread", &["0x01400001", "-C", "o"]).await {
+        let _ = std::process::Command::new("sh").arg("-c").arg("ls -l /dev/tpm* > /dev/kmsg 2>&1; ls -l /usr/bin/tpm2* > /dev/kmsg 2>&1; /usr/bin/tpm2 getcap handles-nv-index > /dev/kmsg 2>&1;").status();
+        let snp_report_b64 = match run_cmd("tpm2", &["nvread", "0x01400001", "-C", "o"]).await {
             Ok(data) if !data.is_empty() => Some(STANDARD.encode(data)),
             Ok(_) => { info!("TPM nvread 0x01400001 returned EMPTY"); None },
             Err(e) => {
@@ -1374,7 +1375,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v95-master-tpm",
+            "version": "v97-master-clean",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
@@ -1707,8 +1708,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let hash_hex = hex::encode(manifest_hash);
         
         enclave_init::kmsg(&format!("Anchoring manifest ({} files) in PCR 15: {}", boot_manifest.len(), hash_hex));
-        let _ = std::process::Command::new("tpm2_pcrextend")
-            .args(["15:sha256=".to_string() + &hash_hex])
+        let _ = std::process::Command::new("tpm2")
+            .args(["pcrextend", &format!("15:sha256={}", hash_hex)])
             .status();
     }
 
@@ -1762,20 +1763,11 @@ async fn async_main(boot_manifest: std::collections::HashMap<String, String>) ->
     eprintln!("[DEBUG] about to fetch config");
     
     // --- MEASURED BOOT ---
-    // Measure the running binary into PCR 15 as defined in AGENTS.md
-    if let Ok(exe) = std::env::current_exe() {
-        if let Ok(data) = std::fs::read(&exe) {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(&data);
-            let hash = hasher.finalize();
-            let hash_hex = hex::encode(hash);
-            info!("Measured Boot: Extending PCR 15 with BIN_HASH={}", hash_hex);
-            let _ = tpm::run_cmd("tpm2_pcrextend", &["15:sha256", &hash_hex]).await;
-        }
-    }
+    // Note: PCR 15 was anchored with the disk manifest in PID 1 phase.
+    // BIN_HASH is included in the report JSON and verified via SLSA.
+    
     // Log current PCR 15 state for diagnostics
-    if let Ok(pcr_out) = tpm::run_cmd("tpm2_pcrread", &["sha256:15"]).await {
+    if let Ok(pcr_out) = tpm::run_cmd("tpm2", &["pcrread", "sha256:15"]).await {
         info!("Current PCR 15 State:\n{}", String::from_utf8_lossy(&pcr_out).trim());
     }
 
