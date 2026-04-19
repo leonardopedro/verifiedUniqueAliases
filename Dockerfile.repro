@@ -61,7 +61,7 @@ WORKDIR /build
 COPY --from=rust-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin
 COPY --from=rust-builder /usr/bin/add-det /usr/bin/add-det
 
-COPY build-initramfs-tools.sh build-gcp-gpt-image.sh github_attestation.jsonl* ./
+COPY build-initramfs-tools.sh build-gcp-gpt-image.sh ./
 
 RUN chmod +x build-initramfs-tools.sh build-gcp-gpt-image.sh && \
     dpkg-query -W -f='${Package} ${Version} ${Architecture}\n' | sort > /build/packages.txt && \
