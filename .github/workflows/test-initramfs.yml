@@ -15,7 +15,7 @@ jobs:
 
       - name: Build initramfs rapidly
         run: |
-          docker build --no-cache --load --target image-builder -f Dockerfile.repro -t paypal-auth-vm-test .
+          docker build --no-cache --load --target image-builder -f Dockerfile.test -t paypal-auth-vm-test .
           CONTAINER_ID=$(docker create paypal-auth-vm-test)
           docker cp $CONTAINER_ID:/initramfs-paypal-auth.img ./initramfs.img
           docker rm $CONTAINER_ID
