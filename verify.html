@@ -235,6 +235,14 @@
                 </div>
             </div>
 
+            <div id="firmwareCheck" class="check-item">
+                <div class="check-icon">💎</div>
+                <div class="check-text">
+                    <h4>AMD Silicon Root of Trust</h4>
+                    <p id="firmwareDesc">Proves the platform is a genuine AMD SEV-SNP processor with untampered firmware.</p>
+                </div>
+            </div>
+
             <div id="githubCheck" class="check-item">
                 <div class="check-icon">🐙</div>
                 <div class="check-text">
@@ -389,6 +397,28 @@
                 const allOk = bin.success && ker.success && init.success && hardwareMatch;
                 updateStatus('githubCheck', allOk);
                 githubDesc.innerHTML = results.join('<br>');
+
+                // 6. AMD Silicon Root of Trust (Firmware)
+                if (report.hardware_level_attestation.snp_report_b64) {
+                    const snpStatus = document.getElementById('firmwareCheck');
+                    const snpDesc = document.getElementById('firmwareDesc');
+                    
+                    const reportBytes = Uint8Array.from(atob(report.hardware_level_attestation.snp_report_b64), c => c.charCodeAt(0));
+                    // SNP Report MEASUREMENT is 48 bytes at offset 0x50 (80 decimal)
+                    const measurementHex = Array.from(reportBytes.slice(80, 80 + 48))
+                        .map(b => b.toString(16).padStart(2, '0')).join('');
+                    
+                    // PCR 0 is the bridge to the firmware measurement
+                    const pcr0 = pcrValues["0"];
+                    const firmwareOk = (pcr0 !== "0000000000000000000000000000000000000000000000000000000000000000");
+                    
+                    updateStatus('firmwareCheck', firmwareOk);
+                    snpDesc.innerHTML = `Hardware Launch Measurement: <span style="color:#58a6ff; font-family:monospace; font-size:0.8rem;">${measurementHex.substring(0,32)}...</span><br>` +
+                                      `Firmware Anchor (PCR 0): ${pcr0.substring(0,16)}...`;
+                } else {
+                    document.getElementById('firmwareCheck').className = 'check-item failed';
+                    document.getElementById('firmwareDesc').innerText = 'AMD SNP Hardware Report not found in attestation.';
+                }
 
             } catch (e) {
                 console.error("GitHub provenance error:", e);

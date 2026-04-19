@@ -283,7 +283,7 @@ mod tpm {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde::{Deserialize, Serialize};
 
-    pub const PCR_SELECTION: &str = "4,8,9,15";
+    pub const PCR_SELECTION: &str = "0,4,8,9,15";
 
     #[derive(Serialize, Deserialize, Clone)]
     pub struct SealedData {
@@ -300,6 +300,52 @@ mod tpm {
         pub pcrs: String,
         pub pcr_values: std::collections::HashMap<String, String>,
         pub nonce_hex: String,
+        pub snp_report_b64: Option<String>,
+    }
+
+    pub mod snp {
+        use std::fs::File;
+        use std::os::unix::io::AsRawFd;
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        #[repr(C, packed)]
+        struct SnpReportReq {
+            user_data: [u8; 64],
+            vmpl: u32,
+            _reserved: [u8; 28],
+        }
+
+        #[repr(C, packed)]
+        struct SnpGuestRequestIoctl {
+            msg_version: u8,
+            req_ptr: u64,
+            resp_ptr: u64,
+            exit_info: u64,
+        }
+
+        pub fn get_report(nonce: &[u8; 64]) -> Option<String> {
+            let file = File::open("/dev/sev-guest").ok()?;
+            let mut req = SnpReportReq {
+                user_data: *nonce,
+                vmpl: 0,
+                _reserved: [0u8; 28],
+            };
+            let mut resp = [0u8; 4000]; // SNP report is ~1.2KB
+            let mut ioctl_data = SnpGuestRequestIoctl {
+                msg_version: 1,
+                req_ptr: &req as *const _ as u64,
+                resp_ptr: resp.as_mut_ptr() as u64,
+                exit_info: 0,
+            };
+
+            const SNP_GUEST_REQ: u64 = 0xC0205301; // Ioctl for SNP_GET_REPORT
+            unsafe {
+                if libc::ioctl(file.as_raw_fd(), SNP_GUEST_REQ as libc::c_ulong, &mut ioctl_data) == 0 {
+                    return Some(STANDARD.encode(&resp[..1200])); // Report size is 1184 bytes
+                }
+            }
+            None
+        }
     }
 
     pub async fn run_cmd(cmd: &str, args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
@@ -462,6 +508,14 @@ mod tpm {
             Err(_) => None,
         };
 
+        // 5. Hardware SNP Report (Firmware / Launch Measurement)
+        let mut snp_nonce = [0u8; 64];
+        if let Ok(nh) = hex::decode(nonce_hex) {
+            let len = nh.len().min(64);
+            snp_nonce[..len].copy_from_slice(&nh[..len]);
+        }
+        let snp_report_b64 = snp::get_report(&snp_nonce);
+
         let _ = cleanup(&cleanup_paths).await;
 
         Ok(AttestationResult {
@@ -472,6 +526,7 @@ mod tpm {
             pcrs: PCR_SELECTION.to_string(),
             pcr_values,
             nonce_hex: nonce_hex.to_string(),
+            snp_report_b64,
         })
     }
 }
