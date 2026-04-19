@@ -139,6 +139,11 @@ if command -v add-det >/dev/null; then
     add-det "$RAW_IMAGE"
 fi
 
+# v74: Ensure grub.cfg is available in output for attestation
+mkdir -p output
+cp "$ESP_MOUNT/EFI/BOOT/grub.cfg" "output/grub.cfg"
+
+
 # ==============================================================================
 # PHASE 5: Package outputs
 # ==============================================================================
