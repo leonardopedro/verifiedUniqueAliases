@@ -72,7 +72,7 @@ RUN chmod +x build-initramfs-tools.sh build-gcp-gpt-image.sh && \
 # Copy artifacts to root for easy extraction
 RUN cp /build/disk.tar.gz /disk.tar.gz && \
     cp /build/output/initramfs-paypal-auth.img /initramfs-paypal-auth.img && \
-    cp /build/esp_mount/EFI/BOOT/grub.cfg /grub.cfg && \
+    cp /build/output/grub.cfg /grub.cfg && \
     cp /build/packages.txt /packages.txt && \
     echo "Build Hashes:" && \
     sha256sum /disk.tar.gz /initramfs-paypal-auth.img /grub.cfg
