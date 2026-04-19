@@ -27,13 +27,23 @@ mod enclave_init {
         modprobe("virtio_scsi");
         modprobe("virtio_blk");
         modprobe("virtio_pci");
+        
+        // v88: Recursive module hunter for attestation drivers
+        kmsg("Scanning for attestation modules...");
+        let _ = std::process::Command::new("find").args(["/lib/modules", "-name", "*sev*", "-o", "-name", "*tsm*", "-o", "-name", "*coco*"]).status();
+        
         modprobe("sev_guest");
         modprobe("sev-guest");
         modprobe("coco_guest");
         modprobe("amd_tsm");
+        modprobe("tsm");
+        
         modprobe("vfat");
         modprobe("nls_cp437");
         modprobe("nls_ascii");
+        
+        // Ensure configfs is mounted for TSM
+        let _ = std::process::Command::new("mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
     }
 
     pub fn mount_filesystems() {
@@ -1349,7 +1359,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v86-master",
+            "version": "v88-master",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
