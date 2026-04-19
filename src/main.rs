@@ -56,25 +56,41 @@ mod enclave_init {
         use sha2::{Digest, Sha256};
         let mut manifest = std::collections::HashMap::new();
         
-        fn hash_recursive(dir: &str, manifest: &mut std::collections::HashMap<String, String>) {
+        let mount_point = "/tmp/esp";
+        let _ = std::fs::create_dir_all(mount_point);
+        
+        // GCP specific: The ESP is first partition on the boot disk
+        // We try both /dev/sda1 and /dev/vda1
+        let _ = std::process::Command::new("/bin/mount").args(["-o", "ro", "/dev/sda1", mount_point]).status();
+        let _ = std::process::Command::new("/bin/mount").args(["-o", "ro", "/dev/vda1", mount_point]).status();
+
+        fn hash_recursive(dir: &str, mount_point: &str, manifest: &mut std::collections::HashMap<String, String>) {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.filter_map(|e| e.ok()) {
                     let path = entry.path();
+                    let path_str = path.to_string_lossy();
                     if path.is_dir() {
-                        hash_recursive(&path.to_string_lossy(), manifest);
+                        hash_recursive(&path_str, mount_point, manifest);
                     } else if path.is_file() {
                         if let Ok(mut file) = std::fs::File::open(&path) {
                             let mut hasher = Sha256::new();
                             if std::io::copy(&mut file, &mut hasher).is_ok() {
                                 let h = hex::encode(hasher.finalize());
-                                manifest.insert(path.to_string_lossy().replace("/boot/efi/", ""), h);
+                                // Key should be relative to the ESP root (e.g. EFI/BOOT/grub.cfg)
+                                let key = path_str.strip_prefix(mount_point)
+                                    .unwrap_or(&path_str)
+                                    .trim_start_matches('/')
+                                    .to_string();
+                                manifest.insert(key, h);
                             }
                         }
                     }
                 }
             }
         }
-        hash_recursive("/boot/efi", &mut manifest);
+        hash_recursive(mount_point, mount_point, &mut manifest);
+        
+        let _ = std::process::Command::new("/bin/umount").arg(mount_point).status();
         manifest
     }
 
@@ -230,6 +246,7 @@ mod enclave_init {
     pub async fn configure_network() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         modprobe("gve");
         modprobe("virtio_net");
+        modprobe("sev-guest");
 
         kmsg("Waiting for network interface...");
         let iface = {
