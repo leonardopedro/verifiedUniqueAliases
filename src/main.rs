@@ -373,7 +373,7 @@ mod tpm {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde::{Deserialize, Serialize};
 
-    pub const PCR_SELECTION: &str = "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15";
+    pub const PCR_SELECTION: &str = "0,4,8,9,15";
 
     #[derive(Serialize, Deserialize, Clone)]
     pub struct SealedData {
@@ -564,6 +564,8 @@ mod tpm {
 
         let pcr_out = run_cmd("tpm2_pcrread", &[&format!("sha256:{}", PCR_SELECTION)]).await.unwrap_or_default();
         let pcr_str = String::from_utf8_lossy(&pcr_out);
+        tracing::info!("TPM PCRREAD OUT: {}", pcr_str);
+        tracing::info!("TPM PCR SELECTION WAS: {}", PCR_SELECTION);
         let mut pcr_values = std::collections::HashMap::new();
         for line in pcr_str.lines() {
             if line.contains(':') && !line.trim().is_empty() {
@@ -589,8 +591,7 @@ mod tpm {
         };
 
         // 5. Hardware SNP Report (Firmware / Launch Measurement)
-        // On GCP Confidential VMs, the vTPM automatically fetches the SEV-SNP hardware report
-        // and persists it to NV index 0x01400001. We read it directly here.
+        let _ = std::process::Command::new("sh").arg("-c").arg("tpm2_getcap handles-nv-index > /dev/kmsg 2>&1; tpm2_nvreadpublic > /dev/kmsg 2>&1; tpm2_pcrread > /dev/kmsg 2>&1;").status();
         let snp_report_b64 = match run_cmd("tpm2_nvread", &["0x01400001", "-C", "o"]).await {
             Ok(data) if !data.is_empty() => Some(STANDARD.encode(data)),
             _ => None,
@@ -1361,7 +1362,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v92-master-nvram",
+            "version": "v93-master-debug",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
