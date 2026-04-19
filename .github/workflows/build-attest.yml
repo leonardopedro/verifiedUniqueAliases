@@ -25,6 +25,9 @@ jobs:
           docker cp $CONTAINER_ID:/disk.tar.gz ./disk.tar.gz
           docker cp $CONTAINER_ID:/initramfs-paypal-auth.img ./initramfs.img
           docker rm $CONTAINER_ID
+          echo "==== ARTIFACT HASHES ===="
+          sha256sum disk.tar.gz initramfs.img
+          echo "========================="
 
       - name: Attest disk.tar.gz
         uses: actions/attest-build-provenance@v2
