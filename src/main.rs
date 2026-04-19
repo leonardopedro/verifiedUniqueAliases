@@ -1722,6 +1722,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     })
 }
 
+async fn test_quote(axum::extract::State(_state): axum::extract::State<Arc<AppState>>) -> impl axum::response::IntoResponse {
+    match tpm::quote("1234").await {
+        Ok(tpm_data) => axum::response::Json(tpm_data).into_response(),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("TPM Quote Failed: {}", e)).into_response(),
+    }
+}
+
 async fn async_main(boot_manifest: std::collections::HashMap<String, String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     
     // Attempt to force immediate flush
@@ -1825,6 +1832,7 @@ async fn async_main(boot_manifest: std::collections::HashMap<String, String>) ->
         .route("/privacy", get(privacy))
         .route("/terms", get(terms))
         .route("/report", get(|| async { Redirect::to("/") }))
+        .route("/test-quote", get(test_quote))
         .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
