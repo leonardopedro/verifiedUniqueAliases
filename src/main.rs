@@ -27,8 +27,10 @@ mod enclave_init {
         modprobe("virtio_scsi");
         modprobe("virtio_blk");
         modprobe("virtio_pci");
+        modprobe("nvme");
+        modprobe("nvme_core");
         
-        // v88: Recursive module hunter for attestation drivers
+        // v91: Recursive module hunter for attestation drivers
         kmsg("Scanning for attestation modules...");
         let _ = std::process::Command::new("find").args(["/lib/modules", "-name", "*sev*", "-o", "-name", "*tsm*", "-o", "-name", "*coco*"]).status();
         
@@ -1359,7 +1361,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v90-master-2026-04-19-2125",
+            "version": "v91-master-nvme",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
