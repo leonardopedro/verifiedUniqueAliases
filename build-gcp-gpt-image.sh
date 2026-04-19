@@ -153,7 +153,7 @@ rm -f "$TAR_IMAGE"
 tar --owner=0 --group=0 --numeric-owner \
     --mtime="@$SOURCE_DATE_EPOCH" \
     --sort=name \
-    -czf "$TAR_IMAGE" "$RAW_IMAGE"
+    --sparse -cvf - "$RAW_IMAGE" | gzip -n > "$TAR_IMAGE"
 
 if command -v add-det >/dev/null; then
     add-det "$TAR_IMAGE"
