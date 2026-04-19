@@ -22,11 +22,12 @@ jobs:
         run: |
           docker build --load --target image-builder -f Dockerfile.repro -t paypal-auth-vm .
           CONTAINER_ID=$(docker create paypal-auth-vm)
+          docker cp $CONTAINER_ID:/build/paypal-auth-vm-bin ./paypal-auth-vm.bin
           docker cp $CONTAINER_ID:/disk.tar.gz ./disk.tar.gz
           docker cp $CONTAINER_ID:/initramfs-paypal-auth.img ./initramfs.img
           docker rm $CONTAINER_ID
           echo "==== ARTIFACT HASHES ===="
-          sha256sum disk.tar.gz initramfs.img
+          sha256sum paypal-auth-vm.bin disk.tar.gz initramfs.img
           echo "========================="
 
       - name: Attest disk.tar.gz
