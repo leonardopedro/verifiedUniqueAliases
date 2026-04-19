@@ -246,6 +246,15 @@ if [ -n "$KERNEL_VER" ] && [ -d "./usr/lib/modules/$KERNEL_VER" ]; then
     fi
 fi
 
+# Normalize ELF binaries and shared libraries with add-det before repacking
+if command -v add-det > /dev/null; then
+    echo "🔧 Normalizing ELF files with add-det..."
+    find . -type f \( -name "*.so*" -o -name "*.ko" -o -name "*.ko.xz" -o -name "*.ko.zst" \) -print0 | \
+        xargs -0 -r add-det 2>/dev/null || true
+    find . -type f -executable ! -name "*.sh" -print0 | \
+        xargs -0 -r add-det 2>/dev/null || true
+fi
+
 # Ensure all files and directories in staging have a fixed timestamp for bitwise reproducibility
 # Use -depth to ensure parent directories are touched AFTER their children
 find . -depth -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
@@ -253,6 +262,11 @@ find . -depth -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 # 10. Repack the initramfs
 echo "📦 Repacking initramfs..."
 find . | sort | cpio -o -H newc -R 0:0 --reproducible --quiet | zstd -T1 -19 -f -o "$OUTPUT_FILE"
+
+# Apply add-det to the final initramfs image as well
+if command -v add-det > /dev/null; then
+    add-det "$OUTPUT_FILE" 2>/dev/null || true
+fi
 
 # Clean up
 cd /
