@@ -261,7 +261,7 @@ mod tpm {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde::{Deserialize, Serialize};
 
-    pub const PCR_INDEX: &str = "15";
+    pub const PCR_SELECTION: &str = "4,8,9,15";
 
     #[derive(Serialize, Deserialize, Clone)]
     pub struct SealedData {
@@ -276,7 +276,7 @@ mod tpm {
         pub ak_pub_pem: String,
         pub ek_cert: Option<String>,
         pub pcrs: String,
-        pub pcr15_hex: String,
+        pub pcr_values: std::collections::HashMap<String, String>,
         pub nonce_hex: String,
     }
 
@@ -406,7 +406,7 @@ mod tpm {
 
         run_cmd("tpm2_quote", &[
             "-c", ak_ctx,
-            "-l", &format!("sha256:{}", PCR_INDEX),
+            "-l", &format!("sha256:{}", PCR_SELECTION),
             "-q", nonce_hex,
             "-m", "/tmp/quote.msg",
             "-s", "/tmp/quote.sig",
@@ -414,11 +414,21 @@ mod tpm {
         let msg = tokio::fs::read("/tmp/quote.msg").await?;
         let sig = tokio::fs::read("/tmp/quote.sig").await?;
 
-        let pcr_out = run_cmd("tpm2_pcrread", &[&format!("sha256:{}", PCR_INDEX)]).await.unwrap_or_default();
+        let pcr_out = run_cmd("tpm2_pcrread", &[&format!("sha256:{}", PCR_SELECTION)]).await.unwrap_or_default();
         let pcr_str = String::from_utf8_lossy(&pcr_out);
-        let pcr_hex = pcr_str.lines().find(|l| l.contains(PCR_INDEX))
-            .and_then(|l| l.split_whitespace().last())
-            .unwrap_or("00000000").to_string();
+        let mut pcr_values = std::collections::HashMap::new();
+        for line in pcr_str.lines() {
+            if line.contains(':') && !line.trim().is_empty() {
+                let parts: Vec<&str> = line.split(':').collect();
+                if parts.len() >= 2 {
+                    let idx = parts[0].trim_matches(|c: char| !c.is_numeric()).to_string();
+                    let val = parts[1].trim().to_string();
+                    if !idx.is_empty() && !val.is_empty() {
+                        pcr_values.insert(idx, val);
+                    }
+                }
+            }
+        }
 
         let ek_cert = match run_cmd("tpm2_readpublic", &["-c", "0x81010001", "-f", "pem", "-o", "/tmp/ek.pub"]).await {
             Ok(_) => {
@@ -437,8 +447,8 @@ mod tpm {
             tpm_quote_sig: STANDARD.encode(sig),
             ak_pub_pem: ak_pem,
             ek_cert,
-            pcrs: PCR_INDEX.to_string(),
-            pcr15_hex: pcr_hex,
+            pcrs: PCR_SELECTION.to_string(),
+            pcr_values,
             nonce_hex: nonce_hex.to_string(),
         })
     }
