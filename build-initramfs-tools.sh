@@ -252,7 +252,7 @@ find . -depth -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
 # 10. Repack the initramfs
 echo "📦 Repacking initramfs..."
-find . | sort | cpio -o -H newc -R 0:0 --quiet | zstd -T1 -19 -f -o "$OUTPUT_FILE"
+find . | sort | cpio -o -H newc -R 0:0 --reproducible --quiet | zstd -T1 -19 -f -o "$OUTPUT_FILE"
 
 # Clean up
 cd /
