@@ -589,12 +589,12 @@ mod tpm {
         };
 
         // 5. Hardware SNP Report (Firmware / Launch Measurement)
-        let mut snp_nonce = [0u8; 64];
-        if let Ok(nh) = hex::decode(nonce_hex) {
-            let len = nh.len().min(64);
-            snp_nonce[..len].copy_from_slice(&nh[..len]);
-        }
-        let snp_report_b64 = snp::get_report(&snp_nonce);
+        // On GCP Confidential VMs, the vTPM automatically fetches the SEV-SNP hardware report
+        // and persists it to NV index 0x01400001. We read it directly here.
+        let snp_report_b64 = match run_cmd("tpm2_nvread", &["0x01400001", "-C", "o"]).await {
+            Ok(data) if !data.is_empty() => Some(STANDARD.encode(data)),
+            _ => None,
+        };
 
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
 
@@ -1361,7 +1361,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v91-master-nvme",
+            "version": "v92-master-nvram",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
