@@ -382,47 +382,35 @@ mod tpm {
     }
 
     pub mod snp {
-        use std::fs::File;
-        use std::os::unix::io::AsRawFd;
+        use std::fs;
         use base64::{engine::general_purpose::STANDARD, Engine as _};
 
-        #[repr(C, packed)]
-        struct SnpReportReq {
-            user_data: [u8; 64],
-            vmpl: u32,
-            _reserved: [u8; 28],
-        }
-
-        #[repr(C, packed)]
-        struct SnpGuestRequestIoctl {
-            msg_version: u8,
-            req_ptr: u64,
-            resp_ptr: u64,
-            exit_info: u64,
-        }
-
         pub fn get_report(nonce: &[u8; 64]) -> Option<String> {
-            let file = File::open("/dev/sev-guest").ok()?;
-            let mut req = SnpReportReq {
-                user_data: *nonce,
-                vmpl: 0,
-                _reserved: [0u8; 28],
-            };
-            let mut resp = [0u8; 4000]; // SNP report is ~1.2KB
-            let mut ioctl_data = SnpGuestRequestIoctl {
-                msg_version: 1,
-                req_ptr: &req as *const _ as u64,
-                resp_ptr: resp.as_mut_ptr() as u64,
-                exit_info: 0,
+            // v86-master: Use the modern unified TSM (Trusted Security Module) ConfigFS interface
+            // This works on Linux 6.3+ and supports SEV-SNP, TDX, etc.
+            let tsm_base = "/sys/kernel/config/tsm/report";
+            if !fs::metadata(tsm_base).is_ok() {
+                // Try mounting configfs if not present
+                let _ = std::process::Command::new("mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
+            }
+
+            let report_dir = format!("{}/paypal_audit_{}", tsm_base, hex::encode(&nonce[..8]));
+            let _ = fs::create_dir_all(&report_dir);
+
+            // 1. Set the nonce/inblob
+            let _ = fs::write(format!("{}/inblob", report_dir), nonce);
+            // 2. Set the type to 'sev-snp'
+            let _ = fs::write(format!("{}/privlevel", report_dir), "0"); // VMPL 0
+
+            // 3. Read the report
+            let report = match fs::read(format!("{}/outblob", report_dir)) {
+                Ok(data) => Some(STANDARD.encode(&data)),
+                Err(_) => None,
             };
 
-            const SNP_GUEST_REQ: u64 = 0xC0205301; // Ioctl for SNP_GET_REPORT
-            unsafe {
-                if libc::ioctl(file.as_raw_fd(), SNP_GUEST_REQ as libc::c_ulong, &mut ioctl_data) == 0 {
-                    return Some(STANDARD.encode(&resp[..1200])); // Report size is 1184 bytes
-                }
-            }
-            None
+            // 4. Cleanup
+            let _ = fs::remove_dir(&report_dir);
+            report
         }
     }
 
@@ -1361,7 +1349,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v85-master",
+            "version": "v86-master",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
