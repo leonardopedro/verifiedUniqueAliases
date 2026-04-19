@@ -248,7 +248,7 @@ fi
 
 # 10. Repack the initramfs
 echo "📦 Repacking initramfs..."
-find . | sort | cpio -o -H newc -R 0:0 --quiet | zstd -T0 -b8 --ultra -22 --long -f -o "$OUTPUT_FILE"
+find . | sort | cpio -o -H newc -R 0:0 --quiet | zstd -T0 -b8 -19 -f -o "$OUTPUT_FILE"
 
 # Clean up
 cd /
