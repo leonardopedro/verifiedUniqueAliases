@@ -18,11 +18,27 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build and extract artifacts
+      - name: Build Rust Binary
         run: |
+          docker build --no-cache --load --target rust-builder -f Dockerfile.repro -t rust-builder .
+          CONTAINER_ID=$(docker create rust-builder)
+          docker cp $CONTAINER_ID:/paypal-auth-vm-bin ./paypal-auth-vm.bin
+          docker rm $CONTAINER_ID
+
+      - name: Attest Enclave Binary
+        uses: actions/attest-build-provenance@v2
+        id: attest_binary
+        with:
+          subject-name: paypal-auth-vm.bin
+          subject-path: paypal-auth-vm.bin
+
+      - name: Inject Attestation and Complete Synthesis
+        run: |
+          # Inject the sigstore provenance bundle so the enclave can serve it
+          cp ${{ steps.attest_binary.outputs.bundle-path }} ./github_attestation.jsonl
+          
           docker build --no-cache --load --target image-builder -f Dockerfile.repro -t paypal-auth-vm .
           CONTAINER_ID=$(docker create paypal-auth-vm)
-          docker cp $CONTAINER_ID:/build/paypal-auth-vm-bin ./paypal-auth-vm.bin
           docker cp $CONTAINER_ID:/disk.tar.gz ./disk.tar.gz
           docker cp $CONTAINER_ID:/initramfs-paypal-auth.img ./initramfs.img
           docker cp $CONTAINER_ID:/packages.txt ./packages.txt
