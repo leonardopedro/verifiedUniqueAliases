@@ -39,6 +39,8 @@ mod enclave_init {
         modprobe("coco_guest");
         modprobe("amd_tsm");
         modprobe("tsm");
+        modprobe("tpm_tis");
+        modprobe("tpm_crb");
         
         modprobe("vfat");
         modprobe("nls_cp437");
@@ -562,7 +564,13 @@ mod tpm {
         let msg = tokio::fs::read(&quote_msg).await?;
         let sig = tokio::fs::read(&quote_sig).await?;
 
-        let pcr_out = run_cmd("tpm2_pcrread", &[&format!("sha256:{}", PCR_SELECTION)]).await.unwrap_or_default();
+        let pcr_out = match run_cmd("tpm2_pcrread", &[&format!("sha256:{}", PCR_SELECTION)]).await {
+            Ok(out) => out,
+            Err(e) => {
+                error!("TPM pcrread FAILED: {}", e);
+                vec![]
+            }
+        };
         let pcr_str = String::from_utf8_lossy(&pcr_out);
         tracing::info!("TPM PCRREAD OUT: {}", pcr_str);
         tracing::info!("TPM PCR SELECTION WAS: {}", PCR_SELECTION);
@@ -594,7 +602,11 @@ mod tpm {
         let _ = std::process::Command::new("sh").arg("-c").arg("tpm2_getcap handles-nv-index > /dev/kmsg 2>&1; tpm2_nvreadpublic > /dev/kmsg 2>&1; tpm2_pcrread > /dev/kmsg 2>&1;").status();
         let snp_report_b64 = match run_cmd("tpm2_nvread", &["0x01400001", "-C", "o"]).await {
             Ok(data) if !data.is_empty() => Some(STANDARD.encode(data)),
-            _ => None,
+            Ok(_) => { info!("TPM nvread 0x01400001 returned EMPTY"); None },
+            Err(e) => {
+                error!("TPM nvread 0x01400001 FAILED: {}", e);
+                None
+            }
         };
 
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
@@ -1362,7 +1374,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v93-master-debug",
+            "version": "v95-master-tpm",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
