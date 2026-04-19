@@ -67,13 +67,7 @@ RUN chmod +x build-initramfs-tools.sh build-gcp-gpt-image.sh && \
     dpkg-query -W -f='${Package} ${Version} ${Architecture}\n' | sort > /build/packages.txt && \
     echo "=== Installed Package Manifest ===" && cat /build/packages.txt && \
     ./build-initramfs-tools.sh && \
-    ./build-gcp-gpt-image.sh && \
-    echo "=== Initramfs File Hashes ===" && \
-    mkdir -p /tmp/initrd_inspect && \
-    zstd -d /build/output/initramfs-paypal-auth.img -o /tmp/initrd.cpio && \
-    cd /tmp/initrd_inspect && cpio -idm < /tmp/initrd.cpio 2>/dev/null && \
-    find . -type f | sort | xargs sha256sum | sed 's|\./||' && \
-    cd /build && rm -rf /tmp/initrd_inspect /tmp/initrd.cpio
+    ./build-gcp-gpt-image.sh
 
 # Copy artifacts to root for easy extraction
 RUN cp /build/disk.tar.gz /disk.tar.gz && \
