@@ -164,9 +164,9 @@ tar --owner=0 --group=0 --numeric-owner \
     --mtime="@$SOURCE_DATE_EPOCH" \
     --sort=name \
     --sparse -cf "$TAR_INNER" "$RAW_IMAGE"
-# Step 2: compress with single-threaded zstd (bitstream-identical across all runtimes)
-# Rename to .tar.gz to keep the expected filename for downstream consumers
-zstd -T1 -19 -f --no-progress "$TAR_INNER" -o "$TAR_IMAGE"
+# Step 2: compress with standard gzip (required by GCP)
+# Use -n to ensure timestamps are not embedded, maintaining bitwise reproducibility
+gzip -n -9 -c "$TAR_INNER" > "$TAR_IMAGE"
 rm -f "$TAR_INNER"
 
 if command -v add-det > /dev/null; then
