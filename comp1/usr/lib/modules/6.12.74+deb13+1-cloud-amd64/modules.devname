@@ -1,0 +1,5 @@
+# Device nodes to trigger on-demand module loading.
+dm_mod mapper/control c10:236
+loop loop-control c10:237
+btrfs btrfs-control c10:234
+uhid uhid c10:239

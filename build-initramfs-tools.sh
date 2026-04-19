@@ -246,12 +246,13 @@ if [ -n "$KERNEL_VER" ] && [ -d "./usr/lib/modules/$KERNEL_VER" ]; then
     fi
 fi
 
-# Ensure all files in staging have a fixed timestamp for bitwise reproducibility
-find . -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+# Ensure all files and directories in staging have a fixed timestamp for bitwise reproducibility
+# Use -depth to ensure parent directories are touched AFTER their children
+find . -depth -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
 # 10. Repack the initramfs
 echo "📦 Repacking initramfs..."
-find . | sort | cpio -o -H newc -R 0:0 --quiet | zstd -T0 -19 -f -o "$OUTPUT_FILE"
+find . | sort | cpio -o -H newc -R 0:0 --quiet | zstd -T1 -19 -f -o "$OUTPUT_FILE"
 
 # Clean up
 cd /
