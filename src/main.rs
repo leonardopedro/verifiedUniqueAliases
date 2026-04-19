@@ -24,6 +24,9 @@ mod enclave_init {
     pub fn load_drivers() {
         modprobe("gve");
         modprobe("virtio_net");
+        modprobe("virtio_scsi");
+        modprobe("virtio_blk");
+        modprobe("sev_guest");
         modprobe("sev-guest");
         modprobe("vfat");
         modprobe("nls_cp437");
@@ -81,17 +84,26 @@ mod enclave_init {
             }
         }
 
-        // Try common boot device paths on GCP (GPT often uses Partition 1 or 15 for ESP)
+        // DYNAMIC DISCOVERY: Scan /sys/class/block for anything that looks like a partition
         let mut success = false;
-        for dev in &["/dev/sda1", "/dev/vda1", "/dev/sda15", "/dev/vda15", "/dev/sda2"] {
-            if mount_device(dev, mount_point) {
-                success = true;
-                break;
+        if let Ok(entries) = std::fs::read_dir("/sys/class/block") {
+            let mut candidates: Vec<String> = entries.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.chars().any(|c| c.is_digit(10))) // Likely a partition
+                .collect();
+            candidates.sort(); // Try sda1 before sda2 etc.
+            
+            for dev_name in candidates {
+                let dev_path = format!("/dev/{}", dev_name);
+                if mount_device(&dev_path, mount_point) {
+                    success = true;
+                    break;
+                }
             }
         }
         
         if !success {
-            kmsg("CRITICAL: Failed to mount EFI System Partition from any known path!");
+            kmsg("CRITICAL: Failed to mount EFI System Partition after scanning all devices!");
         }
 
         fn hash_recursive(dir: &str, mount_point: &str, manifest: &mut std::collections::HashMap<String, String>) {
@@ -1346,7 +1358,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v81-master",
+            "version": "v82-master",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },

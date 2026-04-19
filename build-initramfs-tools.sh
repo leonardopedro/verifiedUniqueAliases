@@ -37,6 +37,9 @@ chmod 644 /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
 # Force inclusion of GCP network and hardware modules in the base image
 echo "gve" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "virtio_net" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "virtio_scsi" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "virtio_blk" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "sev_guest" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "sev-guest" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "vfat" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "nls_cp437" | tee -a /etc/initramfs-tools/modules >/dev/null
