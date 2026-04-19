@@ -1,7 +1,7 @@
 FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a AS rust-builder
 # Dummy stage to bypass all slow Rust compiling!
-RUN echo '#!/bin/sh\necho "dummy binary"' > /paypal-auth-vm-bin && chmod +x /paypal-auth-vm-bin
-RUN echo '#!/bin/sh\necho "dummy add-det"' > /usr/bin/add-det && chmod +x /usr/bin/add-det
+RUN echo 'int main() { return 0; }' > dummy.c && gcc -o /paypal-auth-vm-bin dummy.c
+RUN echo '#!/bin/sh\nexit 0' > /usr/bin/add-det && chmod +x /usr/bin/add-det
 
 FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a AS image-builder
 ENV DEBIAN_FRONTEND=noninteractive
