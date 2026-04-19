@@ -1,0 +1,38 @@
+FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a AS rust-builder
+# Dummy stage to bypass all slow Rust compiling!
+RUN echo '#!/bin/sh\necho "dummy binary"' > /paypal-auth-vm-bin && chmod +x /paypal-auth-vm-bin
+RUN echo '#!/bin/sh\necho "dummy add-det"' > /usr/bin/add-det && chmod +x /usr/bin/add-det
+
+FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a AS image-builder
+ENV DEBIAN_FRONTEND=noninteractive
+ENV SOURCE_DATE_EPOCH=1712260800
+ENV TZ=UTC
+ENV LC_ALL=C.UTF-8
+
+# Pin Debian snapshots for 100% stable package versions
+RUN echo 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/20260406T000000Z\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/20260406T000000Z\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp' > /etc/apt/sources.list.d/debian.sources
+
+RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends \
+    curl ca-certificates gcc g++ make pkg-config libssl-dev \
+    cpio xz-utils zstd qemu-utils mtools gdisk binutils initramfs-tools \
+    linux-image-cloud-amd64 shim-signed grub-efi-amd64-signed \
+    tpm2-tools iproute2 kmod python3 file dosfstools bash \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY --from=rust-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin
+COPY --from=rust-builder /usr/bin/add-det /usr/bin/add-det
+
+COPY build-initramfs-tools.sh build-gcp-gpt-image.sh ./
+
+RUN chmod +x build-initramfs-tools.sh build-gcp-gpt-image.sh && \
+    ./build-initramfs-tools.sh && \
+    ./build-gcp-gpt-image.sh
+
+# Copy artifacts to root for easy extraction
+RUN cp /build/disk.tar.gz /disk.tar.gz && \
+    cp /build/output/initramfs-paypal-auth.img /initramfs-paypal-auth.img && \
+    echo "Build Hashes:" && \
+    sha256sum /disk.tar.gz /initramfs-paypal-auth.img
+
+CMD ["/bin/bash"]
