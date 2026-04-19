@@ -235,6 +235,16 @@
                 </div>
             </div>
 
+            <div id="githubCheck" class="check-item">
+                <div class="check-icon">🐙</div>
+                <div class="check-text">
+                    <h4>GitHub Build Provenance</h4>
+                    <p id="githubDesc">Proves the binary running was reproducibly built by GitHub Actions and matches PCR 15.</p>
+                    <input type="file" id="githubFile" accept=".jsonl" onchange="loadFile(this, 'githubInput')" class="file-input" style="margin-top: 10px;">
+                    <textarea id="githubInput" style="display:none;"></textarea>
+                </div>
+            </div>
+
             <div id="tlsCheck" class="check-item">
                 <div class="check-icon">🔒</div>
                 <div class="check-text">
@@ -339,6 +349,31 @@
             }
             
             updateStatus('enclaveCheck', sigOk);
+
+            // 5. GitHub Software Provenance (Sigstore)
+            const githubInput = document.getElementById('githubInput').value;
+            if (githubInput) {
+                try {
+                    const bundle = JSON.parse(githubInput.trim().split('\n')[0]);
+                    let payloadRaw = "";
+                    if (bundle.dsseEnvelope && bundle.dsseEnvelope.payload) {
+                        payloadRaw = atob(bundle.dsseEnvelope.payload);
+                    } else if (bundle.payload) { // older formats
+                        payloadRaw = atob(bundle.payload);
+                    }
+                    const ghPayload = JSON.parse(payloadRaw);
+                    const subjectDigest = ghPayload.subject[0].digest.sha256;
+                    
+                    updateStatus('githubCheck', subjectDigest === report.hardware_level_attestation.pcr15_hex);
+                } catch (e) {
+                    console.error("GitHub bundle parse error:", e);
+                    document.getElementById('githubCheck').className = 'check-item failed';
+                    document.getElementById('githubDesc').innerText = 'Failed to parse GitHub Attestation bundle.';
+                }
+            } else {
+                document.getElementById('githubCheck').className = 'check-item';
+                document.getElementById('githubDesc').innerText = 'Provide the GitHub Attestation (.jsonl) bundle to verify software provenance.';
+            }
 
         } catch (e) {
             console.error(e);
