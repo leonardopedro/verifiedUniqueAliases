@@ -12,6 +12,7 @@ export LC_ALL=C.UTF-8
 IMAGE_NAME="paypal-auth-vm-gcp.qcow2"
 RAW_IMAGE="disk.raw"
 TAR_IMAGE="disk.tar.gz"
+TAR_INNER="disk.tar"
 ESP_IMAGE="esp.img"
 ESP_MOUNT="$(pwd)/esp_mount"
 
@@ -149,13 +150,18 @@ if command -v add-det >/dev/null; then
 fi
 
 echo "📦 Packaging to disk.tar.gz (deterministic)..."
-rm -f "$TAR_IMAGE"
+rm -f "$TAR_INNER" "$TAR_IMAGE"
+# Step 1: create a portable uncompressed tar (fully deterministic)
 tar --owner=0 --group=0 --numeric-owner \
     --mtime="@$SOURCE_DATE_EPOCH" \
     --sort=name \
-    --sparse -cvf - "$RAW_IMAGE" | gzip -n > "$TAR_IMAGE"
+    --sparse -cf "$TAR_INNER" "$RAW_IMAGE"
+# Step 2: compress with single-threaded zstd (bitstream-identical across all runtimes)
+# Rename to .tar.gz to keep the expected filename for downstream consumers
+zstd -T1 -19 -f --no-progress "$TAR_INNER" -o "$TAR_IMAGE"
+rm -f "$TAR_INNER"
 
-if command -v add-det >/dev/null; then
+if command -v add-det > /dev/null; then
     add-det "$TAR_IMAGE"
 fi
 
