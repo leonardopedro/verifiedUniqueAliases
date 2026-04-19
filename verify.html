@@ -239,9 +239,7 @@
                 <div class="check-icon">🐙</div>
                 <div class="check-text">
                     <h4>GitHub Build Provenance</h4>
-                    <p id="githubDesc">Proves the binary running was reproducibly built by GitHub Actions and matches PCR 15.</p>
-                    <input type="file" id="githubFile" accept=".jsonl" onchange="loadFile(this, 'githubInput')" class="file-input" style="margin-top: 10px;">
-                    <textarea id="githubInput" style="display:none;"></textarea>
+                    <p id="githubDesc">Proves the binary running was built by GitHub Actions and matches hardware PCR 15.</p>
                 </div>
             </div>
 
@@ -350,29 +348,53 @@
             
             updateStatus('enclaveCheck', sigOk);
 
-            // 5. GitHub Software Provenance (Sigstore)
-            const githubInput = document.getElementById('githubInput').value;
-            if (githubInput) {
-                try {
-                    const bundle = JSON.parse(githubInput.trim().split('\n')[0]);
-                    let payloadRaw = "";
-                    if (bundle.dsseEnvelope && bundle.dsseEnvelope.payload) {
-                        payloadRaw = atob(bundle.dsseEnvelope.payload);
-                    } else if (bundle.payload) { // older formats
-                        payloadRaw = atob(bundle.payload);
-                    }
-                    const ghPayload = JSON.parse(payloadRaw);
-                    const subjectDigest = ghPayload.subject[0].digest.sha256;
-                    
-                    updateStatus('githubCheck', subjectDigest === report.hardware_level_attestation.pcr15_hex);
-                } catch (e) {
-                    console.error("GitHub bundle parse error:", e);
-                    document.getElementById('githubCheck').className = 'check-item failed';
-                    document.getElementById('githubDesc').innerText = 'Failed to parse GitHub Attestation bundle.';
+            // 5. GitHub Software Provenance (Sigstore) via API
+            const pcr15 = report.hardware_level_attestation.pcr15_hex;
+            const githubStatus = document.getElementById('githubCheck');
+            const githubDesc = document.getElementById('githubDesc');
+            
+            githubStatus.className = 'check-item';
+            githubDesc.innerText = 'Fetching provenance from GitHub for hash: ' + pcr15.substring(0, 12) + '...';
+
+            try {
+                // Determine repo from report if possible, or fallback to current project
+                const repo = "leonardopedro/verifiedUniqueAliases"; 
+                const url = `https://api.github.com/repos/${repo}/attestations/sha256:${pcr15}`;
+                
+                const response = await fetch(url, {
+                    headers: { 'Accept': 'application/vnd.github+json' }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`GitHub API returned ${response.status}`);
                 }
-            } else {
-                document.getElementById('githubCheck').className = 'check-item';
-                document.getElementById('githubDesc').innerText = 'Provide the GitHub Attestation (.jsonl) bundle to verify software provenance.';
+
+                const bundleData = await response.json();
+                if (!bundleData.attestations || bundleData.attestations.length === 0) {
+                    throw new Error("No attestations found on GitHub for this hash.");
+                }
+
+                // Parse the first attestation bundle
+                const bundle = bundleData.attestations[0].bundle;
+                let payloadRaw = "";
+                if (bundle.dsseEnvelope && bundle.dsseEnvelope.payload) {
+                    payloadRaw = atob(bundle.dsseEnvelope.payload);
+                } else if (bundle.payload) {
+                    payloadRaw = atob(bundle.payload);
+                }
+                
+                const ghPayload = JSON.parse(payloadRaw);
+                const subjectDigest = ghPayload.subject[0].digest.sha256;
+                
+                const matched = (subjectDigest === pcr15);
+                updateStatus('githubCheck', matched);
+                if (matched) {
+                    githubDesc.innerText = `Verified binary built by ${ghPayload.builder.id} from ${repo}`;
+                }
+            } catch (e) {
+                console.error("GitHub provenance fetch/parse error:", e);
+                githubStatus.className = 'check-item failed';
+                githubDesc.innerText = 'GitHub Provenance Verification Failed: ' + e.message;
             }
 
         } catch (e) {
