@@ -1415,11 +1415,8 @@ async fn callback(
             <p><strong>Hashed & Signed Evidence:</strong></p>
             <pre id="raw_report">{}</pre>
         </div>
-        <div style="margin-bottom: 20px;">
-            <button onclick="downloadReport()" class="btn" style="background:#4caf50; margin-right: 10px;">Download Attestation Report (.json)</button>
-            <a href="/attestation.jsonl" download="github_attestation.jsonl" class="btn" style="background:#1f6feb; margin-right: 10px;">Download GitHub Provenance (.jsonl)</a>
-            <a href="/" class="btn" style="background: #333;">Back</a>
-        </div>
+        <button onclick="downloadReport()" class="btn" style="background:#4caf50; margin-right: 10px;">Download Attestation Report (.json)</button>
+        <a href="/" class="btn" style="background: #333;">Back</a>
 
         <script>
             function downloadReport() {{
@@ -1465,22 +1462,6 @@ async fn acme_challenge(
 #[allow(dead_code)]
 async fn http_to_https_redirect() -> impl IntoResponse {
     Redirect::permanent("https://")
-}
-
-async fn serve_github_attestation(
-    State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
-) -> Response {
-    if let Err(status) = state.record_egress_data(addr.ip(), 10000) {
-        return status.into_response();
-    }
-    match tokio::fs::read_to_string("/etc/github_attestation.jsonl").await {
-        Ok(c) => (
-            [(axum::http::header::CONTENT_TYPE, "application/jsonl")],
-            c
-        ).into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
 }
 
 // ============================================================================
@@ -1632,7 +1613,6 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/privacy", get(privacy))
         .route("/terms", get(terms))
         .route("/report", get(|| async { Redirect::to("/") }))
-        .route("/attestation.jsonl", get(serve_github_attestation))
         .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());

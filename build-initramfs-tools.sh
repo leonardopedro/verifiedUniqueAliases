@@ -188,9 +188,6 @@ echo "hosts: files dns" > etc/nsswitch.conf
 echo "127.0.0.1 localhost" > etc/hosts
 
 # 9. Ensure critical device nodes exist
-if [ -f /build/github_attestation.jsonl ]; then
-    cp -pn /build/github_attestation.jsonl "$STAGING_DIR/etc/github_attestation.jsonl"
-fi
 
 # 9. Ensure critical device nodes exist
 mkdir -p dev
