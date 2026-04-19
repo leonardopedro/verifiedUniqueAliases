@@ -20,6 +20,23 @@ jobs:
           docker cp $CONTAINER_ID:/initramfs-paypal-auth.img ./initramfs.img
           docker rm $CONTAINER_ID
           zstd -d ./initramfs.img -o ./initrd.cpio
-          echo "==== RAPID TEST HASHES ===="
-          sha256sum initramfs.img initrd.cpio
-          echo "==========================="
+          cat << 'EOF' > /tmp/cpio_hash.py
+          import sys, hashlib
+          def hash_cpio(path):
+              with open(path, 'rb') as f: data = bytearray(f.read())
+              pos = 0
+              while pos < len(data):
+                  hdr = data[pos:pos+110]
+                  if len(hdr) < 110 or hdr[:6] != b'070701': break
+                  namesize = int(hdr[94:102], 16)
+                  filesize = int(hdr[54:62], 16)
+                  name = data[pos+110:pos+110+namesize-1].decode('utf-8', errors='replace')
+                  h = hashlib.sha256(data[pos:pos+110+namesize]).hexdigest()
+                  print(f"{h} {name}")
+                  pos += 110 + namesize + ((namesize + 110 + 3) // 4 * 4 - namesize - 110) + filesize + ((filesize + 3) // 4 * 4 - filesize)
+          hash_cpio('./initrd.cpio')
+          EOF
+          echo "==== CPIO HEADER HASHES ===="
+          python3 /tmp/cpio_hash.py > cpio_headers.txt
+          head -n 25 cpio_headers.txt
+          echo "============================"
