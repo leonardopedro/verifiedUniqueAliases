@@ -431,11 +431,21 @@
                 const manifestHashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(manifestJson));
                 const manifestHash = Array.from(new Uint8Array(manifestHashBuffer)).map(b => b.toString(16).padStart(2,'0')).join('');
                 
+                // v97: PCR 15 is the result of tpm2 pcrextend 15:sha256=manifestHash
+                // Which means PCR15 = sha256(existing_zeros(32) || manifestHash)
+                const zeros = new Uint8Array(32);
+                const manifestBytes = new Uint8Array(manifestHash.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+                const combined = new Uint8Array(32 + 32);
+                combined.set(zeros);
+                combined.set(manifestBytes, 32);
+                const expectedPcrBuffer = await crypto.subtle.digest('SHA-256', combined);
+                const expectedPcr15 = Array.from(new Uint8Array(expectedPcrBuffer)).map(b => b.toString(16).padStart(2,'0')).join('');
+                
                 const pcr15_raw = pcrValues["15"] || "";
                 const pcr15_clean = pcr15_raw.replace(/^0x/i, '').toLowerCase();
 
-                const hardwareMatch = (pcr15_clean === manifestHash) && (manifestHash.length > 0);
-                results.push(hardwareMatch ? "✅ Hardware: PCR 15 bound to Manifest Anchor" : `❌ Hardware: PCR 15 MISMATCH (Got: ${pcr15_clean ? pcr15_clean.substring(0,8) : 'N/A'}...) vs ${manifestHash.substring(0,8)}... (Raw PCKs: ${JSON.stringify(pcrValues)})`);
+                const hardwareMatch = (pcr15_clean === expectedPcr15) && (expectedPcr15.length > 0);
+                results.push(hardwareMatch ? "✅ Hardware: PCR 15 bound to Manifest Anchor" : `❌ Hardware: PCR 15 MISMATCH (Got: ${pcr15_clean ? pcr15_clean.substring(0,8) : 'N/A'}...) vs Expected: ${expectedPcr15.substring(0,8)}... (Manifest: ${manifestHash.substring(0,8)}...)`);
 
                 const allOk = bin.success && ker.success && init.success && cfg.success && hardwareMatch && consistent;
                 updateStatus('githubCheck', allOk);
