@@ -126,10 +126,21 @@ mod enclave_init {
     }
 
     fn modprobe(module: &str) {
-        match std::process::Command::new("modprobe").arg("-q").arg(module).status() {
-            Ok(s) if s.success() => kmsg(&format!("modprobe {}: OK", module)),
-            Ok(s) => kmsg(&format!("modprobe {}: FAILED ({})", module, s)),
-            Err(e) => kmsg(&format!("modprobe {} error: {}", module, e)),
+        let paths = ["/sbin/modprobe", "/usr/sbin/modprobe", "/bin/modprobe", "modprobe"];
+        let mut success = false;
+        for path in &paths {
+            match std::process::Command::new(path).arg("-q").arg(module).status() {
+                Ok(s) if s.success() => {
+                    kmsg(&format!("modprobe {} (via {}): OK", module, path));
+                    success = true;
+                    break;
+                },
+                Ok(_) => {}, // Try next path if this one failed (maybe not found)
+                Err(_) => {},
+            }
+        }
+        if !success {
+            kmsg(&format!("modprobe {}: ALL PATHS FAILED", module));
         }
     }
 
