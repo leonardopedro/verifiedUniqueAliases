@@ -106,7 +106,6 @@ done
 
 # Replace original ESP with normalized one
 mv $ESP_NORM $ESP_IMAGE
-rm -rf "$ESP_MOUNT"
 
 # ==============================================================================
 # PHASE 3: Assemble the raw disk with fixed GPT metadata
@@ -143,6 +142,10 @@ fi
 mkdir -p output
 cp "$ESP_MOUNT/EFI/BOOT/grub.cfg" "output/grub.cfg"
 
+# Final Cleanup
+rm -rf "$ESP_MOUNT"
+rm -f .mtoolsrc grub.cfg $ESP_IMAGE
+
 
 # ==============================================================================
 # PHASE 5: Package outputs
@@ -169,9 +172,6 @@ rm -f "$TAR_INNER"
 if command -v add-det > /dev/null; then
     add-det "$TAR_IMAGE"
 fi
-
-# Cleanup
-rm -f .mtoolsrc grub.cfg $ESP_IMAGE
 
 echo ""
 echo "✅ Synthesis Complete."
