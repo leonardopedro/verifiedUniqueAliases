@@ -247,6 +247,9 @@ mod enclave_init {
         modprobe("gve");
         modprobe("virtio_net");
         modprobe("sev-guest");
+        modprobe("vfat");
+        modprobe("nls_cp437");
+        modprobe("nls_ascii");
 
         kmsg("Waiting for network interface...");
         let iface = {
@@ -1316,6 +1319,10 @@ async fn generate_attestation(
             "boot_measurements": {
                 "binary_sha256": &binary_self_hash,
                 "disk_manifest": &state.boot_manifest,
+            },
+            "enclave_debug": {
+                "manifest_size": state.boot_manifest.len(),
+                "kernel_log_tail": if let Ok(log) = std::fs::read_to_string("/dev/kmsg") { log.chars().rev().take(1000).collect::<String>().chars().rev().collect::<String>() } else { "LOG_UNREADABLE".to_string() }
             }
         },
         "session_context": {

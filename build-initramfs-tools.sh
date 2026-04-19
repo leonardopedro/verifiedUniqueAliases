@@ -34,9 +34,13 @@ echo "🔍 Using kernel version: $KERNEL_VERSION"
 touch /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
 chmod 644 /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
 
-# Force inclusion of GCP network modules in the base image
+# Force inclusion of GCP network and hardware modules in the base image
 echo "gve" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "virtio_net" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "sev-guest" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "vfat" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "nls_cp437" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "nls_ascii" | tee -a /etc/initramfs-tools/modules >/dev/null
 
 echo "🔨 Generating base mkinitramfs..."
 BASE_IMG="/tmp/base-initrd.img"
