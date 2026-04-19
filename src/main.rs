@@ -68,18 +68,30 @@ mod enclave_init {
         let mount_point = "/tmp/esp";
         let _ = std::fs::create_dir_all(mount_point);
         
-        // Helper to mount with libc directly for robustness
         fn mount_device(source: &str, target: &str) -> bool {
             let src = std::ffi::CString::new(source).unwrap();
             let tgt = std::ffi::CString::new(target).unwrap();
             let fst = std::ffi::CString::new("vfat").unwrap();
             let ret = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), libc::MS_RDONLY, std::ptr::null()) };
-            ret == 0
+            if ret == 0 {
+                kmsg(&format!("Successfully mounted {} to {}", source, target));
+                true
+            } else {
+                false
+            }
         }
 
-        // Try common boot device paths on GCP
-        if !mount_device("/dev/sda1", mount_point) {
-            mount_device("/dev/vda1", mount_point);
+        // Try common boot device paths on GCP (GPT often uses Partition 1 or 15 for ESP)
+        let mut success = false;
+        for dev in &["/dev/sda1", "/dev/vda1", "/dev/sda15", "/dev/vda15", "/dev/sda2"] {
+            if mount_device(dev, mount_point) {
+                success = true;
+                break;
+            }
+        }
+        
+        if !success {
+            kmsg("CRITICAL: Failed to mount EFI System Partition from any known path!");
         }
 
         fn hash_recursive(dir: &str, mount_point: &str, manifest: &mut std::collections::HashMap<String, String>) {
@@ -114,13 +126,10 @@ mod enclave_init {
     }
 
     fn modprobe(module: &str) {
-        match std::process::Command::new("/sbin/modprobe").arg("-q").arg(module).status() {
-            Ok(s) => kmsg(&format!("modprobe {}: {}", module, s)),
-            Err(e) => kmsg(&format!("modprobe {} failed: {} (falling back to insmod?)", module, e)),
-        }
-        // Fallback: if modprobe is missing, maybe busybox or raw insmod works
-        if let Ok(_paths) = std::fs::read_dir(format!("/lib/modules")) {
-            // Very primitive, just relies on the kernel matching it if modprobe itself is broken
+        match std::process::Command::new("modprobe").arg("-q").arg(module).status() {
+            Ok(s) if s.success() => kmsg(&format!("modprobe {}: OK", module)),
+            Ok(s) => kmsg(&format!("modprobe {}: FAILED ({})", module, s)),
+            Err(e) => kmsg(&format!("modprobe {} error: {}", module, e)),
         }
     }
 
@@ -476,54 +485,56 @@ mod tpm {
     }
 
     pub async fn quote(nonce_hex: &str) -> Result<AttestationResult, Box<dyn std::error::Error + Send + Sync>> {
-        let cleanup_paths = [
-            "/tmp/primary.ctx", "/tmp/ak.ctx", "/tmp/ak.pub",
-            "/tmp/ak.priv", "/tmp/ak.pem", "/tmp/quote.msg",
-            "/tmp/quote.sig", "/tmp/ek.pub", "/tmp/ek.cert",
-        ];
-        let _ = cleanup(&cleanup_paths).await;
+        let work_dir = format!("/tmp/tpm_{}", hex::encode(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos().to_be_bytes()));
+        let _ = std::fs::create_dir_all(&work_dir);
 
-        let ak_ctx = "/tmp/akv2.ctx";
+        let primary_ctx = format!("{}/primary.ctx", work_dir);
+        let ak_ctx = format!("{}/ak.ctx", work_dir);
+        let ak_pub = format!("{}/ak.pub", work_dir);
+        let ak_priv = format!("{}/ak.priv", work_dir);
+        let ak_pem = format!("{}/ak.pem", work_dir);
+        let quote_msg = format!("{}/quote.msg", work_dir);
+        let quote_sig = format!("{}/quote.sig", work_dir);
 
         // 1. Create primary key in Owner hierarchy explicitly
         run_cmd("tpm2_createprimary", &[
             "-C", "o", 
             "-g", "sha256", 
             "-G", "rsa2048", 
-            "-c", "/tmp/primary_ak.ctx"
+            "-c", &primary_ctx
         ]).await?;
 
         // 2. Create the AK with 'restricted|sign' - required for TPM2_Quote
         run_cmd("tpm2_create", &[
-            "-C", "/tmp/primary_ak.ctx",
+            "-C", &primary_ctx,
             "-g", "sha256",
             "-G", "rsa2048",
             "-a", "sign|fixedtpm|fixedparent|sensitivedataorigin|userwithauth",
-            "-u", "/tmp/akv2.pub",
-            "-r", "/tmp/akv2.priv"
+            "-u", &ak_pub,
+            "-r", &ak_priv
         ]).await?;
         
         // 3. Load it
         run_cmd("tpm2_load", &[
-            "-C", "/tmp/primary_ak.ctx",
-            "-u", "/tmp/akv2.pub",
-            "-r", "/tmp/akv2.priv",
-            "-c", ak_ctx
+            "-C", &primary_ctx,
+            "-u", &ak_pub,
+            "-r", &ak_priv,
+            "-c", &ak_ctx
         ]).await?;
 
         // Extract AK PEM for the report
-        run_cmd("tpm2_readpublic", &["-c", ak_ctx, "-f", "pem", "-o", "/tmp/akv2.pem"]).await?;
-        let ak_pem = tokio::fs::read_to_string("/tmp/akv2.pem").await?;
+        run_cmd("tpm2_readpublic", &["-c", &ak_ctx, "-f", "pem", "-o", &ak_pem]).await?;
+        let ak_pem_str = tokio::fs::read_to_string(&ak_pem).await?;
 
         run_cmd("tpm2_quote", &[
-            "-c", ak_ctx,
+            "-c", &ak_ctx,
             "-l", &format!("sha256:{}", PCR_SELECTION),
             "-q", nonce_hex,
-            "-m", "/tmp/quote.msg",
-            "-s", "/tmp/quote.sig",
+            "-m", &quote_msg,
+            "-s", &quote_sig,
         ]).await?;
-        let msg = tokio::fs::read("/tmp/quote.msg").await?;
-        let sig = tokio::fs::read("/tmp/quote.sig").await?;
+        let msg = tokio::fs::read(&quote_msg).await?;
+        let sig = tokio::fs::read(&quote_sig).await?;
 
         let pcr_out = run_cmd("tpm2_pcrread", &[&format!("sha256:{}", PCR_SELECTION)]).await.unwrap_or_default();
         let pcr_str = String::from_utf8_lossy(&pcr_out);
@@ -541,9 +552,9 @@ mod tpm {
             }
         }
 
-        let ek_cert = match run_cmd("tpm2_readpublic", &["-c", "0x81010001", "-f", "pem", "-o", "/tmp/ek.pub"]).await {
+        let ek_cert = match run_cmd("tpm2_readpublic", &["-c", "0x81010001", "-f", "pem", "-o", &format!("{}/ek.pub", work_dir)]).await {
             Ok(_) => {
-                match run_cmd("tpm2_getekcertificate", &["-X", "-o", "/tmp/ek.cert"]).await {
+                match run_cmd("tpm2_getekcertificate", &["-X", "-o", &format!("{}/ek.cert", work_dir)]).await {
                     Ok(cert_der) => Some(STANDARD.encode(cert_der)),
                     Err(_) => None,
                 }
@@ -559,12 +570,12 @@ mod tpm {
         }
         let snp_report_b64 = snp::get_report(&snp_nonce);
 
-        let _ = cleanup(&cleanup_paths).await;
+        let _ = tokio::fs::remove_dir_all(&work_dir).await;
 
         Ok(AttestationResult {
             tpm_quote_msg: STANDARD.encode(msg),
             tpm_quote_sig: STANDARD.encode(sig),
-            ak_pub_pem: ak_pem,
+            ak_pub_pem: ak_pem_str,
             ek_cert,
             pcrs: PCR_SELECTION.to_string(),
             pcr_values,
