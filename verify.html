@@ -447,10 +447,12 @@
                             <span style="word-break: break-all; background: #0d1117; padding: 4px; border-radius: 4px; display: block; margin: 4px 0;">${measurementHex}</span>
                             Firmware PCR 0: <span style="color: #8b949e;">${pcr0.substring(0,32)}...</span>
                         </div>
-                        <p style="font-size: 0.85rem; margin-top: 10px; color: #8b949e;">
-                            Google Cloud provides signed integrity policies for this firmware. You can verify this measurement against the 
-                            <a href="https://console.cloud.google.com/storage/browser/gce_tcb_integrity/ovmf_x64_csm/sevsnp" target="_blank" style="color: #58a6ff;">Google GCE TCB Integrity Portal</a>.
                         </p>
+                        ${report.enclave_config && report.enclave_config.version ? `
+                        <div style="font-size: 0.75rem; color: #8b949e; border-top: 1px solid #30363d; padding-top: 8px; margin-top: 8px;">
+                            Enclave: <span style="color:#7ee787;">${report.enclave_config.version}</span> | 
+                            Manifest: <span style="color:#7ee787;">${Object.keys(report.enclave_config.boot_measurements.disk_manifest).length} files</span>
+                        </div>` : ''}
                     `;
                 } else {
                     document.getElementById('firmwareCheck').className = 'check-item failed';
