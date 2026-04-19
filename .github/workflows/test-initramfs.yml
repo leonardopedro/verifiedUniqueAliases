@@ -1,0 +1,24 @@
+name: Test Initramfs Reproducibility
+
+on:
+  push:
+    branches: [main, test-initramfs]
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build initramfs rapidly
+        run: |
+          docker build --no-cache --load --target image-builder -f Dockerfile.repro -t paypal-auth-vm-test .
+          CONTAINER_ID=$(docker create paypal-auth-vm-test)
+          docker cp $CONTAINER_ID:/initramfs-paypal-auth.img ./initramfs.img
+          docker rm $CONTAINER_ID
+          echo "==== RAPID TEST HASHES ===="
+          sha256sum initramfs.img
+          echo "==========================="
