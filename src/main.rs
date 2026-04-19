@@ -52,19 +52,30 @@ mod enclave_init {
         kmsg("Filesystems mounted");
     }
 
-    pub fn measure_boot_components() -> (String, String) {
+    pub fn measure_boot_components() -> std::collections::HashMap<String, String> {
         use sha2::{Digest, Sha256};
-        fn hash(p: &str) -> String {
-            match std::fs::read(p) {
-                Ok(d) => {
-                    let mut hasher = Sha256::new();
-                    hasher.update(&d);
-                    hex::encode(hasher.finalize())
+        let mut manifest = std::collections::HashMap::new();
+        
+        fn hash_recursive(dir: &str, manifest: &mut std::collections::HashMap<String, String>) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        hash_recursive(&path.to_string_lossy(), manifest);
+                    } else if path.is_file() {
+                        if let Ok(mut file) = std::fs::File::open(&path) {
+                            let mut hasher = Sha256::new();
+                            if std::io::copy(&mut file, &mut hasher).is_ok() {
+                                let h = hex::encode(hasher.finalize());
+                                manifest.insert(path.to_string_lossy().replace("/boot/efi/", ""), h);
+                            }
+                        }
+                    }
                 }
-                Err(_) => "NOT_FOUND".to_string()
             }
         }
-        (hash("/boot/efi/vmlinuz"), hash("/boot/efi/initrd.img"))
+        hash_recursive("/boot/efi", &mut manifest);
+        manifest
     }
 
     fn modprobe(module: &str) {
@@ -694,8 +705,7 @@ struct AppState {
     last_limit_reset: Arc<RwLock<Instant>>,
     // v71: Concurrency Control
     connection_semaphore: Arc<Semaphore>,
-    boot_kernel_hash: String,
-    boot_initrd_hash: String,
+    boot_manifest: std::collections::HashMap<String, String>,
 }
 
 struct PayPalFlowConfig {
@@ -1287,9 +1297,8 @@ async fn generate_attestation(
             "staging_mode": if state.staging { "sandbox" } else { "production" },
             "domain": &state.domain,
             "boot_measurements": {
-                "kernel_sha256": &state.boot_kernel_hash,
-                "initrd_sha256": &state.boot_initrd_hash,
                 "binary_sha256": &binary_self_hash,
+                "disk_manifest": &state.boot_manifest,
             }
         },
         "session_context": {
@@ -1596,7 +1605,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     
     // 1. PID 1 RESPONSIBILITIES: Mount filesystems BEFORE anything else!
     enclave_init::mount_filesystems();
-    let (kernel_h, initrd_h) = enclave_init::measure_boot_components();
+    let boot_manifest = enclave_init::measure_boot_components();
 
     // 2. Initialize the Tokio runtime now that the environment is sane
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1610,11 +1619,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             enclave_init::poweroff();
         }
 
-        async_main().await
+        async_main(boot_manifest).await
     })
 }
 
-async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn async_main(boot_manifest: std::collections::HashMap<String, String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     
     // Attempt to force immediate flush
     use std::io::Write;
@@ -1644,11 +1653,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let hash = hasher.finalize();
             let hash_hex = hex::encode(hash);
             info!("Measured Boot: Extending PCR 15 with BIN_HASH={}", hash_hex);
-            let _ = tpm::run_cmd("tpm2_pcrextend", &[&format!("{}:sha256={}", tpm::PCR_INDEX, hash_hex)]).await;
+            let _ = tpm::run_cmd("tpm2_pcrextend", &["15:sha256", &hash_hex]).await;
         }
     }
     // Log current PCR 15 state for diagnostics
-    if let Ok(pcr_out) = tpm::run_cmd("tpm2_pcrread", &[&format!("sha256:{}", tpm::PCR_INDEX)]).await {
+    if let Ok(pcr_out) = tpm::run_cmd("tpm2_pcrread", &["sha256:15"]).await {
         info!("Current PCR 15 State:\n{}", String::from_utf8_lossy(&pcr_out).trim());
     }
 
@@ -1705,8 +1714,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         global_egress_bytes: Arc::new(AtomicU64::new(0)),
         last_limit_reset: Arc::new(RwLock::new(Instant::now())),
         connection_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
-        boot_kernel_hash: kernel_h,
-        boot_initrd_hash: initrd_h,
+        boot_manifest,
     });
 
     // Build the main app router
