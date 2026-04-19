@@ -27,11 +27,12 @@ jobs:
           docker cp $CONTAINER_ID:/build/output/initramfs-paypal-auth.img ./initramfs.img
           docker cp $CONTAINER_ID:/build/output/shimx64.efi ./shimx64.efi
           docker cp $CONTAINER_ID:/build/output/grubx64.efi ./grubx64.efi
+          docker cp $CONTAINER_ID:/build/esp_mount/EFI/BOOT/grub.cfg ./grub.cfg
           docker cp $CONTAINER_ID:/disk.tar.gz ./disk.tar.gz
           docker cp $CONTAINER_ID:/packages.txt ./packages.txt
           docker rm $CONTAINER_ID
           echo "==== ARTIFACT HASHES ===="
-          sha256sum paypal-auth-vm.bin vmlinuz initramfs.img shimx64.efi grubx64.efi disk.tar.gz
+          sha256sum paypal-auth-vm.bin vmlinuz initramfs.img shimx64.efi grubx64.efi grub.cfg disk.tar.gz
           echo "========================="
 
       - name: Attest Enclave Binary
@@ -59,6 +60,7 @@ jobs:
           subject-path: |
             shimx64.efi
             grubx64.efi
+            grub.cfg
 
       - name: Attest VM Disk Image
         uses: actions/attest-build-provenance@v2

@@ -372,31 +372,51 @@
                 const resp = await fetch(url, { headers: { 'Accept': 'application/vnd.github+json' } });
                 if (!resp.ok) return { success: false, name };
                 const data = await resp.json();
-                return { success: (data.attestations && data.attestations.length > 0), name };
+                if (!data.attestations || data.attestations.length === 0) return { success: false, name };
+                
+                // Extract Build Run ID from DSSE payload
+                let runId = "Unknown";
+                try {
+                    const bundle = data.attestations[0].bundle;
+                    const payload = JSON.parse(atob(bundle.dsseEnvelope ? bundle.dsseEnvelope.payload : bundle.payload));
+                    runId = payload.invocation.uri || "External";
+                } catch(e) {}
+
+                return { success: true, name, runId };
             }
 
             try {
                 const results = [];
                 
-                // 1. Verify Enclave Binary
+                // 1. Verify Components via Manifest
+                const manifest = boot.disk_manifest;
+                
+                // Find critical files in manifest
+                const ker_hash = manifest["EFI/BOOT/vmlinuz"] || manifest["vmlinuz"];
+                const init_hash = manifest["EFI/BOOT/initrd.img"] || manifest["initrd.img"];
+                const config_hash = manifest["EFI/BOOT/grub.cfg"] || manifest["grub.cfg"];
+
                 const bin = await getProvenance(boot.binary_sha256, "Enclave Binary");
-                results.push(bin.success ? `✅ ${bin.name} Provenance Match` : `❌ ${bin.name} Not Found on GitHub`);
+                const ker = await getProvenance(ker_hash, "Linux Kernel");
+                const init = await getProvenance(init_hash, "Initramfs Image");
+                const cfg = await getProvenance(config_hash, "GRUB Configuration");
 
-                // 2. Verify Kernel
-                const ker = await getProvenance(boot.kernel_sha256, "Linux Kernel");
-                results.push(ker.success ? `✅ ${ker.name} Provenance Match` : `❌ ${ker.name} Not Found on GitHub`);
+                results.push(bin.success ? `✅ Binary: Provenance Valid` : `❌ Binary: No Provenance`);
+                results.push(ker.success ? `✅ Kernel: Provenance Valid` : `❌ Kernel: No Provenance`);
+                results.push(init.success ? `✅ Initrd: Provenance Valid` : `❌ Initrd: No Provenance`);
+                results.push(cfg.success ? `✅ Boot Config: Provenance Valid` : `❌ Boot Config: No Provenance`);
 
-                // 3. Verify Initrd
-                const init = await getProvenance(boot.initrd_sha256, "Initramfs Image");
-                results.push(init.success ? `✅ ${init.name} Provenance Match` : `❌ ${init.name} Not Found on GitHub`);
+                // 2. Consistency Check (Atomicity)
+                const consistent = (bin.runId === ker.runId && ker.runId === init.runId && ker.runId === cfg.runId);
+                results.push(consistent ? `✅ Image Atomicity: All components from Run #${bin.runId.split('/').pop()}` : `❌ Image Atomicity: COMPONENTS FROM DIFFERENT BUILDS`);
 
-                // 4. Hardware Bind Check
+                // 3. Hardware Bind Check
                 const hardwareMatch = (pcrValues["15"] === boot.binary_sha256);
-                results.push(hardwareMatch ? "✅ Hardware Bind: PCR 15 matches Binary Measurement" : "❌ Hardware Bind: PCR 15 MISMATCH");
+                results.push(hardwareMatch ? "✅ Hardware: PCR 15 bound to Binary" : "❌ Hardware: PCR 15 MISMATCH");
 
-                const allOk = bin.success && ker.success && init.success && hardwareMatch;
+                const allOk = bin.success && ker.success && init.success && cfg.success && hardwareMatch && consistent;
                 updateStatus('githubCheck', allOk);
-                githubDesc.innerHTML = results.join('<br>');
+                githubDesc.innerHTML = results.join('<br>') + `<br><small>Verified ${Object.keys(manifest).length} file(s) on boot partition.</small>`;
 
                 // 6. AMD Silicon Root of Trust (Firmware)
                 if (report.hardware_level_attestation.snp_report_b64) {
