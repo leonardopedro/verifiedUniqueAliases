@@ -27,7 +27,7 @@ jobs:
           docker cp $CONTAINER_ID:/build/output/initramfs-paypal-auth.img ./initramfs.img
           docker cp $CONTAINER_ID:/build/output/shimx64.efi ./shimx64.efi
           docker cp $CONTAINER_ID:/build/output/grubx64.efi ./grubx64.efi
-          docker cp $CONTAINER_ID:/build/esp_mount/EFI/BOOT/grub.cfg ./grub.cfg
+          docker cp $CONTAINER_ID:/grub.cfg ./grub.cfg
           docker cp $CONTAINER_ID:/disk.tar.gz ./disk.tar.gz
           docker cp $CONTAINER_ID:/packages.txt ./packages.txt
           docker rm $CONTAINER_ID
