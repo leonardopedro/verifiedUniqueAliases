@@ -12,7 +12,6 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && . /usr/local/cargo/env \
     && export RUST_MIN_STACK=16777216 \
     && cargo install -j 1 --root /usr --locked add-determinism \
-    && mv /usr/bin/add-determinism /usr/bin/add-det \
     && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
 
 WORKDIR /app
