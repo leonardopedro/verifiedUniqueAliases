@@ -19,6 +19,7 @@ jobs:
           CONTAINER_ID=$(docker create paypal-auth-vm-test)
           docker cp $CONTAINER_ID:/initramfs-paypal-auth.img ./initramfs.img
           docker rm $CONTAINER_ID
+          zstd -d ./initramfs.img -o ./initrd.cpio
           echo "==== RAPID TEST HASHES ===="
-          sha256sum initramfs.img
+          sha256sum initramfs.img initrd.cpio
           echo "==========================="
