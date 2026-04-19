@@ -64,12 +64,15 @@ COPY --from=rust-builder /usr/bin/add-det /usr/bin/add-det
 COPY build-initramfs-tools.sh build-gcp-gpt-image.sh ./
 
 RUN chmod +x build-initramfs-tools.sh build-gcp-gpt-image.sh && \
+    dpkg-query -W -f='${Package} ${Version} ${Architecture}\n' | sort > /build/packages.txt && \
+    echo "=== Installed Package Manifest ==" && cat /build/packages.txt && \
     ./build-initramfs-tools.sh && \
     ./build-gcp-gpt-image.sh
 
 # Copy artifacts to root for easy extraction
 RUN cp /build/disk.tar.gz /disk.tar.gz && \
     cp /build/output/initramfs-paypal-auth.img /initramfs-paypal-auth.img && \
+    cp /build/packages.txt /packages.txt && \
     echo "Build Hashes:" && \
     sha256sum /disk.tar.gz /initramfs-paypal-auth.img
 

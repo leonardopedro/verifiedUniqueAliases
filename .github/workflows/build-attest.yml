@@ -20,15 +20,19 @@ jobs:
 
       - name: Build and extract artifacts
         run: |
-          docker build --load --target image-builder -f Dockerfile.repro -t paypal-auth-vm .
+          docker build --no-cache --load --target image-builder -f Dockerfile.repro -t paypal-auth-vm .
           CONTAINER_ID=$(docker create paypal-auth-vm)
           docker cp $CONTAINER_ID:/build/paypal-auth-vm-bin ./paypal-auth-vm.bin
           docker cp $CONTAINER_ID:/disk.tar.gz ./disk.tar.gz
           docker cp $CONTAINER_ID:/initramfs-paypal-auth.img ./initramfs.img
+          docker cp $CONTAINER_ID:/packages.txt ./packages.txt
           docker rm $CONTAINER_ID
           echo "==== ARTIFACT HASHES ===="
           sha256sum paypal-auth-vm.bin disk.tar.gz initramfs.img
           echo "========================="
+          echo "==== PACKAGE MANIFEST ===="
+          cat packages.txt
+          echo "=========================="
 
       - name: Attest disk.tar.gz
         uses: actions/attest-build-provenance@v2
