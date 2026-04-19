@@ -358,6 +358,13 @@
 
             // 5. GitHub Software Provenance (Sigstore) via API
             // We verify the full boot chain: PCR 4 (Bootloader), PCR 9 (Kernel/Initrd), PCR 15 (Binary)
+            if (!report.enclave_config || !report.enclave_config.boot_measurements) {
+                const err = "Audit stalled: boot_measurements missing. Likely running an outdated enclave version.";
+                document.getElementById('githubDesc').innerText = err;
+                document.getElementById('firmwareDesc').innerText = "Silicon report missing from attestation JSON.";
+                return;
+            }
+
             const pcrValues = report.hardware_level_attestation.pcr_values;
             const boot = report.enclave_config.boot_measurements;
             const githubStatus = document.getElementById('githubCheck');
