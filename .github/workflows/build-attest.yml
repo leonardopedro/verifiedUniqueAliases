@@ -27,18 +27,16 @@ jobs:
           docker rm $CONTAINER_ID
 
       - name: Attest disk.tar.gz
-        uses: actions/attest@v2
+        uses: actions/attest-build-provenance@v2
         with:
           subject-name: VM disk image
           subject-path: disk.tar.gz
-          push-to-blob: false
 
       - name: Attest initramfs
-        uses: actions/attest@v2
+        uses: actions/attest-build-provenance@v2
         with:
           subject-name: initramfs image
           subject-path: initramfs.img
-          push-to-blob: false
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
