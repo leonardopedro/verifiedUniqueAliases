@@ -1358,7 +1358,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v82-master",
+            "version": "v83-master",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
@@ -1680,6 +1680,27 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     enclave_init::load_drivers();
     // 3. Finally measure boot components
     let boot_manifest = enclave_init::measure_boot_components();
+    
+    // 4. Anchor manifest in PCR 15 for the auditor
+    {
+        use sha2::{Digest, Sha256};
+        let mut sorted_manifest: Vec<_> = boot_manifest.iter().collect();
+        sorted_manifest.sort_by_key(|(k, _)| *k);
+        let manifest_json = serde_json::to_string(&sorted_manifest).unwrap_or_default();
+        let manifest_hash = Sha256::digest(manifest_json.as_bytes());
+        let hash_hex = hex::encode(manifest_hash);
+        
+        kmsg(&format!("Anchoring manifest ({} files) in PCR 15: {}", boot_manifest.len(), hash_hex));
+        let _ = std::process::Command::new("tpm2_pcrextend")
+            .args(["15:sha256=".to_string() + &hash_hex])
+            .status();
+    }
+
+    if std::path::Path::new("/dev/sev-guest").exists() {
+        kmsg("Hardware interface /dev/sev-guest is PRESENT (likely built-in)");
+    } else {
+        kmsg("Hardware interface /dev/sev-guest is MISSING");
+    }
 
     // 2. Initialize the Tokio runtime now that the environment is sane
     let rt = tokio::runtime::Builder::new_multi_thread()
