@@ -381,13 +381,19 @@
                 const data = await resp.json();
                 if (!data.attestations || data.attestations.length === 0) return { success: false, name };
                 
-                // Extract Build Run ID from DSSE payload
+                // Extract Build Run ID from DSSE payload (SLSA Predicate)
                 let runId = "Unknown";
                 try {
                     const bundle = data.attestations[0].bundle;
                     const payload = JSON.parse(atob(bundle.dsseEnvelope ? bundle.dsseEnvelope.payload : bundle.payload));
-                    runId = payload.invocation.uri || "External";
-                } catch(e) {}
+                    // Try multiple SLSA / GitHub paths
+                    runId = (payload.invocation && payload.invocation.metadata && payload.invocation.metadata.id) ||
+                            (payload.invocation && payload.invocation.uri) ||
+                            (payload.buildConfig && payload.buildConfig.env && payload.buildConfig.env.GITHUB_RUN_ID) ||
+                            "External";
+                } catch(e) {
+                    console.warn(`Failed to parse attestation payload for ${name}:`, e);
+                }
 
                 return { success: true, name, runId };
             }
@@ -417,9 +423,14 @@
                 const consistent = (bin.runId === ker.runId && ker.runId === init.runId && ker.runId === cfg.runId);
                 results.push(consistent ? `✅ Image Atomicity: All components from Run #${bin.runId.split('/').pop()}` : `❌ Image Atomicity: COMPONENTS FROM DIFFERENT BUILDS`);
 
-                // 3. Hardware Bind Check
-                const hardwareMatch = (pcrValues["15"] === boot.binary_sha256);
-                results.push(hardwareMatch ? "✅ Hardware: PCR 15 bound to Binary" : "❌ Hardware: PCR 15 MISMATCH");
+                // 3. Hardware Bind Check (v83: PCR 15 is the manifest anchor)
+                const manifestSorted = Object.entries(manifest).sort((a,b) => a[0].localeCompare(b[0]));
+                const manifestJson = JSON.stringify(manifestSorted);
+                const manifestHashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(manifestJson));
+                const manifestHash = Array.from(new Uint8Array(manifestHashBuffer)).map(b => b.toString(16).padStart(2,'0')).join('');
+                
+                const hardwareMatch = (pcrValues["15"] === manifestHash);
+                results.push(hardwareMatch ? "✅ Hardware: PCR 15 bound to Manifest Anchor" : `❌ Hardware: PCR 15 MISMATCH (Got: ${pcrValues["15"] ? pcrValues["15"].substring(0,8) : 'N/A'}...)`);
 
                 const allOk = bin.success && ker.success && init.success && cfg.success && hardwareMatch && consistent;
                 updateStatus('githubCheck', allOk);
