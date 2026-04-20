@@ -53,7 +53,7 @@ RUN echo 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/20260406T0
 RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends \
     curl ca-certificates gcc g++ make pkg-config libssl-dev \
     cpio xz-utils zstd qemu-utils mtools gdisk binutils initramfs-tools \
-    linux-image-amd64 shim-signed grub-efi-amd64-signed \
+    linux-image-cloud-amd64 shim-signed grub-efi-amd64-signed \
     tpm2-tools iproute2 kmod python3 file dosfstools bash \
     && rm -rf /var/lib/apt/lists/*
 

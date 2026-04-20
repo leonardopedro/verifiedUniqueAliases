@@ -24,8 +24,8 @@ mkdir -p "$OUTPUT_DIR"
 rm -rf "$STAGING_DIR"
 mkdir -p "$STAGING_DIR"
 
-# In Debian, the kernel is in /boot/vmlinuz-*-amd64
-KERNEL_FILE=$(ls /boot/vmlinuz-*-amd64 | sort -V | tail -n 1)
+# In Debian, the kernel is in /boot/vmlinuz-*-amd64 or /boot/vmlinuz-*-cloud-amd64
+KERNEL_FILE=$(ls /boot/vmlinuz-*amd64 | sort -V | tail -n 1)
 # The modules are in /lib/modules/
 KERNEL_VERSION=$(basename "$KERNEL_FILE" | sed 's/vmlinuz-//')
 echo "🔍 Using kernel version: $KERNEL_VERSION"
