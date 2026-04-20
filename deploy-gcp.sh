@@ -93,7 +93,56 @@ gcloud compute images create ${IMAGE_NAME} \
     --storage-location=${REGION} \
     --quiet
 
-# --- Phase 5: Launching the Confidential VM ---
+# --- Phase 5.5: VPC Network Hardening (Egress Rules) ---
+echo ""
+echo "🛡️  [2.5/3] Hardening VPC Egress (Deny-by-Default)..."
+# 1. Deny all egress for hardened enclaves
+gcloud compute firewall-rules create enclave-egress-deny-all \
+    --project=${PROJECT_ID} \
+    --direction=EGRESS \
+    --priority=65000 \
+    --action=DENY \
+    --rules=all \
+    --destination-ranges=0.0.0.0/0 \
+    --target-tags=egress-hardened \
+    --quiet 2>/dev/null || true
+
+# 2. Allow DNS to Google Metadata Server
+gcloud compute firewall-rules create enclave-egress-allow-dns \
+    --project=${PROJECT_ID} \
+    --direction=EGRESS \
+    --priority=1000 \
+    --action=ALLOW \
+    --rules=udp:53,tcp:53 \
+    --destination-ranges=169.254.169.254/32 \
+    --target-tags=egress-hardened \
+    --quiet 2>/dev/null || true
+
+# 3. Allow Google Metadata Server (for secrets/token retrieval)
+gcloud compute firewall-rules create enclave-egress-allow-metadata \
+    --project=${PROJECT_ID} \
+    --direction=EGRESS \
+    --priority=1000 \
+    --action=ALLOW \
+    --rules=tcp:80 \
+    --destination-ranges=169.254.169.254/32 \
+    --target-tags=egress-hardened \
+    --quiet 2>/dev/null || true
+
+# 4. Allow HTTPS Egress (PayPal, Google CA)
+# Note: In a high-security env without Google Cloud Firewall Plus, we allow 443 
+# but restrict it to the egress-hardened instances.
+gcloud compute firewall-rules create enclave-egress-allow-https \
+    --project=${PROJECT_ID} \
+    --direction=EGRESS \
+    --priority=1000 \
+    --action=ALLOW \
+    --rules=tcp:443 \
+    --destination-ranges=0.0.0.0/0 \
+    --target-tags=egress-hardened \
+    --quiet 2>/dev/null || true
+
+# --- Phase 6: Launching the Confidential VM ---
 echo ""
 echo "🔒 [3/3] Launching Confidential VM..."
 echo "Releasing Static IP ($STATIC_IP) from any previous instances..."
@@ -105,7 +154,7 @@ if [ -n "$OLD_INSTANCE" ]; then
 else
     echo "No existing instances found holding IP $STATIC_IP."
 fi
-echo "Provisioning AMD SEV-SNP Enclave..."
+echo "Provisioning AMD SEV-SNP Enclave (Spot n2d-highcpu-2, Netherlands)..."
 # We explicitly set the TLS_CACHE_SECRET tee-env attribute so the service knows where to find/store the sealed DEK
 gcloud compute instances create ${VM_NAME} \
     --project=${PROJECT_ID} \
