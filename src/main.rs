@@ -45,9 +45,44 @@ mod enclave_init {
         modprobe("vfat");
         modprobe("nls_cp437");
         modprobe("nls_ascii");
+
+        // v116: Strict Kernel Egress Filtering via nftables
+        modprobe("nf_tables");
+        modprobe("nft_chain_filter_ipv4");
+        modprobe("nft_reject_ipv4");
+        modprobe("nft_limit");
         
         // Ensure configfs is mounted for TSM
         let _ = std::process::Command::new("mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
+    }
+
+    pub fn setup_firewall() {
+        kmsg("Initializing hardened egress firewall (nftables)...");
+        let commands = [
+            "flush ruleset",
+            "add table inet filter",
+            "add chain inet filter input { type filter hook input priority 0; policy drop; }",
+            "add chain inet filter output { type filter hook output priority 0; policy drop; }",
+            "add chain inet filter forward { type filter hook forward priority 0; policy drop; }",
+            "add rule inet filter input iif lo accept",
+            "add rule inet filter output oif lo accept",
+            "add rule inet filter input ct state established,related accept",
+            "add rule inet filter output ct state established,related accept",
+            "add rule inet filter input tcp dport { 80, 443 } accept",
+            "add rule inet filter output udp dport 53 accept",
+            "add rule inet filter output tcp dport 53 accept",
+            "add rule inet filter output ip daddr 169.254.169.254 accept",
+            "add rule inet filter output tcp dport 443 accept",
+        ];
+
+        for cmd in commands {
+            let status = std::process::Command::new("nft")
+                .arg(cmd)
+                .status();
+            if let Err(e) = status {
+                kmsg(&format!("Failed to execute nft command '{}': {}", cmd, e));
+            }
+        }
     }
 
     pub fn mount_filesystems() {
@@ -1766,6 +1801,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .build()?;
 
     // 3. Configure network (DHCP) from within the async runtime
+    enclave_init::setup_firewall();
     rt.block_on(async {
         if let Err(e) = enclave_init::configure_network().await {
             eprintln!("[FATAL] Network config failed: {}", e);

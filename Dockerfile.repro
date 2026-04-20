@@ -54,7 +54,7 @@ RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --n
     curl ca-certificates gcc g++ make pkg-config libssl-dev \
     cpio xz-utils zstd qemu-utils mtools gdisk binutils initramfs-tools \
     linux-image-cloud-amd64 shim-signed grub-efi-amd64-signed \
-    tpm2-tools iproute2 kmod python3 file dosfstools bash \
+    tpm2-tools iproute2 kmod python3 file dosfstools bash nftables \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
