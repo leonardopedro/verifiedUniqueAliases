@@ -107,10 +107,20 @@
         </div>
 
         <div class="links-grid">
-            <a href="verify.html" class="card">
-                <h3>🔍 Hardware Auditor</h3>
-                <p>Verify your attestation report against the AMD silicon root of trust.</p>
+            <div class="card" style="grid-column: 1 / -1; border-color: var(--accent);">
+                <h3>✅ Hardware Auditor (Recommended: Local Execution)</h3>
+                <p>For maximum security and to avoid any remote execution risks, it is highly recommended to download the auditor to your local machine and open it in your browser.</p>
+                <div style="margin-top: 15px;">
+                    <a href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/refs/heads/main/verify.html" class="btn" target="_blank" style="display:inline-block; padding: 8px 16px; background:var(--accent); color:white; text-decoration:none; border-radius:4px; font-weight:bold;">Download verify.html</a>
+                    <span style="font-size: 0.85rem; color: var(--text-dim); margin-left: 10px;">(Right-click link and choose "Save Link As...", then open the file locally)</span>
+                </div>
+            </div>
+
+            <a href="verify.html" class="card" style="border-color: #d29922;">
+                <h3 style="color: #d29922;">⚠️ Web Auditor (Less Safe)</h3>
+                <p>Run the auditor directly on GitHub Pages. Note: Execution on a hosted domain is theoretically susceptible to XSS or DNS hijacking.</p>
             </a>
+            
             <a href="https://github.com/leonardopedro/verifiedUniqueAliases" target="_blank" class="card">
                 <h3>🐙 Source Code</h3>
                 <p>Inspect the bitwise-reproducible Rust enclave and synthesis engine.</p>
