@@ -221,32 +221,11 @@ fi
 KERNEL_VER=$(ls -1 ./usr/lib/modules 2>/dev/null | head -1 || true)
 if [ -n "$KERNEL_VER" ] && [ -d "./usr/lib/modules/$KERNEL_VER" ]; then
     echo "🗜️  Decompressing critical kernel modules for insmod..."
-    for zst_mod in \
-        "./usr/lib/modules/$KERNEL_VER/kernel/drivers/net/ethernet/google/gve/gve.ko.zst" \
-        "./usr/lib/modules/$KERNEL_VER/kernel/drivers/virtio/virtio_pci.ko.zst" \
-        "./usr/lib/modules/$KERNEL_VER/kernel/drivers/virtio/virtio.ko.zst" \
-        "./usr/lib/modules/$KERNEL_VER/kernel/net/core/virtio_net.ko.zst"; do
-        if [ -f "$zst_mod" ]; then
-            ko_out="${zst_mod%.zst}"
-            echo "  decompressing $(basename "$zst_mod") → $(basename "$ko_out")"
-            zstd -d -f "$zst_mod" -o "$ko_out" 2>/dev/null || true
-        fi
-    done
-
-    # Also search for any other .ko.zst in the gve and virtio directories
-    # and decompress them (dependencies of gve like gve_drv if present)
-    for dir in \
-        "./usr/lib/modules/$KERNEL_VER/kernel/drivers/net/ethernet/google/gve" \
-        "./usr/lib/modules/$KERNEL_VER/kernel/drivers/virtio"; do
-        if [ -d "$dir" ]; then
-            for zst in "$dir"/*.ko.zst; do
-                [ -f "$zst" ] || continue
-                ko_out="${zst%.zst}"
-                [ -f "$ko_out" ] && continue  # already decompressed
-                echo "  decompressing $(basename "$zst")"
-                zstd -d -f "$zst" -o "$ko_out" 2>/dev/null || true
-            done
-        fi
+    # Robustly find gve and virtio modules even if paths differ in cloud-kernel
+    find ./usr/lib/modules/"$KERNEL_VER" -name "gve.ko.zst" -o -name "virtio_net.ko.zst" -o -name "virtio_pci.ko.zst" -o -name "virtio.ko.zst" | while read -r zst_mod; do
+        ko_out="${zst_mod%.zst}"
+        echo "  decompressing $(basename "$zst_mod")"
+        zstd -d -f "$zst_mod" -o "$ko_out" 2>/dev/null || true
     done
 
     # Generate module dependency data now that .ko files exist
@@ -255,6 +234,9 @@ if [ -n "$KERNEL_VER" ] && [ -d "./usr/lib/modules/$KERNEL_VER" ]; then
         depmod -b . "$KERNEL_VER" 2>/dev/null || true
     fi
 fi
+
+echo "  Adding libgcc_s.so.1..."
+copy_bin_and_deps "libgcc_s.so.1"
 
 # Normalize ELF binaries and shared libraries with add-det before repacking
 if command -v add-det > /dev/null; then
