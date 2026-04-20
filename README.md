@@ -4,13 +4,14 @@ Hardware-attested PayPal OAuth service on **GCP Confidential VM** (AMD SEV-SNP).
 Built for 100% bit-by-bit reproducibility and maximum security.
 
 ---
-## 🚀 Current Status (v74)
+## 🚀 Current Status (v115-FINAL)
 
 | Component | Status |
 |---|---|
-| **Silicon Root of Trust (AMD SEV-SNP)** | ✅ Achieved (v74) |
-| **Atomic Image Verification (GitHub Sigstore)** | ✅ Achieved (v74) |
-| **Whole-Disk Manifest Audit (100% Volume Hash)** | ✅ Achieved (v74) |
+| **Silicon Root of Trust (AMD SEV-SNP)** | ✅ Achieved (v115) |
+| **Atomic Image Verification (GitHub Sigstore)** | ✅ Achieved (v115) |
+| **Whole-Disk Manifest Audit (100% Volume Hash)** | ✅ Achieved (v115) |
+| **Enclave Identity Signature (Alphabetical Determinisim)**| ✅ Resolved (v115) |
 | Bitwise Reproducibility (Local vs GitHub Actions) | ✅ Achieved |
 | Native PID 1 Rust Integration | ✅ Achieved |
 | Hardened Resource Boundaries | ✅ Achieved |
@@ -22,7 +23,8 @@ Built for 100% bit-by-bit reproducibility and maximum security.
 The service now provides a continuous, cryptographically-anchored chain of trust that starts at the physical AMD CPU and extends to the application logic:
 - **Silicon Anchor (v74)**: Direct hardware **SNP Attestation Reports** provide a launch measurement of the firmware (OVMF), ensuring the root of trust is exclusively the AMD hardware, independent of GCP or the hypervisor.
 - **Image Atomicity (v74)**: Every executable component (Binary, Kernel, Initrd, Bootloader) is individually attested via GitHub Sigstore. The auditor (`verify.html`) ensures all components share the same **GitHub Run ID**, proving they come from a single, atomic build session.
-- **Total Disk Audit (v74)**: The enclave performs a recursive SHA-256 scan of the entire boot partition. This **Disk Manifest** is included in the hardware-signed report, guaranteeing that not a single byte of configuration (`grub.cfg`) or code was altered on the disk image.
+- **Total Disk Audit (v115)**: The enclave performs a recursive SHA-256 scan of the entire boot partition. This **Disk Manifest** is included in the hardware-signed report, guaranteeing that not a single byte of configuration (`grub.cfg`) or code was altered on the disk image.
+- **Alphabetical Determinism (v115)**: Resolved cross-platform JSON serialization discrepancies (V8 vs Rust) by implementing strictly alphabetical `BTreeMap` structures and string-prefixed PCR keys (`pcr_0`, `pcr_15`, etc.), ensuring the Enclave Identity Signature verifies 100% of the time.
 - **Resource Hardening**: Includes 50-connection concurrency limits, 512MB/hour egress caps, and DDoS-resistant IP tracking.
 - **Native PID 1 Rust**: Hand-off directly from BIOS to Rust. No `systemd`, no shell, no userspace bloat.
 

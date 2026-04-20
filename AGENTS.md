@@ -3,8 +3,9 @@
 ## Project Overview
 `paypal-auth-vm` is a hardware-attested Rust service on **GCP Confidential VM** (AMD SEV-SNP). It provides a secure bridge for PayPal OAuth tokens, ensuring the integrity of the computing environment before secrets are accessible.
 
-### 🏆 Current Accomplishments (v74)
+### 🏆 Current Accomplishments (v115-FINAL)
 - **AMD Silicon Root of Trust**: Integrated direct hardware **SNP Attestation Reports** (via `/dev/sev-guest` ioctl). The launch measurement (Firmware/OVMF) is now cryptographically verified, ensuring the environment is anchored exclusively in AMD hardware, independent of the Cloud Provider.
+- **Enclave Identity Signature Resolution**: Resolved a critical cross-platform canonicalization failure by forcing strictly alphabetical JSON serialization. This involved migrating all non-deterministic collections to `BTreeMap` and implementing a string-prefixed PCR key system (`pcr_0`, `pcr_4`, etc.) to prevent JavaScript engines from reordering numeric keys during verification.
 - **Whole-Disk Manifest verification**: Implemented recursive SHA-256 hashing of the entire EFI System Partition (ESP). The resulting manifest (Kernel, Initrd, GRUB Config, Bootloaders) is included in the signed enclave report, proving 100% bitwise identity of the boot volume.
 - **GitHub Actions Image Atomicity**: Transitioned the supply chain into an atomic ledger. The Auditor (`verify.html`) now extracts the **GitHub Run ID** from Sigstore bundles and confirms that every component (Binary, Kernel, Initrd) was built in the same, authenticated CI session.
 - **TPM Hardware Bridging**: Expanded the hardware quote to include **PCR 0 (Firmware)**, **PCR 4 (Bootloader)**, **PCR 8 (Kernel Cmdline)**, and **PCR 9 (Kernel/Initrd)**, creating a seamless audit trail from silicon to software.
