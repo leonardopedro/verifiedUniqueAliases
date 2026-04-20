@@ -169,7 +169,7 @@ gcloud compute instances create ${VM_NAME} \
     --machine-type=n2d-highcpu-2 \
     --confidential-compute-type=SEV_SNP \
     --provisioning-model=SPOT \
-    --instance-termination-action=DELETE \
+    --instance-termination-action=STOP \
     --maintenance-policy=TERMINATE \
     --image=${IMAGE_NAME} \
     --service-account=${SERVICE_ACCOUNT} \
