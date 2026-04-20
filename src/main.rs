@@ -584,7 +584,7 @@ mod tpm {
                     let idx = parts[0].trim_matches(|c: char| !c.is_numeric()).to_string();
                     let val = parts[1].trim().to_string();
                     if !idx.is_empty() && !val.is_empty() {
-                        pcr_values.insert(idx, val);
+                        pcr_values.insert(format!("pcr_{}", idx), val);
                     }
                 }
             }
@@ -1406,7 +1406,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v114-DEBUG",
+            "version": "v115-FINAL",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },

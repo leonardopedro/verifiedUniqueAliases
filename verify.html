@@ -344,8 +344,18 @@
             // v71: Enclave signs alphabetical JSON for dynamic fields
             const signedReport = reorder(report);
             const payloadCompact = JSON.stringify(signedReport);
-            console.log("DEBUG: Signature Payload Base:", payloadCompact);
-            let sigOk = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', publicKey, signature, new TextEncoder().encode(payloadCompact));
+            console.log("DEBUG: Signature Payload Base (Auditor):", payloadCompact);
+            console.log("DEBUG: Payload Length:", payloadCompact.length);
+            
+            const encoder = new TextEncoder();
+            const encodedPayload = encoder.encode(payloadCompact);
+            
+            let sigOk = await crypto.subtle.verify(
+                { name: 'RSASSA-PKCS1-v1_5' }, 
+                publicKey, 
+                signature, 
+                encodedPayload
+            );
             
             if (!sigOk) {
                 // Debug log for identifying serialization mismatches
@@ -442,7 +452,7 @@
                 const expectedPcrBuffer = await crypto.subtle.digest('SHA-256', combined);
                 const expectedPcr15 = Array.from(new Uint8Array(expectedPcrBuffer)).map(b => b.toString(16).padStart(2,'0')).join('');
                 
-                const pcr15_raw = pcrValues["15"] || "";
+                const pcr15_raw = pcrValues["pcr_15"] || "";
                 const pcr15_clean = pcr15_raw.replace(/^0x/i, '').toLowerCase();
 
                 const hardwareMatch = (pcr15_clean === expectedPcr15) && (expectedPcr15.length > 0);
@@ -463,7 +473,7 @@
                     const measurementHex = Array.from(reportBytes.slice(144, 144 + 48))
                         .map(b => b.toString(16).padStart(2, '0')).join('');
                     
-                    const pcr0_raw = pcrValues["0"] || "N/A";
+                    const pcr0_raw = pcrValues["pcr_0"] || "N/A";
                     const pcr0 = pcr0_raw.replace(/^0x/i, '').toLowerCase();
                     // PCR 0 matches the firmware measurement on genuine Confidential Space
                     const firmwareOk = (pcr0 !== "0000000000000000000000000000000000000000000000000000000000000000") && pcr0.length > 0;
