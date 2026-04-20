@@ -82,9 +82,9 @@ mod enclave_init {
         kmsg("Filesystems mounted");
     }
 
-    pub fn measure_boot_components() -> BTreeMap<String, String> {
+    pub fn measure_boot_components() -> std::collections::BTreeMap<String, String> {
         use sha2::{Digest, Sha256};
-        let mut manifest = BTreeMap::new();
+        let mut manifest = std::collections::BTreeMap::new();
         
         let mount_point = "/tmp/esp";
         let _ = std::fs::create_dir_all(mount_point);
@@ -124,7 +124,7 @@ mod enclave_init {
             kmsg("CRITICAL: Failed to mount EFI System Partition after scanning all devices!");
         }
 
-        fn hash_recursive(dir: &str, mount_point: &str, manifest: &mut BTreeMap<String, String>) {
+        fn hash_recursive(dir: &str, mount_point: &str, manifest: &mut std::collections::BTreeMap<String, String>) {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.filter_map(|e| e.ok()) {
                     let path = entry.path();
@@ -1406,7 +1406,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v105-FINAL",
+            "version": "v106-FINAL",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
