@@ -46,6 +46,12 @@ echo "sev-guest" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "vfat" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "nls_cp437" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "nls_ascii" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "nf_tables" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "nft_chain_filter" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "nft_reject_ipv4" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "nft_limit" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "nf_conntrack" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "nft_ct" | tee -a /etc/initramfs-tools/modules >/dev/null
 
 echo "🔨 Generating base mkinitramfs..."
 BASE_IMG="/tmp/base-initrd.img"
@@ -222,8 +228,8 @@ fi
 KERNEL_VER=$(ls -1 ./usr/lib/modules 2>/dev/null | head -1 || true)
 if [ -n "$KERNEL_VER" ] && [ -d "./usr/lib/modules/$KERNEL_VER" ]; then
     echo "🗜️  Decompressing critical kernel modules for insmod..."
-    # Robustly find gve and virtio modules even if paths differ in cloud-kernel
-    find ./usr/lib/modules/"$KERNEL_VER" -name "gve.ko.zst" -o -name "virtio_net.ko.zst" -o -name "virtio_pci.ko.zst" -o -name "virtio.ko.zst" | while read -r zst_mod; do
+    # Robustly find ALL modules in the initramfs and decompress them
+    find ./usr/lib/modules/"$KERNEL_VER" -name "*.ko.zst" | while read -r zst_mod; do
         ko_out="${zst_mod%.zst}"
         echo "  decompressing $(basename "$zst_mod")"
         zstd -d -f "$zst_mod" -o "$ko_out" 2>/dev/null || true

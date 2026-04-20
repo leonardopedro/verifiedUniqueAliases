@@ -47,8 +47,10 @@ mod enclave_init {
         modprobe("nls_ascii");
 
         // v116: Strict Kernel Egress Filtering via nftables
+        modprobe("nf_conntrack");
+        modprobe("nft_ct");
         modprobe("nf_tables");
-        modprobe("nft_chain_filter_ipv4");
+        modprobe("nft_chain_filter");
         modprobe("nft_reject_ipv4");
         modprobe("nft_limit");
         
@@ -76,7 +78,7 @@ mod enclave_init {
         ];
 
         for cmd in commands {
-            let status = std::process::Command::new("nft")
+            let status = std::process::Command::new("/usr/sbin/nft")
                 .arg(cmd)
                 .status();
             if let Err(e) = status {
