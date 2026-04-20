@@ -764,6 +764,11 @@ const HTML_TEMPLATE: &str = r#"
         .footer a { color: #64b5f6; text-decoration: none; margin: 0 10px; }
         .document-content h2 { color: #64b5f6; margin-top: 25px; border-bottom: 1px solid #333; padding-bottom: 5px; }
         .document-content p { line-height: 1.6; }
+        .links-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 40px; }
+        .card { background: rgba(255,255,255,0.02); padding: 24px; border-radius: 8px; border: 1px solid #30363d; text-decoration: none; color: #c9d1d9; display: block; font-family: system-ui, -apple-system, sans-serif; }
+        .card:hover { border-color: #58a6ff; }
+        .card h3 { margin: 0 0 10px 0; color: #58a6ff; }
+        .card p { margin: 0; font-size: 0.9rem; }
     </style>
 </head>
 <body><div class="container">{{CONTENT}}</div></body></html>
@@ -1711,10 +1716,25 @@ async fn generate_cert(
             <p><strong>Hashed & Signed Evidence:</strong></p>
             <pre id="raw_report">{}</pre>
         </div>
-        <div style="margin-top: 20px;">
-            <button onclick="downloadReport()" class="btn" style="background:#4caf50; margin-right: 10px;">Download Report (.json)</button>
-            <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" target="_blank" class="btn" style="background:#2196f3; margin-right: 10px;">Verify on Official GitHub Auditor</a>
-            <a href="/" class="btn" style="background: #333;">Back</a>
+        <div class="links-grid">
+            <div class="card" style="grid-column: 1 / -1; border-color: #4caf50;">
+                <h3 style="color: #4caf50;">✅ Download Attestation & Auditor (Recommended)</h3>
+                <p>For maximum security, download both your generated report and the auditor file, then verify locally.</p>
+                <div style="margin-top: 15px;">
+                    <button onclick="downloadReport()" class="btn" style="background:#4caf50; margin-right: 10px; font-family: inherit;">Download Report (.json)</button>
+                    <a href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/refs/heads/main/verify.html" class="btn" target="_blank" style="background:#238636; margin-right: 10px; font-family: inherit;">Download Auditor (.html)</a>
+                    <span style="font-size: 0.85rem; color: #888;">(Right-click the second link and choose "Save Link As...")</span>
+                </div>
+            </div>
+
+            <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" target="_blank" class="card" style="border-color: #d29922;">
+                <h3 style="color: #d29922;">⚠️ Web Auditor (Less Safe)</h3>
+                <p>Verify your generated JSON directly on the hosted GitHub Pages domain.</p>
+            </a>
+            
+            <a href="/" class="card" style="border-color: #30363d; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center;">
+                <h3 style="color: #c9d1d9;">Return Home</h3>
+            </a>
         </div>
 
         <script>
