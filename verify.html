@@ -481,9 +481,9 @@
                     updateStatus('firmwareCheck', firmwareOk);
                     snpDesc.innerHTML = `
                         <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; margin-top: 8px; color: #7ee787;">
-                            SNP Launch Measurement (SHA-384):<br>
+                            SNP Silicon Audit (Direct Hardware Report):<br>
                             <span style="word-break: break-all; background: #0d1117; padding: 4px; border-radius: 4px; display: block; margin: 4px 0;">${measurementHex}</span>
-                            Firmware PCR 0: <span style="color: #8b949e;">${pcr0.substring(0,32)}...</span>
+                            Firmware PCR 0: <span style="color: #8b949e; word-break: break-all;">${pcr0}</span>
                         </div>
                         </p>
                         ${report.enclave_config && report.enclave_config.version ? `
