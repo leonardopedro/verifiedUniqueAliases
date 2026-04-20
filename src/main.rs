@@ -70,6 +70,7 @@ mod enclave_init {
         mount_fs("sysfs",    "/sys",  "sysfs");
         mount_fs("tmpfs",    "/tmp",  "tmpfs");
         mount_fs("tmpfs",    "/run",  "tmpfs");
+        mount_fs("configfs", "/sys/kernel/config", "configfs");
         std::fs::create_dir_all("/dev/pts").ok();
 
         // 9. Mount EFI partition to measure the boot chain
@@ -372,7 +373,7 @@ use std::net::IpAddr;
 
 mod tpm {
     use tokio::process::Command;
-    use tracing::{error, info};
+    use tracing::{error, info, debug};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde::{Deserialize, Serialize};
 
@@ -611,14 +612,26 @@ mod tpm {
                 Some(report)
             },
             None => {
-                info!("TSM ConfigFS failed, falling back to NVRAM 0x01400001...");
-                match run_cmd("tpm2", &["nvread", "0x01400001", "-C", "o"]).await {
-                    Ok(data) if !data.is_empty() => Some(STANDARD.encode(data)),
-                    Ok(_) => { info!("TPM nvread 0x01400001 returned EMPTY"); None },
-                    Err(e) => {
-                        error!("TPM nvread 0x01400001 FAILED: {}", e);
-                        None
+                info!("TSM ConfigFS failed, trying NVRAM fallback handles...");
+                // Strategy: Try common GCP indices
+                let indices = ["0x01400001", "0x01c00002", "0x01c00001"];
+                let mut data = vec![];
+                for idx in &indices {
+                    match run_cmd("tpm2", &["nvread", idx, "-C", "o"]).await {
+                        Ok(d) if !d.is_empty() => {
+                            info!("Obtained hardware report from NVRAM index {}", idx);
+                            data = d;
+                            break;
+                        },
+                        _ => { debug!("Index {} not found or empty", idx); }
                     }
+                }
+                
+                if !data.is_empty() {
+                    Some(STANDARD.encode(data))
+                } else {
+                    error!("All hardware report strategies failed.");
+                    None
                 }
             }
         };
@@ -1388,7 +1401,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v100-PROD",
+            "version": "v101-PROD",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
@@ -1399,7 +1412,6 @@ async fn generate_attestation(
             },
             "enclave_debug": {
                 "manifest_size": state.boot_manifest.len(),
-                "kernel_log_tail": if let Ok(log) = std::fs::read_to_string("/dev/kmsg") { log.chars().rev().take(1000).collect::<String>().chars().rev().collect::<String>() } else { "LOG_UNREADABLE".to_string() }
             }
         },
         "session_context": {
