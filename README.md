@@ -4,10 +4,13 @@ Hardware-attested PayPal OAuth service on **GCP Confidential VM** (AMD SEV-SNP).
 Built for 100% bit-by-bit reproducibility and maximum security.
 
 ---
-## 🚀 Current Status (v115-FINAL)
+## 🚀 Current Status (v116-PROD)
 
 | Component | Status |
 |---|---|
+| **Decentralized Hub & Static Frontend** | ✅ Achieved (v116) |
+| **Custom Attestation Nonce Injection** | ✅ Achieved (v116) |
+| **Kernel Egress Firewalling (nftables)** | ✅ Achieved (v116) |
 | **Silicon Root of Trust (AMD SEV-SNP)** | ✅ Achieved (v115) |
 | **Atomic Image Verification (GitHub Sigstore)** | ✅ Achieved (v115) |
 | **Whole-Disk Manifest Audit (100% Volume Hash)** | ✅ Achieved (v115) |
@@ -21,6 +24,9 @@ Built for 100% bit-by-bit reproducibility and maximum security.
 
 ### Architectural Breakthrough: Silicon-to-App Verifiable Chain
 The service now provides a continuous, cryptographically-anchored chain of trust that starts at the physical AMD CPU and extends to the application logic:
+- **Decentralized Transparency (v116)**: Web Auditor and legal policies decoupled from the enclave and hosted natively on GitHub Pages to eliminate web-vector attack surfaces.
+- **Custom Hardware Binding (v116)**: Supports 2-phase secure session processing allowing users to inject a custom, cryptographically-bound nonce strictly mapped to their verified PayPal identity.
+- **Kernel-Level Dropping (v116)**: Zero-trust `nftables` baseline directly in `PID 1` guaranteeing network isolation beyond VPC semantics.
 - **Silicon Anchor (v74)**: Direct hardware **SNP Attestation Reports** provide a launch measurement of the firmware (OVMF), ensuring the root of trust is exclusively the AMD hardware, independent of GCP or the hypervisor.
 - **Image Atomicity (v74)**: Every executable component (Binary, Kernel, Initrd, Bootloader) is individually attested via GitHub Sigstore. The auditor (`verify.html`) ensures all components share the same **GitHub Run ID**, proving they come from a single, atomic build session.
 - **Total Disk Audit (v115)**: The enclave performs a recursive SHA-256 scan of the entire boot partition. This **Disk Manifest** is included in the hardware-signed report, guaranteeing that not a single byte of configuration (`grub.cfg`) or code was altered on the disk image.

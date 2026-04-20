@@ -816,9 +816,9 @@ struct AppState {
     ip_stats: Arc<RwLock<std::collections::BTreeMap<IpAddr, u64>>>,
     global_egress_bytes: Arc<AtomicU64>,
     last_limit_reset: Arc<RwLock<Instant>>,
-    // v71: Concurrency Control
     connection_semaphore: Arc<Semaphore>,
     boot_manifest: BTreeMap<String, String>,
+    pending_attestations: Arc<RwLock<std::collections::HashMap<String, (String, PayPalUserInfo)>>>,
 }
 
 struct PayPalFlowConfig {
@@ -1368,6 +1368,7 @@ async fn generate_attestation(
     state: &AppState,
     clicked_button_label: String,
     userinfo: PayPalUserInfo,
+    custom_info: Option<String>,
 ) -> String {
     use sha2::{Digest, Sha256};
     
@@ -1422,6 +1423,7 @@ async fn generate_attestation(
             "clicked_button_label": clicked_button_label,
             "tls_certificate_pem": &cert_pem,
         },
+        "custom_info": custom_info.unwrap_or_else(|| "NONE".to_string()),
         "hardware_level_attestation": tpm_val,
     });
 
@@ -1622,16 +1624,82 @@ async fn callback(
         ).into_response();
     }
 
-    let attestation = generate_attestation(&state, config.label.clone(), userinfo.clone()).await;
+    // v116-PROD: Multi-step attestation feature mapping PayPal profile to custom nonce before generation.
+    use rand::Rng;
+    let session_id: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
 
-    // Show all userinfo data as formatted JSON
-    let userinfo_full_json = serde_json::to_string_pretty(&userinfo).unwrap();
+    state.pending_attestations.write().insert(session_id.clone(), (config.label.clone(), userinfo.clone()));
 
     let html = HTML_TEMPLATE.replace(
         "{{CONTENT}}",
         &format!(
             r#"
         <h1>Authentication Successful</h1>
+        <div class="info">
+            <h3>Verified PayPal Profile Linked</h3>
+            <p>Your PayPal identity has been successfully secured in RAM. You may now generate your one-time Hardware Attestation Certificate.</p>
+        </div>
+        <div class="info" style="border-color: #2196f3;">
+            <h3>Optional: Attach Custom Data</h3>
+            <p>You may optionally attach a custom string (e.g. a Wallet Address, a nonce, or a public key) strictly bound to this attestation report.</p>
+            <form action="/generate" method="POST">
+                <input type="hidden" name="session_id" value="{}">
+                <input type="text" name="custom_info" placeholder="Enter custom data here..." style="width: 100%; padding: 12px; margin-bottom: 20px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;" maxlength="512">
+                <button type="submit" class="btn" style="background:#4caf50; width: 100%;">Generate Certificate (One-Time)</button>
+            </form>
+        </div>
+        "#,
+            session_id
+        ),
+    );
+    
+    if let Err(status) = state.record_egress_data(addr.ip(), html.len() as u64) {
+        return status.into_response();
+    }
+
+    Html(html).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct GenerateCertForm {
+    session_id: String,
+    custom_info: String,
+}
+
+async fn generate_cert(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+    axum::extract::Form(form): axum::extract::Form<GenerateCertForm>,
+) -> Response {
+    let pending = state.pending_attestations.write().remove(&form.session_id);
+    let (label, userinfo) = match pending {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::FORBIDDEN,
+                "Invalid Session ID or Certificate already generated. You may only generate the certificate once per PayPal authentication.",
+            ).into_response();
+        }
+    };
+
+    let custom_info = if form.custom_info.trim().is_empty() {
+        None
+    } else {
+        Some(form.custom_info.clone())
+    };
+
+    let attestation = generate_attestation(&state, label, userinfo.clone(), custom_info).await;
+    let userinfo_full_json = serde_json::to_string_pretty(&userinfo).unwrap();
+
+    let html = HTML_TEMPLATE.replace(
+        "{{CONTENT}}",
+        &format!(
+            r#"
+        <h1>Attestation Complete</h1>
         <div class="info">
             <h3>Verified PayPal User Profile</h3>
             <pre>{}</pre>
@@ -1858,6 +1926,7 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         last_limit_reset: Arc::new(RwLock::new(Instant::now())),
         connection_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         boot_manifest,
+        pending_attestations: Arc::new(RwLock::new(std::collections::HashMap::new())),
     });
 
     // Build the main app router
@@ -1866,6 +1935,7 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         .route("/", get(index))
         .route("/login", get(login))
         .route("/callback", get(callback))
+        .route("/generate", axum::routing::post(generate_cert))
         .route("/privacy", get(privacy))
         .route("/terms", get(terms))
         .route("/report", get(|| async { Redirect::to("/") }))
