@@ -1428,7 +1428,7 @@ async fn generate_attestation(
 
     // v70: We use Compact JSON for the signature to ensure deterministic verification (Canonical-lite)
     let payload_compact = serde_json::to_string(&payload).expect("Failed to serialize compact payload");
-    enclave_init::kmsg(&format!("DEBUG PAYLOAD: {}", payload_compact));
+    tracing::info!("DEBUG PAYLOAD: {}", payload_compact);
     
     // 6. Sign everything using the enclave-bound asymmetric key
     let signature = if let Some(key) = &state.attestation_signing_key {
