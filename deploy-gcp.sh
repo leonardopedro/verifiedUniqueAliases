@@ -118,7 +118,7 @@ gcloud compute instances create ${VM_NAME} \
     --subnet=${SUBNET} \
     --address=${STATIC_IP} \
     --scopes=cloud-platform \
-    --tags=http-server,https-server \
+    --tags=http-server,https-server,egress-hardened \
     --metadata=tee-env-TLS_CACHE_SECRET=projects/${PROJECT_ID}/secrets/PAYPAL_TLS_CACHE,tee-env-FORCE_SANDBOX=true
 
 echo "============================================================"
