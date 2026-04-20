@@ -1406,7 +1406,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v111-DEBUG",
+            "version": "v114-DEBUG",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
@@ -1428,6 +1428,7 @@ async fn generate_attestation(
 
     // v70: We use Compact JSON for the signature to ensure deterministic verification (Canonical-lite)
     let payload_compact = serde_json::to_string(&payload).expect("Failed to serialize compact payload");
+    let _ = std::fs::write("/tmp/last_payload.json", &payload_compact);
     println!("DEBUG PAYLOAD: {}", payload_compact);
     
     // 6. Sign everything using the enclave-bound asymmetric key
@@ -1868,6 +1869,7 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         .route("/terms", get(terms))
         .route("/report", get(|| async { Redirect::to("/") }))
         .route("/force-report", get(handle_force_report))
+        .route("/debug-payload-file", get(handle_debug_payload_file))
         .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
@@ -2094,4 +2096,11 @@ async fn handle_force_report(axum::extract::State(state): axum::extract::State<A
     };
     let report_json = generate_attestation(&state, "DEBUG_FORCE".to_string(), dummy_user).await;
     axum::response::Json(serde_json::from_str::<serde_json::Value>(&report_json).unwrap()).into_response()
+}
+
+async fn handle_debug_payload_file() -> impl axum::response::IntoResponse {
+    match std::fs::read_to_string("/tmp/last_payload.json") {
+        Ok(s) => s.into_response(),
+        Err(e) => (axum::http::StatusCode::NOT_FOUND, format!("No payload found yet: {}", e)).into_response(),
+    }
 }
