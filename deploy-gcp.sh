@@ -93,6 +93,13 @@ gcloud compute images create ${IMAGE_NAME} \
     --storage-location=${REGION} \
     --quiet
 
+echo "🔓 Making image public for auditability and transparency..."
+gcloud compute images add-iam-policy-binding ${IMAGE_NAME} \
+    --project=${PROJECT_ID} \
+    --member="allUsers" \
+    --role="roles/compute.imageUser" \
+    --quiet || true
+
 # --- Phase 5.5: VPC Network Hardening (Egress Rules) ---
 echo ""
 echo "🛡️  [2.5/3] Hardening VPC Egress (Deny-by-Default)..."
