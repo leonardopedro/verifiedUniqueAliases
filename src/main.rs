@@ -1406,7 +1406,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v115-FINAL",
+            "version": "v116-PROD",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
@@ -1624,6 +1624,15 @@ async fn callback(
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("Userinfo failed: {}", e)).into_response();
         }
     };
+
+    // v74-PROD: Strict verified_account check to prevent resource spend on unverified profiles
+    if userinfo.verified_account.as_deref() != Some("true") {
+        warn!("Blocked attestation for unverified PayPal account: {:?}", userinfo.payer_id);
+        return (
+            StatusCode::FORBIDDEN,
+            "Verification Failed: Your PayPal account must be fully verified to obtain a hardware-attested report."
+        ).into_response();
+    }
 
     let attestation = generate_attestation(&state, config.label.clone(), userinfo.clone()).await;
 
@@ -1868,8 +1877,6 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         .route("/privacy", get(privacy))
         .route("/terms", get(terms))
         .route("/report", get(|| async { Redirect::to("/") }))
-        .route("/force-report", get(handle_force_report))
-        .route("/debug-payload-file", get(handle_debug_payload_file))
         .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
@@ -2066,41 +2073,4 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
     Ok(())
 }
 
-async fn handle_force_report(axum::extract::State(state): axum::extract::State<Arc<AppState>>) -> impl axum::response::IntoResponse {
-    let dummy_user = PayPalUserInfo {
-        user_id: "DEBUG_USER_123".to_string(),
-        sub: Some("debug-sub".to_string()),
-        name: Some("Enclave Auditor".to_string()),
-        given_name: None,
-        family_name: None,
-        middle_name: None,
-        nickname: None,
-        preferred_username: None,
-        profile: None,
-        picture: None,
-        website: None,
-        email: None,
-        emails: None,
-        email_verified: None,
-        gender: None,
-        birthdate: None,
-        zoneinfo: None,
-        locale: None,
-        phone_number: None,
-        address: None,
-        verified_account: None,
-        verified: None,
-        account_type: None,
-        age_range: None,
-        payer_id: None,
-    };
-    let report_json = generate_attestation(&state, "DEBUG_FORCE".to_string(), dummy_user).await;
-    axum::response::Json(serde_json::from_str::<serde_json::Value>(&report_json).unwrap()).into_response()
-}
-
-async fn handle_debug_payload_file() -> impl axum::response::IntoResponse {
-    match std::fs::read_to_string("/tmp/last_payload.json") {
-        Ok(s) => s.into_response(),
-        Err(e) => (axum::http::StatusCode::NOT_FOUND, format!("No payload found yet: {}", e)).into_response(),
-    }
-}
+// PROD: Debug handlers removed
