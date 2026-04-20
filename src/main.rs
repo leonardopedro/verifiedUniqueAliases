@@ -1406,7 +1406,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v108-DEBUG",
+            "version": "v109-DEBUG",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
@@ -2065,9 +2065,32 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
 }
 
 async fn handle_force_report(axum::extract::State(state): axum::extract::State<Arc<AppState>>) -> impl axum::response::IntoResponse {
-    let report_json = match generate_attestation(&state, "DEBUG_FORCE".to_string(), None).await {
-        Ok(json) => json,
-        Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to generate report: {}", e)).into_response(),
+    let dummy_user = PayPalUserInfo {
+        user_id: "DEBUG_USER_123".to_string(),
+        sub: Some("debug-sub".to_string()),
+        name: Some("Enclave Auditor".to_string()),
+        given_name: None,
+        family_name: None,
+        middle_name: None,
+        nickname: None,
+        preferred_username: None,
+        profile: None,
+        picture: None,
+        website: None,
+        email: None,
+        email_verified: None,
+        gender: None,
+        birthdate: None,
+        zoneinfo: None,
+        locale: None,
+        phone_number: None,
+        phone_number_verified: None,
+        address: None,
+        verified_account: None,
+        account_type: None,
+        age_range: None,
+        payer_id: None,
     };
+    let report_json = generate_attestation(&state, "DEBUG_FORCE".to_string(), dummy_user).await;
     axum::response::Json(serde_json::from_str::<serde_json::Value>(&report_json).unwrap()).into_response()
 }
