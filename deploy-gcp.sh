@@ -112,6 +112,8 @@ gcloud compute instances create ${VM_NAME} \
     --zone=${ZONE} \
     --machine-type=n2d-highcpu-2 \
     --confidential-compute-type=SEV_SNP \
+    --provisioning-model=SPOT \
+    --instance-redistribution-config=off \
     --maintenance-policy=TERMINATE \
     --image=${IMAGE_NAME} \
     --service-account=${SERVICE_ACCOUNT} \
