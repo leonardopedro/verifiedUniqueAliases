@@ -363,7 +363,7 @@ use tokio::sync::Semaphore;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
