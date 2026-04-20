@@ -344,6 +344,7 @@
             // v71: Enclave signs alphabetical JSON for dynamic fields
             const signedReport = reorder(report);
             const payloadCompact = JSON.stringify(signedReport);
+            console.log("DEBUG: Signature Payload Base:", payloadCompact);
             let sigOk = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', publicKey, signature, new TextEncoder().encode(payloadCompact));
             
             if (!sigOk) {

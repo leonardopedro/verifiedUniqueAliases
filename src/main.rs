@@ -82,9 +82,9 @@ mod enclave_init {
         kmsg("Filesystems mounted");
     }
 
-    pub fn measure_boot_components() -> std::collections::HashMap<String, String> {
+    pub fn measure_boot_components() -> BTreeMap<String, String> {
         use sha2::{Digest, Sha256};
-        let mut manifest = std::collections::HashMap::new();
+        let mut manifest = BTreeMap::new();
         
         let mount_point = "/tmp/esp";
         let _ = std::fs::create_dir_all(mount_point);
@@ -124,7 +124,7 @@ mod enclave_init {
             kmsg("CRITICAL: Failed to mount EFI System Partition after scanning all devices!");
         }
 
-        fn hash_recursive(dir: &str, mount_point: &str, manifest: &mut std::collections::HashMap<String, String>) {
+        fn hash_recursive(dir: &str, mount_point: &str, manifest: &mut BTreeMap<String, String>) {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.filter_map(|e| e.ok()) {
                     let path = entry.path();
@@ -364,7 +364,7 @@ use tokio::net::TcpListener;
 use tower::ServiceExt;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 // ============================================================================
@@ -392,7 +392,7 @@ mod tpm {
         pub ak_pub_pem: String,
         pub ek_cert: Option<String>,
         pub pcrs: String,
-        pub pcr_values: std::collections::HashMap<String, String>,
+        pub pcr_values: BTreeMap<String, String>,
         pub nonce_hex: String,
         pub snp_report_b64: Option<String>,
     }
@@ -576,7 +576,7 @@ mod tpm {
         let pcr_str = String::from_utf8_lossy(&pcr_out);
         tracing::info!("TPM PCRREAD OUT: {}", pcr_str);
         tracing::info!("TPM PCR SELECTION WAS: {}", PCR_SELECTION);
-        let mut pcr_values = std::collections::HashMap::new();
+        let mut pcr_values = BTreeMap::new();
         for line in pcr_str.lines() {
             if line.contains(':') && !line.trim().is_empty() {
                 let parts: Vec<&str> = line.split(':').collect();
@@ -819,7 +819,7 @@ struct AppState {
     last_limit_reset: Arc<RwLock<Instant>>,
     // v71: Concurrency Control
     connection_semaphore: Arc<Semaphore>,
-    boot_manifest: std::collections::HashMap<String, String>,
+    boot_manifest: BTreeMap<String, String>,
 }
 
 struct PayPalFlowConfig {
@@ -1406,7 +1406,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v103-FINAL",
+            "version": "v104-FINAL",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
@@ -1428,6 +1428,7 @@ async fn generate_attestation(
 
     // v70: We use Compact JSON for the signature to ensure deterministic verification (Canonical-lite)
     let payload_compact = serde_json::to_string(&payload).expect("Failed to serialize compact payload");
+    enclave_init::kmsg(&format!("DEBUG PAYLOAD: {}", payload_compact));
     
     // 6. Sign everything using the enclave-bound asymmetric key
     let signature = if let Some(key) = &state.attestation_signing_key {
@@ -1772,7 +1773,7 @@ async fn test_quote(axum::extract::State(_state): axum::extract::State<Arc<AppSt
     }
 }
 
-async fn async_main(boot_manifest: std::collections::HashMap<String, String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     
     // Attempt to force immediate flush
     use std::io::Write;
