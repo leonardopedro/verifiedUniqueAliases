@@ -605,7 +605,7 @@ mod tpm {
         let len = raw_nonce.len().min(64);
         nonce_bytes[..len].copy_from_slice(&raw_nonce[..len]);
 
-        let snp_report_b64 = match get_report(&nonce_bytes) {
+        let snp_report_b64 = match snp::get_report(&nonce_bytes) {
             Some(report) => {
                 info!("Obtained SEV-SNP report via TSM ConfigFS");
                 Some(report)
@@ -1388,7 +1388,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v99-master-tsm-final",
+            "version": "v100-PROD",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
@@ -1849,7 +1849,6 @@ async fn async_main(boot_manifest: std::collections::HashMap<String, String>) ->
         .route("/privacy", get(privacy))
         .route("/terms", get(terms))
         .route("/report", get(|| async { Redirect::to("/") }))
-        .route("/test-quote", get(test_quote))
         .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
