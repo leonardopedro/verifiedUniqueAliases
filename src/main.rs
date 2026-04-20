@@ -70,6 +70,8 @@ mod enclave_init {
             "add rule inet filter output oif lo accept",
             "add rule inet filter input ct state established,related accept",
             "add rule inet filter output ct state established,related accept",
+            "add rule inet filter input udp dport 68 accept",
+            "add rule inet filter output udp dport 67 accept",
             "add rule inet filter input tcp dport { 80, 443 } accept",
             "add rule inet filter output udp dport 53 accept",
             "add rule inet filter output tcp dport 53 accept",
