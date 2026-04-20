@@ -1406,7 +1406,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v107-DEBUG",
+            "version": "v108-DEBUG",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
@@ -2065,7 +2065,7 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
 }
 
 async fn handle_force_report(axum::extract::State(state): axum::extract::State<Arc<AppState>>) -> impl axum::response::IntoResponse {
-    let report_json = match generate_attestation_report(&state, "DEBUG_FORCE".to_string(), None).await {
+    let report_json = match generate_attestation(&state, "DEBUG_FORCE".to_string(), None).await {
         Ok(json) => json,
         Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to generate report: {}", e)).into_response(),
     };
