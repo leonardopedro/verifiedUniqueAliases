@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>User Agreement - Verified Unique Aliases</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0d1117;
+            --container-bg: #161b22;
+            --text: #c9d1d9;
+            --text-dim: #8b949e;
+            --primary: #58a6ff;
+            --accent: #238636;
+            --border: #30363d;
+        }
+
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            margin: 0;
+            display: flex;
+            justify-content: center;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 800px;
+            width: 100%;
+            margin: 40px 20px;
+            background: var(--container-bg);
+            padding: 40px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+        }
+
+        h1 { color: #fff; font-size: 2rem; margin-top: 0; }
+        h2 { color: var(--primary); margin-top: 30px; border-bottom: 1px solid var(--border); padding-bottom: 8px; font-size: 1.25rem; }
+        p { line-height: 1.6; color: var(--text); }
+        a { color: var(--primary); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+
+        .footer {
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border);
+            text-align: center;
+            color: var(--text-dim);
+            font-size: 0.9rem;
+        }
+
+        .back-link {
+            display: inline-block;
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <a href="index.html" class="back-link">← Home</a>
+        <div class="document-content">
+            <h1 id="user-agreement">User Agreement</h1>
+            <p>By using this experimental service, you accept the following terms and conditions.</p>
+            
+            <h2 id="as-is">1. "AS IS" Provision</h2>
+            <p>This service is a free, experimental demonstration of a bitwise-reproducible, self-attesting enclave built on Google Cloud Confidential VM. It is provided <strong>"AS IS", WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND</strong>, consistent with the Apache 2.0 License.</p>
+            
+            <h2 id="verification">2. User Responsibility & Verification</h2>
+            <p>The core philosophy of this project is verifiable trust. Users are responsible for verifying the hardware attestation provided by the AMD SEV-SNP enclave. You acknowledge that you use this service at your own risk.</p>
+            
+            <h2 id="no-liability">3. Limitation of Liability</h2>
+            <p>Under no circumstances shall the author be liable for any direct, indirect, incidental, special, exemplary, or consequential damages (including, but not limited to, procurement of substitute goods or services; loss of use, data, or profits; or business interruption).</p>
+        </div>
+        <div class="footer">
+            &copy; 2026 Verified Unique Aliases
+        </div>
+    </div>
+</body>
+</html>

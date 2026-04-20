@@ -765,47 +765,7 @@ const HTML_TEMPLATE: &str = r#"
 <body><div class="container">{{CONTENT}}</div></body></html>
 "#;
 
-const PRIVACY_POLICY: &str = r#"
-    <div class="document-content">
-        <h1 id="privacy-policy">Privacy Policy & Data Security</h1>
-        <p>This service is an experimental, open-source project maintained by Leonardo Pedro.</p>
-        
-        <h2 id="security-assurance">1. Data Security & Integrity</h2>
-        <p>I have performed amateur-level testing and amateur-level code audits to identify potential data leak vectors. As of the latest release, <strong>I have found no evidence of data leaks or vulnerabilities</strong>. However, given the experimental nature of this service, I cannot offer any absolute guarantee that the system is free of flaws or leaks.</p>
-        
-        <h2 id="shared-responsibility">2. Shared Responsibility Model</h2>
-        <p>This service is offered for free with the understanding that security is a collective effort. By using this service, you agree to assume the responsibility of <strong>verifying the remote attestation</strong>. You are encouraged to inspect the hardware quotes and binary identity to confirm you are running the intended code.</p>
-        
-        <h2 id="reporting-vulnerabilities">3. Reporting Vulnerabilities</h2>
-        <p>The risks and responsibilities are shared by all users. If you discover a security flaw or vulnerability, you are expected to alert me immediately by opening an issue at: <br>
-        <a href="https://github.com/leonardopedro/verifiedUniqueAliases/issues" target="_blank" style="color:#64b5f6;">github.com/leonardopedro/verifiedUniqueAliases/issues</a>.<br>
-        Your reports allow me to correct or minimize issues for the benefit of the entire community.</p>
-        
-        <h2 id="data-handling">4. Data Handling</h2>
-        <p>All evidence so far suggests that this service operates in encrypted RAM (AMD SEV-SNP),  it does not utilize persistent databases for user profiles and your data exists only for the duration of the session required to perform the OAuth flow and generate your attestation report. But it is up to the user (you) to verify this is so in the remote attestation.</p>
-        <div class="footer"><a href="/">Back to Home</a></div>
-    </div>
-"#;
-
-const USER_AGREEMENT: &str = r#"
-    <div class="document-content">
-        <h1 id="user-agreement">User Agreement</h1>
-        <p>By using this experimental service, you accept the following terms and conditions.</p>
-        
-        <h2 id="as-is">1. "AS IS" Provision</h2>
-        <p>This service is a free, experimental demonstration of a bitwise-reproducible, self-attesting enclave built on Google Cloud Confidential VM. It is provided <strong>"AS IS", WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND</strong>, consistent with the Apache 2.0 License.</p>
-        
-        <h2 id="verification">2. User Responsibility & Verification</h2>
-        <p>The core philosophy of this project is verifiable trust. Users are responsible for verifying the hardware attestation provided by the AMD SEV-SNP enclave. You acknowledge that you use this service at your own risk.</p>
-        
-        <h2 id="community-reporting">3. Community Security</h2>
-        <p>You agree to report any potential security issues or flaws at <a href="https://github.com/leonardopedro/verifiedUniqueAliases/issues" target="_blank" style="color:#64b5f6;">github.com/leonardopedro/verifiedUniqueAliases/issues</a>. This collaborative approach allows us to minimize risks for everyone. You acknowledge that vulnerabilities may exist despite best efforts.</p>
-        
-        <h2 id="liability">4. Limitation of Liability</h2>
-        <p>To the maximum extent permitted by applicable law, I (Leonardo Pedro) shall not be liable for any direct, indirect, incidental, or consequential damages resulting from the use of this service.</p>
-        <div class="footer"><a href="/">Back to Home</a></div>
-    </div>
-"#;
+// Legal policies migrated to GitHub Pages
 
 // ============================================================================
 // CONFIG (single JSON secret)
@@ -1566,8 +1526,9 @@ async fn index(
             <a href="/login?flow=full" class="btn">Login with PayPal (Full Data)</a>
         </div>
         <div class="footer">
-            <a href="/privacy#privacy-policy">Privacy Policy</a> |
-            <a href="/terms#user-agreement">User Agreement</a>
+            <a href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html">Privacy Policy</a> |
+            <a href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html">User Agreement</a> |
+            <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">Official Auditor</a>
         </div>
         "#,
         state.domain
@@ -1579,24 +1540,12 @@ async fn index(
     Html(html).into_response()
 }
 
-async fn privacy(
-    State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
-) -> Response {
-    if let Err(status) = state.record_egress_data(addr.ip(), PRIVACY_POLICY.len() as u64) {
-        return status.into_response();
-    }
-    Html(HTML_TEMPLATE.replace("{{CONTENT}}", PRIVACY_POLICY)).into_response()
+async fn privacy() -> Response {
+    Redirect::to("https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html").into_response()
 }
 
-async fn terms(
-    State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
-) -> Response {
-    if let Err(status) = state.record_egress_data(addr.ip(), USER_AGREEMENT.len() as u64) {
-        return status.into_response();
-    }
-    Html(HTML_TEMPLATE.replace("{{CONTENT}}", USER_AGREEMENT)).into_response()
+async fn terms() -> Response {
+    Redirect::to("https://leonardopedro.github.io/verifiedUniqueAliases/terms.html").into_response()
 }
 
 #[derive(Deserialize)]
@@ -1690,8 +1639,11 @@ async fn callback(
             <p><strong>Hashed & Signed Evidence:</strong></p>
             <pre id="raw_report">{}</pre>
         </div>
-        <button onclick="downloadReport()" class="btn" style="background:#4caf50; margin-right: 10px;">Download Attestation Report (.json)</button>
-        <a href="/" class="btn" style="background: #333;">Back</a>
+        <div style="margin-top: 20px;">
+            <button onclick="downloadReport()" class="btn" style="background:#4caf50; margin-right: 10px;">Download Report (.json)</button>
+            <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" target="_blank" class="btn" style="background:#2196f3; margin-right: 10px;">Verify on Official GitHub Auditor</a>
+            <a href="/" class="btn" style="background: #333;">Back</a>
+        </div>
 
         <script>
             function downloadReport() {{
