@@ -392,7 +392,7 @@ mod tpm {
         pub ak_pub_pem: String,
         pub ek_cert: Option<String>,
         pub pcrs: String,
-        pub pcr_values: BTreeMap<String, String>,
+        pub pcr_values: std::collections::BTreeMap<String, String>,
         pub nonce_hex: String,
         pub snp_report_b64: Option<String>,
     }
@@ -576,7 +576,7 @@ mod tpm {
         let pcr_str = String::from_utf8_lossy(&pcr_out);
         tracing::info!("TPM PCRREAD OUT: {}", pcr_str);
         tracing::info!("TPM PCR SELECTION WAS: {}", PCR_SELECTION);
-        let mut pcr_values = BTreeMap::new();
+        let mut pcr_values = std::collections::BTreeMap::new();
         for line in pcr_str.lines() {
             if line.contains(':') && !line.trim().is_empty() {
                 let parts: Vec<&str> = line.split(':').collect();
@@ -814,7 +814,7 @@ struct AppState {
     tls_cert_pem: Arc<RwLock<Option<String>>>,
     attestation_signing_key: Option<String>,
     // v70: DDoS Protection for IP tracking
-    ip_stats: Arc<RwLock<HashMap<IpAddr, u64>>>,
+    ip_stats: Arc<RwLock<std::collections::BTreeMap<IpAddr, u64>>>,
     global_egress_bytes: Arc<AtomicU64>,
     last_limit_reset: Arc<RwLock<Instant>>,
     // v71: Concurrency Control
@@ -1406,7 +1406,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v104-FINAL",
+            "version": "v105-FINAL",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
@@ -1851,7 +1851,7 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         staging: config.staging,
         tls_cert_pem: Arc::new(RwLock::new(None)),
         attestation_signing_key,
-        ip_stats: Arc::new(RwLock::new(HashMap::new())),
+        ip_stats: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
         global_egress_bytes: Arc::new(AtomicU64::new(0)),
         last_limit_reset: Arc::new(RwLock::new(Instant::now())),
         connection_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
