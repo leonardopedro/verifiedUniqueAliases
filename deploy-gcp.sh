@@ -96,7 +96,7 @@ gcloud compute images create ${IMAGE_NAME} \
 echo "🔓 Making image public for auditability and transparency..."
 gcloud compute images add-iam-policy-binding ${IMAGE_NAME} \
     --project=${PROJECT_ID} \
-    --member="allUsers" \
+    --member="allAuthenticatedUsers" \
     --role="roles/compute.imageUser" \
     --quiet || true
 
@@ -169,7 +169,7 @@ gcloud compute instances create ${VM_NAME} \
     --machine-type=n2d-highcpu-2 \
     --confidential-compute-type=SEV_SNP \
     --provisioning-model=SPOT \
-    --instance-redistribution-config=off \
+    --instance-termination-action=DELETE \
     --maintenance-policy=TERMINATE \
     --image=${IMAGE_NAME} \
     --service-account=${SERVICE_ACCOUNT} \
