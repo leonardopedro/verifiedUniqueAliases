@@ -612,25 +612,30 @@ mod tpm {
                 Some(report)
             },
             None => {
-                info!("TSM ConfigFS failed, trying NVRAM fallback handles...");
-                // Strategy: Try common GCP indices
-                let indices = ["0x01400001", "0x01c00002", "0x01c00001"];
+                info!("TSM ConfigFS failed, trying known GCP NVRAM handles...");
+                // GCP SEV-SNP report is often at 0x01c00002 (1184 bytes)
+                // or 0x01400001 (64 bytes header + report)
+                let indices = [
+                    ("0x01c00002", "1184"), 
+                    ("0x01400001", "1248"),
+                    ("0x01c00001", "1184")
+                ];
                 let mut data = vec![];
-                for idx in &indices {
-                    match run_cmd("tpm2", &["nvread", idx, "-C", "o"]).await {
+                for (idx, size) in &indices {
+                    match run_cmd("tpm2", &["nvread", idx, "-C", "o", "-s", size]).await {
                         Ok(d) if !d.is_empty() => {
-                            info!("Obtained hardware report from NVRAM index {}", idx);
+                            info!("Obtained hardware report from NVRAM index {} ({} bytes)", idx, d.len());
                             data = d;
                             break;
                         },
-                        _ => { debug!("Index {} not found or empty", idx); }
+                        _ => { debug!("Index {} not found, empty, or wrong size", idx); }
                     }
                 }
                 
                 if !data.is_empty() {
                     Some(STANDARD.encode(data))
                 } else {
-                    error!("All hardware report strategies failed.");
+                    error!("All hardware report strategies failed. AMD SNP check will fail.");
                     None
                 }
             }
@@ -1401,7 +1406,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v101-PROD",
+            "version": "v102-PROD",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
@@ -1861,6 +1866,7 @@ async fn async_main(boot_manifest: std::collections::HashMap<String, String>) ->
         .route("/privacy", get(privacy))
         .route("/terms", get(terms))
         .route("/report", get(|| async { Redirect::to("/") }))
+        .route("/test-quote", get(test_quote))
         .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
