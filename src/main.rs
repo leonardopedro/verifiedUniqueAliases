@@ -377,7 +377,7 @@ mod enclave_init {
         apply_lease(&iface, &lease);
 
         // SYNC TIME from trusted source over PINNED TLS
-        if let Ok(resp) = hardened_client().get("https://www.google.com").send().await {
+        if let Ok(resp) = crate::hardened_client().get("https://www.google.com").send().await {
             if let Some(date_str) = resp.headers().get("Date") {
                 if let Ok(date) = date_str.to_str() {
                     let _ = std::process::Command::new("/bin/date").args(["-s", date]).status();
