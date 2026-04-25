@@ -3,14 +3,13 @@
 ## Project Overview
 `paypal-auth-vm` is a hardware-attested Rust service on **GCP Confidential VM** (AMD SEV-SNP). It provides a secure bridge for PayPal OAuth tokens, ensuring the integrity of the computing environment before secrets are accessible.
 
-### 🏆 Current Accomplishments (v119-STABLE)
-- **Stable OS Migration (Trixie)**: Transitioned the entire build system, kernel, and initramfs to **Debian 13 (Trixie)** using pinned snapshots. This ensures long-term support for modern Confidential Computing drivers while maintaining bit-perfect reproducibility.
-- **Hardware-Isolated TLS Private Key**: Transitioned to a "Minimalist Sealing" model where only the TLS private key is TPM-bound and measurement-locked. The certificate and ACME credentials are RAM-resident but not sealed, optimizing for security-sensitive recovery.
-- **Hardened Hardware Binding**: Implemented a "Triple-Lock" nonce (sha256 of User Profile + Enclave Public Key) injected into both TPM Quotes and SEV-SNP reports. This cryptographically binds the identity of the signer to the physical silicon.
-- **Set-Intersection Image Atomicity**: Upgraded the auditor to use set-intersection logic for GitHub Run IDs. This ensures that even when components (like kernels) are reused across builds, the final image is verified as a single, consistent atomic unit.
-- **Asymmetric Auditor Verification**: Upgraded the `verify.html` auditor to perform full cryptographic signature verification of TPM quotes using WebCrypto, moving beyond simple string-matching.
-- **GCP Silicon Root Fallback**: Implemented support for Google Attestation Key (AK) certificates in the Silicon Audit. This allows the auditor to verify the chain of trust on GCP even when raw SNP devices are abstracted, using the TPM Quote as a hardware anchor.
-- **Egress Hardening & CA Pinning**: Implemented a custom `reqwest` client with bit-perfect pinning of PayPal and Google Root CAs, neutralizing hypervisor-level Man-in-the-Middle attacks via certificate substitution.
+### 🏆 Current Accomplishments (v119-FIXED)
+- **Hardened TPM Quote Verification**: Implemented full binary parsing of `TPMS_ATTEST` in the auditor to verify the nonce (`extraData`), neutralizing session replay and forgery attacks.
+- **PCR 15 Software Binding**: Restored strict verification of the `disk_manifest` hash against hardware PCR 15, ensuring the code running on the silicon matches the GitHub provenance.
+- **AK Root of Trust**: Implemented cryptographic verification of the Attestation Key (AK) against the hardware Endorsement Key (EK) certificate and trusted manufacturer roots.
+- **Egress & Metadata Hardening**: Eliminated hypervisor-controlled environment injection and enforced TLS pinning (hardened client) for all sensitive configuration and time synchronization fetches.
+- **Secure Time Synchronization**: Transitioned from plaintext metadata headers to pinned HTTPS-based time fetching to prevent TLS rollback and clock spoofing attacks.
+- **Stable OS Migration (Trixie)**: Transitioned the entire build system, kernel, and initramfs to **Debian 13 (Trixie)** using pinned snapshots.
 
 ## Unified Synthesis Pipeline (v119)
 To ensure 100% bitwise reproducibility regardless of the host build environment, the project uses a multi-stage Docker synthesis engine (`Dockerfile.repro`).

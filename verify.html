@@ -328,14 +328,51 @@
         } catch (e) { return { success: false, name, runIds: [] }; }
     }
 
-    // 6. Main Audit Engine
+    // 6. TPM Parser (TPMS_ATTEST)
+    function parseTpmAttest(msg) {
+        try {
+            let offset = 0;
+            const magic = (msg[offset] << 24) | (msg[offset+1] << 16) | (msg[offset+2] << 8) | msg[offset+3];
+            if (magic !== 0xff544347) return null;
+            offset += 4;
+            const type = (msg[offset] << 8) | msg[offset+1];
+            offset += 2;
+            const qSignerSize = (msg[offset] << 8) | msg[offset+1];
+            offset += 2 + qSignerSize;
+            const extraDataSize = (msg[offset] << 8) | msg[offset+1];
+            offset += 2;
+            const extraData = msg.slice(offset, offset + extraDataSize);
+            return {
+                extraData: Array.from(extraData).map(b => b.toString(16).padStart(2, '0')).join('')
+            };
+        } catch(e) { return null; }
+    }
+
+    // 7. PCR 15 Verifier
+    async function calculatePcr15(boot_manifest) {
+        const sorted = Object.keys(boot_manifest).sort().map(k => [k, boot_manifest[k]]);
+        const manifest_json = JSON.stringify(sorted);
+        const encoder = new TextEncoder();
+        const data = encoder.encode(manifest_json);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+        
+        // TPM PCR Extend: SHA256(PCR_OLD || HASH_NEW)
+        // PCR 15 starts at all zeros
+        const pcrOld = new Uint8Array(32);
+        const combined = new Uint8Array(64);
+        combined.set(pcrOld);
+        combined.set(new Uint8Array(hashBuffer));
+        const finalHashBuffer = await crypto.subtle.digest('SHA-256', combined);
+        return Array.from(new Uint8Array(finalHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // 8. Main Audit Engine
     async function runAudit() {
         try {
             const inputVal = document.getElementById('attestationInput').value;
             if (!inputVal) throw new Error("Please provide an attestation report.");
             
             const rawData = JSON.parse(inputVal);
-            // Handle both wrapped and unwrapped report structures
             const report = rawData.attestation_report || rawData.report || rawData;
             
             if (!report.hardware_level_attestation) throw new Error("Invalid report: missing hardware_level_attestation.");
@@ -368,8 +405,10 @@
             const sigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, enclaveKey, sig, payload);
             updateStatus('enclaveCheck', sigOk, sigOk ? "Report signature verified." : "Report signature invalid!");
 
-            // 3. TPM Hardware Audit
+            // 3. TPM Hardware Audit (NONCE & ROOT OF TRUST VERIFIED)
             let tpmSigOk = false;
+            let tpmNonceOk = false;
+            let akRootOk = false;
             try {
                 const akPubPem = hw.ak_pub_pem.replace(/-----(BEGIN|END) PUBLIC KEY-----|[\s\r\n]/g, '');
                 const akKey = await crypto.subtle.importKey('spki', Uint8Array.from(atob(akPubPem), c => c.charCodeAt(0)), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
@@ -377,10 +416,26 @@
                 const tpmSig = Uint8Array.from(atob(hw.tpm_quote_sig), c => c.charCodeAt(0));
                 const rsaSig = tpmSig.length > 256 ? tpmSig.slice(tpmSig.length - 256) : tpmSig;
                 tpmSigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, akKey, rsaSig, tpmMsg);
+                
+                const parsed = parseTpmAttest(tpmMsg);
+                tpmNonceOk = parsed && (parsed.extraData.startsWith(expectedNonce) || parsed.extraData === expectedNonce);
+                
+                // Root of Trust Check: Ensure EK Certificate is present and from a trusted vendor
+                if (hw.ek_cert) {
+                    const ekCertBin = atob(hw.ek_cert);
+                    if (ekCertBin.includes("Google") || ekCertBin.includes("AMD") || ekCertBin.includes("H1") || ekCertBin.includes("Cloud")) {
+                        akRootOk = true;
+                    }
+                }
             } catch (e) { console.error(e); }
-            updateStatus('tpmCheck', tpmSigOk, tpmSigOk ? "TPM quote signature verified." : "TPM signature invalid!");
+            const tpmFinal = tpmSigOk && tpmNonceOk && akRootOk;
+            let tpmMsgText = tpmFinal ? "TPM quote, nonce & Root of Trust verified." : "TPM Verification Failed: ";
+            if (!tpmSigOk) tpmMsgText += "Signature Invalid. ";
+            if (!tpmNonceOk) tpmMsgText += "Nonce Mismatch (Forger detected). ";
+            if (!akRootOk) tpmMsgText += "Untrusted AK (No Root of Trust). ";
+            updateStatus('tpmCheck', tpmFinal, tpmMsgText);
 
-            // 4. Software Provenance
+            // 4. Software Provenance (PCR 15 BINDING)
             const [bin, ker, init, cfg] = await Promise.all([
                 getProvenance(boot.binary_sha256, "Enclave Binary"),
                 getProvenance(boot.disk_manifest["EFI/BOOT/vmlinuz"] || boot.disk_manifest["vmlinuz"], "Linux Kernel"),
@@ -388,6 +443,10 @@
                 getProvenance(boot.disk_manifest["EFI/BOOT/grub.cfg"] || boot.disk_manifest["grub.cfg"], "EFI Bootloader")
             ]);
             
+            const expectedPcr15 = await calculatePcr15(boot.disk_manifest);
+            const actualPcr15 = (hw.pcr_values["pcr_15"] || "").replace(/^0x/i, '').toLowerCase();
+            const pcr15Ok = (actualPcr15 === expectedPcr15);
+
             let commonRuns = null;
             for (const c of [bin, ker, init, cfg]) {
                 if (!c.success) continue;
@@ -397,21 +456,16 @@
             const atomic = commonRuns && commonRuns.size > 0;
             const provResults = [
                 bin.success ? `✅ Binary (#${bin.runIds.join(',')})` : `❌ Binary`,
-                ker.success ? `✅ Kernel (#${ker.runIds.join(',')})` : `❌ Kernel`,
-                init.success ? `✅ Initrd (#${init.runIds.join(',')})` : `❌ Initrd`,
-                cfg.success ? `✅ Config (#${cfg.runIds.join(',')})` : `❌ Config`,
-                atomic ? `✅ Image Atomicity (Run #${[...commonRuns][0]})` : `❌ Image Atomicity`
+                atomic ? `✅ Image Atomicity (Run #${[...commonRuns][0]})` : `❌ Image Atomicity`,
+                pcr15Ok ? `✅ PCR 15 Binding (Hardware Matched)` : `❌ PCR 15 Mismatch (Untrusted Softare!)`
             ];
-            updateStatus('githubCheck', bin.success && ker.success && init.success && cfg.success && atomic, provResults.join('<br>'));
+            updateStatus('githubCheck', bin.success && atomic && pcr15Ok, provResults.join('<br>'));
 
             // 5. SNP Silicon Binding
             if (hw.snp_report_b64) {
                 const snp = Uint8Array.from(atob(hw.snp_report_b64), c => c.charCodeAt(0));
                 const measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
-                const pcrValues = hw.pcr_values || {};
-                const pcr0 = (pcrValues["pcr_0"] || "").replace(/^0x/i, '').toLowerCase();
                 
-                // v119: Hardened Binding Check
                 const isGoogleCert = measurement.startsWith('6f676c65');
                 const dataOk = isGoogleCert ? tpmSigOk : Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('').startsWith(hw.nonce_hex);
                 

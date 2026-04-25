@@ -376,12 +376,10 @@ mod enclave_init {
         let lease = dhcp(&iface).await?;
         apply_lease(&iface, &lease);
 
-        // SYNC TIME from metadata server (HTTP headers)
-        let client = reqwest::Client::new();
-        if let Ok(resp) = client.get("http://metadata.google.internal/computeMetadata/v1/instance/").header("Metadata-Flavor", "Google").send().await {
+        // SYNC TIME from trusted source over PINNED TLS
+        if let Ok(resp) = hardened_client().get("https://www.google.com").send().await {
             if let Some(date_str) = resp.headers().get("Date") {
                 if let Ok(date) = date_str.to_str() {
-                    // Use date command to set time: `date -s "Sat, 25 Apr 2026 19:30:44 GMT"`
                     let _ = std::process::Command::new("/bin/date").args(["-s", date]).status();
                     kmsg(&format!("System time synced to: {}", date));
                 }
@@ -1069,9 +1067,10 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
 
     // 1. Determine which secret to load by checking PAYPAL_AUTH_MODE
     let mode_secret = "projects/project-ae136ba1-3cc9-42cf-a48/secrets/PAYPAL_AUTH_MODE/versions/latest";
-    let client = reqwest::Client::new();
+    let client = hardened_client();
 
     // Get access token from metadata server
+    // Note: metadata server is local, pinning doesn't apply but we use the same client for consistency
     let token_resp: serde_json::Value = client
         .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
         .header("Metadata-Flavor", "Google")
@@ -1080,29 +1079,9 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
         .json()
         .await?;
 
-
     let access_token = token_resp["access_token"]
         .as_str()
         .ok_or("No access token from metadata server")?;
-
-    // --- PHASE 0: Parse all metadata attributes into environment variables ---
-    // This allows tee-env-TLS_CACHE_SECRET to be picked up by std::env::var later
-    if let Ok(resp) = client.get("http://metadata.google.internal/computeMetadata/v1/instance/attributes/?recursive=true")
-        .header("Metadata-Flavor", "Google")
-        .send().await {
-        if let Ok(attrs) = resp.json::<serde_json::Value>().await {
-            if let Some(obj) = attrs.as_object() {
-                for (k, v) in obj {
-                    if let Some(val) = v.as_str() {
-                        if let Some(env_key) = k.strip_prefix("tee-env-") {
-                            info!("Setting metadata env: {}={}", env_key, val);
-                            std::env::set_var(env_key, val);
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     // 1. Determine which secret to load by checking PAYPAL_AUTH_MODE
     let mode = if let Ok(resp) = client.get(format!("https://secretmanager.googleapis.com/v1/{}:access", mode_secret))
