@@ -24,21 +24,21 @@ COPY Cargo.toml Cargo.lock ./
 ENV RUSTFLAGS="-C target-cpu=generic -C strip=symbols"
 
 # Layer 1: compile dependencies
-RUN . /usr/local/cargo/env && \
+RUN bash -c ". /usr/local/cargo/env && \
     set -euo pipefail && \
     mkdir -p src && \
     echo 'fn main() {}' > src/main.rs && \
     cargo build --release --target x86_64-unknown-linux-gnu && \
     rm -f target/x86_64-unknown-linux-gnu/release/deps/paypal_auth_vm* \
           target/x86_64-unknown-linux-gnu/release/paypal_auth_vm* \
-          target/x86_64-unknown-linux-gnu/release/deps/paypal-auth-vm*
+          target/x86_64-unknown-linux-gnu/release/deps/paypal-auth-vm*"
 
 # Layer 2: compile our crate
 COPY src ./src
-RUN . /usr/local/cargo/env && \
+RUN bash -c ". /usr/local/cargo/env && \
     set -euo pipefail && \
     cargo build --release --target x86_64-unknown-linux-gnu && \
-    cp target/x86_64-unknown-linux-gnu/release/paypal-auth-vm /paypal-auth-vm-bin
+    cp target/x86_64-unknown-linux-gnu/release/paypal-auth-vm /paypal-auth-vm-bin"
 
 
 FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a AS image-builder
@@ -47,7 +47,7 @@ ENV SOURCE_DATE_EPOCH=1712260800
 ENV TZ=UTC
 ENV LC_ALL=C.UTF-8
 
-# Pin Debian snapshots for 100% stable package versions
+# Pin Debian snapshots for 100% stable package versions (Trixie is current stable)
 RUN echo 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/20260406T000000Z\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/20260406T000000Z\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp' > /etc/apt/sources.list.d/debian.sources
 
 RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends \
