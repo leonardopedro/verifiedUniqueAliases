@@ -434,23 +434,24 @@
                 const data = await resp.json();
                 if (!data.attestations || data.attestations.length === 0) return { success: false, name };
                 
-                // Extract Build Run ID from DSSE payload (SLSA Predicate)
-                let runId = "Unknown";
-                try {
-                    const bundle = data.attestations[0].bundle;
-                    const payload = JSON.parse(atob(bundle.dsseEnvelope ? bundle.dsseEnvelope.payload : bundle.payload));
-                    // Try multiple SLSA / GitHub paths
-                    runId = (payload.predicate && payload.predicate.runDetails && payload.predicate.runDetails.metadata && payload.predicate.runDetails.metadata.invocationId) ||
-                            (payload.invocation && payload.invocation.metadata && payload.invocation.metadata.id) ||
-                            (payload.invocation && payload.invocation.uri) ||
-                            (payload.buildConfig && payload.buildConfig.env && payload.buildConfig.env.GITHUB_RUN_ID) ||
-                            (payload.predicate && payload.predicate.invocation && payload.predicate.invocation.environment && payload.predicate.invocation.environment.github_run_id) ||
-                            "External";
-                } catch(e) {
-                    console.warn(`Failed to parse attestation payload for ${name}:`, e);
+                const runIds = [];
+                for (const attestation of data.attestations) {
+                    try {
+                        const bundle = attestation.bundle;
+                        const payload = JSON.parse(atob(bundle.dsseEnvelope ? bundle.dsseEnvelope.payload : bundle.payload));
+                        const runId = (payload.predicate && payload.predicate.runDetails && payload.predicate.runDetails.metadata && payload.predicate.runDetails.metadata.invocationId) ||
+                                (payload.invocation && payload.invocation.metadata && payload.invocation.metadata.id) ||
+                                (payload.invocation && payload.invocation.uri) ||
+                                (payload.buildConfig && payload.buildConfig.env && payload.buildConfig.env.GITHUB_RUN_ID) ||
+                                (payload.predicate && payload.predicate.invocation && payload.predicate.invocation.environment && payload.predicate.invocation.environment.github_run_id) ||
+                                "External";
+                        runIds.push(runId);
+                    } catch(e) {
+                        console.warn(`Failed to parse attestation payload for ${name}:`, e);
+                    }
                 }
 
-                return { success: true, name, runId };
+                return { success: true, name, runIds };
             }
 
             try {
@@ -475,8 +476,25 @@
                 results.push(cfg.success ? `✅ Boot Config: Provenance Valid` : `❌ Boot Config: No Provenance`);
 
                 // 2. Consistency Check (Atomicity)
-                const consistent = (bin.runId === ker.runId && ker.runId === init.runId && ker.runId === cfg.runId);
-                results.push(consistent ? `✅ Image Atomicity: All components from Run #${bin.runId.split('/').pop()}` : `❌ Image Atomicity: COMPONENTS FROM DIFFERENT BUILDS`);
+                // v118: We check if there is at least one common GitHub Run ID across all components
+                // to support reproducible files that might be associated with multiple historical runs.
+                let commonRunIds = null;
+                const componentRuns = [bin, ker, init, cfg];
+                
+                for (const comp of componentRuns) {
+                    if (!comp.success) continue;
+                    const runSet = new Set(comp.runIds);
+                    if (commonRunIds === null) {
+                        commonRunIds = runSet;
+                    } else {
+                        commonRunIds = new Set([...commonRunIds].filter(x => runSet.has(x)));
+                    }
+                }
+
+                const consistent = commonRunIds && commonRunIds.size > 0;
+                const displayRunId = consistent ? [...commonRunIds][0].split('/').pop() : "N/A";
+                
+                results.push(consistent ? `✅ Image Atomicity: All components found in Run #${displayRunId}` : `❌ Image Atomicity: COMPONENTS FROM DIFFERENT BUILDS`);
 
                 // 3. Hardware Bind Check (v83: PCR 15 is the manifest anchor)
                 const manifestSorted = Object.entries(manifest).sort((a,b) => a[0].localeCompare(b[0]));
