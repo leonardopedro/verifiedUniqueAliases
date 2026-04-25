@@ -569,29 +569,6 @@
                 updateStatus('githubCheck', false);
                 document.getElementById('githubDesc').innerHTML = `<span style="color:#f85149;">Audit Failed: ${e.message}</span>`;
             }
-        }
-    </script>
-</body>
-</html>
-                        </div>
-                        </p>
-                        ${report.enclave_config && report.enclave_config.version ? `
-                        <div style="font-size: 0.75rem; color: #8b949e; border-top: 1px solid #30363d; padding-top: 8px; margin-top: 8px;">
-                            Enclave: <span style="color:#7ee787;">${report.enclave_config.version}</span> | 
-                            Manifest: <span style="color:#7ee787;">${Object.keys(report.enclave_config.boot_measurements.disk_manifest).length} files</span>
-                        </div>` : ''}
-                    `;
-                } else {
-                    document.getElementById('firmwareCheck').className = 'check-item failed';
-                    document.getElementById('firmwareDesc').innerText = 'AMD SNP Hardware Report not found in attestation.';
-                }
-
-            } catch (e) {
-                console.error("GitHub provenance error:", e);
-                githubStatus.className = 'check-item failed';
-                githubDesc.innerText = 'GitHub Audit Failed: ' + e.message;
-            }
-
         } catch (e) {
             console.error(e);
             alert("Error parsing report: " + e.message);
@@ -602,8 +579,7 @@
         const el = document.getElementById(id);
         el.className = 'check-item ' + (success ? 'verified' : 'failed');
         const desc = el.querySelector('p');
-        if (success) desc.innerText = "Verification successful. cryptographic proof is valid.";
-        else desc.innerText = "Verification failed. the data has been modified or the signature is invalid.";
+        desc.innerText = success ? "Verification successful. cryptographic proof is valid." : "Verification failed. safety check failed.";
     }
 </script>
 
