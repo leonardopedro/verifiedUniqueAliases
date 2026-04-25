@@ -495,8 +495,8 @@
 
                 const bin = await getProvenance(boot.binary_sha256, "Enclave Binary");
                 const ker = await getProvenance(ker_hash, "Linux Kernel");
-                const init = await getProvenance(init_hash, "Initramfs Image");
-                const cfg = await getProvenance(config_hash, "GRUB Configuration");
+                const init = await getProvenance(init_hash, "Initramfs");
+                const cfg = await getProvenance(config_hash, "EFI Bootloader");
 
                 results.push(bin.success ? `✅ Binary: Provenance Valid` : `❌ Binary: No Provenance`);
                 results.push(ker.success ? `✅ Kernel: Provenance Valid` : `❌ Kernel: No Provenance`);
