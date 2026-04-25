@@ -702,21 +702,36 @@ mod tpm {
             },
             None => {
                 tracing::info!("TSM ConfigFS failed, trying known GCP NVRAM handles...");
+                // v118-fix: Re-prioritize indices to avoid reading certificates as reports.
+                // 0x01c00002: Primary SNP report index on GCP.
+                // 0x01c00001: Legacy SNP report index.
+                // Removed 0x01400001 (Certificates) as it causes "Google Cloud" ASCII measurements.
                 let indices = [
                     ("0x01c00002", "1184"), 
-                    ("0x01400001", "1248"),
                     ("0x01c00001", "1184")
                 ];
                 let mut data = vec![];
                 for (idx, size) in &indices {
-                    tracing::info!("DEBUG: Trying NVRAM index {}", idx);
+                    tracing::info!("DEBUG: Trying NVRAM index {} (Owner Hierarchy)", idx);
+                    // Try Owner Hierarchy (-C o) first
                     match run_cmd("tpm2_nvread", &[idx, "-C", "o", "-s", size]).await {
                         Ok(d) if !d.is_empty() => {
-                            tracing::info!("Obtained hardware report from NVRAM index {} ({} bytes)", idx, d.len());
+                            tracing::info!("Obtained report from NVRAM index {} (Owner)", idx);
                             data = d;
                             break;
                         },
-                        _ => { tracing::debug!("Index {} not found, empty, or wrong size", idx); }
+                        _ => {
+                            tracing::info!("DEBUG: Trying NVRAM index {} (Platform Hierarchy)", idx);
+                            // Some firmware versions put reports in Platform Hierarchy (-C p)
+                            match run_cmd("tpm2_nvread", &[idx, "-C", "p", "-s", size]).await {
+                                Ok(d) if !d.is_empty() => {
+                                    tracing::info!("Obtained report from NVRAM index {} (Platform)", idx);
+                                    data = d;
+                                    break;
+                                },
+                                _ => { tracing::debug!("Index {} not found in O or P hierarchies", idx); }
+                            }
+                        }
                     }
                 }
                 
