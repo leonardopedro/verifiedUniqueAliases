@@ -141,7 +141,7 @@ echo "🔍 Resolving and copying dependencies..."
 copy_bin_and_deps "$BIN_PATH"
 
 echo "  Adding TPM2 tools..."
-for tool in tpm2_createpolicy tpm2_createprimary tpm2_create tpm2_load \
+for tool in tpm2 tpm2_createpolicy tpm2_createprimary tpm2_create tpm2_load \
             tpm2_unseal tpm2_quote tpm2_createak tpm2_pcrextend \
             tpm2_pcrread tpm2_nvread \
             tpm2_readpublic tpm2_flushcontext tpm2_startauthsession \
