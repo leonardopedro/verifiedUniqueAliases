@@ -264,6 +264,7 @@
 </div>
 
 <script>
+    // 1. Utility: Canonicalize JSON (alphabetical keys)
     function reorder(obj) {
         if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
             return Array.isArray(obj) ? obj.map(reorder) : obj;
@@ -273,13 +274,15 @@
         return newObj;
     }
 
+    // 2. Utility: Extract Leaf Certificate (Case-Corrected)
     function getLeafCert(pem) {
         if (!pem) return "";
         const match = pem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/);
         if (!match) return pem.replace(/[\s\r\n]/g, '');
-        return match[0].replace(/-----BEGIN CERTIFICATE-----|-----END CERTIFICATE-----|[\s\r\n]/g, '');
+        return match[0].replace(/-----(BEGIN|END) CERTIFICATE-----|[\s\r\n]/g, '');
     }
 
+    // 3. File Loader
     function loadFile(input, targetId) {
         const file = input.files[0];
         if (!file) return;
@@ -294,6 +297,7 @@
         reader.readAsText(file);
     }
 
+    // 4. Status Updater
     function updateStatus(id, success, desc) {
         const el = document.getElementById(id);
         if (!el) return;
@@ -304,6 +308,7 @@
         }
     }
 
+    // 5. GitHub Provenance Fetcher
     async function getProvenance(hash, name) {
         const repo = "leonardopedro/verifiedUniqueAliases";
         const url = `https://api.github.com/repos/${repo}/attestations/sha256:${hash}`;
@@ -323,10 +328,19 @@
         } catch (e) { return { success: false, name, runIds: [] }; }
     }
 
+    // 6. Main Audit Engine
     async function runAudit() {
         try {
-            const data = JSON.parse(document.getElementById('attestationInput').value);
-            const report = data.attestation_report;
+            const inputVal = document.getElementById('attestationInput').value;
+            if (!inputVal) throw new Error("Please provide an attestation report.");
+            
+            const rawData = JSON.parse(inputVal);
+            // Handle both wrapped and unwrapped report structures
+            const report = rawData.attestation_report || rawData.report || rawData;
+            
+            if (!report.hardware_level_attestation) throw new Error("Invalid report: missing hardware_level_attestation.");
+            if (!report.enclave_config?.boot_measurements) throw new Error("Invalid report: missing enclave_config.");
+
             const hw = report.hardware_level_attestation;
             const boot = report.enclave_config.boot_measurements;
             
@@ -334,7 +348,7 @@
             document.getElementById('signTime').innerText = new Date(report.timestamp_ms).toLocaleString();
 
             // 1. Identity Binding
-            const pubKeyPem = data.enclave_signing_public_key.replace(/-----(BEGIN|END) PUBLIC KEY-----|[\s\r\n]/g, '');
+            const pubKeyPem = (rawData.enclave_signing_public_key || report.public_key_pem || "").replace(/-----(BEGIN|END) PUBLIC KEY-----|[\s\r\n]/g, '');
             const pubKeyBuffer = Uint8Array.from(atob(pubKeyPem), c => c.charCodeAt(0));
             const pubKeyHash = await crypto.subtle.digest('SHA-256', pubKeyBuffer);
             const paypalHash = new Uint8Array(report.paypal_user_info_raw_hash.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
@@ -344,14 +358,15 @@
             const combinedHash = await crypto.subtle.digest('SHA-256', combined);
             const expectedNonce = Array.from(new Uint8Array(combinedHash)).map(b => b.toString(16).padStart(2, '0')).join('');
             const nonceOk = (hw.nonce_hex === expectedNonce);
-            updateStatus('identityCheck', nonceOk, nonceOk ? "Identity bound to hardware nonce." : "Nonce mismatch!");
+            updateStatus('identityCheck', nonceOk, nonceOk ? "Identity bound to hardware nonce." : "Nonce mismatch! tampering detected.");
 
             // 2. Enclave Signature
-            const sig = Uint8Array.from(atob(data.enclave_signature_b64), c => c.charCodeAt(0));
+            const sigB64 = rawData.enclave_signature_b64 || report.signature_b64;
+            const sig = Uint8Array.from(atob(sigB64), c => c.charCodeAt(0));
             const enclaveKey = await crypto.subtle.importKey('spki', pubKeyBuffer, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
             const payload = new TextEncoder().encode(JSON.stringify(reorder(report)));
             const sigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, enclaveKey, sig, payload);
-            updateStatus('enclaveCheck', sigOk, sigOk ? "Report signature verified." : "Signature invalid!");
+            updateStatus('enclaveCheck', sigOk, sigOk ? "Report signature verified." : "Report signature invalid!");
 
             // 3. TPM Hardware Audit
             let tpmSigOk = false;
@@ -404,7 +419,10 @@
                 const reportLeaf = getLeafCert(report.session_context.tls_certificate_pem);
                 updateStatus('tlsCheck', userLeaf === reportLeaf, userLeaf === reportLeaf ? "TLS channel bound." : "TLS mismatch!");
             }
-        } catch (e) { console.error(e); alert("Error: " + e.message); }
+        } catch (e) { 
+            console.error(e); 
+            alert("Audit Failed: " + e.message); 
+        }
     }
 </script>
 
