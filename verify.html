@@ -283,19 +283,31 @@
     }
 
     // 3. File Loader
-    function loadFile(input, targetId) {
+    window.loadFile = function(input, targetId) {
         const file = input.files[0];
         if (!file) return;
         const reader = new FileReader();
         reader.onload = (e) => {
-            document.getElementById(targetId).value = e.target.result;
-            const label = input.closest('.input-card').querySelector('label');
-            const original = label.innerText;
-            label.innerText = "✅ " + original;
-            setTimeout(() => { label.innerText = original; }, 2000);
+            const target = document.getElementById(targetId);
+            if (target) {
+                target.value = e.target.result;
+                const card = input.closest('.input-card');
+                if (card) {
+                    const label = card.querySelector('label');
+                    if (label) {
+                        const original = label.innerText;
+                        label.innerText = "✅ " + original;
+                        setTimeout(() => { label.innerText = original; }, 2000);
+                    }
+                }
+            }
+        };
+        reader.onerror = (err) => {
+            console.error("FileReader error:", err);
+            alert("Failed to read file.");
         };
         reader.readAsText(file);
-    }
+    };
 
     // 4. Status Updater
     function updateStatus(id, success, desc) {
@@ -350,6 +362,7 @@
 
     // 7. PCR 15 Verifier
     async function calculatePcr15(boot_manifest) {
+        // Reproduce exactly: serde_json::to_string(&sorted_manifest) where sorted_manifest is Vec<(&String, &String)>
         const sorted = Object.keys(boot_manifest).sort().map(k => [k, boot_manifest[k]]);
         const manifest_json = JSON.stringify(sorted);
         const encoder = new TextEncoder();
@@ -357,11 +370,10 @@
         const hashBuffer = await crypto.subtle.digest('SHA-256', data);
         
         // TPM PCR Extend: SHA256(PCR_OLD || HASH_NEW)
-        // PCR 15 starts at all zeros
-        const pcrOld = new Uint8Array(32);
+        const pcrOld = new Uint8Array(32); // PCR 15 starts at 0
         const combined = new Uint8Array(64);
         combined.set(pcrOld);
-        combined.set(new Uint8Array(hashBuffer));
+        combined.set(new Uint8Array(hashBuffer), 32); // Append hash to the zeros
         const finalHashBuffer = await crypto.subtle.digest('SHA-256', combined);
         return Array.from(new Uint8Array(finalHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
     }
