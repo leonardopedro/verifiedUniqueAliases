@@ -18,6 +18,7 @@ echo "✅ Using pre-built binary: $BIN_PATH"
 
 echo "✅ Using pre-built binary: $BIN_PATH"
 chmod +x "$BIN_PATH"
+SRC_ROOT="$(pwd)"
 
 # 2. Prepare build environment
 mkdir -p "$OUTPUT_DIR"
@@ -142,6 +143,7 @@ copy_bin_and_deps "$BIN_PATH"
 echo "  Adding TPM2 tools..."
 for tool in tpm2_createpolicy tpm2_createprimary tpm2_create tpm2_load \
             tpm2_unseal tpm2_quote tpm2_createak tpm2_pcrextend \
+            tpm2_pcrread tpm2_nvread \
             tpm2_readpublic tpm2_flushcontext tpm2_startauthsession \
             tpm2_policypcr tpm2_getekcertificate; do
     copy_bin_and_deps "$tool"
@@ -157,9 +159,14 @@ echo "  Adding system tools..."
 copy_bin_and_deps "ip"
 copy_bin_and_deps "modprobe"
 copy_bin_and_deps "depmod"
+copy_bin_and_deps "date"
 copy_bin_and_deps "insmod"
 copy_bin_and_deps "curl"
 copy_bin_and_deps "sha256sum"
+
+echo "  Adding PayPal Root CA..."
+mkdir -p ./etc/ssl/certs
+cp "$SRC_ROOT/src/paypal.pem" ./etc/ssl/certs/paypal.pem
 copy_bin_and_deps "nft"
 
 echo "  Adding TSS2 TCTI libraries (for dynamic loading)..."

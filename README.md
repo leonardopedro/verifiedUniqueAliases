@@ -6,10 +6,11 @@ Hardware-attested PayPal OAuth service on **GCP Confidential VM** (AMD SEV-SNP).
 Built for 100% bit-by-bit reproducibility and maximum security.
 
 ---
-## 🚀 Current Status (v116-PROD)
+## 🚀 Current Status (v118-PROD)
 
 | Component | Status |
 |---|---|
+| **TPM-Bound TLS Private Key** | ✅ Hardened (v118) |
 | **Decentralized Hub & Static Frontend** | ✅ Achieved (v116) |
 | **Custom Attestation Nonce Injection** | ✅ Achieved (v116) |
 | **Kernel Egress Firewalling (nftables)** | ✅ Achieved (v116) |
@@ -69,5 +70,21 @@ The browser-based Auditor performs a 4-stage validation:
 | `Dockerfile.repro` | Multi-stage build for 100% bitwise-reproducible disk images |
 | `AGENTS.md` | Detailed implementation state and security architecture guidelines |
 
-TODO: move to the folder legacy all files in this repository that are no longer strictly needed in this project (except README.md and AGENTS.md which should be updated to reflect the present status of this project). Add to the landing page the link to download verify.html directly from github and signal it as recommended way with instructions to open it after download it, give also the githubpages link to the same page but say  it is not the most  safe way
-Add also a custom field in the callback page before the certificate is generated, for the user to input custom info in the attestation report, the user then clicks a button and the certificate is generated (only one time, do not allow to regenerate the certificate)
+---
+
+## 🛠️ Verification Workflow (Recommended)
+For maximum security, do not trust the hosted web auditor. Verify the enclave locally:
+
+1. **Download the Report**: After a successful PayPal login, click **"Download Report (.json)"** on the attestation page.
+2. **Download the Auditor**: Click **"Download Auditor (.html)"** to get a local copy of the `verify.html` tool.
+3. **Capture TLS Evidence**: 
+   - Use `openssl` to capture the server's public certificate:
+   ```bash
+   echo | openssl s_client -connect login.airma.de:443 -showcerts | sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' > cert.pem
+   ```
+4. **Run Local Audit**:
+   - Open your local `verify.html` in a web browser.
+   - Upload the `attestation_report.json`.
+   - Upload the `cert.pem`.
+   - Click **"Perform Cryptographic Audit"**.
+   - Verify all green checks: Identity, TPM, Silicon, GitHub, and TLS Binding.
