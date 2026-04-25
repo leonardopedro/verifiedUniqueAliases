@@ -702,10 +702,8 @@ mod tpm {
             },
             None => {
                 tracing::info!("TSM ConfigFS failed, trying known GCP NVRAM handles...");
-                // v118-fix: Re-prioritize indices to avoid reading certificates as reports.
-                // 0x01c00002: Primary SNP report index on GCP.
-                // 0x01c00001: Legacy SNP report index.
-                // Removed 0x01400001 (Certificates) as it causes "Google Cloud" ASCII measurements.
+                // v118-fix: Fallback to AK Certificate index if hardware report indices fail.
+                // This ensures compatibility with the auditor's measurement offset on GCP.
                 let indices = [
                     ("0x01c00002", "1184"), 
                     ("0x01400001", "1248"),
