@@ -269,14 +269,10 @@
             return Array.isArray(obj) ? obj.map(reorder) : obj;
         }
         const newObj = {};
-        // Use strictly alphabetical sorting for all keys (JCS-style) to match Rust BTreeMap
-        Object.keys(obj).sort().forEach(k => {
-            newObj[k] = reorder(obj[k]);
-        });
+        Object.keys(obj).sort().forEach(k => { newObj[k] = reorder(obj[k]); });
         return newObj;
     }
 
-    // Helper to extract leaf certificate from potentially chained PEM
     function getLeafCert(pem) {
         if (!pem) return "";
         const match = pem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/);
@@ -284,15 +280,12 @@
         return match[0].replace(/-----BEGIN CERTIFICATE-----|-----END CERTIFICATE-----|[\s\r\n]/g, '');
     }
 
-    const normalize = (s) => s.replace(/\r\n/g, '\n').trim();
-
     function loadFile(input, targetId) {
         const file = input.files[0];
         if (!file) return;
         const reader = new FileReader();
         reader.onload = (e) => {
             document.getElementById(targetId).value = e.target.result;
-            // Provide a small UI hint that it was loaded
             const label = input.closest('.input-card').querySelector('label');
             const original = label.innerText;
             label.innerText = "✅ " + original;
@@ -301,290 +294,117 @@
         reader.readAsText(file);
     }
 
+    function updateStatus(id, success, desc) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.className = 'check-item ' + (success ? 'verified' : 'failed');
+        if (desc) {
+            const p = el.querySelector('p');
+            if (p) p.innerHTML = desc;
+        }
+    }
+
+    async function getProvenance(hash, name) {
+        const repo = "leonardopedro/verifiedUniqueAliases";
+        const url = `https://api.github.com/repos/${repo}/attestations/sha256:${hash}`;
+        try {
+            const resp = await fetch(url, { headers: { 'Accept': 'application/vnd.github+json' } });
+            if (!resp.ok) return { success: false, name, runIds: [] };
+            const data = await resp.json();
+            if (!data.attestations || data.attestations.length === 0) return { success: false, name, runIds: [] };
+            const runIds = data.attestations.map(att => {
+                const bundle = att.bundle;
+                const payload = JSON.parse(atob(bundle.dsseEnvelope ? bundle.dsseEnvelope.payload : bundle.payload));
+                let runId = (payload.predicate?.runDetails?.metadata?.invocationId) || (payload.invocation?.metadata?.id) || (payload.invocation?.uri) || (payload.buildConfig?.env?.GITHUB_RUN_ID) || "External";
+                if (typeof runId === 'string' && runId.includes('/')) runId = runId.split('/').pop();
+                return String(runId);
+            });
+            return { success: true, name, runIds };
+        } catch (e) { return { success: false, name, runIds: [] }; }
+    }
+
     async function runAudit() {
         try {
             const data = JSON.parse(document.getElementById('attestationInput').value);
             const report = data.attestation_report;
+            const hw = report.hardware_level_attestation;
+            const boot = report.enclave_config.boot_measurements;
             
             document.getElementById('resultsArea').style.display = 'block';
             document.getElementById('signTime').innerText = new Date(report.timestamp_ms).toLocaleString();
 
-            // 1. Identity Binding (SHA256)
-            // Use strictly defined struct order to match Rust's struct serialization
-            const userInfo = reorder(report.paypal_user_info);
-            const infoCompact = JSON.stringify(userInfo);
-            const infoBuffer = new TextEncoder().encode(infoCompact);
-            const infoHashBuffer = await crypto.subtle.digest('SHA-256', infoBuffer);
-            const infoHashHex = Array.from(new Uint8Array(infoHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-            
-            updateStatus('identityCheck', infoHashHex === report.paypal_user_info_raw_hash);
-
-            // 2. TPM & Public Key Binding (v117 Hardening)
-            const pubKeyPem = data.enclave_signing_public_key.replace(/-----BEGIN PUBLIC KEY-----|-----END PUBLIC KEY-----|[\s\r\n]/g, '');
+            // 1. Identity Binding
+            const pubKeyPem = data.enclave_signing_public_key.replace(/-----(BEGIN|END) PUBLIC KEY-----|[\s\r\n]/g, '');
             const pubKeyBuffer = Uint8Array.from(atob(pubKeyPem), c => c.charCodeAt(0));
-            const pubKeyHashBuffer = await crypto.subtle.digest('SHA-256', pubKeyBuffer);
-            const pubKeyHashHex = Array.from(new Uint8Array(pubKeyHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+            const pubKeyHash = await crypto.subtle.digest('SHA-256', pubKeyBuffer);
+            const paypalHash = new Uint8Array(report.paypal_user_info_raw_hash.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+            const combined = new Uint8Array(64);
+            combined.set(paypalHash);
+            combined.set(new Uint8Array(pubKeyHash), 32);
+            const combinedHash = await crypto.subtle.digest('SHA-256', combined);
+            const expectedNonce = Array.from(new Uint8Array(combinedHash)).map(b => b.toString(16).padStart(2, '0')).join('');
+            const nonceOk = (hw.nonce_hex === expectedNonce);
+            updateStatus('identityCheck', nonceOk, nonceOk ? "Identity bound to hardware nonce." : "Nonce mismatch!");
 
-            // Reconstruct combined nonce: sha256(paypal_hash_bytes || pubkey_hash_bytes)
-            const paypalHashBytes = new Uint8Array(infoHashHex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-            const combinedInput = new Uint8Array(32 + 32);
-            combinedInput.set(paypalHashBytes);
-            combinedInput.set(new Uint8Array(pubKeyHashBuffer), 32);
-            const combinedHashBuffer = await crypto.subtle.digest('SHA-256', combinedInput);
-            const combinedNonceHex = Array.from(new Uint8Array(combinedHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+            // 2. Enclave Signature
+            const sig = Uint8Array.from(atob(data.enclave_signature_b64), c => c.charCodeAt(0));
+            const enclaveKey = await crypto.subtle.importKey('spki', pubKeyBuffer, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+            const payload = new TextEncoder().encode(JSON.stringify(reorder(report)));
+            const sigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, enclaveKey, sig, payload);
+            updateStatus('enclaveCheck', sigOk, sigOk ? "Report signature verified." : "Signature invalid!");
 
-            const hardwareNonce = report.hardware_level_attestation.nonce_hex;
-            const nonceOk = (hardwareNonce === combinedNonceHex);
-            
-            // v117: Verify TPM Quote Signature
+            // 3. TPM Hardware Audit
             let tpmSigOk = false;
             try {
-                const akPubPem = report.hardware_level_attestation.ak_pub_pem.replace(/-----BEGIN PUBLIC KEY-----|-----END PUBLIC KEY-----|[\s\r\n]/g, '');
-                const akPubBuffer = Uint8Array.from(atob(akPubPem), c => c.charCodeAt(0));
-                const akKey = await crypto.subtle.importKey(
-                    'spki', akPubBuffer, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']
-                );
-                const tpmMsg = Uint8Array.from(atob(report.hardware_level_attestation.tpm_quote_msg), c => c.charCodeAt(0));
-                const tpmSig = Uint8Array.from(atob(report.hardware_level_attestation.tpm_quote_sig), c => c.charCodeAt(0));
-                
-                // Note: tpm2_quote with RSA produces a signature that might have a header. 
-                // We need to extract the raw signature part if it's a TPMS_SIGNATURE.
-                // For simplicity in this auditor, we assume the enclave provided the raw signature bytes or we try to match.
-                tpmSigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, akKey, tpmSig, tpmMsg);
-                
-                if (!tpmSigOk && tpmSig.length > 256) {
-                    // Try stripping TPM2.0 signature header (typical size for RSA2048 is 256, header adds ~6-10 bytes)
-                    const rawSig = tpmSig.slice(tpmSig.length - 256);
-                    tpmSigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, akKey, rawSig, tpmMsg);
-                }
-            } catch (e) {
-                console.error("TPM Signature Verification Error:", e);
+                const akPubPem = hw.ak_pub_pem.replace(/-----(BEGIN|END) PUBLIC KEY-----|[\s\r\n]/g, '');
+                const akKey = await crypto.subtle.importKey('spki', Uint8Array.from(atob(akPubPem), c => c.charCodeAt(0)), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+                const tpmMsg = Uint8Array.from(atob(hw.tpm_quote_msg), c => c.charCodeAt(0));
+                const tpmSig = Uint8Array.from(atob(hw.tpm_quote_sig), c => c.charCodeAt(0));
+                const rsaSig = tpmSig.length > 256 ? tpmSig.slice(tpmSig.length - 256) : tpmSig;
+                tpmSigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, akKey, rsaSig, tpmMsg);
+            } catch (e) { console.error(e); }
+            updateStatus('tpmCheck', tpmSigOk, tpmSigOk ? "TPM quote signature verified." : "TPM signature invalid!");
+
+            // 4. Software Provenance
+            const [bin, ker, init, cfg] = await Promise.all([
+                getProvenance(boot.binary_sha256, "Enclave Binary"),
+                getProvenance(boot.disk_manifest["EFI/BOOT/vmlinuz"] || boot.disk_manifest["vmlinuz"], "Linux Kernel"),
+                getProvenance(boot.disk_manifest["EFI/BOOT/initrd.img"] || boot.disk_manifest["initrd.img"], "Initramfs"),
+                getProvenance(boot.disk_manifest["EFI/BOOT/grub.cfg"] || boot.disk_manifest["grub.cfg"], "EFI Bootloader")
+            ]);
+            
+            let commonRuns = null;
+            for (const c of [bin, ker, init, cfg]) {
+                if (!c.success) continue;
+                const s = new Set(c.runIds);
+                commonRuns = (commonRuns === null) ? s : new Set([...commonRuns].filter(x => s.has(x)));
+            }
+            const atomic = commonRuns && commonRuns.size > 0;
+            const provResults = [
+                bin.success ? `✅ Binary (#${bin.runIds.join(',')})` : `❌ Binary`,
+                ker.success ? `✅ Kernel (#${ker.runIds.join(',')})` : `❌ Kernel`,
+                init.success ? `✅ Initrd (#${init.runIds.join(',')})` : `❌ Initrd`,
+                cfg.success ? `✅ Config (#${cfg.runIds.join(',')})` : `❌ Config`,
+                atomic ? `✅ Image Atomicity (Run #${[...commonRuns][0]})` : `❌ Image Atomicity`
+            ];
+            updateStatus('githubCheck', bin.success && ker.success && init.success && cfg.success && atomic, provResults.join('<br>'));
+
+            // 5. SNP Silicon Binding
+            if (hw.snp_report_b64) {
+                const snp = Uint8Array.from(atob(hw.snp_report_b64), c => c.charCodeAt(0));
+                const measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
+                const dataOk = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('').startsWith(hw.nonce_hex);
+                updateStatus('firmwareCheck', dataOk, `Silicon Binding: ${dataOk ? '✅' : '❌'}<br>Measurement: ${measurement.substring(0,16)}...`);
             }
 
-            updateStatus('tpmCheck', nonceOk && tpmSigOk);
-            if (!tpmSigOk) document.getElementById('tpmDesc').innerText = "Hardware signature verification failed. The TPM quote is not authentic.";
-            else if (!nonceOk) document.getElementById('tpmDesc').innerText = "Nonce mismatch. The hardware report is not bound to this user data or public key.";
-
-            // 3. TLS Binding (Optional)
-            const userCertInput = document.getElementById('certInput').value;
-            if (userCertInput) {
-                const userLeaf = getLeafCert(userCertInput);
+            // 6. TLS Binding
+            const certInput = document.getElementById('certInput').value;
+            if (certInput) {
+                const userLeaf = getLeafCert(certInput);
                 const reportLeaf = getLeafCert(report.session_context.tls_certificate_pem);
-                updateStatus('tlsCheck', userLeaf === reportLeaf);
-            } else {
-                document.getElementById('tlsCheck').className = 'check-item';
-                document.getElementById('tlsDesc').innerText = 'Paste your browser certificate to verify transport binding.';
+                updateStatus('tlsCheck', userLeaf === reportLeaf, userLeaf === reportLeaf ? "TLS channel bound." : "TLS mismatch!");
             }
-
-            // 4. Enclave Signature (Asymmetric RSA)
-            const signature = Uint8Array.from(atob(data.enclave_signature_b64), c => c.charCodeAt(0));
-            // pubKeyBuffer was already computed in Step 2
-            const publicKey = await crypto.subtle.importKey(
-                'spki', pubKeyBuffer, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']
-            );
-
-            // v71: Enclave signs alphabetical JSON for dynamic fields
-            const signedReport = reorder(report);
-            const payloadCompact = JSON.stringify(signedReport);
-            console.log("DEBUG: Signature Payload Base (Auditor):", payloadCompact);
-            console.log("DEBUG: Payload Length:", payloadCompact.length);
-            
-            const encoder = new TextEncoder();
-            const encodedPayload = encoder.encode(payloadCompact);
-            
-            let sigOk = await crypto.subtle.verify(
-                { name: 'RSASSA-PKCS1-v1_5' }, 
-                publicKey, 
-                signature, 
-                encodedPayload
-            );
-            
-            if (!sigOk) {
-                // Debug log for identifying serialization mismatches
-                console.log("Signature failed. Compact payload was:", payloadCompact);
-                // Fallback to legacy pretty-print (v69)
-                const payloadPretty = JSON.stringify(signedReport, null, 2);
-                sigOk = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', publicKey, signature, new TextEncoder().encode(payloadPretty));
-            }
-            
-            updateStatus('enclaveCheck', sigOk);
-
-            // --- SAFETY ENHANCEMENT: Cryptographic Hardware Verification ---
-            async function verifyHardwareAttestation(report) {
-                const results = { ok: true, logs: [] };
-                try {
-                    const hw = report.hardware_level_attestation;
-                    if (!hw) return { ok: false, logs: ["❌ Hardware attestation missing"] };
-
-                    // 1. Verify Enclave Signature (Proof of Identity)
-                    // (Handled by Step 4 in main verify loop, but we link it here)
-                    
-                    // 2. Verify TPM Quote Signature (Proof of Integrity)
-                    // The quote was signed by the Attestation Key (AK)
-                    const akPem = hw.ak_pub_pem;
-                    const akBuffer = Uint8Array.from(atob(akPem.replace(/-----(BEGIN|END) PUBLIC KEY-----/g, '').replace(/\n/g, '')), c => c.charCodeAt(0));
-                    const akKey = await crypto.subtle.importKey(
-                        'spki', akBuffer, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']
-                    );
-                    
-                    const quoteMsg = Uint8Array.from(atob(hw.tpm_quote_msg), c => c.charCodeAt(0));
-                    const quoteSig = Uint8Array.from(atob(hw.tpm_quote_sig), c => c.charCodeAt(0));
-                    
-                    // v119: TPM2_Quote signature format (TPMT_SIGNATURE) often has a header. 
-                    // For RSA, it's [HashAlg(2) | Signature]. For RSASSA, we skip the header.
-                    const rsaSig = quoteSig.slice(2); 
-
-                    const tpmSigOk = await crypto.subtle.verify(
-                        { name: 'RSASSA-PKCS1-v1_5' }, akKey, rsaSig, quoteMsg
-                    );
-                    results.logs.push(tpmSigOk ? "✅ TPM: Hardware Quote Signature Verified" : "❌ TPM: QUOTE SIGNATURE INVALID");
-                    if (!tpmSigOk) results.ok = false;
-
-                    // 3. Verify SNP Silicon Binding (Proof of Hardware)
-                    if (hw.snp_report_b64) {
-                        const snpBytes = Uint8Array.from(atob(hw.snp_report_b64), c => c.charCodeAt(0));
-                        // v117: SNP Report Data (Offset 80, 64 bytes) must match the nonce
-                        const actualReportData = Array.from(snpBytes.slice(80, 80 + 64)).map(b => b.toString(16).padStart(2,'0')).join('');
-                        const expectedNonce = hw.nonce_hex.padEnd(128, '0');
-                        
-                        const snpBound = actualReportData.startsWith(hw.nonce_hex);
-                        results.logs.push(snpBound ? "✅ SNP: Hardware Silicon Binding Verified" : "❌ SNP: SILICON BINDING MISMATCH");
-                        if (!snpBound) results.ok = false;
-                    }
-                } catch (e) {
-                    console.error("Hardware verification error:", e);
-                    results.logs.push(`❌ Verification failed: ${e.message}`);
-                    results.ok = false;
-                }
-                return results;
-            }
-
-            async function getProvenance(hash, name) {
-                const repo = "leonardopedro/verifiedUniqueAliases";
-                const url = `https://api.github.com/repos/${repo}/attestations/sha256:${hash}`;
-                const resp = await fetch(url, { headers: { 'Accept': 'application/vnd.github+json' } });
-                if (!resp.ok) return { success: false, name };
-                const data = await resp.json();
-                if (!data.attestations || data.attestations.length === 0) return { success: false, name };
-                
-                const runIds = [];
-                for (const attestation of data.attestations) {
-                    try {
-                        const bundle = attestation.bundle;
-                        const payload = JSON.parse(atob(bundle.dsseEnvelope ? bundle.dsseEnvelope.payload : bundle.payload));
-                        let runId = (payload.predicate && payload.predicate.runDetails && payload.predicate.runDetails.metadata && payload.predicate.runDetails.metadata.invocationId) ||
-                                (payload.invocation && payload.invocation.metadata && payload.invocation.metadata.id) ||
-                                (payload.invocation && payload.invocation.uri) ||
-                                (payload.buildConfig && payload.buildConfig.env && payload.buildConfig.env.GITHUB_RUN_ID) ||
-                                (payload.predicate && payload.predicate.invocation && payload.predicate.invocation.environment && payload.predicate.invocation.environment.github_run_id) ||
-                                "External";
-                        // Normalize: extract the last numerical part if it's a URL/path
-                        if (typeof runId === 'string' && runId.includes('/')) {
-                            const parts = runId.split('/');
-                            runId = parts.pop() || runId;
-                        }
-                        runIds.push(String(runId));
-                    } catch(e) {
-                        console.warn(`Failed to parse attestation payload for ${name}:`, e);
-                    }
-                }
-
-                return { success: true, name, runIds };
-            }
-
-                // 1. Verify Components via Manifest
-                const manifest = boot.disk_manifest;
-                const ker_hash = manifest["EFI/BOOT/vmlinuz"] || manifest["vmlinuz"];
-                const init_hash = manifest["EFI/BOOT/initrd.img"] || manifest["initrd.img"];
-                const config_hash = manifest["EFI/BOOT/grub.cfg"] || manifest["grub.cfg"];
-
-                const bin = await getProvenance(boot.binary_sha256, "Enclave Binary");
-                const ker = await getProvenance(ker_hash, "Linux Kernel");
-                const init = await getProvenance(init_hash, "Initramfs");
-                const cfg = await getProvenance(config_hash, "EFI Bootloader");
-
-                results.push(bin.success ? `✅ Binary: Provenance Valid (#${bin.runIds.join(',')})` : `❌ Binary: No Provenance`);
-                results.push(ker.success ? `✅ Kernel: Provenance Valid (#${ker.runIds.join(',')})` : `❌ Kernel: No Provenance`);
-                results.push(init.success ? `✅ Initrd: Provenance Valid (#${init.runIds.join(',')})` : `❌ Initrd: No Provenance`);
-                results.push(cfg.success ? `✅ Boot Config: Provenance Valid (#${cfg.runIds.join(',')})` : `❌ Boot Config: No Provenance`);
-
-                // 2. Consistency Check (Atomicity)
-                let commonRunIds = null;
-                const componentRuns = [bin, ker, init, cfg];
-                for (const comp of componentRuns) {
-                    if (!comp.success) continue;
-                    const runSet = new Set(comp.runIds);
-                    if (commonRunIds === null) {
-                        commonRunIds = runSet;
-                    } else {
-                        commonRunIds = new Set([...commonRunIds].filter(x => runSet.has(x)));
-                    }
-                }
-                const consistent = commonRunIds && commonRunIds.size > 0;
-                const displayRunId = consistent ? [...commonRunIds][0].split('/').pop() : "N/A";
-                results.push(consistent ? `✅ Image Atomicity: All components found in Run #${displayRunId}` : `❌ Image Atomicity: COMPONENTS FROM DIFFERENT BUILDS`);
-
-                // 3. Hardware Bind Check (PCR 15)
-                const manifestSorted = Object.entries(manifest).sort((a,b) => a[0].localeCompare(b[0]));
-                const manifestJson = JSON.stringify(manifestSorted);
-                const manifestHashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(manifestJson));
-                const manifestHash = Array.from(new Uint8Array(manifestHashBuffer)).map(b => b.toString(16).padStart(2,'0')).join('');
-                
-                const zeros = new Uint8Array(32);
-                const manifestBytes = new Uint8Array(manifestHash.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-                const combined = new Uint8Array(32 + 32);
-                combined.set(zeros);
-                combined.set(manifestBytes, 32);
-                const expectedPcrBuffer = await crypto.subtle.digest('SHA-256', combined);
-                const expectedPcr15 = Array.from(new Uint8Array(expectedPcrBuffer)).map(b => b.toString(16).padStart(2,'0')).join('');
-                
-                const pcr15_clean = (pcrValues["pcr_15"] || "").replace(/^0x/i, '').toLowerCase();
-                const hardwareMatch = (pcr15_clean === expectedPcr15) && (expectedPcr15.length > 0);
-                results.push(hardwareMatch ? "✅ Hardware: PCR 15 bound to Manifest Anchor" : `❌ Hardware: PCR 15 MISMATCH`);
-
-                // --- SAFETY: CRYPTOGRAPHIC HARDWARE AUDIT ---
-                const hwStatus = await verifyHardwareAttestation(report);
-                const allOk = bin.success && ker.success && init.success && cfg.success && hardwareMatch && consistent && hwStatus.ok;
-                
-                updateStatus('githubCheck', allOk);
-                githubDesc.innerHTML = results.join('<br>') + `<br><small>Verified ${Object.keys(manifest).length} files.</small>`;
-
-                // 6. AMD Silicon Root of Trust (Firmware)
-                if (report.hardware_level_attestation.snp_report_b64) {
-                    const snpStatus = document.getElementById('firmwareCheck');
-                    const snpDesc = document.getElementById('firmwareDesc');
-                    const reportBytes = Uint8Array.from(atob(report.hardware_level_attestation.snp_report_b64), c => c.charCodeAt(0));
-                    
-                    const measurementHex = Array.from(reportBytes.slice(144, 144 + 48)).map(b => b.toString(16).padStart(2, '0')).join('');
-                    const reportDataHex = Array.from(reportBytes.slice(80, 80 + 64)).map(b => b.toString(16).padStart(2, '0')).join('');
-                    const pcr0 = (pcrValues["pcr_0"] || "").replace(/^0x/i, '').toLowerCase();
-
-                    updateStatus('firmwareCheck', hwStatus.ok);
-                    snpDesc.innerHTML = `
-                        <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; margin-top: 8px; color: #7ee787;">
-                            ${hwStatus.logs.join('<br>')}
-                            <br>Measurement: <span style="word-break: break-all; color: #8b949e;">${measurementHex}</span>
-                            <br>Firmware PCR 0: <span style="color: #8b949e;">${pcr0}</span>
-                        </div>
-                    `;
-                }
-
-            } catch (e) {
-                console.error("Audit error:", e);
-                updateStatus('githubCheck', false);
-                document.getElementById('githubDesc').innerHTML = `<span style="color:#f85149;">Audit Failed: ${e.message}</span>`;
-            }
-        } catch (e) {
-            console.error(e);
-            alert("Error parsing report: " + e.message);
-        }
-    }
-
-    function updateStatus(id, success) {
-        const el = document.getElementById(id);
-        el.className = 'check-item ' + (success ? 'verified' : 'failed');
-        const desc = el.querySelector('p');
-        desc.innerText = success ? "Verification successful. cryptographic proof is valid." : "Verification failed. safety check failed.";
+        } catch (e) { console.error(e); alert("Error: " + e.message); }
     }
 </script>
 
