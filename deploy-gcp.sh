@@ -166,7 +166,7 @@ echo "Provisioning AMD SEV-SNP Enclave (Spot n2d-highcpu-2, Netherlands)..."
 gcloud compute instances create ${VM_NAME} \
     --project=${PROJECT_ID} \
     --zone=${ZONE} \
-    --machine-type=n2d-standard-2 \
+    --machine-type=n2d-highcpu-2 \
     --confidential-compute-type=SEV_SNP \
     --provisioning-model=SPOT \
     --instance-termination-action=STOP \
