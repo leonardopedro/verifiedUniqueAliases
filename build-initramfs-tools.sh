@@ -1,4 +1,60 @@
 #!/bin/bash
+# -----------------------------------------------------------------------------
+# ROBUST DEPENDENCY RESOLVER FUNCTION
+# This safely handles copying binaries, resolving their real paths,
+# and meticulously recreating symlinks for shared libraries (crucial for glibc)
+# -----------------------------------------------------------------------------
+copy_bin_and_deps() {
+    local bin_path
+    bin_path=$(command -v "$1" 2>/dev/null || echo "$1")
+
+    if [ ! -f "$bin_path" ]; then
+        echo "  ⚠️  Warning: $1 not found, skipping."
+        return
+    fi
+
+    # 1. Resolve and copy the binary itself
+    local real_bin
+    real_bin=$(readlink -f "$bin_path")
+    mkdir -p ".$(dirname "$real_bin")"
+    
+    # Use --update=none on newer cp versions, fallback to -n
+    if cp --help | grep -q "update=none"; then
+        cp -p --update=none "$real_bin" ".${real_bin}"
+    else
+        cp -pn "$real_bin" ".${real_bin}"
+    fi
+
+    # If the binary was a symlink, recreate the symlink in staging
+    if [ "$bin_path" != "$real_bin" ]; then
+        mkdir -p ".$(dirname "$bin_path")"
+        # Create RELATIVE symlink for stability
+        (cd ".$(dirname "$bin_path")" && ln -sf "$(real_bin=$(readlink -f "$real_bin"); python3 -c "import os; print(os.path.relpath('$real_bin', '$(dirname "$bin_path")'))")" "$(basename "$bin_path")")
+    fi
+
+    # 2. Resolve and copy all shared libraries via ldd
+    # If the binary is static, ldd will return 'not a dynamic executable' and the loop won't run.
+    ldd "$real_bin" 2>/dev/null | awk '/=>/ {print $3} /ld-linux/ {print $1}' | grep '^/' | while read -r lib; do
+        [ -f "$lib" ] || continue
+        local real_lib
+        real_lib=$(readlink -f "$lib")
+
+        # Copy real library
+        mkdir -p ".$(dirname "$real_lib")"
+        if cp --help | grep -q "update=none"; then
+            cp -p --update=none "$real_lib" ".${real_lib}" 2>/dev/null || true
+        else
+            cp -pn "$real_lib" ".${real_lib}" 2>/dev/null || true
+        fi
+
+        # Recreate symlink (e.g., libc.so.6 -> libc-2.31.so)
+        if [ "$lib" != "$real_lib" ]; then
+            mkdir -p ".$(dirname "$lib")"
+            (cd ".$(dirname "$lib")" && ln -sf "$(real_lib=$(readlink -f "$real_lib"); python3 -c "import os; print(os.path.relpath('$real_lib', '$(dirname "$lib")'))")" "$(basename "$lib")")
+        fi
+    done
+}
+
 set -exuo pipefail
 
 echo "🏗️  Building robust reproducible initramfs for GCP Confidential VM..."
@@ -14,9 +70,6 @@ OUTPUT_FILE="${OUTPUT_DIR}/initramfs-paypal-auth.img"
 STAGING_DIR="/tmp/initramfs_staging"
 BIN_PATH="$(pwd)/paypal-auth-vm-bin"
 
-echo "✅ Using pre-built binary: $BIN_PATH"
-
-echo "✅ Using pre-built binary: $BIN_PATH"
 chmod +x "$BIN_PATH"
 SRC_ROOT="$(pwd)"
 
@@ -74,67 +127,14 @@ else
     cpio -idm --quiet < "$BASE_IMG" 2>/dev/null || true
 fi
 
-# 5. Overwrite the default init with our Rust binary
+# 🚀 Installing Enclave Init...
 echo "🚀 Installing Enclave Init..."
-rm -f ./init
-cp "$BIN_PATH" ./init
+# Use our robust helper to ensure all shared libraries (libc, libssl, libcrypto, etc.) are included
+copy_bin_and_deps "$BIN_PATH"
+
+# Now symlink the binary to /init as expected by the kernel
+ln -sf "$BIN_PATH" ./init
 chmod 755 ./init
-
-# -----------------------------------------------------------------------------
-# ROBUST DEPENDENCY RESOLVER FUNCTION
-# This safely handles copying binaries, resolving their real paths,
-# and meticulously recreating symlinks for shared libraries (crucial for glibc)
-# -----------------------------------------------------------------------------
-copy_bin_and_deps() {
-    local bin_path
-    bin_path=$(command -v "$1" 2>/dev/null || echo "$1")
-
-    if [ ! -f "$bin_path" ]; then
-        echo "  ⚠️  Warning: $1 not found, skipping."
-        return
-    fi
-
-    # 1. Resolve and copy the binary itself
-    local real_bin
-    real_bin=$(readlink -f "$bin_path")
-    mkdir -p ".$(dirname "$real_bin")"
-    
-    # Use --update=none on newer cp versions, fallback to -n
-    if cp --help | grep -q "update=none"; then
-        cp -p --update=none "$real_bin" ".${real_bin}"
-    else
-        cp -pn "$real_bin" ".${real_bin}"
-    fi
-
-    # If the binary was a symlink, recreate the symlink in staging
-    if [ "$bin_path" != "$real_bin" ]; then
-        mkdir -p ".$(dirname "$bin_path")"
-        # Create RELATIVE symlink for stability
-        (cd ".$(dirname "$bin_path")" && ln -sf "$(real_bin=$(readlink -f "$real_bin"); python3 -c "import os; print(os.path.relpath('$real_bin', '$(dirname "$bin_path")'))")" "$(basename "$bin_path")")
-    fi
-
-    # 2. Resolve and copy all shared libraries via ldd
-    # If the binary is static, ldd will return 'not a dynamic executable' and the loop won't run.
-    ldd "$real_bin" 2>/dev/null | awk '/=>/ {print $3} /ld-linux/ {print $1}' | grep '^/' | while read -r lib; do
-        [ -f "$lib" ] || continue
-        local real_lib
-        real_lib=$(readlink -f "$lib")
-
-        # Copy real library
-        mkdir -p ".$(dirname "$real_lib")"
-        if cp --help | grep -q "update=none"; then
-            cp -p --update=none "$real_lib" ".${real_lib}" 2>/dev/null || true
-        else
-            cp -pn "$real_lib" ".${real_lib}" 2>/dev/null || true
-        fi
-
-        # Recreate symlink (e.g., libc.so.6 -> libc-2.31.so)
-        if [ "$lib" != "$real_lib" ]; then
-            mkdir -p ".$(dirname "$lib")"
-            (cd ".$(dirname "$lib")" && ln -sf "$(real_lib=$(readlink -f "$real_lib"); python3 -c "import os; print(os.path.relpath('$real_lib', '$(dirname "$lib")'))")" "$(basename "$lib")")
-        fi
-    done
-}
 
 # 6. Inject required binaries and their dependencies
 echo "🔍 Resolving and copying dependencies..."

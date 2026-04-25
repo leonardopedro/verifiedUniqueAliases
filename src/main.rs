@@ -643,7 +643,7 @@ mod tpm {
         run_cmd("tpm2_quote", &[
             "-c", &ak_ctx,
             "-l", &format!("sha256:{}", PCR_SELECTION),
-            "-q", &format!("0x{}", nonce_hex),
+            "-q", &nonce_hex,
             "-m", &quote_msg,
             "-s", &quote_sig,
         ]).await?;
