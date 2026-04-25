@@ -304,7 +304,11 @@ mod enclave_init {
             let resolv: String = lease.dns.iter().map(|ip| format!("nameserver {}\n", ip)).collect();
             std::fs::write("/etc/resolv.conf", resolv).ok();
         }
-        kmsg(&format!("Network up: {} gw={:?}", cidr, lease.gw));
+        
+        // CRITICAL GCP FIX: Set MTU to 1460 to avoid fragmentation on ACME/TLS packets
+        let _ = Command::new("/sbin/ip").args(["link", "set", "dev", iface, "mtu", "1460"]).status();
+        
+        kmsg(&format!("Network up: {} gw={:?} mtu=1460", cidr, lease.gw));
     }
 
     async fn dhcp(iface: &str) -> Result<Lease, Box<dyn std::error::Error + Send + Sync>> {
@@ -371,6 +375,19 @@ mod enclave_init {
 
         let lease = dhcp(&iface).await?;
         apply_lease(&iface, &lease);
+
+        // SYNC TIME from metadata server (HTTP headers)
+        let client = reqwest::Client::new();
+        if let Ok(resp) = client.get("http://metadata.google.internal/computeMetadata/v1/instance/").header("Metadata-Flavor", "Google").send().await {
+            if let Some(date_str) = resp.headers().get("Date") {
+                if let Ok(date) = date_str.to_str() {
+                    // Use date command to set time: `date -s "Sat, 25 Apr 2026 19:30:44 GMT"`
+                    let _ = std::process::Command::new("/bin/date").args(["-s", date]).status();
+                    kmsg(&format!("System time synced to: {}", date));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -451,20 +468,25 @@ mod tpm {
             }
 
             let report_dir = format!("{}/paypal_audit_{}", tsm_base, hex::encode(&nonce[..8]));
-            let _ = fs::create_dir_all(&report_dir);
-
-            // 1. Set the nonce/inblob
-            let _ = fs::write(format!("{}/inblob", report_dir), nonce);
-            // 2. Set the type to 'sev-snp'
-            let _ = fs::write(format!("{}/privlevel", report_dir), "0"); // VMPL 0
+            let _ = fs::create_dir_all(&report_dir);            // 1. Set the nonce/inblob
+            if let Err(e) = fs::write(format!("{}/inblob", report_dir), nonce) {
+                tracing::error!("Failed to write inblob to ConfigFS: {}", e);
+                return None;
+            }
 
             // 3. Read the report
             let report = match fs::read(format!("{}/outblob", report_dir)) {
-                Ok(data) => Some(STANDARD.encode(&data)),
-                Err(_) => None,
+                Ok(data) => {
+                    tracing::info!("Successfully read SNP report from ConfigFS outblob ({} bytes)", data.len());
+                    Some(STANDARD.encode(&data))
+                },
+                Err(e) => {
+                    tracing::error!("Failed to read outblob from ConfigFS: {}", e);
+                    None
+                }
             };
-
-            // 4. Cleanup
+            
+            // Cleanup
             let _ = fs::remove_dir(&report_dir);
             report
         }
@@ -584,14 +606,17 @@ mod tpm {
         let quote_sig = format!("{}/quote.sig", work_dir);
 
         // 1. Create primary key in Owner hierarchy explicitly
+        tracing::info!("DEBUG: TPM CreatePrimary starting...");
         run_cmd("tpm2_createprimary", &[
             "-C", "o", 
             "-g", "sha256", 
             "-G", "rsa2048", 
             "-c", &primary_ctx
         ]).await?;
+        tracing::info!("DEBUG: TPM CreatePrimary done.");
 
         // 2. Create the AK with 'restricted|sign' - required for TPM2_Quote
+        tracing::info!("DEBUG: TPM Create AK starting...");
         run_cmd("tpm2_create", &[
             "-C", &primary_ctx,
             "-g", "sha256",
@@ -600,6 +625,7 @@ mod tpm {
             "-u", &ak_pub,
             "-r", &ak_priv
         ]).await?;
+        tracing::info!("DEBUG: TPM Create AK done.");
         
         // 3. Load it
         run_cmd("tpm2_load", &[
@@ -613,13 +639,15 @@ mod tpm {
         run_cmd("tpm2_readpublic", &["-c", &ak_ctx, "-f", "pem", "-o", &ak_pem]).await?;
         let ak_pem_str = tokio::fs::read_to_string(&ak_pem).await?;
 
+        tracing::info!("DEBUG: TPM Quote starting with nonce 0x{}...", nonce_hex);
         run_cmd("tpm2_quote", &[
             "-c", &ak_ctx,
             "-l", &format!("sha256:{}", PCR_SELECTION),
-            "-q", nonce_hex,
+            "-q", &format!("0x{}", nonce_hex),
             "-m", &quote_msg,
             "-s", &quote_sig,
         ]).await?;
+        tracing::info!("DEBUG: TPM Quote done.");
 
         // v117: Capture the public key hash that was bound to this nonce (if any)
         // Note: The nonce_hex passed here is already the combined hash.
@@ -666,15 +694,14 @@ mod tpm {
         let len = raw_nonce.len().min(64);
         nonce_bytes[..len].copy_from_slice(&raw_nonce[..len]);
 
+        tracing::info!("DEBUG: SNP nonce bytes prepared");
         let snp_report_b64 = match snp::get_report(&nonce_bytes) {
             Some(report) => {
-                info!("Obtained SEV-SNP report via TSM ConfigFS");
+                tracing::info!("Obtained SEV-SNP report via TSM ConfigFS");
                 Some(report)
             },
             None => {
-                info!("TSM ConfigFS failed, trying known GCP NVRAM handles...");
-                // GCP SEV-SNP report is often at 0x01c00002 (1184 bytes)
-                // or 0x01400001 (64 bytes header + report)
+                tracing::info!("TSM ConfigFS failed, trying known GCP NVRAM handles...");
                 let indices = [
                     ("0x01c00002", "1184"), 
                     ("0x01400001", "1248"),
@@ -682,24 +709,26 @@ mod tpm {
                 ];
                 let mut data = vec![];
                 for (idx, size) in &indices {
+                    tracing::info!("DEBUG: Trying NVRAM index {}", idx);
                     match run_cmd("tpm2_nvread", &[idx, "-C", "o", "-s", size]).await {
                         Ok(d) if !d.is_empty() => {
-                            info!("Obtained hardware report from NVRAM index {} ({} bytes)", idx, d.len());
+                            tracing::info!("Obtained hardware report from NVRAM index {} ({} bytes)", idx, d.len());
                             data = d;
                             break;
                         },
-                        _ => { debug!("Index {} not found, empty, or wrong size", idx); }
+                        _ => { tracing::debug!("Index {} not found, empty, or wrong size", idx); }
                     }
                 }
                 
                 if !data.is_empty() {
                     Some(STANDARD.encode(data))
                 } else {
-                    error!("All hardware report strategies failed. AMD SNP check will fail.");
+                    tracing::error!("All hardware report strategies failed. AMD SNP check will fail.");
                     None
                 }
             }
         };
+        tracing::info!("DEBUG: SNP report fetch complete");
 
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
 
@@ -1214,8 +1243,12 @@ impl GooglePublicCaManager {
             info!("Creating new ACME account with EAB Key ID: {}...", &kid[..8.min(kid.len())]);
             let hmac_str = self.eab_hmac_key.as_ref().ok_or("Missing EAB HMAC key")?;
 
-            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-            let hmac_bytes = URL_SAFE_NO_PAD.decode(hmac_str.trim()).map_err(|e| format!("EAB HMAC decode failed: {}", e))?;
+            use base64::{engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+            let hmac_bytes = if hmac_str.contains('-') || hmac_str.contains('_') {
+                URL_SAFE_NO_PAD.decode(hmac_str.trim()).map_err(|e| format!("EAB HMAC URL-Safe decode failed: {}", e))?
+            } else {
+                STANDARD.decode(hmac_str.trim()).map_err(|e| format!("EAB HMAC Standard decode failed: {}", e))?
+            };
             let hmac_pkey = openssl::pkey::PKey::hmac(&hmac_bytes)?;
 
             let dir = DirectoryBuilder::new(acme_url.to_string()).build().await?;
@@ -1409,10 +1442,13 @@ async fn generate_attestation(
 
     // 2. Convert userinfo to a sorted Value and hash its alphabetical representation
     let userinfo_val = serde_json::to_value(&userinfo).expect("Failed to value-ize userinfo");
-    let paypal_json = serde_json::to_string(&userinfo_val).expect("Failed to serialize userinfo");
+    let userinfo_compact = serde_json::to_string(&userinfo_val).expect("Failed to serialize userinfo");
     let mut hasher = Sha256::new();
-    hasher.update(paypal_json.as_bytes());
+    hasher.update(userinfo_compact.as_bytes());
     let paypal_hash = hex::encode(hasher.finalize());
+
+    println!("DEBUG: userinfo_compact: {}", userinfo_compact);
+    println!("DEBUG: paypal_hash: {}", paypal_hash);
 
     // 2.5 Software Hash Check (Self-measure)
     let bin_path = "/init"; 
@@ -1520,11 +1556,14 @@ fn hardened_client() -> reqwest::Client {
         .use_rustls_tls();
     
     // Pin PayPal Root CA
-    if let Ok(cert_bytes) = std::fs::read("/media/leo/e7ed9d6f-5f0a-4e19-a74e-83424bc154ba/verifiedUniqueAliases/src/paypal.pem") {
+    let cert_path = "/etc/ssl/certs/paypal.pem";
+    if let Ok(cert_bytes) = std::fs::read(cert_path) {
         if let Ok(cert) = Certificate::from_pem(&cert_bytes) {
             builder = builder.add_root_certificate(cert);
-            info!("Pinned PayPal Root CA for egress hardening");
+            info!("Pinned PayPal Root CA from {} for egress hardening", cert_path);
         }
+    } else {
+        warn!("PayPal Root CA not found at {}. Proceeding without pinning.", cert_path);
     }
     
     // Pin Google Public CA Root (for Secret Manager/Metadata)
