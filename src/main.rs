@@ -1468,8 +1468,19 @@ async fn generate_attestation(
         "N/A".to_string()
     };
     
+    // CRITICAL: Hash the raw DER bytes of the public key, NOT the PEM string.
+    // verify.html does: strip PEM headers → atob() → SHA256 of raw DER bytes.
+    // Previously this was hashing the full PEM string (with headers + newlines),
+    // which produced a completely different hash, causing the nonce mismatch.
     let mut pub_key_hasher = Sha256::new();
-    pub_key_hasher.update(pub_key_pem.as_bytes());
+    if let Some(key) = &state.attestation_signing_key {
+        use openssl::pkey::PKey;
+        if let Ok(pkey) = PKey::private_key_from_pem(key.as_bytes()) {
+            if let Ok(der_bytes) = pkey.public_key_to_der() {
+                pub_key_hasher.update(&der_bytes);
+            }
+        }
+    }
     let pub_key_hash_bytes = pub_key_hasher.finalize();
     let pub_key_hash_hex = hex::encode(pub_key_hash_bytes);
 
