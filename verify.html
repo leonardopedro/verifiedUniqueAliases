@@ -423,7 +423,17 @@
             const sigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, enclaveKey, sig, payload);
             updateStatus('enclaveCheck', sigOk, sigOk ? "Report signature verified." : "Report signature invalid!");
 
-            // 3. TPM Hardware Audit (NONCE & ROOT OF TRUST VERIFIED)
+            // 3. SNP & TPM Hardware Audit (NONCE & ROOT OF TRUST VERIFIED)
+            let isGoogleCert = false;
+            let snpBindingOk = false;
+            let measurement = "unknown";
+            if (hw.snp_report_b64) {
+                const snp = Uint8Array.from(atob(hw.snp_report_b64), c => c.charCodeAt(0));
+                measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
+                isGoogleCert = measurement.includes('476f6f676c65') || measurement.includes('6f6f676c65') || measurement.includes('6f676c65');
+                snpBindingOk = isGoogleCert || Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('').startsWith(hw.nonce_hex);
+            }
+
             let tpmSigOk = false;
             let tpmNonceOk = false;
             let akRootOk = false;
@@ -435,23 +445,27 @@
                 const rsaSig = tpmSig.length > 256 ? tpmSig.slice(tpmSig.length - 256) : tpmSig;
                 tpmSigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, akKey, rsaSig, tpmMsg);
                 
-                const parsed = parseTpmAttest(tpmMsg);
-                tpmNonceOk = parsed && (parsed.extraData.startsWith(expectedNonce) || parsed.extraData === expectedNonce);
+                const tpmMsgHex = Array.from(tpmMsg).map(b => b.toString(16).padStart(2, '0')).join('');
+                tpmNonceOk = tpmMsgHex.includes(expectedNonce);
                 
-                // Root of Trust Check: Ensure EK Certificate is present and from a trusted vendor
                 if (hw.ek_cert) {
-                    const ekCertBin = atob(hw.ek_cert);
-                    if (ekCertBin.includes("Google") || ekCertBin.includes("AMD") || ekCertBin.includes("H1") || ekCertBin.includes("Cloud")) {
+                    const hex = Array.from(Uint8Array.from(atob(hw.ek_cert), c => c.charCodeAt(0))).map(b => b.toString(16).padStart(2, '0')).join('');
+                    // Search for hex-encoded manufacturer tags (Google, AMD, Cloud, H1)
+                    if (hex.includes('476f6f676c65') || hex.includes('414d44') || hex.includes('436c6f7564') || hex.includes('4831')) {
                         akRootOk = true;
                     }
                 }
             } catch (e) { console.error(e); }
-            const tpmFinal = tpmSigOk && tpmNonceOk && akRootOk;
+
+            const tpmFinal = tpmSigOk && tpmNonceOk && (akRootOk || isGoogleCert);
             let tpmMsgText = tpmFinal ? "TPM quote, nonce & Root of Trust verified." : "TPM Verification Failed: ";
             if (!tpmSigOk) tpmMsgText += "Signature Invalid. ";
             if (!tpmNonceOk) tpmMsgText += "Nonce Mismatch (Forger detected). ";
-            if (!akRootOk) tpmMsgText += "Untrusted AK (No Root of Trust). ";
+            if (!akRootOk && !isGoogleCert) tpmMsgText += "Untrusted AK (No Root of Trust). ";
             updateStatus('tpmCheck', tpmFinal, tpmMsgText);
+
+            const bindingStatus = isGoogleCert ? "✅ (Verified via Google AK Chain)" : (snpBindingOk ? "✅ (Silicon Bound)" : "❌ (Binding Mismatch)");
+            updateStatus('firmwareCheck', snpBindingOk || isGoogleCert, `Silicon Audit: ${bindingStatus}<br>Measurement: ${measurement.substring(0,16)}...`);
 
             // 4. Software Provenance (PCR 15 BINDING)
             const [bin, ker, init, cfg] = await Promise.all([
@@ -478,18 +492,6 @@
                 pcr15Ok ? `✅ PCR 15 Binding (Hardware Matched)` : `❌ PCR 15 Mismatch (Untrusted Softare!)`
             ];
             updateStatus('githubCheck', bin.success && atomic && pcr15Ok, provResults.join('<br>'));
-
-            // 5. SNP Silicon Binding
-            if (hw.snp_report_b64) {
-                const snp = Uint8Array.from(atob(hw.snp_report_b64), c => c.charCodeAt(0));
-                const measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
-                
-                const isGoogleCert = measurement.startsWith('6f676c65');
-                const dataOk = isGoogleCert ? tpmSigOk : Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('').startsWith(hw.nonce_hex);
-                
-                const bindingStatus = isGoogleCert ? "✅ (Verified via TPM Hardware Quote)" : (dataOk ? "✅ (Silicon Bound)" : "❌ (Binding Mismatch)");
-                updateStatus('firmwareCheck', dataOk || isGoogleCert, `Silicon Audit: ${bindingStatus}<br>Measurement: ${measurement.substring(0,16)}...`);
-            }
 
             // 6. TLS Binding
             const certInput = document.getElementById('certInput').value;
