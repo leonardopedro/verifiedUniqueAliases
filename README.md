@@ -1,3 +1,5 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/leonardopedro/verifiedUniqueAliases)
+
 # GCP Confidential Auth VM — Reproducible & Attested
 
 Hardware-attested PayPal OAuth service on **GCP Confidential VM** (AMD SEV-SNP).
@@ -66,3 +68,6 @@ The browser-based Auditor performs a 4-stage validation:
 | `.github/workflows/build-attest.yml` | Atomic Supply Chain Attestation (Sigstore provenance for all artifacts) |
 | `Dockerfile.repro` | Multi-stage build for 100% bitwise-reproducible disk images |
 | `AGENTS.md` | Detailed implementation state and security architecture guidelines |
+
+TODO: move to the folder legacy all files in this repository that are no longer strictly needed in this project (except README.md and AGENTS.md which should be updated to reflect the present status of this project). Add to the landing page the link to download verify.html directly from github and signal it as recommended way with instructions to open it after download it, give also the githubpages link to the same page but say  it is not the most  safe way
+Add also a custom field in the callback page before the certificate is generated, for the user to input custom info in the attestation report, the user then clicks a button and the certificate is generated (only one time, do not allow to regenerate the certificate)

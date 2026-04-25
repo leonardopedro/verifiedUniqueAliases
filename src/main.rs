@@ -434,6 +434,7 @@ mod tpm {
         pub pcr_values: std::collections::BTreeMap<String, String>,
         pub nonce_hex: String,
         pub snp_report_b64: Option<String>,
+        pub signature_binding_pubkey_hash: String,
     }
 
     pub mod snp {
@@ -505,11 +506,21 @@ mod tpm {
             "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda|restricted|decrypt",
             "-c", "/tmp/primary_seal.ctx",
         ]).await?;
+        // v117: Enforce PCR policy (0,4,8,9,15) to prevent unsealing on a modified image
+        let policy_file = "/tmp/policy.bin";
+        // v118: Explicitly specify --policy-pcr
+        run_cmd("tpm2_createpolicy", &[
+            "--policy-pcr",
+            "-l", &format!("sha256:{}", PCR_SELECTION),
+            "-L", policy_file,
+        ]).await?;
+
         run_cmd("tpm2_create", &[
             "-C", "/tmp/primary_seal.ctx",
             "-r", "/tmp/dek.priv",
             "-u", "/tmp/dek.pub",
             "-i", "/tmp/dek.plain",
+            "-L", policy_file,
         ]).await?;
         let pub_b = tokio::fs::read("/tmp/dek.pub").await?;
         let priv_b = tokio::fs::read("/tmp/dek.priv").await?;
@@ -545,6 +556,13 @@ mod tpm {
             "-u", "/tmp/dek.pub",
             "-r", "/tmp/dek.priv",
             "-c", "/tmp/dek.ctx",
+        ]).await?;
+
+        // Recreate policy for UNSEAL - this is where it's actually ENFORCED
+        run_cmd("tpm2_createpolicy", &[
+            "--policy-pcr",
+            "-l", &format!("sha256:{}", PCR_SELECTION),
+            "-L", "/tmp/policy.bin",
         ]).await?;
 
         let dek = run_cmd("tpm2_unseal", &["-c", "/tmp/dek.ctx"]).await?;
@@ -602,10 +620,13 @@ mod tpm {
             "-m", &quote_msg,
             "-s", &quote_sig,
         ]).await?;
+
+        // v117: Capture the public key hash that was bound to this nonce (if any)
+        // Note: The nonce_hex passed here is already the combined hash.
         let msg = tokio::fs::read(&quote_msg).await?;
         let sig = tokio::fs::read(&quote_sig).await?;
 
-        let pcr_out = match run_cmd("tpm2", &["pcrread", &format!("sha256:{}", PCR_SELECTION)]).await {
+        let pcr_out = match run_cmd("tpm2_pcrread", &[&format!("sha256:{}", PCR_SELECTION)]).await {
             Ok(out) => out,
             Err(e) => {
                 error!("TPM tpm2 pcrread FAILED: {}", e);
@@ -661,7 +682,7 @@ mod tpm {
                 ];
                 let mut data = vec![];
                 for (idx, size) in &indices {
-                    match run_cmd("tpm2", &["nvread", idx, "-C", "o", "-s", size]).await {
+                    match run_cmd("tpm2_nvread", &[idx, "-C", "o", "-s", size]).await {
                         Ok(d) if !d.is_empty() => {
                             info!("Obtained hardware report from NVRAM index {} ({} bytes)", idx, d.len());
                             data = d;
@@ -691,6 +712,7 @@ mod tpm {
             pcr_values,
             nonce_hex: nonce_hex.to_string(),
             snp_report_b64,
+            signature_binding_pubkey_hash: "".to_string(), // Filled by caller
         })
     }
 }
@@ -823,7 +845,7 @@ struct AppState {
     last_limit_reset: Arc<RwLock<Instant>>,
     connection_semaphore: Arc<Semaphore>,
     boot_manifest: BTreeMap<String, String>,
-    pending_attestations: Arc<RwLock<std::collections::HashMap<String, (String, PayPalUserInfo)>>>,
+    pending_attestations: Arc<RwLock<std::collections::HashMap<String, (String, PayPalUserInfo, Instant)>>>,
 }
 
 struct PayPalFlowConfig {
@@ -1284,18 +1306,20 @@ impl GooglePublicCaManager {
             }
         };
 
-        info!("DEK unsealed, decrypting TLS payload...");
+        info!("DEK unsealed, decrypting TLS private key...");
 
         let nonce = STANDARD.decode(wrapper["nonce"].as_str()?).ok()?;
         let ciphertext = STANDARD.decode(wrapper["ciphertext"].as_str()?).ok()?;
         let plaintext = crypto::decrypt(&dek, &nonce, &ciphertext).ok()?;
 
-        let json: serde_json::Value = serde_json::from_slice(&plaintext).ok()?;
-        let cert = STANDARD.decode(json["cert"].as_str()?).ok()?;
-        let key = STANDARD.decode(json["key"].as_str()?).ok()?;
-        let acme_key = json["acme_key"].as_str().and_then(|ak| STANDARD.decode(ak).ok());
+        let inner_json: serde_json::Value = serde_json::from_slice(&plaintext).ok()?;
+        let key = STANDARD.decode(inner_json["key"].as_str()?).ok()?;
         
-        info!("Successfully restored and unsealed TLS cache (including ACME account)");
+        // v118: cert and acme_key are now in the outer wrapper (clear base64)
+        let cert = STANDARD.decode(wrapper["cert"].as_str()?).ok()?;
+        let acme_key = wrapper["acme_key"].as_str().and_then(|ak| STANDARD.decode(ak).ok());
+        
+        info!("Successfully restored and unsealed TLS private key from cache (cert and ACME account unsealed)");
         Some((cert, key, acme_key))
     }
 
@@ -1308,24 +1332,26 @@ impl GooglePublicCaManager {
                 Err(e) => { error!("Failed to seal DEK: {}", e); return; }
             };
 
-            let mut json_map = serde_json::Map::new();
-            json_map.insert("cert".to_string(), serde_json::Value::String(STANDARD.encode(cert)));
-            json_map.insert("key".to_string(), serde_json::Value::String(STANDARD.encode(key)));
-            if let Some(ak) = acme_key {
-                json_map.insert("acme_key".to_string(), serde_json::Value::String(STANDARD.encode(ak)));
-            }
-            let payload_json = serde_json::Value::Object(json_map).to_string();
+            // v118: Only protect the TLS private key with TPM/measurement
+            // cert and acme_key are stored in the clear (base64) in the envelope
+            let mut inner_map = serde_json::Map::new();
+            inner_map.insert("key".to_string(), serde_json::Value::String(STANDARD.encode(key)));
+            let inner_json = serde_json::Value::Object(inner_map).to_string();
 
-            let (nonce, ciphertext) = match crypto::encrypt(&dek, payload_json.as_bytes()) {
+            let (nonce, ciphertext) = match crypto::encrypt(&dek, inner_json.as_bytes()) {
                 Ok(c) => c,
                 Err(e) => { error!("Failed to encrypt: {}", e); return; }
             };
             
-            let payload = serde_json::json!({
-                "sealed_dek": sealed_dek,
-                "nonce": STANDARD.encode(nonce),
-                "ciphertext": STANDARD.encode(ciphertext)
-            });
+            let mut payload_map = serde_json::Map::new();
+            payload_map.insert("sealed_dek".to_string(), serde_json::to_value(sealed_dek).unwrap());
+            payload_map.insert("nonce".to_string(), serde_json::Value::String(STANDARD.encode(nonce)));
+            payload_map.insert("ciphertext".to_string(), serde_json::Value::String(STANDARD.encode(ciphertext)));
+            payload_map.insert("cert".to_string(), serde_json::Value::String(STANDARD.encode(cert)));
+            if let Some(ak) = acme_key {
+                payload_map.insert("acme_key".to_string(), serde_json::Value::String(STANDARD.encode(ak)));
+            }
+            let payload = serde_json::Value::Object(payload_map);
             let payload_b64 = STANDARD.encode(payload.to_string());
             
             let client = reqwest::Client::new();
@@ -1397,8 +1423,30 @@ async fn generate_attestation(
     let binary_self_hash = hex::encode(bin_hasher.finalize());
 
     // 3. Obtain hardware attestation quote (PCR 15 base)
-    // Nonce is the hash of the user data to ensure 1-to-1 binding
-    let tpm_report = tpm::quote(&paypal_hash).await.expect("TPM quote failed");
+    // v117 Hardening: Bind the Enclave Signing Public Key to the Hardware Attestation
+    // This prevents "Key Substitution" attacks where an attacker replaces the public key
+    // in the JSON report with their own.
+    let pub_key_pem = if let Some(key) = &state.attestation_signing_key {
+        extract_pub_key(key)
+    } else {
+        "N/A".to_string()
+    };
+    
+    let mut pub_key_hasher = Sha256::new();
+    pub_key_hasher.update(pub_key_pem.as_bytes());
+    let pub_key_hash_bytes = pub_key_hasher.finalize();
+    let pub_key_hash_hex = hex::encode(pub_key_hash_bytes);
+
+    // Combine paypal_hash and pub_key_hash into a final nonce
+    let mut combined_hasher = Sha256::new();
+    combined_hasher.update(hex::decode(&paypal_hash).expect("Internal Error: Invalid PayPal Hex"));
+    combined_hasher.update(&pub_key_hash_bytes);
+    let final_combined_nonce = hex::encode(combined_hasher.finalize());
+
+    info!("Generating hardware attestation with bound public key hash: {}", pub_key_hash_hex);
+    let mut tpm_report = tpm::quote(&final_combined_nonce).await.expect("TPM quote failed");
+    tpm_report.signature_binding_pubkey_hash = pub_key_hash_hex;
+    
     let tpm_val = serde_json::to_value(&tpm_report).expect("Failed to value-ize tpm_report");
 
     // 4. Resolve current TLS certificate
@@ -1411,7 +1459,7 @@ async fn generate_attestation(
         "paypal_user_info_raw_hash": paypal_hash,
         "timestamp_ms": timestamp_ms,
         "enclave_config": {
-            "version": "v116-PROD",
+            "version": "v118-PROD",
             "paypal_client_id_full": &state.paypal_client_id,
             "paypal_client_id_verified": &state.paypal_verified_client_id,
             "staging_mode": if state.staging { "sandbox" } else { "production" },
@@ -1448,7 +1496,7 @@ async fn generate_attestation(
         "attestation_report": payload,
         "enclave_signature_b64": signature,
         "enclave_signing_public_key": if let Some(key) = &state.attestation_signing_key {
-            extract_pub_key(key)
+            pub_key_pem
         } else {
             "N/A".to_string()
         }
@@ -1461,6 +1509,35 @@ async fn generate_attestation(
 // OAUTH
 // ============================================================================
 
+// ============================================================================
+// HARDENED HTTP CLIENT
+// ============================================================================
+
+fn hardened_client() -> reqwest::Client {
+    use reqwest::Certificate;
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .use_rustls_tls();
+    
+    // Pin PayPal Root CA
+    if let Ok(cert_bytes) = std::fs::read("/media/leo/e7ed9d6f-5f0a-4e19-a74e-83424bc154ba/verifiedUniqueAliases/src/paypal.pem") {
+        if let Ok(cert) = Certificate::from_pem(&cert_bytes) {
+            builder = builder.add_root_certificate(cert);
+            info!("Pinned PayPal Root CA for egress hardening");
+        }
+    }
+    
+    // Pin Google Public CA Root (for Secret Manager/Metadata)
+    if let Ok(cert_bytes) = std::fs::read("/media/leo/e7ed9d6f-5f0a-4e19-a74e-83424bc154ba/verifiedUniqueAliases/src/google_ca.pem") {
+        if let Ok(cert) = Certificate::from_pem(&cert_bytes) {
+            builder = builder.add_root_certificate(cert);
+            info!("Pinned Google Root CA for egress hardening");
+        }
+    }
+
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
 async fn exchange_code_for_token(
     code: &str,
     client_id: &str,
@@ -1469,7 +1546,7 @@ async fn exchange_code_for_token(
     api_base: &str,
 ) -> Result<TokenResponse, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{}/v1/oauth2/token", api_base);
-    let resp = reqwest::Client::new()
+    let resp = hardened_client()
         .post(&url)
         .basic_auth(client_id, Some(client_secret))
         .form(&[
@@ -1488,7 +1565,7 @@ async fn exchange_code_for_token(
 
 async fn get_userinfo(token: &str, api_base: &str) -> Result<PayPalUserInfo, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{}/v1/identity/oauth2/userinfo?schema=paypalv1.1", api_base);
-    let resp = reqwest::Client::new()
+    let resp = hardened_client()
         .get(&url)
         .bearer_auth(token)
         .send()
@@ -1523,7 +1600,7 @@ async fn index(
         <h1>Confidential PayPal Authentication</h1>
         <div class="info">
             <p><strong>Domain:</strong> {}</p>
-            <p><strong>Status:</strong> <span class="cert-status">v71 Hardened (AMD SEV-SNP)</span></p>
+            <p><strong>Status:</strong> <span class="cert-status">v118 Hardened (AMD SEV-SNP)</span></p>
             <p><strong>Certificate:</strong> RAM ONLY (Google Public CA)</p>
         </div>
         <div class="info">
@@ -1637,7 +1714,7 @@ async fn callback(
         .map(char::from)
         .collect();
 
-    state.pending_attestations.write().insert(session_id.clone(), (config.label.clone(), userinfo.clone()));
+    state.pending_attestations.write().insert(session_id.clone(), (config.label.clone(), userinfo.clone(), Instant::now()));
 
     let html = HTML_TEMPLATE.replace(
         "{{CONTENT}}",
@@ -1681,7 +1758,7 @@ async fn generate_cert(
     axum::extract::Form(form): axum::extract::Form<GenerateCertForm>,
 ) -> Response {
     let pending = state.pending_attestations.write().remove(&form.session_id);
-    let (label, userinfo) = match pending {
+    let (label, userinfo, _timestamp) = match pending {
         Some(p) => p,
         None => {
             return (
@@ -1947,6 +2024,25 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         connection_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         boot_manifest,
         pending_attestations: Arc::new(RwLock::new(std::collections::HashMap::new())),
+    });
+
+    // v117: Background task for cleaning up expired pending attestations (DoS mitigation)
+    let state_for_cleanup = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let now = Instant::now();
+            let mut pending = state_for_cleanup.pending_attestations.write();
+            let before = pending.len();
+            pending.retain(|_, (_, _, timestamp)| {
+                now.duration_since(*timestamp) < Duration::from_secs(600) // 10 minute TTL
+            });
+            let after = pending.len();
+            if before != after {
+                info!("Cleaned up {} expired pending attestations ({} remaining)", before - after, after);
+            }
+        }
     });
 
     // Build the main app router

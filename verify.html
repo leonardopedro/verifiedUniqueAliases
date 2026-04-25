@@ -184,7 +184,7 @@
     <header>
         <a href="index.html" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Back to Hub</a>
         <h1>Secure Enclave Auditor</h1>
-        <p class="subtitle">Hardware-Rooted Attestation Verification v70</p>
+        <p class="subtitle">Hardware-Rooted Attestation Verification v118</p>
     </header>
 
     <div class="grid">
@@ -319,8 +319,51 @@
             
             updateStatus('identityCheck', infoHashHex === report.paypal_user_info_raw_hash);
 
-            // 2. TPM Binding
-            updateStatus('tpmCheck', report.hardware_level_attestation.nonce_hex === report.paypal_user_info_raw_hash);
+            // 2. TPM & Public Key Binding (v117 Hardening)
+            const pubKeyPem = data.enclave_signing_public_key.replace(/-----BEGIN PUBLIC KEY-----|-----END PUBLIC KEY-----|[\s\r\n]/g, '');
+            const pubKeyBuffer = Uint8Array.from(atob(pubKeyPem), c => c.charCodeAt(0));
+            const pubKeyHashBuffer = await crypto.subtle.digest('SHA-256', pubKeyBuffer);
+            const pubKeyHashHex = Array.from(new Uint8Array(pubKeyHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+            // Reconstruct combined nonce: sha256(paypal_hash_bytes || pubkey_hash_bytes)
+            const paypalHashBytes = new Uint8Array(infoHashHex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+            const combinedInput = new Uint8Array(32 + 32);
+            combinedInput.set(paypalHashBytes);
+            combinedInput.set(new Uint8Array(pubKeyHashBuffer), 32);
+            const combinedHashBuffer = await crypto.subtle.digest('SHA-256', combinedInput);
+            const combinedNonceHex = Array.from(new Uint8Array(combinedHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+            const hardwareNonce = report.hardware_level_attestation.nonce_hex;
+            const nonceOk = (hardwareNonce === combinedNonceHex);
+            
+            // v117: Verify TPM Quote Signature
+            let tpmSigOk = false;
+            try {
+                const akPubPem = report.hardware_level_attestation.ak_pub_pem.replace(/-----BEGIN PUBLIC KEY-----|-----END PUBLIC KEY-----|[\s\r\n]/g, '');
+                const akPubBuffer = Uint8Array.from(atob(akPubPem), c => c.charCodeAt(0));
+                const akKey = await crypto.subtle.importKey(
+                    'spki', akPubBuffer, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']
+                );
+                const tpmMsg = Uint8Array.from(atob(report.hardware_level_attestation.tpm_quote_msg), c => c.charCodeAt(0));
+                const tpmSig = Uint8Array.from(atob(report.hardware_level_attestation.tpm_quote_sig), c => c.charCodeAt(0));
+                
+                // Note: tpm2_quote with RSA produces a signature that might have a header. 
+                // We need to extract the raw signature part if it's a TPMS_SIGNATURE.
+                // For simplicity in this auditor, we assume the enclave provided the raw signature bytes or we try to match.
+                tpmSigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, akKey, tpmSig, tpmMsg);
+                
+                if (!tpmSigOk && tpmSig.length > 256) {
+                    // Try stripping TPM2.0 signature header (typical size for RSA2048 is 256, header adds ~6-10 bytes)
+                    const rawSig = tpmSig.slice(tpmSig.length - 256);
+                    tpmSigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, akKey, rawSig, tpmMsg);
+                }
+            } catch (e) {
+                console.error("TPM Signature Verification Error:", e);
+            }
+
+            updateStatus('tpmCheck', nonceOk && tpmSigOk);
+            if (!tpmSigOk) document.getElementById('tpmDesc').innerText = "Hardware signature verification failed. The TPM quote is not authentic.";
+            else if (!nonceOk) document.getElementById('tpmDesc').innerText = "Nonce mismatch. The hardware report is not bound to this user data or public key.";
 
             // 3. TLS Binding (Optional)
             const userCertInput = document.getElementById('certInput').value;
@@ -335,9 +378,7 @@
 
             // 4. Enclave Signature (Asymmetric RSA)
             const signature = Uint8Array.from(atob(data.enclave_signature_b64), c => c.charCodeAt(0));
-            const pubKeyPem = data.enclave_signing_public_key.replace(/-----BEGIN PUBLIC KEY-----|-----END PUBLIC KEY-----|[\s\r\n]/g, '');
-            const pubKeyBuffer = Uint8Array.from(atob(pubKeyPem), c => c.charCodeAt(0));
-
+            // pubKeyBuffer was already computed in Step 2
             const publicKey = await crypto.subtle.importKey(
                 'spki', pubKeyBuffer, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']
             );
@@ -474,16 +515,24 @@
                     const measurementHex = Array.from(reportBytes.slice(144, 144 + 48))
                         .map(b => b.toString(16).padStart(2, '0')).join('');
                     
+                    // v117: Verify SNP report_data binding (Offset 0x50 / 80 decimal, 64 bytes)
+                    const reportDataHex = Array.from(reportBytes.slice(80, 80 + 64))
+                        .map(b => b.toString(16).padStart(2, '0')).join('');
+                    const expectedReportData = hardwareNonce.padEnd(128, '0'); // SNP report_data is 64 bytes (128 hex chars)
+                    
+                    const reportDataOk = reportDataHex.startsWith(hardwareNonce);
+
                     const pcr0_raw = pcrValues["pcr_0"] || "N/A";
                     const pcr0 = pcr0_raw.replace(/^0x/i, '').toLowerCase();
                     // PCR 0 matches the firmware measurement on genuine Confidential Space
-                    const firmwareOk = (pcr0 !== "0000000000000000000000000000000000000000000000000000000000000000") && pcr0.length > 0;
+                    const firmwareOk = (pcr0 !== "0000000000000000000000000000000000000000000000000000000000000000") && pcr0.length > 0 && reportDataOk;
                     
                     updateStatus('firmwareCheck', firmwareOk);
                     snpDesc.innerHTML = `
                         <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; margin-top: 8px; color: #7ee787;">
                             SNP Silicon Audit (Direct Hardware Report):<br>
-                            <span style="word-break: break-all; background: #0d1117; padding: 4px; border-radius: 4px; display: block; margin: 4px 0;">${measurementHex}</span>
+                            Measurement: <span style="word-break: break-all; background: #0d1117; padding: 4px; border-radius: 4px; display: block; margin: 4px 0;">${measurementHex}</span>
+                            Report Data: <span style="word-break: break-all; background: #0d1117; padding: 4px; border-radius: 4px; display: block; margin: 4px 0; color: ${reportDataOk ? '#7ee787' : '#f85149'}">${reportDataHex.substring(0,64)}...</span>
                             Firmware PCR 0: <span style="color: #8b949e; word-break: break-all;">${pcr0}</span>
                         </div>
                         </p>

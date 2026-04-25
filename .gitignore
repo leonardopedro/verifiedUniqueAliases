@@ -3,6 +3,7 @@ target/
 **/*.rs.bk
 
 # Build Artifacts & Disk Images
+.gh_cli/
 .idx/
 output/
 img/
