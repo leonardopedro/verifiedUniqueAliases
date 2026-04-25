@@ -3,13 +3,12 @@
 ## Project Overview
 `paypal-auth-vm` is a hardware-attested Rust service on **GCP Confidential VM** (AMD SEV-SNP). It provides a secure bridge for PayPal OAuth tokens, ensuring the integrity of the computing environment before secrets are accessible.
 
-### 🏆 Current Accomplishments (v116-PROD)
-- **Decentralized Transparency Hub**: Migrated all static policies, auditing instructions, and the frontend auditor (`verify.html`) off the enclave and onto a publicly hosted GitHub Pages deployment. The enclave now acts purely as a headless backend API, vastly reducing its attack surface.
-- **Custom Nonce Injection**: Implemented an explicit 2-step OAuth process where users are shown a secondary confirmation page to input an optional custom string (nonce) before the one-time Attestation Certificate is permanently bound to their PayPal Identity and generated.
-- **Strict Kernel Egress Firewall**: Hand-rolled `nftables` via `PID 1` using bare kernel modules (`nft_chain_filter`, `nft_ct`, etc.). Enforces a strict `drop` policy, permitting *only* DHCP broadcasts (`udp 67`, `udp 68`), DNS (`udp/tcp 53`), GCP Metadata (`169.254.169.254`), and strictly required HTTPS traffic (`tcp 443`).
-- **AMD Silicon Root of Trust**: Integrated direct hardware **SNP Attestation Reports** (via `/dev/sev-guest` ioctl). The launch measurement (Firmware/OVMF) is now cryptographically verified.
-- **Whole-Disk Manifest verification**: Implemented recursive SHA-256 hashing of the entire EFI System Partition (ESP), proving 100% bitwise identity of the boot volume.
-- **Bitwise Reproducibility Confirmed**: Achieved consistent `disk.tar.gz` hashes across local Podman and GitHub Actions runners, proving the environment is 100% deterministic and verifiable.
+### 🏆 Current Accomplishments (v117-PROD)
+- **Hardened Hardware Binding**: Implemented a "Triple-Lock" nonce (sha256 of User Profile + Enclave Public Key) injected into both TPM Quotes and SEV-SNP reports. This cryptographically binds the identity of the signer to the physical silicon.
+- **PCR-Policy Sealed Secrets**: Transitioned from simple TPM sealing to strict PCR-policy binding (0, 4, 8, 9, 15). Secrets (TLS cache, ACME keys) are now cryptographically un-extractable if the kernel, bootloader, or enclave binary is modified.
+- **Asymmetric Auditor Verification**: Upgraded the `verify.html` auditor to perform full cryptographic signature verification of TPM quotes using WebCrypto, moving beyond simple string-matching.
+- **Egress Hardening & CA Pinning**: Implemented a custom `reqwest` client with bit-perfect pinning of PayPal and Google Root CAs, neutralizing hypervisor-level Man-in-the-Middle attacks via certificate substitution.
+- **DoS Mitigation**: Added a background session reaper and memory-resident TTL for pending attestations, preventing OOM attacks from uncompleted OAuth flows.
 
 ## Unified Synthesis Pipeline (v116)
 To ensure 100% bitwise reproducibility regardless of the host build environment, the project uses a multi-stage Docker synthesis engine (`Dockerfile.repro`).
