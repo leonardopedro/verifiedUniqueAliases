@@ -409,22 +409,55 @@
             
             updateStatus('enclaveCheck', sigOk);
 
-            // 5. GitHub Software Provenance (Sigstore) via API
-            // We verify the full boot chain: PCR 4 (Bootloader), PCR 9 (Kernel/Initrd), PCR 15 (Binary)
-            if (!report.enclave_config || !report.enclave_config.boot_measurements) {
-                const err = "Audit stalled: boot_measurements missing. Likely running an outdated enclave version.";
-                document.getElementById('githubDesc').innerText = err;
-                document.getElementById('firmwareDesc').innerText = "Silicon report missing from attestation JSON.";
-                return;
-            }
+            // --- SAFETY ENHANCEMENT: Cryptographic Hardware Verification ---
+            async function verifyHardwareAttestation(report) {
+                const results = { ok: true, logs: [] };
+                try {
+                    const hw = report.hardware_level_attestation;
+                    if (!hw) return { ok: false, logs: ["❌ Hardware attestation missing"] };
 
-            const pcrValues = report.hardware_level_attestation.pcr_values;
-            const boot = report.enclave_config.boot_measurements;
-            const githubStatus = document.getElementById('githubCheck');
-            const githubDesc = document.getElementById('githubDesc');
-            
-            githubStatus.className = 'check-item';
-            githubDesc.innerHTML = 'Analyzing full boot chain provenance...<br>';
+                    // 1. Verify Enclave Signature (Proof of Identity)
+                    // (Handled by Step 4 in main verify loop, but we link it here)
+                    
+                    // 2. Verify TPM Quote Signature (Proof of Integrity)
+                    // The quote was signed by the Attestation Key (AK)
+                    const akPem = hw.ak_pub_pem;
+                    const akBuffer = Uint8Array.from(atob(akPem.replace(/-----(BEGIN|END) PUBLIC KEY-----/g, '').replace(/\n/g, '')), c => c.charCodeAt(0));
+                    const akKey = await crypto.subtle.importKey(
+                        'spki', akBuffer, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']
+                    );
+                    
+                    const quoteMsg = Uint8Array.from(atob(hw.tpm_quote_msg), c => c.charCodeAt(0));
+                    const quoteSig = Uint8Array.from(atob(hw.tpm_quote_sig), c => c.charCodeAt(0));
+                    
+                    // v119: TPM2_Quote signature format (TPMT_SIGNATURE) often has a header. 
+                    // For RSA, it's [HashAlg(2) | Signature]. For RSASSA, we skip the header.
+                    const rsaSig = quoteSig.slice(2); 
+
+                    const tpmSigOk = await crypto.subtle.verify(
+                        { name: 'RSASSA-PKCS1-v1_5' }, akKey, rsaSig, quoteMsg
+                    );
+                    results.logs.push(tpmSigOk ? "✅ TPM: Hardware Quote Signature Verified" : "❌ TPM: QUOTE SIGNATURE INVALID");
+                    if (!tpmSigOk) results.ok = false;
+
+                    // 3. Verify SNP Silicon Binding (Proof of Hardware)
+                    if (hw.snp_report_b64) {
+                        const snpBytes = Uint8Array.from(atob(hw.snp_report_b64), c => c.charCodeAt(0));
+                        // v117: SNP Report Data (Offset 80, 64 bytes) must match the nonce
+                        const actualReportData = Array.from(snpBytes.slice(80, 80 + 64)).map(b => b.toString(16).padStart(2,'0')).join('');
+                        const expectedNonce = hw.nonce_hex.padEnd(128, '0');
+                        
+                        const snpBound = actualReportData.startsWith(hw.nonce_hex);
+                        results.logs.push(snpBound ? "✅ SNP: Hardware Silicon Binding Verified" : "❌ SNP: SILICON BINDING MISMATCH");
+                        if (!snpBound) results.ok = false;
+                    }
+                } catch (e) {
+                    console.error("Hardware verification error:", e);
+                    results.logs.push(`❌ Verification failed: ${e.message}`);
+                    results.ok = false;
+                }
+                return results;
+            }
 
             async function getProvenance(hash, name) {
                 const repo = "leonardopedro/verifiedUniqueAliases";
@@ -454,13 +487,8 @@
                 return { success: true, name, runIds };
             }
 
-            try {
-                const results = [];
-                
                 // 1. Verify Components via Manifest
                 const manifest = boot.disk_manifest;
-                
-                // Find critical files in manifest
                 const ker_hash = manifest["EFI/BOOT/vmlinuz"] || manifest["vmlinuz"];
                 const init_hash = manifest["EFI/BOOT/initrd.img"] || manifest["initrd.img"];
                 const config_hash = manifest["EFI/BOOT/grub.cfg"] || manifest["grub.cfg"];
@@ -476,11 +504,8 @@
                 results.push(cfg.success ? `✅ Boot Config: Provenance Valid` : `❌ Boot Config: No Provenance`);
 
                 // 2. Consistency Check (Atomicity)
-                // v118: We check if there is at least one common GitHub Run ID across all components
-                // to support reproducible files that might be associated with multiple historical runs.
                 let commonRunIds = null;
                 const componentRuns = [bin, ker, init, cfg];
-                
                 for (const comp of componentRuns) {
                     if (!comp.success) continue;
                     const runSet = new Set(comp.runIds);
@@ -490,20 +515,16 @@
                         commonRunIds = new Set([...commonRunIds].filter(x => runSet.has(x)));
                     }
                 }
-
                 const consistent = commonRunIds && commonRunIds.size > 0;
                 const displayRunId = consistent ? [...commonRunIds][0].split('/').pop() : "N/A";
-                
                 results.push(consistent ? `✅ Image Atomicity: All components found in Run #${displayRunId}` : `❌ Image Atomicity: COMPONENTS FROM DIFFERENT BUILDS`);
 
-                // 3. Hardware Bind Check (v83: PCR 15 is the manifest anchor)
+                // 3. Hardware Bind Check (PCR 15)
                 const manifestSorted = Object.entries(manifest).sort((a,b) => a[0].localeCompare(b[0]));
                 const manifestJson = JSON.stringify(manifestSorted);
                 const manifestHashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(manifestJson));
                 const manifestHash = Array.from(new Uint8Array(manifestHashBuffer)).map(b => b.toString(16).padStart(2,'0')).join('');
                 
-                // v97: PCR 15 is the result of tpm2 pcrextend 15:sha256=manifestHash
-                // Which means PCR15 = sha256(existing_zeros(32) || manifestHash)
                 const zeros = new Uint8Array(32);
                 const manifestBytes = new Uint8Array(manifestHash.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
                 const combined = new Uint8Array(32 + 32);
@@ -512,46 +533,46 @@
                 const expectedPcrBuffer = await crypto.subtle.digest('SHA-256', combined);
                 const expectedPcr15 = Array.from(new Uint8Array(expectedPcrBuffer)).map(b => b.toString(16).padStart(2,'0')).join('');
                 
-                const pcr15_raw = pcrValues["pcr_15"] || "";
-                const pcr15_clean = pcr15_raw.replace(/^0x/i, '').toLowerCase();
-
+                const pcr15_clean = (pcrValues["pcr_15"] || "").replace(/^0x/i, '').toLowerCase();
                 const hardwareMatch = (pcr15_clean === expectedPcr15) && (expectedPcr15.length > 0);
-                results.push(hardwareMatch ? "✅ Hardware: PCR 15 bound to Manifest Anchor" : `❌ Hardware: PCR 15 MISMATCH (Got: ${pcr15_clean ? pcr15_clean.substring(0,8) : 'N/A'}...) vs Expected: ${expectedPcr15.substring(0,8)}... (Manifest: ${manifestHash.substring(0,8)}...)`);
+                results.push(hardwareMatch ? "✅ Hardware: PCR 15 bound to Manifest Anchor" : `❌ Hardware: PCR 15 MISMATCH`);
 
-                const allOk = bin.success && ker.success && init.success && cfg.success && hardwareMatch && consistent;
+                // --- SAFETY: CRYPTOGRAPHIC HARDWARE AUDIT ---
+                const hwStatus = await verifyHardwareAttestation(report);
+                const allOk = bin.success && ker.success && init.success && cfg.success && hardwareMatch && consistent && hwStatus.ok;
+                
                 updateStatus('githubCheck', allOk);
-                githubDesc.innerHTML = results.join('<br>') + `<br><small>Verified ${Object.keys(manifest).length} file(s) on boot partition.</small>`;
+                githubDesc.innerHTML = results.join('<br>') + `<br><small>Verified ${Object.keys(manifest).length} files.</small>`;
 
                 // 6. AMD Silicon Root of Trust (Firmware)
                 if (report.hardware_level_attestation.snp_report_b64) {
                     const snpStatus = document.getElementById('firmwareCheck');
                     const snpDesc = document.getElementById('firmwareDesc');
-                    
                     const reportBytes = Uint8Array.from(atob(report.hardware_level_attestation.snp_report_b64), c => c.charCodeAt(0));
-                    // v75: SNP Report MEASUREMENT is a SHA-384 hash (48 bytes) at offset 0x90 (144 decimal).
-                    // This fingerprints the BIOS/Firmware (Google OVMF) used at boot.
-                    const measurementHex = Array.from(reportBytes.slice(144, 144 + 48))
-                        .map(b => b.toString(16).padStart(2, '0')).join('');
                     
-                    // v117: Verify SNP report_data binding (Offset 0x50 / 80 decimal, 64 bytes)
-                    const reportDataHex = Array.from(reportBytes.slice(80, 80 + 64))
-                        .map(b => b.toString(16).padStart(2, '0')).join('');
-                    const expectedReportData = hardwareNonce.padEnd(128, '0'); // SNP report_data is 64 bytes (128 hex chars)
-                    
-                    const reportDataOk = reportDataHex.startsWith(hardwareNonce);
+                    const measurementHex = Array.from(reportBytes.slice(144, 144 + 48)).map(b => b.toString(16).padStart(2, '0')).join('');
+                    const reportDataHex = Array.from(reportBytes.slice(80, 80 + 64)).map(b => b.toString(16).padStart(2, '0')).join('');
+                    const pcr0 = (pcrValues["pcr_0"] || "").replace(/^0x/i, '').toLowerCase();
 
-                    const pcr0_raw = pcrValues["pcr_0"] || "N/A";
-                    const pcr0 = pcr0_raw.replace(/^0x/i, '').toLowerCase();
-                    // PCR 0 matches the firmware measurement on genuine Confidential Space
-                    const firmwareOk = (pcr0 !== "0000000000000000000000000000000000000000000000000000000000000000") && pcr0.length > 0 && reportDataOk;
-                    
-                    updateStatus('firmwareCheck', firmwareOk);
+                    updateStatus('firmwareCheck', hwStatus.ok);
                     snpDesc.innerHTML = `
                         <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; margin-top: 8px; color: #7ee787;">
-                            SNP Silicon Audit (Direct Hardware Report):<br>
-                            Measurement: <span style="word-break: break-all; background: #0d1117; padding: 4px; border-radius: 4px; display: block; margin: 4px 0;">${measurementHex}</span>
-                            Report Data: <span style="word-break: break-all; background: #0d1117; padding: 4px; border-radius: 4px; display: block; margin: 4px 0; color: ${reportDataOk ? '#7ee787' : '#f85149'}">${reportDataHex.substring(0,64)}...</span>
-                            Firmware PCR 0: <span style="color: #8b949e; word-break: break-all;">${pcr0}</span>
+                            ${hwStatus.logs.join('<br>')}
+                            <br>Measurement: <span style="word-break: break-all; color: #8b949e;">${measurementHex}</span>
+                            <br>Firmware PCR 0: <span style="color: #8b949e;">${pcr0}</span>
+                        </div>
+                    `;
+                }
+
+            } catch (e) {
+                console.error("Audit error:", e);
+                updateStatus('githubCheck', false);
+                document.getElementById('githubDesc').innerHTML = `<span style="color:#f85149;">Audit Failed: ${e.message}</span>`;
+            }
+        }
+    </script>
+</body>
+</html>
                         </div>
                         </p>
                         ${report.enclave_config && report.enclave_config.version ? `
