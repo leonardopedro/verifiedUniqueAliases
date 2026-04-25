@@ -472,13 +472,18 @@
                     try {
                         const bundle = attestation.bundle;
                         const payload = JSON.parse(atob(bundle.dsseEnvelope ? bundle.dsseEnvelope.payload : bundle.payload));
-                        const runId = (payload.predicate && payload.predicate.runDetails && payload.predicate.runDetails.metadata && payload.predicate.runDetails.metadata.invocationId) ||
+                        let runId = (payload.predicate && payload.predicate.runDetails && payload.predicate.runDetails.metadata && payload.predicate.runDetails.metadata.invocationId) ||
                                 (payload.invocation && payload.invocation.metadata && payload.invocation.metadata.id) ||
                                 (payload.invocation && payload.invocation.uri) ||
                                 (payload.buildConfig && payload.buildConfig.env && payload.buildConfig.env.GITHUB_RUN_ID) ||
                                 (payload.predicate && payload.predicate.invocation && payload.predicate.invocation.environment && payload.predicate.invocation.environment.github_run_id) ||
                                 "External";
-                        runIds.push(runId);
+                        // Normalize: extract the last numerical part if it's a URL/path
+                        if (typeof runId === 'string' && runId.includes('/')) {
+                            const parts = runId.split('/');
+                            runId = parts.pop() || runId;
+                        }
+                        runIds.push(String(runId));
                     } catch(e) {
                         console.warn(`Failed to parse attestation payload for ${name}:`, e);
                     }
@@ -498,10 +503,10 @@
                 const init = await getProvenance(init_hash, "Initramfs");
                 const cfg = await getProvenance(config_hash, "EFI Bootloader");
 
-                results.push(bin.success ? `✅ Binary: Provenance Valid` : `❌ Binary: No Provenance`);
-                results.push(ker.success ? `✅ Kernel: Provenance Valid` : `❌ Kernel: No Provenance`);
-                results.push(init.success ? `✅ Initrd: Provenance Valid` : `❌ Initrd: No Provenance`);
-                results.push(cfg.success ? `✅ Boot Config: Provenance Valid` : `❌ Boot Config: No Provenance`);
+                results.push(bin.success ? `✅ Binary: Provenance Valid (#${bin.runIds.join(',')})` : `❌ Binary: No Provenance`);
+                results.push(ker.success ? `✅ Kernel: Provenance Valid (#${ker.runIds.join(',')})` : `❌ Kernel: No Provenance`);
+                results.push(init.success ? `✅ Initrd: Provenance Valid (#${init.runIds.join(',')})` : `❌ Initrd: No Provenance`);
+                results.push(cfg.success ? `✅ Boot Config: Provenance Valid (#${cfg.runIds.join(',')})` : `❌ Boot Config: No Provenance`);
 
                 // 2. Consistency Check (Atomicity)
                 let commonRunIds = null;
