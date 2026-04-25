@@ -191,14 +191,14 @@
         <div class="input-card">
             <label>Attestation JSON Report</label>
             <div style="margin-bottom: 15px;">
-                <input type="file" id="reportFile" accept=".json" onchange="loadFile(this, 'attestationInput')" class="file-input">
+                <input type="file" id="reportFile" accept=".json" class="file-input">
             </div>
             <textarea id="attestationInput" placeholder="Paste report or use file upload above..."></textarea>
         </div>
         <div class="input-card">
             <label>Browser TLS Certificate (Optional)</label>
             <div style="margin-bottom: 15px;">
-                <input type="file" id="certFile" onchange="loadFile(this, 'certInput')" class="file-input">
+                <input type="file" id="certFile" class="file-input">
             </div>
             <textarea id="certInput" placeholder="Paste .pem or use file upload above..."></textarea>
         </div>
@@ -283,31 +283,37 @@
     }
 
     // 3. File Loader
-    window.loadFile = function(input, targetId) {
+    function loadFile(input, targetId) {
+        if (!input.files || !input.files[0]) return;
         const file = input.files[0];
-        if (!file) return;
         const reader = new FileReader();
         reader.onload = (e) => {
             const target = document.getElementById(targetId);
             if (target) {
                 target.value = e.target.result;
+                // Visual feedback
                 const card = input.closest('.input-card');
                 if (card) {
                     const label = card.querySelector('label');
                     if (label) {
-                        const original = label.innerText;
+                        const original = label.innerText.replace("✅ ", "");
                         label.innerText = "✅ " + original;
                         setTimeout(() => { label.innerText = original; }, 2000);
                     }
                 }
             }
         };
-        reader.onerror = (err) => {
-            console.error("FileReader error:", err);
-            alert("Failed to read file.");
-        };
+        reader.onerror = () => alert("Failed to read file.");
         reader.readAsText(file);
-    };
+    }
+
+    // Initialize Event Listeners
+    document.addEventListener('DOMContentLoaded', () => {
+        const reportInput = document.getElementById('reportFile');
+        const certInput = document.getElementById('certFile');
+        if (reportInput) reportInput.addEventListener('change', (e) => loadFile(e.target, 'attestationInput'));
+        if (certInput) certInput.addEventListener('change', (e) => loadFile(e.target, 'certInput'));
+    });
 
     // 4. Status Updater
     function updateStatus(id, success, desc) {
