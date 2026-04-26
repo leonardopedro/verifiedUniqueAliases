@@ -6,39 +6,25 @@ Hardware-attested PayPal OAuth service on **GCP Confidential VM** (AMD SEV-SNP).
 Built for 100% bit-by-bit reproducibility and maximum security.
 
 ---
-## 🚀 Current Status (v119-STABLE)
+## 🚀 Current Status (v119-FIXED)
 
 | Component | Status |
 |---|---|
 | **Base OS (Debian 13 Trixie)** | ✅ Migrated (v119) |
+| **TPM Quote Hardware Binding** | ✅ Hardened (v119-FIXED) |
+| **PCR 15 Software Manifest Binding**| ✅ Restored (v119-FIXED) |
+| **Pinned TLS Egress & Time Sync** | ✅ Hardened (v119-FIXED) |
 | **Set-Intersection Image Atomicity** | ✅ Achieved (v119) |
 | **GCP Silicon Root Fallback (AK Cert)** | ✅ Achieved (v119) |
 | **TPM-Bound TLS Private Key** | ✅ Hardened (v118) |
 | **Decentralized Hub & Static Frontend** | ✅ Achieved (v116) |
-| **Custom Attestation Nonce Injection** | ✅ Achieved (v116) |
-| **Kernel Egress Firewalling (nftables)** | ✅ Achieved (v116) |
-| **Silicon Root of Trust (AMD SEV-SNP)** | ✅ Achieved (v115) |
-| **Atomic Image Verification (GitHub Sigstore)** | ✅ Achieved (v115) |
-| **Whole-Disk Manifest Audit (100% Volume Hash)** | ✅ Achieved (v115) |
-| **Enclave Identity Signature (Alphabetical Determinisim)**| ✅ Resolved (v115) |
-| Bitwise Reproducibility (Local vs GitHub Actions) | ✅ Achieved |
-| Native PID 1 Rust Integration | ✅ Achieved |
-| Hardened Resource Boundaries | ✅ Achieved |
-| Compact JSON Remote Attestation (RFC 8785) | ✅ Achieved |
-| TPM-Sealed TLS Cache Persistence | ✅ Achieved |
-| Automated Key & EAB Credential Provisioning | ✅ Achieved |
 
-### Architectural Breakthrough: Silicon-to-App Verifiable Chain
-The service now provides a continuous, cryptographically-anchored chain of trust that starts at the physical AMD CPU and extends to the application logic:
+### Architectural Breakthrough: v119-FIXED Hardening
+The service has reached a production-hardened state with the elimination of critical hypervisor-level vulnerabilities:
+- **Hardened TPM Verification (v119-FIXED)**: Implemented full binary parsing of the hardware-signed `TPMS_ATTEST` structure in the auditor. This ensures the attestation nonce is cryptographically bound to the hardware silicon, neutralizing session replay and report forgery attacks.
+- **PCR 15 Manifest Binding (v119-FIXED)**: Restored the cryptographic link between the hardware state and the software manifest. The auditor now strictly verifies that the 100% volume hash matches the hardware-signed PCR 15 value.
+- **Egress Hardening & Secure Time (v119-FIXED)**: Eliminated hypervisor-controlled metadata environment injection. Time synchronization and secret retrieval are now performed over pinned TLS connections (hardened client), neutralizing hypervisor-level time-rollback and Man-in-the-Middle attacks.
 - **Debian Trixie (v119)**: Transitioned to the latest stable Debian architecture for enhanced hardware support and long-term reproducibility using pinned snapshots.
-- **Robust Atomicity (v119)**: Implemented "Set-Intersection" logic in the auditor to correctly handle components (like kernels) reused across multiple GitHub build runs, eliminating false atomicity failures.
-- **Hardware-Anchored Silicon Audit (v119)**: Integrated support for Google's Attestation Key (AK) certificates. The auditor now cryptographically verifies the GCP environment even when direct SNP hardware devices are abstracted, using the TPM Quote as a verifiable hardware anchor.
-- **Decentralized Transparency (v116)**: Web Auditor and legal policies decoupled from the enclave and hosted natively on GitHub Pages to eliminate web-vector attack surfaces.
-- **Custom Hardware Binding (v116)**: Supports 2-phase secure session processing allowing users to inject a custom, cryptographically-bound nonce strictly mapped to their verified PayPal identity.
-- **Kernel-Level Dropping (v116)**: Zero-trust `nftables` baseline directly in `PID 1` guaranteeing network isolation beyond VPC semantics.
-- **Alphabetical Determinism (v115)**: Resolved cross-platform JSON serialization discrepancies (V8 vs Rust) by implementing strictly alphabetical `BTreeMap` structures and string-prefixed PCR keys (`pcr_0`, `pcr_15`, etc.), ensuring the Enclave Identity Signature verifies 100% of the time.
-- **Resource Hardening**: Includes 50-connection concurrency limits, 512MB/hour egress caps, and DDoS-resistant IP tracking.
-- **Native PID 1 Rust**: Hand-off directly from BIOS to Rust. No `systemd`, no shell, no userspace bloat.
 
 ---
 

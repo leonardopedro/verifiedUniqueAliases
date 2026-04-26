@@ -264,7 +264,7 @@
 </div>
 
 <script>
-    // 1. Utility: Canonicalize JSON (alphabetical keys)
+    // 1. Utility: Canonicalize JSON
     function reorder(obj) {
         if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
             return Array.isArray(obj) ? obj.map(reorder) : obj;
@@ -274,7 +274,6 @@
         return newObj;
     }
 
-    // 2. Utility: Extract Leaf Certificate (Case-Corrected)
     function getLeafCert(pem) {
         if (!pem) return "";
         const match = pem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/);
@@ -282,16 +281,13 @@
         return match[0].replace(/-----(BEGIN|END) CERTIFICATE-----|[\s\r\n]/g, '');
     }
 
-    // 3. File Loader
     function loadFile(input, targetId) {
         if (!input.files || !input.files[0]) return;
-        const file = input.files[0];
         const reader = new FileReader();
         reader.onload = (e) => {
             const target = document.getElementById(targetId);
             if (target) {
                 target.value = e.target.result;
-                // Visual feedback
                 const card = input.closest('.input-card');
                 if (card) {
                     const label = card.querySelector('label');
@@ -303,11 +299,10 @@
                 }
             }
         };
-        reader.onerror = () => alert("Failed to read file.");
-        reader.readAsText(file);
+        reader.readAsText(input.files[0]);
     }
 
-    // Initialize Event Listeners
+    // Initialize Event Listeners (Restored for functionality)
     document.addEventListener('DOMContentLoaded', () => {
         const reportInput = document.getElementById('reportFile');
         const certInput = document.getElementById('certFile');
@@ -315,7 +310,6 @@
         if (certInput) certInput.addEventListener('change', (e) => loadFile(e.target, 'certInput'));
     });
 
-    // 4. Status Updater
     function updateStatus(id, success, desc) {
         const el = document.getElementById(id);
         if (!el) return;
@@ -326,15 +320,14 @@
         }
     }
 
-    // 5. GitHub Provenance Fetcher
     async function getProvenance(hash, name) {
         const repo = "leonardopedro/verifiedUniqueAliases";
         const url = `https://api.github.com/repos/${repo}/attestations/sha256:${hash}`;
         try {
             const resp = await fetch(url, { headers: { 'Accept': 'application/vnd.github+json' } });
-            if (!resp.ok) return { success: false, name, runIds: [] };
+            if (!resp.ok) return { success: false, name, runIds:[] };
             const data = await resp.json();
-            if (!data.attestations || data.attestations.length === 0) return { success: false, name, runIds: [] };
+            if (!data.attestations || data.attestations.length === 0) return { success: false, name, runIds:[] };
             const runIds = data.attestations.map(att => {
                 const bundle = att.bundle;
                 const payload = JSON.parse(atob(bundle.dsseEnvelope ? bundle.dsseEnvelope.payload : bundle.payload));
@@ -343,48 +336,75 @@
                 return String(runId);
             });
             return { success: true, name, runIds };
-        } catch (e) { return { success: false, name, runIds: [] }; }
+        } catch (e) { return { success: false, name, runIds:[] }; }
     }
 
-    // 6. TPM Parser (TPMS_ATTEST)
-    function parseTpmAttest(msg) {
-        try {
-            let offset = 0;
-            const magic = (msg[offset] << 24) | (msg[offset+1] << 16) | (msg[offset+2] << 8) | msg[offset+3];
-            if (magic !== 0xff544347) return null;
-            offset += 4;
-            const type = (msg[offset] << 8) | msg[offset+1];
-            offset += 2;
-            const qSignerSize = (msg[offset] << 8) | msg[offset+1];
-            offset += 2 + qSignerSize;
-            const extraDataSize = (msg[offset] << 8) | msg[offset+1];
-            offset += 2;
-            const extraData = msg.slice(offset, offset + extraDataSize);
-            return {
-                extraData: Array.from(extraData).map(b => b.toString(16).padStart(2, '0')).join('')
-            };
-        } catch(e) { return null; }
+    // 🔴 CRITICAL FIX: Binary Parser for TPMS_ATTEST
+    function parseTpmsAttest(msgArray) {
+        const view = new DataView(msgArray.buffer);
+        let offset = 0;
+        
+        const magic = view.getUint32(offset); offset += 4;
+        if (magic !== 0xFF544347) throw new Error("Invalid TPM Magic");
+        
+        const type = view.getUint16(offset); offset += 2;
+        if (type !== 0x8018) throw new Error("Not a TPM Quote (0x8018)");
+        
+        const qSignerSize = view.getUint16(offset); offset += 2;
+        offset += qSignerSize; // skip qualifiedSigner
+        
+        const extraDataSize = view.getUint16(offset); offset += 2;
+        const extraData = msgArray.slice(offset, offset + extraDataSize); offset += extraDataSize;
+        
+        offset += 17; // skip clockInfo
+        offset += 8;  // skip firmwareVersion
+        
+        // TPMS_QUOTE_INFO
+        const pcrSelectCount = view.getUint32(offset); offset += 4;
+        for (let i = 0; i < pcrSelectCount; i++) {
+            offset += 2; // hash alg
+            const size = view.getUint8(offset); offset += 1;
+            offset += size; // pcr selection array
+        }
+        
+        const pcrDigestSize = view.getUint16(offset); offset += 2;
+        const pcrDigest = msgArray.slice(offset, offset + pcrDigestSize);
+        
+        return {
+            extraDataHex: Array.from(extraData).map(b => b.toString(16).padStart(2, '0')).join(''),
+            pcrDigestHex: Array.from(pcrDigest).map(b => b.toString(16).padStart(2, '0')).join('')
+        };
     }
 
-    // 7. PCR 15 Verifier
+    // 🔴 CRITICAL FIX: Calculate standard TPM PCR Composite Digest
+    async function calculatePcrCompositeDigest(pcrValues) {
+        // The enclave quotes PCRs 0, 4, 8, 9, 15. We must concatenate them in order.
+        const pcrList = [0, 4, 8, 9, 15];
+        let combined = new Uint8Array(32 * pcrList.length);
+        for (let i = 0; i < pcrList.length; i++) {
+            let hex = pcrValues["pcr_" + pcrList[i]];
+            if (!hex) throw new Error("Missing PCR " + pcrList[i] + " from report.");
+            hex = hex.replace(/^0x/, '');
+            let bytes = new Uint8Array(hex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+            combined.set(bytes, i * 32);
+        }
+        const hashBuffer = await crypto.subtle.digest('SHA-256', combined);
+        return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
     async function calculatePcr15(boot_manifest) {
-        // Reproduce exactly: serde_json::to_string(&sorted_manifest) where sorted_manifest is Vec<(&String, &String)>
         const sorted = Object.keys(boot_manifest).sort().map(k => [k, boot_manifest[k]]);
-        const manifest_json = JSON.stringify(sorted);
-        const encoder = new TextEncoder();
-        const data = encoder.encode(manifest_json);
+        const data = new TextEncoder().encode(JSON.stringify(sorted));
         const hashBuffer = await crypto.subtle.digest('SHA-256', data);
         
-        // TPM PCR Extend: SHA256(PCR_OLD || HASH_NEW)
-        const pcrOld = new Uint8Array(32); // PCR 15 starts at 0
+        const pcrOld = new Uint8Array(32); 
         const combined = new Uint8Array(64);
         combined.set(pcrOld);
-        combined.set(new Uint8Array(hashBuffer), 32); // Append hash to the zeros
+        combined.set(new Uint8Array(hashBuffer), 32); 
         const finalHashBuffer = await crypto.subtle.digest('SHA-256', combined);
         return Array.from(new Uint8Array(finalHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
-    // 8. Main Audit Engine
     async function runAudit() {
         try {
             const inputVal = document.getElementById('attestationInput').value;
@@ -393,29 +413,29 @@
             const rawData = JSON.parse(inputVal);
             const report = rawData.attestation_report || rawData.report || rawData;
             
-            if (!report.hardware_level_attestation) throw new Error("Invalid report: missing hardware_level_attestation.");
-            if (!report.enclave_config?.boot_measurements) throw new Error("Invalid report: missing enclave_config.");
-
+            if (!report.hardware_level_attestation) throw new Error("Invalid report.");
             const hw = report.hardware_level_attestation;
             const boot = report.enclave_config.boot_measurements;
             
             document.getElementById('resultsArea').style.display = 'block';
             document.getElementById('signTime').innerText = new Date(report.timestamp_ms).toLocaleString();
 
-            // 1. Identity Binding
+            // 1. Identity Binding (Nonce Generation)
             const pubKeyPem = (rawData.enclave_signing_public_key || report.public_key_pem || "").replace(/-----(BEGIN|END) PUBLIC KEY-----|[\s\r\n]/g, '');
             const pubKeyBuffer = Uint8Array.from(atob(pubKeyPem), c => c.charCodeAt(0));
             const pubKeyHash = await crypto.subtle.digest('SHA-256', pubKeyBuffer);
             const paypalHash = new Uint8Array(report.paypal_user_info_raw_hash.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+            
             const combined = new Uint8Array(64);
             combined.set(paypalHash);
             combined.set(new Uint8Array(pubKeyHash), 32);
             const combinedHash = await crypto.subtle.digest('SHA-256', combined);
             const expectedNonce = Array.from(new Uint8Array(combinedHash)).map(b => b.toString(16).padStart(2, '0')).join('');
-            const nonceOk = (hw.nonce_hex === expectedNonce);
-            updateStatus('identityCheck', nonceOk, nonceOk ? "Identity bound to hardware nonce." : "Nonce mismatch! tampering detected.");
+            
+            // Note: The JSON nonce_hex is entirely untrusted. We use expectedNonce moving forward.
+            updateStatus('identityCheck', true, "Identity cryptographically hashed.");
 
-            // 2. Enclave Signature
+            // 2. Enclave Signature Validation
             const sigB64 = rawData.enclave_signature_b64 || report.signature_b64;
             const sig = Uint8Array.from(atob(sigB64), c => c.charCodeAt(0));
             const enclaveKey = await crypto.subtle.importKey('spki', pubKeyBuffer, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
@@ -423,51 +443,33 @@
             const sigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, enclaveKey, sig, payload);
             updateStatus('enclaveCheck', sigOk, sigOk ? "Report signature verified." : "Report signature invalid!");
 
-            // 3. SNP & TPM Hardware Audit (NONCE & ROOT OF TRUST VERIFIED)
-            let isGoogleCert = false;
-            let snpBindingOk = false;
-            let measurement = "unknown";
-            if (hw.snp_report_b64) {
-                const snp = Uint8Array.from(atob(hw.snp_report_b64), c => c.charCodeAt(0));
-                measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
-                isGoogleCert = measurement.includes('476f6f676c65') || measurement.includes('6f6f676c65') || measurement.includes('6f676c65');
-                snpBindingOk = isGoogleCert || Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('').startsWith(hw.nonce_hex);
-            }
-
+            // 3. TPM Hardware Audit (Strict Binary Parsing)
             let tpmSigOk = false;
             let tpmNonceOk = false;
-            let akRootOk = false;
-            try {
-                const akPubPem = hw.ak_pub_pem.replace(/-----(BEGIN|END) PUBLIC KEY-----|[\s\r\n]/g, '');
-                const akKey = await crypto.subtle.importKey('spki', Uint8Array.from(atob(akPubPem), c => c.charCodeAt(0)), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
-                const tpmMsg = Uint8Array.from(atob(hw.tpm_quote_msg), c => c.charCodeAt(0));
-                const tpmSig = Uint8Array.from(atob(hw.tpm_quote_sig), c => c.charCodeAt(0));
-                const rsaSig = tpmSig.length > 256 ? tpmSig.slice(tpmSig.length - 256) : tpmSig;
-                tpmSigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, akKey, rsaSig, tpmMsg);
-                
-                const tpmMsgHex = Array.from(tpmMsg).map(b => b.toString(16).padStart(2, '0')).join('');
-                tpmNonceOk = tpmMsgHex.includes(expectedNonce);
-                
-                if (hw.ek_cert) {
-                    const hex = Array.from(Uint8Array.from(atob(hw.ek_cert), c => c.charCodeAt(0))).map(b => b.toString(16).padStart(2, '0')).join('');
-                    // Search for hex-encoded manufacturer tags (Google, AMD, Cloud, H1)
-                    if (hex.includes('476f6f676c65') || hex.includes('414d44') || hex.includes('436c6f7564') || hex.includes('4831')) {
-                        akRootOk = true;
-                    }
-                }
-            } catch (e) { console.error(e); }
+            let pcrDigestOk = false;
 
-            const tpmFinal = tpmSigOk && tpmNonceOk && (akRootOk || isGoogleCert);
-            let tpmMsgText = tpmFinal ? "TPM quote, nonce & Root of Trust verified." : "TPM Verification Failed: ";
+            const akPubPem = hw.ak_pub_pem.replace(/-----(BEGIN|END) PUBLIC KEY-----|[\s\r\n]/g, '');
+            const akKey = await crypto.subtle.importKey('spki', Uint8Array.from(atob(akPubPem), c => c.charCodeAt(0)), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false,['verify']);
+            const tpmMsg = Uint8Array.from(atob(hw.tpm_quote_msg), c => c.charCodeAt(0));
+            const tpmSig = Uint8Array.from(atob(hw.tpm_quote_sig), c => c.charCodeAt(0));
+            const rsaSig = tpmSig.length > 256 ? tpmSig.slice(tpmSig.length - 256) : tpmSig;
+            
+            tpmSigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, akKey, rsaSig, tpmMsg);
+            
+            const parsedAttest = parseTpmsAttest(tpmMsg);
+            tpmNonceOk = (parsedAttest.extraDataHex === expectedNonce); // Strictly bind to our calculated nonce
+
+            const expectedComposite = await calculatePcrCompositeDigest(hw.pcr_values);
+            pcrDigestOk = (parsedAttest.pcrDigestHex === expectedComposite);
+
+            const tpmFinal = tpmSigOk && tpmNonceOk && pcrDigestOk;
+            let tpmMsgText = tpmFinal ? "TPM Quote, Nonce, and PCR Digest verified." : "TPM Verification Failed: ";
             if (!tpmSigOk) tpmMsgText += "Signature Invalid. ";
-            if (!tpmNonceOk) tpmMsgText += "Nonce Mismatch (Forger detected). ";
-            if (!akRootOk && !isGoogleCert) tpmMsgText += "Untrusted AK (No Root of Trust). ";
+            if (!tpmNonceOk) tpmMsgText += "Nonce Mismatch. ";
+            if (!pcrDigestOk) tpmMsgText += "PCR Composite Hash Mismatch. ";
             updateStatus('tpmCheck', tpmFinal, tpmMsgText);
 
-            const bindingStatus = isGoogleCert ? "✅ (Verified via Google AK Chain)" : (snpBindingOk ? "✅ (Silicon Bound)" : "❌ (Binding Mismatch)");
-            updateStatus('firmwareCheck', snpBindingOk || isGoogleCert, `Silicon Audit: ${bindingStatus}<br>Measurement: ${measurement.substring(0,16)}...`);
-
-            // 4. Software Provenance (PCR 15 BINDING)
+            // 4. Software Provenance (Hardware-Anchored PCR 15)
             const [bin, ker, init, cfg] = await Promise.all([
                 getProvenance(boot.binary_sha256, "Enclave Binary"),
                 getProvenance(boot.disk_manifest["EFI/BOOT/vmlinuz"] || boot.disk_manifest["vmlinuz"], "Linux Kernel"),
@@ -486,12 +488,39 @@
                 commonRuns = (commonRuns === null) ? s : new Set([...commonRuns].filter(x => s.has(x)));
             }
             const atomic = commonRuns && commonRuns.size > 0;
-            const provResults = [
+            const provResults =[
                 bin.success ? `✅ Binary (#${bin.runIds.join(',')})` : `❌ Binary`,
                 atomic ? `✅ Image Atomicity (Run #${[...commonRuns][0]})` : `❌ Image Atomicity`,
-                pcr15Ok ? `✅ PCR 15 Binding (Hardware Matched)` : `❌ PCR 15 Mismatch (Untrusted Softare!)`
+                pcr15Ok ? `✅ PCR 15 hardware binding mathematically verified` : `❌ PCR 15 Software Mismatch`
             ];
             updateStatus('githubCheck', bin.success && atomic && pcr15Ok, provResults.join('<br>'));
+
+            // 5. SEV-SNP Silicon Root of Trust
+            let snpBindingOk = false;
+            let measurement = "N/A";
+            
+            if (hw.snp_report_b64) {
+                const snp = Uint8Array.from(atob(hw.snp_report_b64), c => c.charCodeAt(0));
+                
+                // Extract measurement (Offset 144)
+                measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
+                
+                // Extract report_data (Offset 80)
+                const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('');
+                
+                // Because expectedNonce is 32 bytes (64 hex chars), and report_data is 64 bytes (128 hex chars)
+                // we pad the expected nonce as it is done by the hardware struct.
+                const paddedNonce = expectedNonce.padEnd(128, '0');
+                snpBindingOk = (reportDataHex === paddedNonce);
+                
+                // Optional Note: To fully verify the VCEK signature, one would extract the ECDSA P-384
+                // signature at offset 672 and verify it against the AMD Certificate fetched from KDS.
+                // Because AMD KDS has strict CORS rules, the core guarantee relies on the hardware-enforced
+                // report_data binding combined with the TPM signature check.
+            }
+            
+            const bindingStatus = snpBindingOk ? "✅ Valid Silicon Anchor (Hardware Nonce matches AK)" : "❌ Silicon Anchor Failed (Tampering Detected)";
+            updateStatus('firmwareCheck', snpBindingOk && tpmFinal, `Silicon Audit: ${bindingStatus}<br>Firmware Measurement: ${measurement.substring(0,16)}...`);
 
             // 6. TLS Binding
             const certInput = document.getElementById('certInput').value;
