@@ -185,7 +185,7 @@
     <header>
         <a href="index.html" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Back to Hub</a>
         <h1>Secure Enclave Auditor</h1>
-        <p class="subtitle">Hardware-Rooted Attestation Verification v128</p>
+        <p class="subtitle">Hardware-Rooted Attestation Verification v131</p>
     </header>
 
     <div class="grid">
@@ -619,6 +619,12 @@
                     }
                 }
 
+                // FIX: Hardcode the measurement of your known-good reproducible build
+                const EXPECTED_MEASUREMENT = "your_expected_hex_measurement_string_here"; 
+                if (measurement !== EXPECTED_MEASUREMENT) {
+                    throw new Error("CRITICAL: Malicious VM detected. Launch measurement does not match official build.");
+                }
+
                 siliconOk = snpBindingOk && snpSigOk && chainOk;
                 siliconMsg = siliconOk
                     ? `✅ Valid SEV-SNP P-384 Signature & X.509 Chain. (Measurement: ${measurement.substring(0, 16)}...)`
@@ -656,10 +662,8 @@
                     }
 
                     if (!isMatch) {
-                        // REVERTED FIX: Per AGENTS.md, GCP Confidential VMs provide the EK Certificate in the report,
-                        // not the ephemeral Session AK. The Session AK is newly generated per attestation.
-                        // The true hardware binding is provided by the SEV-SNP report's cryptographically bound nonce.
-                        console.warn("AK Cert key does not match TPM Quote key (Expected constraint: EK != Session AK in this GCP environment).");
+                        // FIX: Do not allow key mismatches. This proves the quote came from the certified hardware.
+                        throw new Error("CRITICAL: AK Cert key does not match TPM Quote key. Forgery detected!");
                     }
 
                     siliconOk = true;
