@@ -185,7 +185,7 @@
     <header>
         <a href="index.html" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Back to Hub</a>
         <h1>Secure Enclave Auditor</h1>
-        <p class="subtitle">Hardware-Rooted Attestation Verification v120</p>
+        <p class="subtitle">Hardware-Rooted Attestation Verification v121</p>
     </header>
 
     <div class="grid">
@@ -541,6 +541,9 @@
                 );
 
                 // 5e. X.509 certificate chain: VCEK → ASK → ARK (self-signed)
+                //     CRITICAL: ARK is pinned against the official AMD Milan Root fingerprint.
+                //     This prevents a "Fake Root" attack where an attacker supplies their own CA chain.
+                const OFFICIAL_AMD_MILAN_ARK = "00e7040d7c71ba48530ec1aa7bcbc9f491c360fb1e58284e36ce3b49cb422998";
                 let chainOk = false;
                 if (hw.amd_chain_b64) {
                     const chainStr = atob(hw.amd_chain_b64);
@@ -550,7 +553,17 @@
                         const arkCert = forge.pki.certificateFromPem(pems[1]);
                         const vcekVerified = askCert.verify(vcekCert);
                         const askVerified  = arkCert.verify(askCert);
-                        chainOk = vcekVerified && askVerified;
+
+                        // Pin ARK: SHA-256 of its DER encoding must match AMD's official Milan ARK
+                        const md = forge.md.sha256.create();
+                        md.update(forge.asn1.toDer(forge.pki.certificateToAsn1(arkCert)).getBytes());
+                        const arkFingerprint = md.digest().toHex().toLowerCase();
+                        const isGenuineAmdRoot = (arkFingerprint === OFFICIAL_AMD_MILAN_ARK);
+
+                        chainOk = vcekVerified && askVerified && isGenuineAmdRoot;
+                        if (!isGenuineAmdRoot) {
+                            siliconMsg = `❌ FAKE ROOT DETECTED: ARK fingerprint ${arkFingerprint} does not match official AMD Milan ARK.`;
+                        }
                     }
                 }
 
@@ -560,36 +573,45 @@
                     : `❌ Silicon Verification Failed (binding=${snpBindingOk}, sig=${snpSigOk}, chain=${chainOk}).`;
 
             } else if (hw.snp_report_b64) {
-                // Fallback: Google AK Certificate (DER/PEM heuristic) — no VCEK provided
-                const snp = pemToBuffer(hw.snp_report_b64);
-                const derHex = Array.from(snp).map(b => b.toString(16).padStart(2,'0')).join('');
-                const isDerCert = snp[0] === 0x30 && snp[1] === 0x82;
-                const isPemText = snp[0] === 0x2D;
+                // Fallback: Google AK Certificate — no raw VCEK provided.
+                // CRITICAL FIX: Replace heuristic string-scan with forge certificate parsing.
+                // Verify: (1) Issuer is Google Confidential Computing, (2) cert public key
+                // matches hw.ak_pub_pem that was already used to verify the TPM quote.
+                const akDer = pemToBuffer(hw.snp_report_b64);
+                const isDerCert = akDer[0] === 0x30 && akDer[1] === 0x82;
+                const isPemText = akDer[0] === 0x2D;
 
                 if (isPemText || isDerCert) {
-                    // Google OID: PEN 11129 → DER VLQ 0xD6 0x79; ASCII "Google" = 476f6f676c65
-                    const hasGooglePen = derHex.includes('d679');
-                    const hasGoogleStr = derHex.includes('476f6f676c65');
-                    siliconOk = hasGooglePen || hasGoogleStr;
-
-                    // Decode readable identity strings from DER blob
-                    const readableStrings = [];
-                    let i = 0;
-                    while (i < snp.length - 4) {
-                        if (snp[i] >= 0x20 && snp[i] <= 0x7E) {
-                            let j = i, s = '';
-                            while (j < snp.length && snp[j] >= 0x20 && snp[j] <= 0x7E) { s += String.fromCharCode(snp[j++]); }
-                            if (s.length >= 5) readableStrings.push(s);
-                            i = j;
-                        } else { i++; }
+                    // Parse DER or PEM certificate with forge
+                    let akCert;
+                    if (isPemText) {
+                        akCert = forge.pki.certificateFromPem(new TextDecoder().decode(akDer));
+                    } else {
+                        akCert = forge.pki.certificateFromAsn1(
+                            forge.asn1.fromDer(forge.util.createBuffer(akDer))
+                        );
                     }
-                    const identityStrings = readableStrings.filter(s =>
-                        s.includes('Google') || s.includes('Cloud') || s.includes('project-') ||
-                        s.includes('paypal') || s.includes('europe') || s.includes('EK') || s.includes('vm-v')
-                    );
-                    const anchorType = isDerCert ? "Google AK Certificate (DER)" : "Google AK Certificate (PEM)";
-                    const detail = identityStrings.slice(0, 5).join('<br>') || `DER cert (${snp.length} bytes)`;
-                    siliconMsg = (siliconOk ? `✅ Valid ${anchorType} Anchor` : `❌ ${anchorType} Anchor Failed`) + `<br>${detail}`;
+
+                    // 1. Issuer check: must contain Google Confidential Computing
+                    const issuer = akCert.issuer.attributes.map(a => a.value).join(', ');
+                    const isGoogleIssued = issuer.includes('Google') &&
+                        (issuer.includes('Confidential') || issuer.includes('Cloud') || issuer.includes('Trust'));
+                    if (!isGoogleIssued) {
+                        throw new Error(`AK Certificate issuer is not Google Confidential Computing: "${issuer}"`);
+                    }
+
+                    // 2. Public key binding: cert's public key must equal hw.ak_pub_pem
+                    //    This binds the certificate to the TPM quote we already verified cryptographically.
+                    const certPubPem = forge.pki.publicKeyToPem(akCert.publicKey).trim();
+                    const quotePubPem = (hw.ak_pub_pem || '').replace(/\r/g, '').trim();
+                    const pubKeyMatches = (certPubPem === quotePubPem);
+                    if (!pubKeyMatches) {
+                        throw new Error('AK Certificate public key does not match the TPM Quote signing key!');
+                    }
+
+                    siliconOk = true;
+                    const subject = akCert.subject.attributes.map(a => a.value).join(', ');
+                    siliconMsg = `✅ Valid Google AK Certificate Anchor<br>Issuer: ${issuer}<br>Subject: ${subject}`;
                 }
             }
 
