@@ -502,11 +502,13 @@
             
             const parsedAttest = parseTpmsAttest(tpmMsg);
             tpmNonceOk = (parsedAttest.extraDataHex === expectedNonce);
-
             const expectedComposite = await calculatePcrCompositeDigest(hw.pcr_values);
             pcrDigestOk = (parsedAttest.pcrDigestHex === expectedComposite);
 
             const tpmFinal = tpmSigOk && tpmNonceOk && pcrDigestOk;
+            if (!tpmNonceOk) {
+                throw new Error("CRITICAL: TPM Quote Nonce does not match the expected Session Nonce! (Did the user profile hash change?)");
+            }
             let tpmMsgText = tpmFinal ? "TPM Quote, Nonce, and PCR Digest strictly verified." : "TPM validation failed (Forgery detected): ";
             if (!tpmSigOk) tpmMsgText += "Signature Invalid. ";
             if (!tpmNonceOk) tpmMsgText += "Nonce Mismatch. ";
@@ -572,8 +574,9 @@
                 
                 const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('');
                 if (reportDataHex !== expectedBoundNonce.padEnd(128, '0')) {
-                    throw new Error("CRITICAL: SEV-SNP Report is not bound to this TPM Attestation Key!");
+                    throw new Error("CRITICAL: SEV-SNP Report is not bound to this TPM Attestation Key! (Hardware Spoofing Detected)");
                 }
+                const snpBindingOk = true;
 
                 // Verify AMD Signature
                 const rBE = new Uint8Array(48), sBE = new Uint8Array(48);
