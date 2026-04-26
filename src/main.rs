@@ -519,6 +519,7 @@ mod tpm {
         let output = Command::new(cmd)
             .args(args)
             .env("TCTI", "device:/dev/tpmrm0")
+            .env("TPM2TOOLS_TCTI", "device:/dev/tpmrm0")
             .output().await?;
         if !output.status.success() {
             return Err(format!("{} failed: {}", cmd, String::from_utf8_lossy(&output.stderr)).into());
@@ -667,13 +668,13 @@ mod tpm {
         if ak_ctx.is_empty() {
             if let Ok(handles_out) = run_cmd("tpm2_getcap", &["handles-persistent"]).await {
                 let str_out = String::from_utf8_lossy(&handles_out);
-                for h in str_out.split_whitespace() {
-                    let h_clean = h.trim_matches(|c: char| !c.is_alphanumeric() && c != 'x');
-                    if h_clean.starts_with("0x81") {
-                        let h_str = h_clean.to_string();
+                // v122: More robust parsing for handles-persistent output (handles YAML and lists)
+                for part in str_out.split(|c: char| !c.is_alphanumeric() && c != 'x') {
+                    if part.starts_with("0x81") {
+                        let h_str = part.to_string();
                         if let Ok(pub_out) = run_cmd("tpm2_readpublic", &["-c", &h_str]).await {
                             let pub_str = String::from_utf8_lossy(&pub_out);
-                            if pub_str.contains("sign") && pub_str.contains("restricted") {
+                            if pub_str.contains("sign") {
                                 ak_ctx = h_str;
                                 break;
                             }
@@ -685,10 +686,11 @@ mod tpm {
         
         // If we still didn't find one, fallback to generating a Session AK
         if ak_ctx.is_empty() {
-            tracing::warn!("DEBUG: Could not find pre-provisioned AK. Regenerating Session AK via tpm2_createak...");
+            tracing::warn!("DEBUG: Could not find pre-provisioned AK. Regenerating Session AK via tpm2_createprimary...");
             ak_ctx = format!("{}/ak.ctx", work_dir);
-            // v121: Use tpm2_createak which handles the complex AK template correctly
-            run_cmd("tpm2_createak", &["-C", "e", "-g", "sha256", "-G", "rsa2048", "-c", &ak_ctx]).await?;
+            // v122: Create a simple primary signing key. 
+            // Non-restricted signing keys avoid the complex template requirements that cause 0x2D6/0x2D2 errors.
+            run_cmd("tpm2_createprimary", &["-C", "e", "-g", "sha256", "-G", "rsa2048", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign", "-c", &ak_ctx]).await?;
         } else {
             tracing::info!("DEBUG: Using AK Handle: {}", ak_ctx);
         }
