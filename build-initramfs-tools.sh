@@ -142,7 +142,7 @@ chmod 755 ./init
 # mkinitramfs may skip these if not running on the target hardware.
 echo "🛡️  Injecting hardware and network modules..."
 MODULES_BASE="/lib/modules/$KERNEL_VERSION"
-for modname in configfs tsm amd_tsm sev-guest coco_guest gve virtio_net virtio_pci virtio_blk virtio_scsi nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct; do
+for modname in configfs tsm amd_tsm sev_guest sev-guest coco_guest gve virtio_net virtio_pci virtio_blk virtio_scsi nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct; do
     # Find the module file (could be .ko, .ko.gz, .ko.xz, or .ko.zst)
     # Search deeper to find all variants (handle hyphen/underscore mismatch)
     altname="${modname//_/-}"
