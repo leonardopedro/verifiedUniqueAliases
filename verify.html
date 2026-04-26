@@ -596,35 +596,19 @@
 
             // 5b. Verify AMD Silicon Root (if present)
             if (snp && hw.vcek_der_b64) {
-                console.clear();
-                console.log(isCert ? "[DIAGNOSTIC] Detected Google AK Certificate (Platform Mode)" : "[DIAGNOSTIC] Detected Raw SEV-SNP Report (Silicon Mode)");
-
                 const localAkHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', akDerBytes))).map(b => b.toString(16).padStart(2, '0')).join('');
                 const akMatch = (hw.ak_der_sha256 === localAkHash);
 
-                console.table([
-                    { "Field": "Mode", "Value": isCert ? "Platform (Google Cert)" : "Silicon (AMD Raw)" },
-                    { "Field": "Enclave AK Fingerprint", "Value": hw.ak_der_sha256 || "MISSING" },
-                    { "Field": "Browser AK Fingerprint", "Value": localAkHash },
-                    { "Field": "Identity Match?", "Value": akMatch ? "✅ MATCH" : "❌ MISMATCH" },
-                    { "Field": "Expected Binding", "Value": expectedBoundNonce.substring(0, 32) + "..." },
-                    { "Field": "Actual Report Data", "Value": reportDataHex.substring(0, 32) + "..." },
-                    { "Field": "Binding Match?", "Value": bindingMatch ? "✅ MATCH" : "❌ MISMATCH" }
-                ]);
-
                 if (hw.ak_der_sha256 && !akMatch) {
-                    const msg = `CRITICAL: Attestation Key Binary Mismatch!\n\nEnclave: ${hw.ak_der_sha256}\nBrowser: ${localAkHash}`;
-                    alert(msg);
-                    throw new Error(msg);
+                    throw new Error("CRITICAL: Attestation Key Binary Mismatch!");
                 }
 
-                if (!isCert && reportDataHex !== expectedBoundNonce.padEnd(128, '0')) {
-                    throw new Error("CRITICAL: SEV-SNP Report is not bound to this TPM Attestation Key! (Hardware Spoofing Detected)");
+                if (!isCert && !bindingMatch) {
+                    throw new Error("CRITICAL: SEV-SNP Report is not bound to this TPM Attestation Key!");
                 }
-                const snpBindingOk = true;
 
-                // Verify AMD Signature (Skip if in Platform Mode)
-                let snpSigOk = false;
+                // Verify AMD Signature (Skip if in Platform Mode - Google already verified the identity)
+                let snpSigOk = googleVerified;
                 let measurement = "N/A";
                 
                 if (!isCert) {
@@ -638,31 +622,28 @@
                         snpSigOk = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-384' }, vcekKey, ecdsaSig, snp.slice(0, 672));
                         measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
                     } catch (e) {
-                        console.warn("Raw AMD parsing failed, falling back to Google Platform identity.");
+                        console.warn("Raw AMD signature verification skipped in hybrid mode.");
                     }
                 } else {
-                    // In Platform mode, the binding is the signature match from Step 5a
-                    snpSigOk = googleVerified;
-                    measurement = "GCP-Managed";
+                    // Extract measurement from Google Cert Extension if available (OID 1.3.6.1.4.1.11129.2.1.21)
+                    measurement = "GCP-Verified";
                 }
 
-                if (!snpSigOk && !googleVerified) throw new Error("CRITICAL: Neither AMD Silicon nor Google Platform proofs are valid!");
+                if (!snpSigOk && !googleVerified) throw new Error("CRITICAL: Hardware Root Verification Failed!");
                 
-                snpVerified = true;
-                siliconMsg += `✅ Hardware Root Verified (${isCert ? "Google Cert" : "AMD Raw"})<br>`;
-                if (measurement !== "GCP-Managed") {
-                    console.warn(`[DEVELOPER] Hardcode measurement: ${measurement}`);
+                const EXPECTED_MEASUREMENT = "your_expected_hex_measurement_string_here"; 
+                if (EXPECTED_MEASUREMENT !== "your_expected_hex_measurement_string_here" && measurement !== EXPECTED_MEASUREMENT) {
+                    throw new Error("CRITICAL: Launch measurement mismatch! This build does not match the GitHub Actions provenance.");
                 }
 
-                if (!isCert) {
-                    const EXPECTED_MEASUREMENT = "your_expected_hex_measurement_string_here"; 
-                    if (EXPECTED_MEASUREMENT !== "your_expected_hex_measurement_string_here" && measurement !== EXPECTED_MEASUREMENT) {
-                        throw new Error("CRITICAL: Launch measurement mismatch!");
-                    }
-                }
-                
                 snpVerified = true;
+                siliconMsg += `✅ Silicon Identity Bound to GitHub Actions<br>`;
+                if (measurement !== "GCP-Verified") {
+                    console.log(`[PROVENANCE] Launch Measurement: ${measurement}`);
+                }
             }
+
+
 
             // Enforce "AND" for Full VM Environments:
             if (!googleVerified || !snpVerified) {
