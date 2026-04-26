@@ -565,8 +565,13 @@
             if (hw.snp_report_b64 && hw.vcek_der_b64) {
                 const snp = pemToBuffer(hw.snp_report_b64);
                 
-                // Cryptographic Binding: SEV-SNP report_data must contain SHA256(AK_DER || expectedNonce)
+                // 🔴 DEBUG: Binary Transparency Check
                 const akDerBytes = pemToBytes(hw.ak_pub_pem);
+                const localAkHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', akDerBytes))).map(b => b.toString(16).padStart(2, '0')).join('');
+                if (hw.ak_der_sha256 && localAkHash !== hw.ak_der_sha256) {
+                    throw new Error(`CRITICAL: Attestation Key Binary Mismatch! \nEnclave sees: ${hw.ak_der_sha256.substring(0,16)}...\nBrowser sees: ${localAkHash.substring(0,16)}...\n(Check for hidden PEM metadata)`);
+                }
+
                 const rawExpectedNonce = new Uint8Array(expectedNonce.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
                 const boundBuffer = new Uint8Array(akDerBytes.length + rawExpectedNonce.length);
                 boundBuffer.set(akDerBytes); boundBuffer.set(rawExpectedNonce, akDerBytes.length);

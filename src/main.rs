@@ -464,6 +464,7 @@ mod tpm {
         pub vcek_der_b64: Option<String>,
         pub amd_chain_b64: Option<String>,
         pub google_ak_cert_pem: Option<String>,
+        pub ak_der_sha256: String,
     }
 
     pub mod snp {
@@ -744,8 +745,10 @@ mod tpm {
 
         // Hardware SNP Report & AMD Certificates
         use sha2::Digest;
+        let ak_der_sha256 = hex::encode(sha2::Sha256::digest(&ak_der_bytes));
+
         let mut hasher = sha2::Sha256::new();
-        hasher.update(&ak_der_bytes); // <--- HASH THE BINARY DER
+        hasher.update(&ak_der_bytes);
         hasher.update(&hex::decode(nonce_hex).unwrap_or_default());
         let bound_nonce = hasher.finalize();
 
@@ -831,6 +834,7 @@ mod tpm {
             vcek_der_b64,
             amd_chain_b64,
             google_ak_cert_pem,
+            ak_der_sha256,
         })
     }
 }
