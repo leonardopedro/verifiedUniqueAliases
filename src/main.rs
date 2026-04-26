@@ -644,6 +644,7 @@ mod tpm {
         let ak_pub = format!("{}/ak.pub", work_dir);
         let ak_priv = format!("{}/ak.priv", work_dir);
         let ak_pem = format!("{}/ak.pem", work_dir);
+        let ak_der = format!("{}/ak.der", work_dir);
         let quote_msg = format!("{}/quote.msg", work_dir);
         let quote_sig = format!("{}/quote.sig", work_dir);
 
@@ -678,9 +679,12 @@ mod tpm {
             tracing::info!("DEBUG: Using pre-provisioned AK Handle: {}", ak_ctx);
         }
 
-        // Extract AK PEM for the report
+        // Extract AK in both PEM (for report display) and DER (for bit-perfect hashing)
         run_cmd("tpm2_readpublic", &["-c", &ak_ctx, "-f", "pem", "-o", &ak_pem]).await?;
+        run_cmd("tpm2_readpublic", &["-c", &ak_ctx, "-o", &ak_der]).await?;
+        
         let ak_pem_str = tokio::fs::read_to_string(&ak_pem).await?;
+        let ak_der_bytes = tokio::fs::read(&ak_der).await?;
 
         tracing::info!("DEBUG: TPM Quote starting with nonce 0x{}...", nonce_hex);
         run_cmd("tpm2_quote", &[
@@ -737,7 +741,7 @@ mod tpm {
         // came from the exact same physical hardware as the SEV-SNP report.
         use sha2::Digest;
         let mut hasher = sha2::Sha256::new();
-        hasher.update(ak_pem_str.as_bytes());
+        hasher.update(&ak_der_bytes);
         hasher.update(&hex::decode(nonce_hex).unwrap_or_default());
         let bound_nonce = hasher.finalize();
 

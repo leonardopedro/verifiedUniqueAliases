@@ -563,11 +563,11 @@
             if (hw.snp_report_b64 && hw.vcek_der_b64) {
                 const snp = pemToBuffer(hw.snp_report_b64);
                 
-                // Cryptographic Binding: SEV-SNP report_data must contain SHA256(AK_PEM || expectedNonce)
-                const akPemBytes = new TextEncoder().encode(hw.ak_pub_pem);
+                // Cryptographic Binding: SEV-SNP report_data must contain SHA256(AK_DER || expectedNonce)
+                const akDerBytes = pemToBytes(hw.ak_pub_pem);
                 const rawExpectedNonce = new Uint8Array(expectedNonce.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-                const boundBuffer = new Uint8Array(akPemBytes.length + rawExpectedNonce.length);
-                boundBuffer.set(akPemBytes); boundBuffer.set(rawExpectedNonce, akPemBytes.length);
+                const boundBuffer = new Uint8Array(akDerBytes.length + rawExpectedNonce.length);
+                boundBuffer.set(akDerBytes); boundBuffer.set(rawExpectedNonce, akDerBytes.length);
                 const expectedBoundNonce = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', boundBuffer))).map(b => b.toString(16).padStart(2, '0')).join('');
                 
                 const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('');
