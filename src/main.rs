@@ -25,19 +25,27 @@ mod enclave_init {
 
     /// Mount essential kernel virtual filesystems.
     pub fn load_drivers() {
-        // v127: Mount configfs and FORCE RELOAD attestation modules
-        // This ensures they register their ConfigFS subsystems correctly.
-        let _ = modprobe("configfs");
+        // v128: Final boss mode module loading
+        let _ = std::process::Command::new("/bin/mount").args(["-t", "proc", "none", "/proc"]).status();
+        let _ = std::process::Command::new("/bin/mount").args(["-t", "sysfs", "none", "/sys"]).status();
         let _ = std::process::Command::new("/bin/mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
         
+        insmod_all();
+        
         // Try to clear existing (possibly broken) attestation state
-        let _ = std::process::Command::new("rmmod").arg("amd_tsm").status();
-        let _ = std::process::Command::new("rmmod").arg("tsm").status();
-        let _ = std::process::Command::new("rmmod").arg("sev_guest").status();
-        let _ = std::process::Command::new("rmmod").arg("sev-guest").status();
+        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "amd_tsm"]).status();
+        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "amd-tsm"]).status();
+        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "tsm"]).status();
+        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "tsm_report"]).status();
+        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "sev_guest"]).status();
+        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "sev-guest"]).status();
+
+        modprobe("configfs");
+        let _ = std::process::Command::new("/bin/mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
         
         modprobe("tsm");
         modprobe("amd_tsm");
+        modprobe("amd-tsm");
         modprobe("sev-guest");
         modprobe("coco_guest");
         
@@ -207,6 +215,23 @@ mod enclave_init {
         let tgt = std::ffi::CString::new(mount_point).unwrap();
         unsafe { libc::umount(tgt.as_ptr()); }
         manifest
+    }
+
+    fn insmod_all() {
+        kmsg("Aggressively loading all discovered modules via insmod...");
+        let paths = ["/sbin/find", "/usr/bin/find", "/bin/find", "find"];
+        for path in &paths {
+            if let Ok(output) = std::process::Command::new(path).args(["/lib/modules", "-name", "*.ko"]).output() {
+                let s = String::from_utf8_lossy(&output.stdout);
+                for line in s.lines() {
+                    if line.contains("tsm") || line.contains("sev") || line.contains("coco") || line.contains("virtio") || line.contains("gve") || line.contains("configfs") {
+                        kmsg(&format!("insmod {}", line));
+                        let _ = std::process::Command::new("/sbin/insmod").arg(line).status();
+                    }
+                }
+                break;
+            }
+        }
     }
 
     fn modprobe(module: &str) {
@@ -2106,6 +2131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let hash_hex = hex::encode(manifest_hash);
         
         enclave_init::kmsg(&format!("Anchoring manifest ({} files) in PCR 15: {}", boot_manifest.len(), hash_hex));
+        
         let _ = std::process::Command::new("tpm2")
             .args(["pcrextend", &format!("15:sha256={}", hash_hex)])
             .status();
