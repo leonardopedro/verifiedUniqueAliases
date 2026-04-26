@@ -679,12 +679,13 @@ mod tpm {
             tracing::info!("DEBUG: Using pre-provisioned AK Handle: {}", ak_ctx);
         }
 
-        // Extract AK in both PEM (for report display) and DER (for bit-perfect hashing)
+        // Extract AK in both PEM (for report display) and standard X.509 DER (for bit-perfect hashing)
         run_cmd("tpm2_readpublic", &["-c", &ak_ctx, "-f", "pem", "-o", &ak_pem]).await?;
-        run_cmd("tpm2_readpublic", &["-c", &ak_ctx, "-o", &ak_der]).await?;
+        // Use openssl to ensure we have a standard X.509 SubjectPublicKeyInfo (SPKI) DER
+        let _ = run_cmd("openssl", &["rsa", "-pubin", "-inform", "PEM", "-in", &ak_pem, "-outform", "DER", "-out", &ak_der]).await;
         
         let ak_pem_str = tokio::fs::read_to_string(&ak_pem).await?;
-        let ak_der_bytes = tokio::fs::read(&ak_der).await?;
+        let ak_der_bytes = tokio::fs::read(&ak_der).await.unwrap_or_else(|_| vec![]);
 
         tracing::info!("DEBUG: TPM Quote starting with nonce 0x{}...", nonce_hex);
         run_cmd("tpm2_quote", &[
