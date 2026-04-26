@@ -675,7 +675,7 @@ mod tpm {
             tracing::warn!("DEBUG: Could not find pre-provisioned AK. Regenerating from Endorsement Seed...");
             ak_ctx = format!("{}/ak.ctx", work_dir);
             // Google's AK is a Primary Key in the Endorsement Hierarchy
-            run_cmd("tpm2_createprimary", &["-C", "e", "-g", "sha256", "-G", "rsa2048:rsassa", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|restricted|sign", "-c", &ak_ctx]).await?;
+            run_cmd("tpm2_createprimary", &["-C", "e", "-g", "sha256", "-G", "rsa2048:null:rsassa", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|restricted|sign", "-c", &ak_ctx]).await?;
         } else {
             tracing::info!("DEBUG: Using pre-provisioned AK Handle: {}", ak_ctx);
         }
