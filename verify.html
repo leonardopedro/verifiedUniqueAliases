@@ -185,7 +185,7 @@
     <header>
         <a href="index.html" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Back to Hub</a>
         <h1>Secure Enclave Auditor</h1>
-        <p class="subtitle">Hardware-Rooted Attestation Verification v122</p>
+        <p class="subtitle">Hardware-Rooted Attestation Verification v123</p>
     </header>
 
     <div class="grid">
@@ -287,10 +287,11 @@
         return Uint8Array.from(atob(padded), c => c.charCodeAt(0));
     }
     function pemToBinaryStr(pem) {
-        const bytes = pemToBytes(pem);
-        let s = '';
-        for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-        return s;
+        const b64 = pem
+            .replace(/-----(BEGIN|END).*?-----|[\s\r\n]/g, '')
+            .replace(/-/g, '+').replace(/_/g, '/');
+        const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+        return atob(padded);
     }
     const pemToBuffer = pemToBytes; // backward compat
 
@@ -540,7 +541,7 @@
 
                 // 5c. Import VCEK public key via forge (DER → PEM → WebCrypto)
                 const vcekDerBinStr = pemToBinaryStr(hw.vcek_der_b64);
-                const asn1 = forge.asn1.fromDer(forge.util.createBuffer(vcekDerBinStr));
+                const asn1 = forge.asn1.fromDer(forge.util.createBuffer(vcekDerBinStr, 'raw'));
                 const vcekCert = forge.pki.certificateFromAsn1(asn1);
                 const vcekPubPem = forge.pki.publicKeyToPem(vcekCert.publicKey);
                 const vcekKey = await crypto.subtle.importKey(
@@ -602,7 +603,7 @@
                     } else {
                         const akDerBinStr = pemToBinaryStr(hw.snp_report_b64);
                         akCert = forge.pki.certificateFromAsn1(
-                            forge.asn1.fromDer(forge.util.createBuffer(akDerBinStr))
+                            forge.asn1.fromDer(forge.util.createBuffer(akDerBinStr, 'raw'))
                         );
                     }
 
