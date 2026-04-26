@@ -635,17 +635,10 @@ mod tpm {
             }
         }
         
-        // If we still didn't find one, fallback to generating a Session AK so the server doesn't crash
-        let is_ephemeral_ak = ak_ctx.is_empty();
-        if is_ephemeral_ak {
-            tracing::warn!("DEBUG: Could not find pre-provisioned AK with 'sign' attribute! Falling back to ephemeral AK.");
-            ak_ctx = format!("{}/ak.ctx", work_dir);
-            run_cmd("tpm2_createprimary", &["-C", "o", "-g", "sha256", "-G", "rsa2048", "-c", &primary_ctx]).await?;
-            run_cmd("tpm2_create", &["-C", &primary_ctx, "-g", "sha256", "-G", "rsa2048", "-a", "sign|fixedtpm|fixedparent|sensitivedataorigin|userwithauth", "-u", &ak_pub, "-r", &ak_priv]).await?;
-            run_cmd("tpm2_load", &["-C", &primary_ctx, "-u", &ak_pub, "-r", &ak_priv, "-c", &ak_ctx]).await?;
-        } else {
-            tracing::info!("DEBUG: Using pre-provisioned AK Handle: {}", ak_ctx);
+        if ak_ctx.is_empty() {
+            return Err("CRITICAL: Could not find pre-provisioned AK with 'sign' attribute! Forgery prevention requires a certified hardware AK.".into());
         }
+        tracing::info!("DEBUG: Using pre-provisioned AK Handle: {}", ak_ctx);
 
         // Extract AK PEM for the report
         run_cmd("tpm2_readpublic", &["-c", &ak_ctx, "-f", "pem", "-o", &ak_pem]).await?;
@@ -1044,7 +1037,7 @@ struct CallbackQuery {
 // ============================================================================
 
 async fn fetch_secret_direct(secret_id: &str) -> Option<String> {
-    let client = reqwest::Client::new();
+    let client = hardened_client();
     let token_resp: serde_json::Value = client
         .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
         .header("Metadata-Flavor", "Google")
