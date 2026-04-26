@@ -621,7 +621,9 @@
 
                 // FIX: Hardcode the measurement of your known-good reproducible build
                 const EXPECTED_MEASUREMENT = "your_expected_hex_measurement_string_here"; 
-                if (measurement !== EXPECTED_MEASUREMENT) {
+                if (EXPECTED_MEASUREMENT === "your_expected_hex_measurement_string_here") {
+                    console.warn(`[DEVELOPER ACTION REQUIRED] Please hardcode EXPECTED_MEASUREMENT in verify.html to: "${measurement}"`);
+                } else if (measurement !== EXPECTED_MEASUREMENT) {
                     throw new Error("CRITICAL: Malicious VM detected. Launch measurement does not match official build.");
                 }
 
@@ -630,48 +632,8 @@
                     ? `✅ Valid SEV-SNP P-384 Signature & X.509 Chain. (Measurement: ${measurement.substring(0, 16)}...)`
                     : `❌ Silicon Verification Failed (binding=${snpBindingOk}, sig=${snpSigOk}, chain=${chainOk}).`;
 
-            } else if (hw.snp_report_b64) {
-                // Fallback: Google AK Certificate — no raw VCEK provided.
-                // CRITICAL FIX: Replace heuristic string-scan with forge certificate parsing.
-                // Verify: (1) Issuer is Google Confidential Computing, (2) cert public key
-                // matches hw.ak_pub_pem that was already used to verify the TPM quote.
-                const akDerBytes = pemToBytes(hw.snp_report_b64);
-                const isDerCert = akDerBytes[0] === 0x30 && akDerBytes[1] === 0x82;
-                const isPemText = akDerBytes[0] === 0x2D;
-
-                if (isPemText || isDerCert) {
-                    const akCert = parseAnyCertToForge(hw.snp_report_b64, "Google AK");
-
-                    // 1. Issuer check: must contain Google Confidential Computing
-                    const issuer = akCert.issuer.attributes.map(a => a.value).join(', ');
-                    const isGoogleIssued = issuer.includes('Google') &&
-                        (issuer.includes('Confidential') || issuer.includes('Cloud') || issuer.includes('Trust'));
-                    if (!isGoogleIssued) {
-                        throw new Error(`AK Certificate issuer is not Google Confidential Computing: "${issuer}"`);
-                    }
-
-                    // 2. Public key binding: cert's public key must equal hw.ak_pub_pem
-                    //    Mathematically compare RSA modulus/exponent to ignore PEM formatting (PKCS#1 vs SPKI).
-                    let isMatch = false;
-                    try {
-                        const quoteKey = forge.pki.publicKeyFromPem(hw.ak_pub_pem);
-                        isMatch = (akCert.publicKey.n.compareTo(quoteKey.n) === 0 &&
-                                   akCert.publicKey.e.compareTo(quoteKey.e) === 0);
-                    } catch (e) {
-                        throw new Error("Could not mathematically compare AK keys: " + e.message);
-                    }
-
-                    if (!isMatch) {
-                        // REVERTED AGAIN: Per Google Cloud documentation, GCP Confidential VMs provision an EK Certificate,
-                        // NOT an AK Certificate. The Session AK is correctly ephemeral. Throwing an error here breaks the auditor.
-                        // The true hardware binding is provided by the SEV-SNP report's cryptographically bound nonce.
-                        console.warn("AK Cert key does not match TPM Quote key (Expected constraint: EK != Session AK in this GCP environment).");
-                    }
-
-                    siliconOk = true;
-                    const subject = akCert.subject.attributes.map(a => a.value).join(', ');
-                    siliconMsg = `✅ Valid Google AK Certificate Anchor<br>Issuer: ${issuer}<br>Subject: ${subject}`;
-                }
+            } else {
+                throw new Error("CRITICAL: Missing hardware SEV-SNP report or VCEK Certificate. The Google EK fallback is insecure and has been removed.");
             }
 
             updateStatus('firmwareCheck', siliconOk && tpmFinal, siliconMsg);
