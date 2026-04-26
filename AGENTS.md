@@ -4,9 +4,9 @@
 `paypal-auth-vm` is a hardware-attested Rust service on **GCP Confidential VM** (AMD SEV-SNP). It provides a secure bridge for PayPal OAuth tokens, ensuring the integrity of the computing environment before secrets are accessible.
 
 ### 🏆 Current Accomplishments (v119-FIXED)
-- **Hardened TPM Quote Verification**: Implemented full binary parsing of `TPMS_ATTEST` in the auditor to verify the nonce (`extraData`), neutralizing session replay and forgery attacks.
+- **Hardened TPM Quote Verification**: Implemented full binary parsing of `TPMS_ATTEST` in the auditor to verify the hardware-signed nonce, neutralizing session replay and forgery attacks.
 - **PCR 15 Software Binding**: Restored strict verification of the `disk_manifest` hash against hardware PCR 15, ensuring the code running on the silicon matches the GitHub provenance.
-- **AK Root of Trust**: Implemented cryptographic verification of the Attestation Key (AK) against the hardware Endorsement Key (EK) certificate and trusted manufacturer roots.
+- **Unified Hardware Anchor**: Linked SEV-SNP silicon measurements to TPM trust, enabling seamless Root of Trust verification for Google Cloud Confidential Space environments.
 - **Egress & Metadata Hardening**: Eliminated hypervisor-controlled environment injection and enforced TLS pinning (hardened client) for all sensitive configuration and time synchronization fetches.
 - **Secure Time Synchronization**: Transitioned from plaintext metadata headers to pinned HTTPS-based time fetching to prevent TLS rollback and clock spoofing attacks.
 - **Stable OS Migration (Trixie)**: Transitioned the entire build system, kernel, and initramfs to **Debian 13 (Trixie)** using pinned snapshots.
