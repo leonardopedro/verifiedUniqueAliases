@@ -681,8 +681,8 @@ mod tpm {
 
         // Extract AK in both PEM (for report display) and standard X.509 DER (for bit-perfect hashing)
         run_cmd("tpm2_readpublic", &["-c", &ak_ctx, "-f", "pem", "-o", &ak_pem]).await?;
-        // Use openssl to ensure we have a standard X.509 SubjectPublicKeyInfo (SPKI) DER
-        let _ = run_cmd("openssl", &["rsa", "-pubin", "-inform", "PEM", "-in", &ak_pem, "-outform", "DER", "-out", &ak_der]).await;
+        // Use algorithm-agnostic openssl pkey to handle both RSA and ECC keys
+        let _ = run_cmd("openssl", &["pkey", "-pubin", "-inform", "PEM", "-in", &ak_pem, "-outform", "DER", "-out", &ak_der]).await;
         
         let ak_pem_str = tokio::fs::read_to_string(&ak_pem).await?;
         let ak_der_bytes = tokio::fs::read(&ak_der).await.unwrap_or_else(|_| vec![]);
@@ -738,11 +738,11 @@ mod tpm {
 
         // 5. Hardware SNP Report (Firmware / Launch Measurement)
         // CRITICAL SEV-SNP FIX: Cryptographically bind the native AMD hardware report to the vTPM Quote.
-        // We hash the TPM's Attestation Key along with the user's nonce. This proves the TPM Quote
-        // came from the exact same physical hardware as the SEV-SNP report.
+        // We hash the TPM's Attestation Key (DER) along with the COMBINED nonce.
         use sha2::Digest;
         let mut hasher = sha2::Sha256::new();
         hasher.update(&ak_der_bytes);
+        // CRITICAL: We must use the same combined nonce as the TPM quote!
         hasher.update(&hex::decode(nonce_hex).unwrap_or_default());
         let bound_nonce = hasher.finalize();
 
