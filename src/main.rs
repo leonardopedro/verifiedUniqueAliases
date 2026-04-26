@@ -770,48 +770,15 @@ mod tpm {
 
         tracing::info!("DEBUG: SNP nonce bytes prepared");
         let mut auxblob_b64 = None;
-        let mut snp_report_raw = match snp::get_report(&nonce_bytes) {
+        let snp_report_raw = match snp::get_report(&nonce_bytes) {
             Some((report, aux)) => {
                 tracing::info!("Obtained SEV-SNP report via TSM ConfigFS");
                 auxblob_b64 = aux;
                 Some(report)
             },
             None => {
-                tracing::info!("TSM ConfigFS failed or unsupported, trying known GCP NVRAM handles...");
-                let indices = [
-                    ("0x01c00002", "1184"), 
-                    ("0x01400001", "1248"),
-                    ("0x01c00001", "1184")
-                ];
-                let mut data = vec![];
-                for (idx, size) in &indices {
-                    tracing::info!("DEBUG: Trying NVRAM index {} (Owner Hierarchy)", idx);
-                    match run_cmd("tpm2", &["nvread", idx, "-C", "o", "-s", size]).await {
-                        Ok(d) if !d.is_empty() => {
-                            tracing::info!("Obtained report from NVRAM index {} (Owner)", idx);
-                            data = d;
-                            break;
-                        },
-                        _ => {
-                            tracing::info!("DEBUG: Trying NVRAM index {} (Platform Hierarchy)", idx);
-                            match run_cmd("tpm2", &["nvread", idx, "-C", "p", "-s", size]).await {
-                                Ok(d) if !d.is_empty() => {
-                                    tracing::info!("Obtained report from NVRAM index {} (Platform)", idx);
-                                    data = d;
-                                    break;
-                                },
-                                _ => { tracing::debug!("Index {} not found in O or P hierarchies", idx); }
-                            }
-                        }
-                    }
-                }
-                
-                if !data.is_empty() {
-                    Some(data)
-                } else {
-                    tracing::error!("All hardware report strategies failed.");
-                    None
-                }
+                tracing::error!("Failed to obtain SEV-SNP report via TSM ConfigFS.");
+                None
             }
         };
 
