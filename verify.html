@@ -556,12 +556,10 @@
             let googleVerified = false;
             let siliconMsg = "";
 
-            // Detection: Is the SNP report field actually a certificate?
-            let isCert = false;
+            // v132: Dual-Root Enforcement (AMD SEV-SNP + Google AK)
             let snp = null;
             if (hw.snp_report_b64) {
                 snp = pemToBuffer(hw.snp_report_b64);
-                isCert = snp[0] === 0x30 && snp[1] === 0x82;
             }
 
             // Calculate Expected Binding
@@ -572,9 +570,8 @@
             const boundHashBuffer = await crypto.subtle.digest('SHA-256', boundBuffer);
             const expectedBoundNonce = Array.from(new Uint8Array(boundHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
             
-            // 5a. Verify Google Platform Root (if present)
+            // 5a. Verify Google Platform Root (Mandatory for GCP Identity)
             let akCertPem = hw.google_ak_cert_pem;
-            if (!akCertPem && isCert) akCertPem = hw.snp_report_b64;
 
             if (akCertPem) {
                 const akCert = parseAnyCertToForge(akCertPem, "Google AK");
@@ -597,8 +594,8 @@
                 siliconMsg = `✅ Valid Google AK Certificate Anchor<br>Issuer: ${issuer}<br>Subject: ${akCert.subject.attributes.map(a => a.value).join(', ')}`;
             }
 
-            // 5b. Verify AMD Silicon Root (if present)
-            if (snp && hw.vcek_der_b64 && !isCert) {
+            // 5b. Verify AMD Silicon Root (Mandatory for Hardware measurement)
+            if (snp && hw.vcek_der_b64) {
                 const localAkHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', akDerBytes))).map(b => b.toString(16).padStart(2, '0')).join('');
                 const akMatch = (hw.ak_der_sha256 === localAkHash);
 
@@ -633,10 +630,6 @@
 
                 snpVerified = true;
                 siliconMsg += `<br>✅ AMD Silicon Root of Trust Verified`;
-            } else if (isCert) {
-                // In Platform Mode (GCP), the SNP report IS the Google AK certificate.
-                // We've already verified it in the Google block above.
-                snpVerified = true; 
             }
 
             // Enforce "AND" for Full VM Environments:
