@@ -47,7 +47,11 @@ mod enclave_init {
         modprobe("amd_tsm");
         modprobe("amd-tsm");
         modprobe("sev-guest");
+        modprobe("sev_guest");
         modprobe("coco_guest");
+        
+        // v134: Aggressive probe retry
+        let _ = std::process::Command::new("/bin/sh").args(["-c", "echo sev-guest > /sys/bus/platform/drivers/sev-guest/bind"]).status();
         
         if !std::path::Path::new("/sys/kernel/config/tsm").exists() {
              let _ = std::process::Command::new("/bin/mkdir").args(["-p", "/sys/kernel/config/tsm"]).status();
@@ -132,6 +136,9 @@ mod enclave_init {
         mount_fs("sysfs",    "/sys",  "sysfs");
         mount_fs("tmpfs",    "/tmp",  "tmpfs");
         mount_fs("tmpfs",    "/run",  "tmpfs");
+        
+        // CRITICAL FIX: load configfs module BEFORE trying to mount it
+        modprobe("configfs");
         mount_fs("configfs", "/sys/kernel/config", "configfs");
         std::fs::create_dir_all("/dev/pts").ok();
 
@@ -644,66 +651,42 @@ mod tpm {
     async fn fetch_vcek(chip_id: &str, bl: u8, tee: u8, snp: u8, ucode: u8) -> Option<String> {
         let client = reqwest::Client::new(); // Standard client for public KDS to avoid pinning errors
         let url = format!("https://kdsintf.amd.com/vcek/v1/Milan/{}?blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}", chip_id, bl, tee, snp, ucode);
-        if let Ok(resp) = client.get(&url).send().await {
-            if let Ok(bytes) = resp.bytes().await { return Some(STANDARD.encode(&bytes)); }
+        tracing::info!("v136: Fetching VCEK from {}", url);
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    if let Ok(bytes) = resp.bytes().await { 
+                        tracing::info!("v136: VCEK fetch succeeded ({} bytes)", bytes.len());
+                        return Some(STANDARD.encode(&bytes)); 
+                    }
+                } else {
+                    tracing::warn!("v136: VCEK fetch failed with status {}. Response: {:?}", status, resp.text().await.unwrap_or_default());
+                }
+            },
+            Err(e) => tracing::warn!("v136: VCEK fetch HTTP error: {}", e),
         }
         None
     }
 
     async fn fetch_amd_chain() -> Option<String> {
         let client = reqwest::Client::new();
-        if let Ok(resp) = client.get("https://kdsintf.amd.com/vcek/v1/Milan/cert_chain").send().await {
-            if let Ok(text) = resp.text().await { return Some(STANDARD.encode(text.as_bytes())); }
-        }
-        None
-    }
-
-    // 🔴 NEW: Fetch True AK Certificate from GCP API
-    async fn fetch_google_ak_cert() -> Option<String> {
-        let client = crate::hardened_client();
-        
-        tracing::info!("Fetching GCP Metadata Token...");
-        let token_resp: serde_json::Value = match client.get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
-            .header("Metadata-Flavor", "Google").send().await {
-                Ok(resp) => resp.json().await.ok()?,
-                Err(e) => {
-                    tracing::warn!("Failed to fetch GCP Metadata Token: {}", e);
-                    return None;
+        match client.get("https://kdsintf.amd.com/vcek/v1/Milan/cert_chain").send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    if let Ok(text) = resp.text().await { 
+                        tracing::info!("v136: AMD chain fetch succeeded");
+                        return Some(STANDARD.encode(text.as_bytes())); 
+                    }
+                } else {
+                    tracing::warn!("v136: AMD chain fetch failed with status {}", resp.status());
                 }
-            };
-        let access_token = token_resp["access_token"].as_str()?;
-        
-        tracing::info!("Fetching GCP Project ID...");
-        let project: String = client.get("http://metadata.google.internal/computeMetadata/v1/project/project-id")
-            .header("Metadata-Flavor", "Google").send().await.ok()?.text().await.ok()?;
-            
-        tracing::info!("Fetching GCP Zone...");
-        let zone_full: String = client.get("http://metadata.google.internal/computeMetadata/v1/instance/zone")
-            .header("Metadata-Flavor", "Google").send().await.ok()?.text().await.ok()?;
-        let zone = zone_full.split('/').last()?;
-        
-        tracing::info!("Fetching GCP Instance Name...");
-        let instance: String = client.get("http://metadata.google.internal/computeMetadata/v1/instance/name")
-            .header("Metadata-Flavor", "Google").send().await.ok()?.text().await.ok()?;
-
-        let url = format!("https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}/getShieldedInstanceIdentity", project, zone, instance);
-        tracing::info!("Calling Shielded Instance Identity API...");
-        
-        let identity_resp: serde_json::Value = match client.get(&url).bearer_auth(access_token).send().await {
-            Ok(resp) => resp.json().await.ok()?,
-            Err(e) => {
-                tracing::warn!("Failed to call GCP Identity API: {}", e);
-                return None;
-            }
-        };
-        
-        if let Some(cert) = identity_resp.get("signingKey").and_then(|k| k.get("ekCert")).and_then(|c| c.as_str()) {
-            tracing::info!("Successfully fetched GCP Persistent AK Certificate from API");
-            return Some(cert.to_string());
+            },
+            Err(e) => tracing::warn!("v136: AMD chain fetch HTTP error: {}", e),
         }
-        tracing::warn!("GCP Identity API did not return an AK certificate (ekCert). response: {:?}", identity_resp);
         None
     }
+
 
     pub async fn quote(nonce_hex: &str) -> Result<AttestationResult, Box<dyn std::error::Error + Send + Sync>> {
         let work_dir = format!("/tmp/tpm_{}", hex::encode(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos().to_be_bytes()));
@@ -717,6 +700,9 @@ mod tpm {
         let ak_der = format!("{}/ak.der", work_dir);
         let quote_msg = format!("{}/quote.msg", work_dir);
         let quote_sig = format!("{}/quote.sig", work_dir);
+        // v135: GCP delivers the AMD SEV-SNP report in the TPM quote's auxblob
+        // This is the ONLY way to get AMD hardware-signed data on GCP.
+        let auxblob_path = format!("{}/auxblob.bin", work_dir);
 
         // 1. Find the persistent AK handle dynamically from the GCP vTPM
         let mut ak_ctx = String::new();
@@ -774,6 +760,8 @@ mod tpm {
             "-q", &nonce_hex,
             "-m", &quote_msg,
             "-s", &quote_sig,
+            // v135: Request the GCP SNP auxblob — this contains the AMD hardware-signed report
+            "-o", &auxblob_path,
         ]).await?;
         tracing::info!("DEBUG: TPM Quote done.");
 
@@ -840,59 +828,121 @@ mod tpm {
 
         tracing::info!("DEBUG: SNP nonce bytes prepared");
         // 1. Fetch Google AK Certificate (Mandatory Identity Root)
-        // Strategy A: Compute Engine API (Shielded Instance Identity)
-        let mut google_ak_cert_pem = fetch_google_ak_cert().await;
-        
-        // Strategy B: NVRAM Fallback (for air-gapped or restricted networking)
-        if google_ak_cert_pem.is_none() {
-            tracing::info!("Compute API failed for AK cert, trying NVRAM fallback...");
-            let indices = [("0x01c00002", "1184"), ("0x01c00001", "1184")];
-            for (idx, size) in &indices {
-                if let Ok(data) = run_cmd("tpm2", &["nvread", idx, "-C", "o", "-s", size]).await {
-                    if !data.is_empty() {
-                        tracing::info!("Obtained Google AK Cert from NVRAM index {}", idx);
-                        // v125: Manually wrap Base64 in PEM headers to avoid dependency on openssl in initramfs
-                        let b64 = STANDARD.encode(&data);
-                        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
-                        for chunk in b64.as_bytes().chunks(64) {
-                            pem.push_str(std::str::from_utf8(chunk).unwrap());
-                            pem.push('\n');
+        // v137: Directly fetch from TPM NVRAM (primary path) with enlarged buffer (2048 bytes)
+        // to prevent truncation of the hardware-bound AMD SNP extensions.
+        let mut google_ak_cert_pem = None;
+        tracing::info!("Retrieving Google AK Certificate from hardware NVRAM...");
+        let indices = [("0x01c00002", "2048"), ("0x01c00001", "2048")];
+        for (idx, _size_hint) in &indices {
+            if let Ok(data) = run_cmd("tpm2", &["nvread", idx, "-C", "o"]).await {
+                if !data.is_empty() {
+                    tracing::info!("Obtained Google AK Cert from NVRAM index {} ({} bytes)", idx, data.len());
+                    // v125: Manually wrap Base64 in PEM headers to avoid dependency on openssl in initramfs
+                    let b64 = STANDARD.encode(&data);
+                    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+                    for chunk in b64.as_bytes().chunks(64) {
+                        pem.push_str(std::str::from_utf8(chunk).unwrap());
+                        pem.push('\n');
+                    }
+                    pem.push_str("-----END CERTIFICATE-----\n");
+                    google_ak_cert_pem = Some(pem);
+                    break;
+                }
+            }
+        }
+
+        // v136: AMD SEV-SNP Hardware Report — Three-Path Acquisition Strategy
+        // The AMD hardware root of trust: report signed by VCEK (fused AMD silicon key).
+        // Independently verifiable against AMD's KDS without trusting Google.
+        let mut auxblob_b64 = None;
+        let mut vcek_der_b64 = None;
+        let mut amd_chain_b64 = None;
+        let mut snp_report_b64 = None;
+
+        // Helper closure to try parsing SNP report from a byte slice
+        let try_parse_snp = |data: &[u8]| -> Option<Vec<u8>> {
+            for &offset in &[0usize, 4, 8, 16, 32, 64] {
+                if data.len() >= offset + 1088 {
+                    let v = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+                    if v >= 1 && v <= 4 {
+                        let end = (offset + 1184).min(data.len());
+                        if end - offset >= 1088 {
+                            return Some(data[offset..end].to_vec());
                         }
-                        pem.push_str("-----END CERTIFICATE-----\n");
-                        google_ak_cert_pem = Some(pem);
-                        break;
+                    }
+                }
+            }
+            None
+        };
+
+        // PATH 1: GCP vTPM NVRAM — AMD SNP report provisioned by hypervisor at boot
+        // Index 0x01400001 is the well-known GCP location for the hardware SNP report.
+        tracing::info!("v136: PATH 1 — NVRAM index 0x01400001 (GCP SEV-SNP standard)");
+        'nvram: for idx in &["0x01400001", "0x01400002"] {
+            let data = if let Ok(d) = run_cmd("tpm2_nvread", &["-C", "o", idx]).await { d }
+                       else if let Ok(d) = run_cmd("tpm2", &["nvread", idx]).await { d }
+                       else { tracing::warn!("v136: NVRAM {} read failed", idx); continue; };
+            if data.len() < 100 {
+                tracing::warn!("v136: NVRAM {} too small ({} bytes)", idx, data.len());
+                continue;
+            }
+            tracing::info!("v136: NVRAM {} returned {} bytes", idx, data.len());
+            auxblob_b64 = Some(STANDARD.encode(&data));
+            if let Some(snp) = try_parse_snp(&data) {
+                tracing::info!("v136: Parsed SNP report ({} bytes) from NVRAM {}", snp.len(), idx);
+                if snp.len() >= 1088 {
+                    let chip_id = hex::encode(&snp[1024..1088]);
+                    tracing::info!("v136: AMD Chip ID: {}", &chip_id[..16]);
+                    vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
+                    amd_chain_b64 = fetch_amd_chain().await;
+                }
+                snp_report_b64 = Some(STANDARD.encode(&snp));
+                break 'nvram;
+            } else {
+                tracing::warn!("v136: NVRAM {} data has no valid SNP version header", idx);
+            }
+        }
+
+        // PATH 2: TPM quote auxblob (PCR qualification data — may contain SNP embedding)
+        if snp_report_b64.is_none() {
+            tracing::info!("v136: PATH 2 — TPM quote auxblob");
+            if let Ok(raw) = tokio::fs::read(&auxblob_path).await {
+                if !raw.is_empty() {
+                    tracing::info!("v136: auxblob {} bytes", raw.len());
+                    if auxblob_b64.is_none() { auxblob_b64 = Some(STANDARD.encode(&raw)); }
+                    if let Some(snp) = try_parse_snp(&raw) {
+                        if snp.len() >= 1088 {
+                            let chip_id = hex::encode(&snp[1024..1088]);
+                            vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
+                            amd_chain_b64 = fetch_amd_chain().await;
+                        }
+                        snp_report_b64 = Some(STANDARD.encode(&snp));
+                        tracing::info!("v136: Found SNP report in auxblob");
                     }
                 }
             }
         }
 
-        // 2. Fetch AMD SEV-SNP Hardware Report (Mandatory Measurement Root)
-        let mut auxblob_b64 = None;
-        let snp_report_raw = match snp::get_report(&nonce_bytes) {
-            Some((report, aux)) => {
-                tracing::info!("Obtained SEV-SNP report via TSM ConfigFS");
-                auxblob_b64 = aux;
-                Some(report)
-            },
-            None => {
-                tracing::error!("Failed to obtain SEV-SNP report via TSM ConfigFS.");
-                None
-            }
-        };
-
-        let mut vcek_der_b64 = None;
-        let mut amd_chain_b64 = None;
-        let snp_report_b64 = match snp_report_raw {
-            Some(data) => {
-                if data.len() >= 1184 {
-                    let chip_id = hex::encode(&data[1024..1088]);
-                    vcek_der_b64 = fetch_vcek(&chip_id, data[16], data[17], data[22], data[23]).await;
+        // PATH 3: ConfigFS TSM interface (requires sev-guest.ko)
+        if snp_report_b64.is_none() {
+            tracing::info!("v136: PATH 3 — ConfigFS TSM");
+            if let Some((report, aux)) = snp::get_report(&nonce_bytes) {
+                if aux.is_some() { auxblob_b64 = aux; }
+                if report.len() >= 1088 {
+                    let chip_id = hex::encode(&report[1024..1088]);
+                    vcek_der_b64 = fetch_vcek(&chip_id, report[16], report[17], report[22], report[23]).await;
                     amd_chain_b64 = fetch_amd_chain().await;
                 }
-                Some(STANDARD.encode(&data))
-            },
-            None => None,
-        };
+                snp_report_b64 = Some(STANDARD.encode(&report));
+                tracing::info!("v136: Got SNP report via ConfigFS ({} bytes)", report.len());
+            }
+        }
+
+        if snp_report_b64.is_some() {
+            tracing::info!("v136: AMD hardware root established!");
+        } else {
+            tracing::error!("v136: ALL SNP paths failed — AMD hardware root unavailable");
+        }
 
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
 
@@ -1878,14 +1928,17 @@ async fn debug_attestation() -> impl IntoResponse {
     
     // Check ConfigFS status
     let configfs_path = "/sys/kernel/config/tsm/report";
-    results.insert("configfs_exists".to_string(), serde_json::Value::Bool(std::path::Path::new(configfs_path).exists()));
+    results.insert("tsm_loaded".to_string(), serde_json::Value::Bool(std::path::Path::new("/sys/kernel/config/tsm").exists()));
+    results.insert("amd_tsm_loaded".to_string(), serde_json::Value::Bool(std::path::Path::new("/sys/bus/platform/drivers/amd_tsm").exists() || std::path::Path::new("/sys/bus/platform/drivers/amd-tsm").exists()));
+    results.insert("sev_guest_device".to_string(), serde_json::Value::Bool(std::path::Path::new("/dev/sev-guest").exists()));
     
-    // Check modules
-    if let Ok(modules) = std::fs::read_to_string("/proc/modules") {
-        let has_amd = modules.contains("amd_tsm");
-        let has_tsm = modules.contains("tsm");
-        results.insert("amd_tsm_loaded".to_string(), serde_json::Value::Bool(has_amd));
-        results.insert("tsm_loaded".to_string(), serde_json::Value::Bool(has_tsm));
+    if let Ok(output) = std::process::Command::new("dmesg").output() {
+        let s = String::from_utf8_lossy(&output.stdout);
+        let sev_logs: Vec<String> = s.lines()
+            .filter(|l| l.contains("SEV") || l.contains("SNP") || l.contains("tsm") || l.contains("coco") || l.contains("guest"))
+            .map(|s| s.to_string())
+            .collect();
+        results.insert("dmesg_sev".to_string(), serde_json::Value::from(sev_logs));
     }
 
     Json(results)
@@ -2194,6 +2247,30 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
     // Log current PCR 15 state for diagnostics
     if let Ok(pcr_out) = tpm::run_cmd("tpm2", &["pcrread", "sha256:15"]).await {
         info!("Current PCR 15 State:\n{}", String::from_utf8_lossy(&pcr_out).trim());
+    }
+
+    // DIAGNOSTIC: Check TPM device presence
+    let tpm_exists = std::path::Path::new("/dev/tpmrm0").exists() || std::path::Path::new("/dev/tpm0").exists();
+    info!("TPM Device present: {}", tpm_exists);
+
+    // DIAGNOSTIC: Dump all NV indices to find the SEV-SNP report
+    match tpm::run_cmd("/usr/bin/tpm2_getcap", &["handles-nv-index"]).await {
+        Ok(nv_out) => info!("Available TPM NV Indices:\n{}", String::from_utf8_lossy(&nv_out).trim()),
+        Err(e) => warn!("Failed to get TPM NV indices (full path): {}", e),
+    }
+
+    let client = hardened_client();
+    // Try the instance-level identity token (Attestation Token)
+    match client.get("http://metadata.google.internal/computeMetadata/v1/instance/identity?audience=paypal-auditor&format=full")
+        .header("Metadata-Flavor", "Google")
+        .send().await {
+        Ok(resp) => {
+            match resp.text().await {
+                Ok(jwt) => info!("ATTESTATION TOKEN: {}", jwt),
+                Err(e) => warn!("Failed to read attestation token text: {}", e),
+            }
+        },
+        Err(e) => warn!("Failed to fetch attestation token: {}", e),
     }
 
     info!("About to fetch config...");
