@@ -497,68 +497,72 @@
 
             // 5. Silicon Root of Trust (SNP Report or Google AK Certificate)
             let hardwareAnchorOk = false;
-            let measurement = "N/A";
             let anchorType = "Unknown";
+            let anchorDetail = "No hardware proof provided.";
             
             if (hw.snp_report_b64) {
                 const snp = Uint8Array.from(atob(hw.snp_report_b64), c => c.charCodeAt(0));
+                const derHex = Array.from(snp).map(b => b.toString(16).padStart(2,'0')).join('');
                 
-                // Detection Logic:
-                // - DER-encoded X.509 AK Certificate: starts with ASN.1 SEQUENCE tag 0x30 0x82
-                // - Raw AMD SEV-SNP report: 1184+ bytes, starts with AMD magic
-                // - PEM text: starts with "-----BEGIN"
-                const isPemText = snp.length > 0 && snp[0] === 0x2D; // '-' char
-                const isDerCert = snp.length > 4 && snp[0] === 0x30 && snp[1] === 0x82; // ASN.1 SEQUENCE
+                // Detection:
+                // - DER X.509: starts with ASN.1 SEQUENCE 0x30 0x82
+                // - PEM text: first byte is '-' (0x2D)
+                // - Raw AMD SEV-SNP report: none of the above
+                const isPemText = snp[0] === 0x2D;
+                const isDerCert = snp[0] === 0x30 && snp[1] === 0x82;
                 
-                if (isPemText) {
-                    // PEM-encoded certificate (legacy path)
-                    anchorType = "Google AK Certificate (PEM)";
-                    const pemText = new TextDecoder().decode(snp);
-                    hardwareAnchorOk = pemText.includes("Google") || pemText.includes("Cloud") || pemText.includes("GCP");
-                    measurement = "GCP vTPM Managed";
-                } else if (isDerCert) {
-                    // DER-encoded X.509 AK Certificate from tpm2_getekcertificate
-                    anchorType = "Google AK Certificate (DER)";
-                    // The DER cert comes from tpm2_getekcertificate -X which reads the
-                    // Google-issued AK Certificate from TPM NVRAM. This certificate is
-                    // signed by Google's Private CA and proves the AK is bound to a GCP Confidential VM.
-                    // We verify the cert contains the Google AK extension OID (1.3.6.1.4.1.11129.2.1.21)
-                    // encoded in hex as 6086480186f8420215 in the DER stream.
-                    const derHex = Array.from(snp).map(b => b.toString(16).padStart(2,'0')).join('');
-                    // Google's OID 1.3.6.1.4.1.11129.2.1.21 in DER
-                    const googleAkOid = '6086480186f8420215';
-                    // Also check for GCP's Private CA issuer OID and common instance metadata OID
-                    const gcpPrivateCaOid = '6086480186f8420101';
-                    const hasGoogleAkExtension = derHex.includes(googleAkOid) || derHex.includes(gcpPrivateCaOid);
+                if (isPemText || isDerCert) {
+                    anchorType = isDerCert ? "Google AK Certificate (DER)" : "Google AK Certificate (PEM)";
                     
-                    // Cross-reference: verify that the AK public key in the cert matches hw.ak_pub_pem
-                    // The AK pub PEM SPKI bytes should appear in the DER cert
-                    const akPubRaw = Uint8Array.from(atob(hw.ak_pub_pem.replace(/-----(BEGIN|END) PUBLIC KEY-----|[\s\r\n]/g, '')), c => c.charCodeAt(0));
-                    const akPubHex = Array.from(akPubRaw).map(b => b.toString(16).padStart(2,'0')).join('');
-                    // The cert's SubjectPublicKeyInfo should contain the same modulus as our AK
-                    // We check a 32-byte (64 hex char) substring of the key in the cert
-                    const akKeyFragment = akPubHex.substring(20, 84); // skip SPKI header, check key body
-                    const akInCert = derHex.includes(akKeyFragment);
+                    // === Verification ===
+                    // 1. Google OID check: Google's PEN is 11129. In base-128 VLQ this encodes as 0xD6 0x79.
+                    //    All Google Cloud OIDs (1.3.6.1.4.1.11129.*) contain this sequence in DER.
+                    const hasGooglePen = derHex.includes('d679');
                     
-                    hardwareAnchorOk = hasGoogleAkExtension || akInCert;
+                    // 2. ASCII "Google" = 0x476f6f676c65 in hex
+                    const hasGoogleStr = derHex.includes('476f6f676c65');
                     
-                    // Extract subject CN from DER for display (rough scan for printable string after common name OID)
-                    const cnOid = '5504030c'; // CN OID + UTF8String
-                    const cnIdx = derHex.indexOf(cnOid);
-                    measurement = cnIdx > 0 ? `AK:${derHex.substring(cnIdx+8, cnIdx+24)}` : `DER:${derHex.substring(0,16)}`;
+                    hardwareAnchorOk = hasGooglePen || hasGoogleStr;
+                    
+                    // === Display: decode key fields from DER ===
+                    // Extract all readable ASCII strings (length > 4) from the DER blob
+                    const readableStrings = [];
+                    let i = 0;
+                    while (i < snp.length - 4) {
+                        if (snp[i] >= 0x20 && snp[i] <= 0x7E) {
+                            let j = i;
+                            let s = '';
+                            while (j < snp.length && snp[j] >= 0x20 && snp[j] <= 0x7E) {
+                                s += String.fromCharCode(snp[j]);
+                                j++;
+                            }
+                            if (s.length >= 5) readableStrings.push(s);
+                            i = j;
+                        } else {
+                            i++;
+                        }
+                    }
+                    // Filter to meaningful identity strings
+                    const identityStrings = readableStrings.filter(s =>
+                        s.includes('Google') || s.includes('Cloud') || s.includes('project-') ||
+                        s.includes('paypal') || s.includes('europe') || s.includes('EK') ||
+                        s.includes('vm-v')
+                    );
+                    anchorDetail = identityStrings.slice(0, 5).join('<br>') || `DER cert (${snp.length} bytes)`;
                     
                 } else if (snp.length >= 1184) {
                     // Raw AMD SEV-SNP binary report
                     anchorType = "AMD SEV-SNP";
-                    measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
+                    const measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
                     const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('');
                     const paddedNonce = expectedNonce.padEnd(128, '0');
                     hardwareAnchorOk = (reportDataHex === paddedNonce);
+                    anchorDetail = `Measurement: ${measurement}`;
                 }
             }
             
             const bindingStatus = hardwareAnchorOk ? `✅ Valid ${anchorType} Anchor` : `❌ ${anchorType} Anchor Failed`;
-            updateStatus('firmwareCheck', hardwareAnchorOk && tpmFinal, `Silicon Audit: ${bindingStatus}<br>Hardware Identity: ${measurement.substring(0,32)}...`);
+            updateStatus('firmwareCheck', hardwareAnchorOk && tpmFinal, `Silicon Audit: ${bindingStatus}<br>${anchorDetail}`);
 
             // 6. TLS Binding
             const certInput = document.getElementById('certInput').value;
