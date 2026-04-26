@@ -25,6 +25,26 @@ mod enclave_init {
 
     /// Mount essential kernel virtual filesystems.
     pub fn load_drivers() {
+        // v127: Mount configfs and FORCE RELOAD attestation modules
+        // This ensures they register their ConfigFS subsystems correctly.
+        let _ = modprobe("configfs");
+        let _ = std::process::Command::new("/bin/mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
+        
+        // Try to clear existing (possibly broken) attestation state
+        let _ = std::process::Command::new("rmmod").arg("amd_tsm").status();
+        let _ = std::process::Command::new("rmmod").arg("tsm").status();
+        let _ = std::process::Command::new("rmmod").arg("sev_guest").status();
+        let _ = std::process::Command::new("rmmod").arg("sev-guest").status();
+        
+        modprobe("tsm");
+        modprobe("amd_tsm");
+        modprobe("sev-guest");
+        modprobe("coco_guest");
+        
+        if !std::path::Path::new("/sys/kernel/config/tsm").exists() {
+             let _ = std::process::Command::new("/bin/mkdir").args(["-p", "/sys/kernel/config/tsm"]).status();
+        }
+  
         modprobe("gve");
         modprobe("virtio_net");
         modprobe("virtio_scsi");
@@ -37,11 +57,6 @@ mod enclave_init {
         kmsg("Scanning for attestation modules...");
         let _ = std::process::Command::new("find").args(["/lib/modules", "-name", "*sev*", "-o", "-name", "*tsm*", "-o", "-name", "*coco*"]).status();
         
-        modprobe("sev_guest");
-        modprobe("sev-guest");
-        modprobe("coco_guest");
-        modprobe("amd_tsm");
-        modprobe("tsm");
         modprobe("tpm_tis");
         modprobe("tpm_crb");
         
@@ -56,9 +71,6 @@ mod enclave_init {
         modprobe("nft_chain_filter");
         modprobe("nft_reject_ipv4");
         modprobe("nft_limit");
-        
-        // Ensure configfs is mounted for TSM
-        let _ = std::process::Command::new("mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
     }
 
     pub fn setup_firewall() {
@@ -474,8 +486,9 @@ mod tpm {
         pub fn get_report(nonce: &[u8; 64]) -> Option<(Vec<u8>, Option<String>)> {
             // v124: Use the modern unified TSM (Trusted Security Module) ConfigFS interface
             let tsm_base = "/sys/kernel/config/tsm/report";
+            // v125: Ensure the TSM ConfigFS hierarchy is present
             if !fs::metadata(tsm_base).is_ok() {
-                let _ = std::process::Command::new("mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
+                let _ = std::process::Command::new("mkdir").args(["-p", tsm_base]).status();
             }
 
             // v124: Use a unique directory name per request to avoid race conditions or stale reports
@@ -813,13 +826,16 @@ mod tpm {
                 if let Ok(data) = run_cmd("tpm2", &["nvread", idx, "-C", "o", "-s", size]).await {
                     if !data.is_empty() {
                         tracing::info!("Obtained Google AK Cert from NVRAM index {}", idx);
-                        // Note: run_cmd doesn't support stdin easily here, but we can use a temp file
-                        let tmp_der = format!("{}/tmp_ak.der", work_dir);
-                        let _ = tokio::fs::write(&tmp_der, &data).await;
-                        if let Ok(pem_out) = run_cmd("openssl", &["x509", "-inform", "DER", "-in", &tmp_der, "-outform", "PEM"]).await {
-                            google_ak_cert_pem = Some(String::from_utf8_lossy(&pem_out).to_string());
-                            break;
+                        // v125: Manually wrap Base64 in PEM headers to avoid dependency on openssl in initramfs
+                        let b64 = STANDARD.encode(&data);
+                        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+                        for chunk in b64.as_bytes().chunks(64) {
+                            pem.push_str(std::str::from_utf8(chunk).unwrap());
+                            pem.push('\n');
                         }
+                        pem.push_str("-----END CERTIFICATE-----\n");
+                        google_ak_cert_pem = Some(pem);
+                        break;
                     }
                 }
             }

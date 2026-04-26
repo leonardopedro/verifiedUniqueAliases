@@ -138,6 +138,27 @@ copy_bin_and_deps "$BIN_PATH"
 ln -sf "$BIN_PATH" ./init
 chmod 755 ./init
 
+# 5b. Forcefully inject attestation modules (tsm, amd_tsm, sev-guest, virtio_net, gve)
+# mkinitramfs may skip these if not running on the target hardware.
+echo "🛡️  Injecting hardware and network modules..."
+MODULES_BASE="/lib/modules/$KERNEL_VERSION"
+for modname in configfs tsm amd_tsm sev-guest coco_guest gve virtio_net virtio_pci virtio_blk virtio_scsi nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct; do
+    # Find the module file (could be .ko, .ko.gz, .ko.xz, or .ko.zst)
+    # Search deeper to find all variants
+    mod_files=$(find "$MODULES_BASE" -name "${modname}.ko*" 2>/dev/null || true)
+    if [ -n "$mod_files" ]; then
+        for mod_file in $mod_files; do
+            echo "  Found $modname at $mod_file, copying..."
+            # Recreate the directory structure in staging
+            dest_rel_path=$(python3 -c "import os; print(os.path.relpath('$mod_file', '/'))")
+            mkdir -p "./$(dirname "$dest_rel_path")"
+            cp "$mod_file" "./$dest_rel_path"
+        done
+    else
+        echo "  ⚠️ Warning: $modname.ko not found in $MODULES_BASE"
+    fi
+done
+
 # 6. Inject required binaries and their dependencies
 echo "🔍 Resolving and copying dependencies..."
 copy_bin_and_deps "$BIN_PATH"
@@ -222,33 +243,38 @@ mknod -m 666 dev/random c 1 8 2>/dev/null || true
 mknod -m 666 dev/urandom c 1 9 2>/dev/null || true
 
 # 9b. Ensure kernel modules are discoverable by modprobe
-# On Ubuntu 25.10, modules live at /usr/lib/modules/ but modprobe
-# looks at /lib/modules/ — create a RELATIVE symlink so it works
-# whether the initramfs is the rootfs or mounted elsewhere.
-echo "🔗 Setting up /lib/modules symlink for modprobe..."
-mkdir -p ./lib
-if [ -d "./usr/lib/modules" ] && [ ! -e "./lib/modules" ]; then
-    ln -sf ../usr/lib/modules ./lib/modules
+# In modern Debian/Ubuntu, modules might live in /lib or /usr/lib.
+# We unify them in /lib/modules so modprobe always finds them.
+echo "🔗 Unifying /lib/modules..."
+if [ -d "./usr/lib/modules" ]; then
+    mkdir -p ./lib/modules
+    cp -rn ./usr/lib/modules/* ./lib/modules/ 2>/dev/null || true
+    rm -rf ./usr/lib/modules
+    (cd ./usr/lib && ln -sf ../lib/modules modules)
 fi
 
 # 9c. Decompress critical kernel modules so insmod can load them directly.
 # insmod cannot handle .ko.zst, and modprobe may fail if depmod data
 # is incomplete. Decompress the essential network drivers we need at boot.
-KERNEL_VER=$(ls -1 ./usr/lib/modules 2>/dev/null | head -1 || true)
-if [ -n "$KERNEL_VER" ] && [ -d "./usr/lib/modules/$KERNEL_VER" ]; then
+KERNEL_VER=$(ls -1 ./lib/modules 2>/dev/null | head -1 || true)
+if [ -n "$KERNEL_VER" ] && [ -d "./lib/modules/$KERNEL_VER" ]; then
     echo "🗜️  Decompressing critical kernel modules for insmod..."
     # Robustly find ALL modules in the initramfs and decompress them
-    find ./usr/lib/modules/"$KERNEL_VER" -name "*.ko.zst" | while read -r zst_mod; do
+    find ./lib/modules/"$KERNEL_VER" -name "*.ko.zst" | while read -r zst_mod; do
         ko_out="${zst_mod%.zst}"
         echo "  decompressing $(basename "$zst_mod")"
         zstd -d -f "$zst_mod" -o "$ko_out" 2>/dev/null || true
+        rm -f "$zst_mod"
+    done
+    find ./lib/modules/"$KERNEL_VER" -name "*.ko.xz" | while read -r xz_mod; do
+        ko_out="${xz_mod%.xz}"
+        echo "  decompressing $(basename "$xz_mod")"
+        xz -d -f "$xz_mod"
     done
 
     # Generate module dependency data now that .ko files exist
     echo "📋 Running depmod for kernel $KERNEL_VER..."
-    if command -v depmod >/dev/null 2>&1; then
-        depmod -b . "$KERNEL_VER" 2>/dev/null || true
-    fi
+    depmod -b . "$KERNEL_VER" || true
 fi
 
 echo "  Adding libgcc_s.so.1..."
