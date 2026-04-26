@@ -472,32 +472,44 @@ mod tpm {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
 
         pub fn get_report(nonce: &[u8; 64]) -> Option<(Vec<u8>, Option<String>)> {
-            // v86-master: Use the modern unified TSM (Trusted Security Module) ConfigFS interface
-            // This works on Linux 6.3+ and supports SEV-SNP, TDX, etc.
+            // v124: Use the modern unified TSM (Trusted Security Module) ConfigFS interface
             let tsm_base = "/sys/kernel/config/tsm/report";
             if !fs::metadata(tsm_base).is_ok() {
-                // Try mounting configfs if not present
                 let _ = std::process::Command::new("mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
             }
 
-            let report_dir = format!("{}/paypal_audit_{}", tsm_base, hex::encode(&nonce[..8]));
-            let _ = fs::create_dir_all(&report_dir);            // 1. Set the nonce/inblob
+            // v124: Use a unique directory name per request to avoid race conditions or stale reports
+            let unique_id = hex::encode(&nonce[..16]);
+            let report_dir = format!("{}/paypal_audit_{}", tsm_base, unique_id);
+            
+            // Clean up any stale directory if it exists
+            let _ = fs::remove_dir_all(&report_dir);
+            
+            if let Err(e) = fs::create_dir(&report_dir) {
+                tracing::error!("Failed to create TSM report directory {}: {}", report_dir, e);
+                return None;
+            }
+
+            // 1. Set the nonce/inblob
             if let Err(e) = fs::write(format!("{}/inblob", report_dir), nonce) {
                 tracing::error!("Failed to write inblob to ConfigFS: {}", e);
+                let _ = fs::remove_dir_all(&report_dir);
                 return None;
             }
 
             // 2. Wait for hardware report generation (ConfigFS is asynchronous)
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            // Some vTPMs/CPUs are slow to generate the silicon signature.
+            std::thread::sleep(std::time::Duration::from_millis(1000));
 
             // 3. Read the report
-            let report = match fs::read(format!("{}/outblob", report_dir)) {
+            let report_path = format!("{}/outblob", report_dir);
+            let report = match fs::read(&report_path) {
                 Ok(data) => {
                     tracing::info!("Successfully read SNP report from ConfigFS outblob ({} bytes)", data.len());
                     Some(data)
                 },
                 Err(e) => {
-                    tracing::error!("Failed to read outblob from ConfigFS: {}", e);
+                    tracing::error!("Failed to read outblob from ConfigFS at {}: {}", report_path, e);
                     None
                 }
             };
@@ -510,6 +522,7 @@ mod tpm {
                 _ => None,
             };
 
+            // Cleanup
             let _ = fs::remove_dir_all(&report_dir);
             report.map(|r| (r, auxblob))
         }
@@ -1810,6 +1823,36 @@ async fn login(
     Redirect::temporary(&url).into_response()
 }
 
+async fn debug_attestation() -> impl IntoResponse {
+    let mut results = serde_json::Map::new();
+    
+    // Check TPM Quote
+    let nonce = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+    match tpm::quote(nonce).await {
+        Ok(r) => { 
+            results.insert("tpm_quote_status".to_string(), serde_json::Value::String("SUCCESS".to_string())); 
+            results.insert("report".to_string(), serde_json::to_value(r).unwrap()); 
+        },
+        Err(e) => { 
+            results.insert("tpm_quote_status".to_string(), serde_json::Value::String(format!("FAILED: {}", e))); 
+        }
+    }
+    
+    // Check ConfigFS status
+    let configfs_path = "/sys/kernel/config/tsm/report";
+    results.insert("configfs_exists".to_string(), serde_json::Value::Bool(std::path::Path::new(configfs_path).exists()));
+    
+    // Check modules
+    if let Ok(modules) = std::fs::read_to_string("/proc/modules") {
+        let has_amd = modules.contains("amd_tsm");
+        let has_tsm = modules.contains("tsm");
+        results.insert("amd_tsm_loaded".to_string(), serde_json::Value::Bool(has_amd));
+        results.insert("tsm_loaded".to_string(), serde_json::Value::Bool(has_tsm));
+    }
+
+    Json(results)
+}
+
 async fn callback(
     Query(query): Query<CallbackQuery>,
     State(state): State<Arc<AppState>>,
@@ -2197,6 +2240,7 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         .route("/login", get(login))
         .route("/callback", get(callback))
         .route("/generate", axum::routing::post(generate_cert))
+        .route("/debug/attestation", get(debug_attestation))
         .route("/privacy", get(privacy))
         .route("/terms", get(terms))
         .route("/report", get(|| async { Redirect::to("/") }))
