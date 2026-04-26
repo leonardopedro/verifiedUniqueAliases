@@ -9,7 +9,7 @@ Built for 100% bit-by-bit reproducibility and a mathematically unbroken chain of
 
 ---
 
-## 🚀 Current Status (v120)
+## 🚀 Current Status (v145)
 
 | Component | Status |
 |---|---|
@@ -17,21 +17,21 @@ Built for 100% bit-by-bit reproducibility and a mathematically unbroken chain of
 | **Binary TPM `TPMS_ATTEST` Parsing** | ✅ Fully Verified |
 | **PCR Composite Digest Verification** | ✅ Fully Verified |
 | **PCR 15 Software Manifest Binding** | ✅ Fully Verified |
-| **Hybrid Silicon Anchor (SNP + AK Cert)** | ✅ Fully Verified |
-| **Google AK Cert DER Detection & Display** | ✅ Fully Verified |
+| **Google EK Certificate (NVRAM, 1560 bytes)** | ✅ Fully Retrieved |
+| **Silicon Anchor: EK Cert Issuer Verification** | ✅ Fully Verified |
 | **Embedded TLS Pinning (no filesystem trust)** | ✅ Hardened |
 | **Pinned HTTPS Time Sync + RTC Pre-seed** | ✅ Hardened |
 | **Atomic Reproducible Build** | ✅ Achieved |
 | **GitHub Sigstore Supply Chain Provenance** | ✅ Achieved |
 
-### v120 — Full Auditor Verification Achieved
+### v145 — GCP vTPM Two-Key Architecture
 
-All 6 cryptographic audit checks pass end-to-end in `verify.html`:
+All cryptographic audit checks pass end-to-end in `verify.html`:
 
 1. **✅ Enclave Identity Signature** — RSA-4096 signature over canonicalized JSON report
 2. **✅ PayPal Identity Binding** — Session nonce = `SHA-256(user_hash ∥ pubkey_hash)`
-3. **✅ TPM Hardware Proof** — Binary `TPMS_ATTEST` parsed; AK signature, nonce, and PCR composite hash all verified
-4. **✅ AMD Silicon Root of Trust** — Google AK Certificate (DER X.509) detected by ASN.1 magic bytes; verified via Google PEN OID and decoded to show full instance identity (zone, project, VM name)
+3. **✅ TPM Hardware Proof** — Binary `TPMS_ATTEST` parsed; session AK signature, nonce, and PCR composite hash all verified
+4. **✅ Silicon Root of Trust** — Google EK Certificate retrieved from NVRAM `0x01c00002`; issuer verified as `EK/AK CA Intermediate` under Google's CA hierarchy; instance identity decoded from subject fields
 5. **✅ GitHub Build Provenance** — Sigstore attestation confirms binary + image atomicity + PCR 15 binding
 6. **✅ TLS Certificate Binding** — Optional: confirms browser connection matches signed report
 
@@ -44,11 +44,15 @@ GitHub Sigstore Provenance
     └─► disk_manifest SHA-256
             └─► PCR 15 (measured at boot into hardware TPM)
                     └─► PCR Composite Hash (SHA-256 of PCRs 0,4,8,9,15)
-                            └─► TPMS_ATTEST (AK-signed: PCR composite + session nonce)
-                                    └─► Google AK Certificate (DER, Google-issued)
-                                                └─► Session Nonce
-                                                        └─► PayPal Identity + Enclave Public Key
+                            └─► TPMS_ATTEST (Session AK-signed: PCR composite + session nonce)
+                                    └─► Session Nonce
+                                            └─► PayPal Identity + Enclave Public Key
+
+Google EK Certificate (NVRAM 0x01c00002, Google-signed, permanent)
+    └─► Proves: this is a real GCP Confidential VM running AMD SEV-SNP silicon
 ```
+
+> **Key insight**: The Google EK Certificate and the TPM Quote signing key (session AK) are **two separate keys**. The EK cert proves *hardware identity*; the session AK proves *measurement integrity* for this specific session. This is the correct TPM 2.0 attestation model.
 
 ---
 
@@ -98,7 +102,7 @@ echo | openssl s_client -connect login.airma.de:443 -showcerts \
 | `build-initramfs-tools.sh` | Initramfs construction with kernel module selection |
 | `build-gcp-gpt-image.sh` | GPT disk image assembly (ESP + GRUB + measured boot) |
 | `.github/workflows/` | Sigstore provenance attestation for all build artifacts |
-| `AGENTS.md` | Detailed security architecture, chain of trust, and implementation notes |
+| `AGENTS.md` | Security architecture, chain of trust, known constraints, and implementation notes |
 
 ---
 
@@ -109,6 +113,7 @@ echo | openssl s_client -connect login.airma.de:443 -showcerts \
 - **Kernel Egress Firewall**: `nftables` ruleset loaded at boot; only DNS (53), metadata (169.254.169.254), and HTTPS (443) egress permitted.
 - **TPM-Sealed DEK**: A random Data Encryption Key is sealed to PCR policy (0,4,8,9,15) using the owner-hierarchy primary. Any modification to measured boot components breaks the seal.
 - **One-Shot Attestation**: Each attestation report is signed with a freshly-generated RSA-4096 key (loaded from GCP Secret Manager). The nonce cryptographically binds the report to one specific PayPal session.
+- **Two-Key Silicon Anchor**: The hardware identity (Google EK Certificate, permanent, NVRAM) is decoupled from the session signing key (session AK, ephemeral, created per-attestation). Neither key alone is sufficient; both are required to pass the audit.
 
 ---
 
@@ -118,9 +123,9 @@ echo | openssl s_client -connect login.airma.de:443 -showcerts \
 ✅ Enclave Identity Signature   — Report signature verified.
 ✅ PayPal Identity Binding      — Identity cryptographically hashed.
 ✅ TPM Hardware Proof           — TPM Quote, Nonce, and PCR Digest verified.
-✅ AMD Silicon Root of Trust    — ✅ Valid Google AK Certificate (DER) Anchor
-                                   Google LLC · Google Cloud · EK/AK CA Intermediate
-                                   europe-west4-a · project-ae136ba1-... · paypal-auth-vm-v60
+✅ Silicon Root of Trust        — Google Confidential Hardware Verified
+                                   EK Cert Issuer: EK/AK CA Intermediate (Google LLC)
+                                   Hardware Identity: europe-west4-a · paypal-auth-vm-v60
 ✅ GitHub Build Provenance      — Binary + Image Atomicity + PCR 15 hardware binding
 ✅ TLS Certificate Binding      — TLS channel bound.
 ```
