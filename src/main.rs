@@ -683,10 +683,17 @@ mod tpm {
         };
 
         // 5. Hardware SNP Report (Firmware / Launch Measurement)
+        // CRITICAL SEV-SNP FIX: Cryptographically bind the native AMD hardware report to the vTPM Quote.
+        // We hash the TPM's Attestation Key along with the user's nonce. This proves the TPM Quote
+        // came from the exact same physical hardware as the SEV-SNP report.
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(ak_pem_str.as_bytes());
+        hasher.update(&hex::decode(nonce_hex).unwrap_or_default());
+        let bound_nonce = hasher.finalize();
+
         let mut nonce_bytes = [0u8; 64];
-        let raw_nonce = hex::decode(nonce_hex).unwrap_or_default();
-        let len = raw_nonce.len().min(64);
-        nonce_bytes[..len].copy_from_slice(&raw_nonce[..len]);
+        nonce_bytes[..32].copy_from_slice(&bound_nonce);
 
         tracing::info!("DEBUG: SNP nonce bytes prepared");
         let snp_report_b64 = match snp::get_report(&nonce_bytes) {
