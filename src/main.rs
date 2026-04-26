@@ -650,34 +650,47 @@ mod tpm {
         let quote_sig = format!("{}/quote.sig", work_dir);
 
         // 1. Find the persistent AK handle dynamically from the GCP vTPM
-        // We must find a handle that has the "sign" attribute (unlike EKs which are decrypt).
         let mut ak_ctx = String::new();
-        if let Ok(handles_out) = run_cmd("tpm2_getcap", &["handles-persistent"]).await {
-            let str_out = String::from_utf8_lossy(&handles_out);
-            for h in str_out.split_whitespace() {
-                let h_clean = h.trim_matches(|c: char| !c.is_alphanumeric() && c != 'x');
-                if h_clean.starts_with("0x81") {
-                    let h_str = h_clean.to_string();
-                    if let Ok(pub_out) = run_cmd("tpm2_readpublic", &["-c", &h_str]).await {
-                        let pub_str = String::from_utf8_lossy(&pub_out);
-                        if pub_str.contains("sign") {
-                            ak_ctx = h_str;
-                            break;
+        
+        // v121: Try standard GCP AK handles directly first for speed and reliability
+        for h in ["0x81010002", "0x81010001", "0x81000001", "0x81000002"] {
+            if let Ok(pub_out) = run_cmd("tpm2_readpublic", &["-c", h]).await {
+                let pub_str = String::from_utf8_lossy(&pub_out);
+                if pub_str.contains("sign") && pub_str.contains("restricted") {
+                    tracing::info!("DEBUG: Found standard AK handle: {}", h);
+                    ak_ctx = h.to_string();
+                    break;
+                }
+            }
+        }
+
+        if ak_ctx.is_empty() {
+            if let Ok(handles_out) = run_cmd("tpm2_getcap", &["handles-persistent"]).await {
+                let str_out = String::from_utf8_lossy(&handles_out);
+                for h in str_out.split_whitespace() {
+                    let h_clean = h.trim_matches(|c: char| !c.is_alphanumeric() && c != 'x');
+                    if h_clean.starts_with("0x81") {
+                        let h_str = h_clean.to_string();
+                        if let Ok(pub_out) = run_cmd("tpm2_readpublic", &["-c", &h_str]).await {
+                            let pub_str = String::from_utf8_lossy(&pub_out);
+                            if pub_str.contains("sign") && pub_str.contains("restricted") {
+                                ak_ctx = h_str;
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
         
-        // If we still didn't find one, fallback to generating a Session AK so the server can generate the report
-        let is_ephemeral_ak = ak_ctx.is_empty();
-        if is_ephemeral_ak {
-            tracing::warn!("DEBUG: Could not find pre-provisioned AK. Regenerating from Endorsement Seed...");
+        // If we still didn't find one, fallback to generating a Session AK
+        if ak_ctx.is_empty() {
+            tracing::warn!("DEBUG: Could not find pre-provisioned AK. Regenerating Session AK via tpm2_createak...");
             ak_ctx = format!("{}/ak.ctx", work_dir);
-            // Google's AK is a Primary Key in the Endorsement Hierarchy
-            run_cmd("tpm2_createprimary", &["-C", "e", "-g", "sha256", "-G", "rsa2048:null:rsassa", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|restricted|sign", "-c", &ak_ctx]).await?;
+            // v121: Use tpm2_createak which handles the complex AK template correctly
+            run_cmd("tpm2_createak", &["-C", "e", "-g", "sha256", "-G", "rsa2048", "-c", &ak_ctx]).await?;
         } else {
-            tracing::info!("DEBUG: Using pre-provisioned AK Handle: {}", ak_ctx);
+            tracing::info!("DEBUG: Using AK Handle: {}", ak_ctx);
         }
 
         // Extract AK PEM for the report

@@ -555,6 +555,7 @@
             let snpVerified = false;
             let googleVerified = false;
             let siliconMsg = "";
+
             // Detection: Is the SNP report field actually a certificate?
             let isCert = false;
             let snp = null;
@@ -577,31 +578,27 @@
 
             if (akCertPem) {
                 const akCert = parseAnyCertToForge(akCertPem, "Google AK");
-                const quoteKey = forge.pki.publicKeyFromPem(hw.ak_pub_pem);
                 
                 // 1. STRICT PUBLIC KEY BINDING
+                const quoteKey = forge.pki.publicKeyFromPem(hw.ak_pub_pem);
                 const isMatch = (akCert.publicKey.n.compareTo(quoteKey.n) === 0 && akCert.publicKey.e.compareTo(quoteKey.e) === 0);
-
-                // 2. CRYPTOGRAPHIC ROOT OF TRUST VERIFICATION
-                const issuer = akCert.issuer.attributes.map(a => a.value).join(', ');
-                const isOfficialGoogle = issuer.includes('Google Cloud Confidential Computing') || 
-                                         issuer.includes('Google Cloud') || 
-                                         issuer.includes('EK/AK CA Intermediate');
-                
-                if (!isOfficialGoogle) {
-                    throw new Error(`CRITICAL SECURITY FAILURE: Certificate not issued by an official Google Confidential Root CA: "${issuer}"`);
-                }
-
-                if (isMatch) {
-                    googleVerified = true;
-                    siliconMsg += `✅ Valid Google Platform Identity (Hardware Bound)<br>Issuer: ${issuer}`;
-                } else {
+                if (!isMatch) {
                     throw new Error("CRITICAL FORGERY DETECTED: The Google AK Certificate does not match the key used to sign the TPM Quote!");
                 }
+
+                // 2. CRYPTOGRAPHIC ROOT OF TRUST VERIFICATION
+                // v131 Hardening: Strictly pin the official Google Confidential Computing Root CA
+                const issuer = akCert.issuer.attributes.map(a => a.value).join(', ');
+                if (!issuer.includes('Google Cloud Confidential Computing OS Root CA')) {
+                    throw new Error(`CRITICAL: Certificate not issued by the official Google Confidential CA: "${issuer}"`);
+                }
+
+                googleVerified = true;
+                siliconMsg = `✅ Valid Google AK Certificate Anchor<br>Issuer: ${issuer}<br>Subject: ${akCert.subject.attributes.map(a => a.value).join(', ')}`;
             }
 
             // 5b. Verify AMD Silicon Root (if present)
-            if (snp && hw.vcek_der_b64) {
+            if (snp && hw.vcek_der_b64 && !isCert) {
                 const localAkHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', akDerBytes))).map(b => b.toString(16).padStart(2, '0')).join('');
                 const akMatch = (hw.ak_der_sha256 === localAkHash);
 
@@ -609,49 +606,38 @@
                     throw new Error("CRITICAL: Attestation Key Binary Mismatch!");
                 }
 
+                // AMD path binding check (NO bypass allowed)
                 const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('');
                 const snpBindingOk = (reportDataHex === expectedBoundNonce.padEnd(128, '0'));
-
-                if (!isCert && !snpBindingOk) {
-                    throw new Error("CRITICAL FORGERY: SEV-SNP Report is not bound to the current session or key!");
+                if (!snpBindingOk) {
+                    throw new Error("CRITICAL: SEV-SNP Report is not bound to this TPM Attestation Key!");
                 }
 
-                // Verify AMD Signature (Skip if in Platform Mode - Google already verified the identity)
-                let snpSigOk = googleVerified;
-                let measurement = "N/A";
-                
-                if (!isCert) {
-                    const rBE = new Uint8Array(48), sBE = new Uint8Array(48);
-                    for (let i = 0; i < 48; i++) { rBE[i] = snp[672 + 47 - i]; sBE[i] = snp[744 + 47 - i]; }
-                    const ecdsaSig = new Uint8Array(96); ecdsaSig.set(rBE, 0); ecdsaSig.set(sBE, 48);
+                // Verify AMD Signature
+                const rBE = new Uint8Array(48), sBE = new Uint8Array(48);
+                for (let i = 0; i < 48; i++) { rBE[i] = snp[672 + 47 - i]; sBE[i] = snp[744 + 47 - i]; }
+                const ecdsaSig = new Uint8Array(96); ecdsaSig.set(rBE, 0); ecdsaSig.set(sBE, 48);
 
-                    try {
-                        const vcekCert = parseAnyCertToForge(hw.vcek_der_b64, "AMD VCEK");
-                        const vcekKey = await crypto.subtle.importKey('spki', pemToBytes(forge.pki.publicKeyToPem(vcekCert.publicKey)), { name: 'ECDSA', namedCurve: 'P-384' }, false, ['verify']);
-                        snpSigOk = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-384' }, vcekKey, ecdsaSig, snp.slice(0, 672));
-                        measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
-                    } catch (e) {
-                        console.warn("Raw AMD signature verification skipped in hybrid mode.");
-                    }
-                } else {
-                    measurement = "GCP-Verified";
-                }
-
-                if (!snpSigOk && !googleVerified) throw new Error("CRITICAL: Hardware Root Verification Failed!");
+                const vcekCert = parseAnyCertToForge(hw.vcek_der_b64, "AMD VCEK");
+                const vcekKey = await crypto.subtle.importKey('spki', pemToBytes(forge.pki.publicKeyToPem(vcekCert.publicKey)), { name: 'ECDSA', namedCurve: 'P-384' }, false, ['verify']);
+                const snpSigOk = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-384' }, vcekKey, ecdsaSig, snp.slice(0, 672));
                 
+                if (!snpSigOk) throw new Error("CRITICAL: AMD SEV-SNP Hardware Signature Verification Failed!");
+                
+                const measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
                 const EXPECTED_MEASUREMENT = "your_expected_hex_measurement_string_here"; 
+                
                 if (EXPECTED_MEASUREMENT !== "your_expected_hex_measurement_string_here" && measurement !== "GCP-Verified" && measurement !== EXPECTED_MEASUREMENT) {
                     throw new Error("CRITICAL: Launch measurement mismatch! This build does not match the GitHub Actions provenance.");
                 }
 
                 snpVerified = true;
-                siliconMsg += `✅ Silicon Identity Bound to GitHub Actions<br>`;
-                if (measurement !== "GCP-Verified" && measurement !== "N/A") {
-                    console.log(`[PROVENANCE] Launch Measurement: ${measurement}`);
-                }
+                siliconMsg += `<br>✅ AMD Silicon Root of Trust Verified`;
+            } else if (isCert) {
+                // In Platform Mode (GCP), the SNP report IS the Google AK certificate.
+                // We've already verified it in the Google block above.
+                snpVerified = true; 
             }
-
-
 
             // Enforce "AND" for Full VM Environments:
             if (!googleVerified || !snpVerified) {
