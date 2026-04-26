@@ -671,11 +671,10 @@ mod tpm {
         // If we still didn't find one, fallback to generating a Session AK so the server can generate the report
         let is_ephemeral_ak = ak_ctx.is_empty();
         if is_ephemeral_ak {
-            tracing::warn!("DEBUG: Could not find pre-provisioned AK with 'sign' attribute! Falling back to ephemeral AK.");
+            tracing::warn!("DEBUG: Could not find pre-provisioned AK. Regenerating from Endorsement Seed...");
             ak_ctx = format!("{}/ak.ctx", work_dir);
-            run_cmd("tpm2_createprimary", &["-C", "o", "-g", "sha256", "-G", "rsa2048", "-c", &primary_ctx]).await?;
-            run_cmd("tpm2_create", &["-C", &primary_ctx, "-g", "sha256", "-G", "rsa2048", "-a", "sign|fixedtpm|fixedparent|sensitivedataorigin|userwithauth", "-u", &ak_pub, "-r", &ak_priv]).await?;
-            run_cmd("tpm2_load", &["-C", &primary_ctx, "-u", &ak_pub, "-r", &ak_priv, "-c", &ak_ctx]).await?;
+            // Google's AK is a Primary Key in the Endorsement Hierarchy
+            run_cmd("tpm2_createprimary", &["-C", "e", "-g", "sha256", "-G", "rsa2048", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|restricted|sign", "-c", &ak_ctx]).await?;
         } else {
             tracing::info!("DEBUG: Using pre-provisioned AK Handle: {}", ak_ctx);
         }
