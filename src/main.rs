@@ -655,8 +655,9 @@ mod tpm {
         if let Ok(handles_out) = run_cmd("tpm2_getcap", &["handles-persistent"]).await {
             let str_out = String::from_utf8_lossy(&handles_out);
             for h in str_out.split_whitespace() {
-                if h.starts_with("0x81") {
-                    let h_str = h.to_string();
+                let h_clean = h.trim_matches(|c: char| !c.is_alphanumeric() && c != 'x');
+                if h_clean.starts_with("0x81") {
+                    let h_str = h_clean.to_string();
                     if let Ok(pub_out) = run_cmd("tpm2_readpublic", &["-c", &h_str]).await {
                         let pub_str = String::from_utf8_lossy(&pub_out);
                         if pub_str.contains("sign") {
@@ -674,7 +675,7 @@ mod tpm {
             tracing::warn!("DEBUG: Could not find pre-provisioned AK. Regenerating from Endorsement Seed...");
             ak_ctx = format!("{}/ak.ctx", work_dir);
             // Google's AK is a Primary Key in the Endorsement Hierarchy
-            run_cmd("tpm2_createprimary", &["-C", "e", "-g", "sha256", "-G", "rsa2048", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|restricted|sign", "-c", &ak_ctx]).await?;
+            run_cmd("tpm2_createprimary", &["-C", "e", "-g", "sha256", "-G", "rsa2048:rsassa", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|restricted|sign", "-c", &ak_ctx]).await?;
         } else {
             tracing::info!("DEBUG: Using pre-provisioned AK Handle: {}", ak_ctx);
         }
