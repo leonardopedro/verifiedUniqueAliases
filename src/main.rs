@@ -617,17 +617,35 @@ mod tpm {
         let quote_sig = format!("{}/quote.sig", work_dir);
 
         // 1. Find the persistent AK handle dynamically from the GCP vTPM
-        let mut ak_ctx = String::from("0x81000000"); // default guess
+        // We must find a handle that has the "sign" attribute (unlike EKs which are decrypt).
+        let mut ak_ctx = String::new();
         if let Ok(handles_out) = run_cmd("tpm2_getcap", &["handles-persistent"]).await {
             let str_out = String::from_utf8_lossy(&handles_out);
             for h in str_out.split_whitespace() {
-                if h.starts_with("0x81") && h != "0x81010001" {
-                    ak_ctx = h.to_string();
-                    break;
+                if h.starts_with("0x81") {
+                    let h_str = h.to_string();
+                    if let Ok(pub_out) = run_cmd("tpm2_readpublic", &["-c", &h_str]).await {
+                        let pub_str = String::from_utf8_lossy(&pub_out);
+                        if pub_str.contains("sign") {
+                            ak_ctx = h_str;
+                            break;
+                        }
+                    }
                 }
             }
         }
-        tracing::info!("DEBUG: Using pre-provisioned AK Handle: {}", ak_ctx);
+        
+        // If we still didn't find one, fallback to generating a Session AK so the server doesn't crash
+        let is_ephemeral_ak = ak_ctx.is_empty();
+        if is_ephemeral_ak {
+            tracing::warn!("DEBUG: Could not find pre-provisioned AK with 'sign' attribute! Falling back to ephemeral AK.");
+            ak_ctx = format!("{}/ak.ctx", work_dir);
+            run_cmd("tpm2_createprimary", &["-C", "o", "-g", "sha256", "-G", "rsa2048", "-c", &primary_ctx]).await?;
+            run_cmd("tpm2_create", &["-C", &primary_ctx, "-g", "sha256", "-G", "rsa2048", "-a", "sign|fixedtpm|fixedparent|sensitivedataorigin|userwithauth", "-u", &ak_pub, "-r", &ak_priv]).await?;
+            run_cmd("tpm2_load", &["-C", &primary_ctx, "-u", &ak_pub, "-r", &ak_priv, "-c", &ak_ctx]).await?;
+        } else {
+            tracing::info!("DEBUG: Using pre-provisioned AK Handle: {}", ak_ctx);
+        }
 
         // Extract AK PEM for the report
         run_cmd("tpm2_readpublic", &["-c", &ak_ctx, "-f", "pem", "-o", &ak_pem]).await?;
