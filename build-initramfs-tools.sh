@@ -106,6 +106,8 @@ echo "nft_reject_ipv4" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "nft_limit" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "nf_conntrack" | tee -a /etc/initramfs-tools/modules >/dev/null
 echo "nft_ct" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "tsm" | tee -a /etc/initramfs-tools/modules >/dev/null
+echo "amd_tsm" | tee -a /etc/initramfs-tools/modules >/dev/null
 
 echo "🔨 Generating base mkinitramfs..."
 BASE_IMG="/tmp/base-initrd.img"
