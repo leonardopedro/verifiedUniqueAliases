@@ -539,85 +539,69 @@
             ];
             updateStatus('githubCheck', bin.success && atomic && pcr15Ok, provResults.join('<br>'));
 
-            // 5. Silicon Root of Trust (ECDSA P-384 AMD SEV-SNP Signature + X.509 Chain)
+            // 5. Silicon Root of Trust
             let siliconOk = false;
             let siliconMsg = "No hardware proof provided.";
 
-            if (hw.snp_report_b64 && hw.vcek_der_b64) {
-                // Decode the raw SEV-SNP report
-                const snp = pemToBuffer(hw.snp_report_b64);
-
-                // 5a. Nonce binding: report_data field is bytes 80-143
-                const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('');
+            if (hw.google_ak_cert_pem) {
+                // 🔴 CRITICAL FIX: Pure mathematical binding of Google AK Cert
+                const akCert = parseAnyCertToForge(hw.google_ak_cert_pem, "Google AK");
+                const issuer = akCert.issuer.attributes.map(a => a.value).join(', ');
                 
-                // CRITICAL SEV-SNP FIX: Cryptographic Binding between Native Hardware & TPM Quote
-                // The native AMD hardware report does NOT measure our software (PCRs do). To prevent
-                // an attacker from spinning up a malicious VM and signing our nonce, the SEV-SNP
-                // report is bound to the TPM's Attestation Key: SHA256(AK_PEM || expectedNonce)
+                if (!issuer.includes('Google')) {
+                    throw new Error(`AK Certificate issuer is not Google: "${issuer}"`);
+                }
+
+                // 🔴 STRICT PUBLIC KEY BINDING: No Bypasses Allowed.
+                // The AK used for the TPM Quote MUST mathematically match the one certified by Google.
+                const quoteKey = forge.pki.publicKeyFromPem(hw.ak_pub_pem);
+                const isMatch = (akCert.publicKey.n.compareTo(quoteKey.n) === 0 && akCert.publicKey.e.compareTo(quoteKey.e) === 0);
+
+                if (!isMatch) {
+                    throw new Error("CRITICAL FORGERY DETECTED: The Google AK Certificate does not match the key used to sign the TPM Quote! (GCP Metadata Spoofing / Host MitM)");
+                }
+
+                siliconOk = true;
+                const subject = akCert.subject.attributes.map(a => a.value).join(', ');
+                siliconMsg = `✅ Valid Google AK Certificate Anchor<br>Issuer: ${issuer}<br>Subject: ${subject}`;
+
+            } else if (hw.snp_report_b64 && hw.vcek_der_b64) {
+                // Native AMD SEV-SNP verification
+                const snp = pemToBuffer(hw.snp_report_b64);
+                
                 const akPemBytes = new TextEncoder().encode(hw.ak_pub_pem);
                 const rawExpectedNonce = new Uint8Array(expectedNonce.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
                 const boundBuffer = new Uint8Array(akPemBytes.length + rawExpectedNonce.length);
-                boundBuffer.set(akPemBytes);
-                boundBuffer.set(rawExpectedNonce, akPemBytes.length);
-                const boundHashBuffer = await crypto.subtle.digest('SHA-256', boundBuffer);
-                const expectedBoundNonce = Array.from(new Uint8Array(boundHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-                const paddedExpectedBoundNonce = expectedBoundNonce.padEnd(128, '0');
+                boundBuffer.set(akPemBytes); boundBuffer.set(rawExpectedNonce, akPemBytes.length);
+                const expectedBoundNonce = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', boundBuffer))).map(b => b.toString(16).padStart(2, '0')).join('');
                 
-                const snpBindingOk = (reportDataHex === paddedExpectedBoundNonce);
+                const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('');
+                const snpBindingOk = (reportDataHex === expectedBoundNonce.padEnd(128, '0'));
 
-                const measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
+                const rBE = new Uint8Array(48), sBE = new Uint8Array(48);
+                for (let i = 0; i < 48; i++) { rBE[i] = snp[672 + 47 - i]; sBE[i] = snp[744 + 47 - i]; }
+                const ecdsaSig = new Uint8Array(96); ecdsaSig.set(rBE, 0); ecdsaSig.set(sBE, 48);
 
-                // 5b. Extract P-384 ECDSA signature from SEV-SNP report
-                //     AMD spec: R at bytes 672-719, S at bytes 720-767 (48 bytes each, little-endian)
-                const rBE = new Uint8Array(48);
-                const sBE = new Uint8Array(48);
-                for (let i = 0; i < 48; i++) {
-                    rBE[i] = snp[672 + 47 - i];
-                    sBE[i] = snp[744 + 47 - i];
-                }
-                const ecdsaSig = new Uint8Array(96);
-                ecdsaSig.set(rBE, 0);
-                ecdsaSig.set(sBE, 48);
-
-                // 5c. Import VCEK public key via forge (DER → PEM → WebCrypto)
                 const vcekCert = parseAnyCertToForge(hw.vcek_der_b64, "AMD VCEK");
-                const vcekPubPem = forge.pki.publicKeyToPem(vcekCert.publicKey);
-                const vcekKey = await crypto.subtle.importKey(
-                    'spki', pemToBytes(vcekPubPem),
-                    { name: 'ECDSA', namedCurve: 'P-384' }, false, ['verify']
-                );
+                const vcekKey = await crypto.subtle.importKey('spki', pemToBytes(forge.pki.publicKeyToPem(vcekCert.publicKey)), { name: 'ECDSA', namedCurve: 'P-384' }, false, ['verify']);
+                const snpSigOk = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-384' }, vcekKey, ecdsaSig, snp.slice(0, 672));
 
-                // 5d. Verify ECDSA-P384-SHA384 signature over bytes 0-671 (AMD spec)
-                const snpSigOk = await crypto.subtle.verify(
-                    { name: 'ECDSA', hash: 'SHA-384' }, vcekKey, ecdsaSig, snp.slice(0, 672)
-                );
-
-                // 5e. X.509 certificate chain: VCEK → ASK → ARK (self-signed)
-                //     CRITICAL: ARK is pinned against the official AMD Milan Root fingerprint.
-                //     This prevents a "Fake Root" attack where an attacker supplies their own CA chain.
-                const OFFICIAL_AMD_MILAN_ARK = "00e7040d7c71ba48530ec1aa7bcbc9f491c360fb1e58284e36ce3b49cb422998";
                 let chainOk = false;
                 if (hw.amd_chain_b64) {
-                    const chainStr = atob(hw.amd_chain_b64);
-                    const pems = chainStr.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
+                    const pems = atob(hw.amd_chain_b64).match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
                     if (pems && pems.length >= 2) {
                         const askCert = forge.pki.certificateFromPem(pems[0]);
                         const arkCert = forge.pki.certificateFromPem(pems[1]);
-                        const vcekVerified = askCert.verify(vcekCert);
-                        const askVerified  = arkCert.verify(askCert);
-
-                        // Pin ARK: SHA-256 of its DER encoding must match AMD's official Milan ARK
+                        
+                        const OFFICIAL_AMD_MILAN_ARK = "00e7040d7c71ba48530ec1aa7bcbc9f491c360fb1e58284e36ce3b49cb422998";
                         const md = forge.md.sha256.create();
                         md.update(forge.asn1.toDer(forge.pki.certificateToAsn1(arkCert)).getBytes());
-                        const arkFingerprint = md.digest().toHex().toLowerCase();
-                        const isGenuineAmdRoot = (arkFingerprint === OFFICIAL_AMD_MILAN_ARK);
-
-                        chainOk = vcekVerified && askVerified && isGenuineAmdRoot;
-                        if (!isGenuineAmdRoot) {
-                            siliconMsg = `❌ FAKE ROOT DETECTED: ARK fingerprint ${arkFingerprint} does not match official AMD Milan ARK.`;
-                        }
+                        
+                        chainOk = askCert.verify(vcekCert) && arkCert.verify(askCert) && (md.digest().toHex().toLowerCase() === OFFICIAL_AMD_MILAN_ARK);
                     }
                 }
+
+                const measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
 
                 // FIX: Hardcode the measurement of your known-good reproducible build
                 const EXPECTED_MEASUREMENT = "your_expected_hex_measurement_string_here"; 
@@ -632,46 +616,6 @@
                     ? `✅ Valid SEV-SNP P-384 Signature & X.509 Chain. (Measurement: ${measurement.substring(0, 16)}...)`
                     : `❌ Silicon Verification Failed (binding=${snpBindingOk}, sig=${snpSigOk}, chain=${chainOk}).`;
 
-            } else if (hw.snp_report_b64) {
-                // Fallback: Google AK Certificate — no raw VCEK provided.
-                // CRITICAL FIX: Replace heuristic string-scan with forge certificate parsing.
-                // Verify: (1) Issuer is Google Confidential Computing, (2) cert public key
-                // matches hw.ak_pub_pem that was already used to verify the TPM quote.
-                const akDerBytes = pemToBytes(hw.snp_report_b64);
-                const isDerCert = akDerBytes[0] === 0x30 && akDerBytes[1] === 0x82;
-                const isPemText = akDerBytes[0] === 0x2D;
-
-                if (isPemText || isDerCert) {
-                    const akCert = parseAnyCertToForge(hw.snp_report_b64, "Google AK");
-
-                    // 1. Issuer check: must contain Google Confidential Computing
-                    const issuer = akCert.issuer.attributes.map(a => a.value).join(', ');
-                    const isGoogleIssued = issuer.includes('Google') &&
-                        (issuer.includes('Confidential') || issuer.includes('Cloud') || issuer.includes('Trust'));
-                    if (!isGoogleIssued) {
-                        throw new Error(`AK Certificate issuer is not Google Confidential Computing: "${issuer}"`);
-                    }
-
-                    // 2. Public key binding: cert's public key must equal hw.ak_pub_pem
-                    let isMatch = false;
-                    try {
-                        const quoteKey = forge.pki.publicKeyFromPem(hw.ak_pub_pem);
-                        isMatch = (akCert.publicKey.n.compareTo(quoteKey.n) === 0 &&
-                                   akCert.publicKey.e.compareTo(quoteKey.e) === 0);
-                    } catch (e) {
-                        throw new Error("Could not mathematically compare AK keys: " + e.message);
-                    }
-
-                    if (!isMatch) {
-                        // REVERTED AGAIN: Per Google Cloud documentation, GCP Confidential VMs provision an EK Certificate,
-                        // NOT an AK Certificate. The Session AK is correctly ephemeral. Throwing an error here breaks the auditor.
-                        console.warn("AK Cert key does not match TPM Quote key (Expected constraint: EK != Session AK in this GCP environment).");
-                    }
-
-                    siliconOk = true;
-                    const subject = akCert.subject.attributes.map(a => a.value).join(', ');
-                    siliconMsg = `✅ Valid Google AK Certificate Anchor<br>Issuer: ${issuer}<br>Subject: ${subject}`;
-                }
             } else {
                 throw new Error("CRITICAL: Missing hardware SEV-SNP report or VCEK Certificate.");
             }
