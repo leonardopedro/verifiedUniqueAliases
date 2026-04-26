@@ -185,7 +185,7 @@
     <header>
         <a href="index.html" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Back to Hub</a>
         <h1>Secure Enclave Auditor</h1>
-        <p class="subtitle">Hardware-Rooted Attestation Verification v121</p>
+        <p class="subtitle">Hardware-Rooted Attestation Verification v122</p>
     </header>
 
     <div class="grid">
@@ -275,11 +275,24 @@
         return newObj;
     }
 
-    // 2. Utility: Decode PEM (or raw base64) to Uint8Array
-    function pemToBuffer(pem) {
-        const b64 = pem.replace(/-----(BEGIN|END).*?-----|[\s\r\n]/g, '');
-        return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    // 2. Utilities: decode PEM / raw base64
+    //    pemToBytes    → Uint8Array  (for WebCrypto importKey / verify)
+    //    pemToBinaryStr→ forge binary string (for forge.asn1.fromDer / createBuffer)
+    //    pemToBuffer   → alias for pemToBytes (legacy callers)
+    function pemToBytes(pem) {
+        const b64 = pem
+            .replace(/-----(BEGIN|END).*?-----|[\s\r\n]/g, '')
+            .replace(/-/g, '+').replace(/_/g, '/');          // handle base64url
+        const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+        return Uint8Array.from(atob(padded), c => c.charCodeAt(0));
     }
+    function pemToBinaryStr(pem) {
+        const bytes = pemToBytes(pem);
+        let s = '';
+        for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+        return s;
+    }
+    const pemToBuffer = pemToBytes; // backward compat
 
     function getLeafCert(pem) {
         if (!pem) return "";
@@ -526,12 +539,12 @@
                 ecdsaSig.set(sBE, 48);
 
                 // 5c. Import VCEK public key via forge (DER → PEM → WebCrypto)
-                const vcekDer = pemToBuffer(hw.vcek_der_b64);
-                const asn1 = forge.asn1.fromDer(forge.util.createBuffer(vcekDer));
+                const vcekDerBinStr = pemToBinaryStr(hw.vcek_der_b64);
+                const asn1 = forge.asn1.fromDer(forge.util.createBuffer(vcekDerBinStr));
                 const vcekCert = forge.pki.certificateFromAsn1(asn1);
                 const vcekPubPem = forge.pki.publicKeyToPem(vcekCert.publicKey);
                 const vcekKey = await crypto.subtle.importKey(
-                    'spki', pemToBuffer(vcekPubPem),
+                    'spki', pemToBytes(vcekPubPem),
                     { name: 'ECDSA', namedCurve: 'P-384' }, false, ['verify']
                 );
 
@@ -577,18 +590,19 @@
                 // CRITICAL FIX: Replace heuristic string-scan with forge certificate parsing.
                 // Verify: (1) Issuer is Google Confidential Computing, (2) cert public key
                 // matches hw.ak_pub_pem that was already used to verify the TPM quote.
-                const akDer = pemToBuffer(hw.snp_report_b64);
-                const isDerCert = akDer[0] === 0x30 && akDer[1] === 0x82;
-                const isPemText = akDer[0] === 0x2D;
+                const akDerBytes = pemToBytes(hw.snp_report_b64);
+                const isDerCert = akDerBytes[0] === 0x30 && akDerBytes[1] === 0x82;
+                const isPemText = akDerBytes[0] === 0x2D;
 
                 if (isPemText || isDerCert) {
                     // Parse DER or PEM certificate with forge
                     let akCert;
                     if (isPemText) {
-                        akCert = forge.pki.certificateFromPem(new TextDecoder().decode(akDer));
+                        akCert = forge.pki.certificateFromPem(new TextDecoder().decode(akDerBytes));
                     } else {
+                        const akDerBinStr = pemToBinaryStr(hw.snp_report_b64);
                         akCert = forge.pki.certificateFromAsn1(
-                            forge.asn1.fromDer(forge.util.createBuffer(akDer))
+                            forge.asn1.fromDer(forge.util.createBuffer(akDerBinStr))
                         );
                     }
 
