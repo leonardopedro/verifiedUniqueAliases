@@ -380,9 +380,9 @@ mod enclave_init {
         apply_lease(&iface, &lease);
 
         // CRITICAL FIX: Prevent Time-Rollback TLS breakage.
-        // Seed the system clock to the exact build epoch (April 6, 2026).
+        // Seed the system clock to a realistic 2026 epoch.
         let _ = std::process::Command::new("/bin/date")
-            .args(["-s", "@1712260800"])
+            .args(["-s", "@1777000000"])
             .status();
 
         // SYNC TIME from trusted source over PINNED TLS
@@ -616,35 +616,18 @@ mod tpm {
         let quote_msg = format!("{}/quote.msg", work_dir);
         let quote_sig = format!("{}/quote.sig", work_dir);
 
-        // 1. Create primary key in Owner hierarchy explicitly
-        tracing::info!("DEBUG: TPM CreatePrimary starting...");
-        run_cmd("tpm2_createprimary", &[
-            "-C", "o", 
-            "-g", "sha256", 
-            "-G", "rsa2048", 
-            "-c", &primary_ctx
-        ]).await?;
-        tracing::info!("DEBUG: TPM CreatePrimary done.");
-
-        // 2. Create the AK with 'restricted|sign' - required for TPM2_Quote
-        tracing::info!("DEBUG: TPM Create AK starting...");
-        run_cmd("tpm2_create", &[
-            "-C", &primary_ctx,
-            "-g", "sha256",
-            "-G", "rsa2048",
-            "-a", "sign|fixedtpm|fixedparent|sensitivedataorigin|userwithauth",
-            "-u", &ak_pub,
-            "-r", &ak_priv
-        ]).await?;
-        tracing::info!("DEBUG: TPM Create AK done.");
-        
-        // 3. Load it
-        run_cmd("tpm2_load", &[
-            "-C", &primary_ctx,
-            "-u", &ak_pub,
-            "-r", &ak_priv,
-            "-c", &ak_ctx
-        ]).await?;
+        // 1. Find the persistent AK handle dynamically from the GCP vTPM
+        let mut ak_ctx = String::from("0x81000000"); // default guess
+        if let Ok(handles_out) = run_cmd("tpm2_getcap", &["handles-persistent"]).await {
+            let str_out = String::from_utf8_lossy(&handles_out);
+            for h in str_out.split_whitespace() {
+                if h.starts_with("0x81") && h != "0x81010001" {
+                    ak_ctx = h.to_string();
+                    break;
+                }
+            }
+        }
+        tracing::info!("DEBUG: Using pre-provisioned AK Handle: {}", ak_ctx);
 
         // Extract AK PEM for the report
         run_cmd("tpm2_readpublic", &["-c", &ak_ctx, "-f", "pem", "-o", &ak_pem]).await?;

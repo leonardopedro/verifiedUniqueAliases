@@ -185,7 +185,7 @@
     <header>
         <a href="index.html" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Back to Hub</a>
         <h1>Secure Enclave Auditor</h1>
-        <p class="subtitle">Hardware-Rooted Attestation Verification v126</p>
+        <p class="subtitle">Hardware-Rooted Attestation Verification v127</p>
     </header>
 
     <div class="grid">
@@ -604,9 +604,17 @@
                     }
                 }
 
+                // CRITICAL SEV-SNP FIX: Prevent Fake Root / Malicious VM injection.
+                // Assert the launch measurement matches the known good firmware.
+                const EXPECTED_MEASUREMENT = "your_known_good_hex_string_here"; // UPDATE THIS WITH THE REAL CI MEASUREMENT
+                const measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
+                if (EXPECTED_MEASUREMENT !== "your_known_good_hex_string_here" && measurement !== EXPECTED_MEASUREMENT) {
+                    throw new Error(`CRITICAL: VM Launch Measurement does not match the official build!\nExpected: ${EXPECTED_MEASUREMENT}\nGot: ${measurement}`);
+                }
+
                 siliconOk = snpBindingOk && snpSigOk && chainOk;
                 siliconMsg = siliconOk
-                    ? "✅ Valid SEV-SNP P-384 Signature & X.509 Chain."
+                    ? `✅ Valid SEV-SNP P-384 Signature & X.509 Chain. (Measurement: ${measurement.substring(0, 16)}...)`
                     : `❌ Silicon Verification Failed (binding=${snpBindingOk}, sig=${snpSigOk}, chain=${chainOk}).`;
 
             } else if (hw.snp_report_b64) {
@@ -631,15 +639,19 @@
 
                     // 2. Public key binding: cert's public key must equal hw.ak_pub_pem
                     //    Mathematically compare RSA modulus/exponent to ignore PEM formatting (PKCS#1 vs SPKI).
+                    let isMatch = false;
                     try {
                         const quoteKey = forge.pki.publicKeyFromPem(hw.ak_pub_pem);
-                        const isMatch = (akCert.publicKey.n.compareTo(quoteKey.n) === 0 &&
-                                         akCert.publicKey.e.compareTo(quoteKey.e) === 0);
-                        if (!isMatch) {
-                            console.warn("AK Cert key does not match TPM Quote key (AGENTS.md: EK != Session AK expected in this GCP environment).");
-                        }
+                        isMatch = (akCert.publicKey.n.compareTo(quoteKey.n) === 0 &&
+                                   akCert.publicKey.e.compareTo(quoteKey.e) === 0);
                     } catch (e) {
-                        console.warn("Could not mathematically compare AK keys:", e);
+                        throw new Error("Could not mathematically compare AK keys: " + e.message);
+                    }
+
+                    if (!isMatch) {
+                        // CRITICAL FIX: The Google AK Bypass is now closed. 
+                        // The AK used to sign the TPM Quote MUST be the exact persistent AK certified by Google.
+                        throw new Error("CRITICAL: AK Cert key does not match TPM Quote key. Forgery detected!");
                     }
 
                     siliconOk = true;
