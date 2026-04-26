@@ -461,6 +461,7 @@ mod tpm {
         pub snp_report_b64: Option<String>,
         pub auxblob_b64: Option<String>,
         pub signature_binding_pubkey_hash: String,
+        pub google_ak_cert_pem: Option<String>,
     }
 
     pub mod snp {
@@ -610,6 +611,36 @@ mod tpm {
 
         let _ = cleanup(&cleanup_paths).await;
         Ok(dek)
+    }
+
+    // 🔴 NEW: Fetch True AK Certificate from GCP API
+    async fn fetch_google_ak_cert() -> Option<String> {
+        let client = crate::hardened_client();
+        
+        let token_resp: serde_json::Value = client.get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
+            .header("Metadata-Flavor", "Google").send().await.ok()?.json().await.ok()?;
+        let access_token = token_resp["access_token"].as_str()?;
+        
+        let project: String = client.get("http://metadata.google.internal/computeMetadata/v1/project/project-id")
+            .header("Metadata-Flavor", "Google").send().await.ok()?.text().await.ok()?;
+            
+        let zone_full: String = client.get("http://metadata.google.internal/computeMetadata/v1/instance/zone")
+            .header("Metadata-Flavor", "Google").send().await.ok()?.text().await.ok()?;
+        let zone = zone_full.split('/').last()?;
+        
+        let instance: String = client.get("http://metadata.google.internal/computeMetadata/v1/instance/name")
+            .header("Metadata-Flavor", "Google").send().await.ok()?.text().await.ok()?;
+
+        let url = format!("https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}/getShieldedInstanceIdentity", project, zone, instance);
+        
+        let identity_resp: serde_json::Value = client.get(&url).bearer_auth(access_token).send().await.ok()?.json().await.ok()?;
+        
+        if let Some(cert) = identity_resp.get("signingKey").and_then(|k| k.get("ekCert")).and_then(|c| c.as_str()) {
+            tracing::info!("Successfully fetched GCP Persistent AK Certificate");
+            return Some(cert.to_string());
+        }
+        tracing::warn!("Failed to fetch GCP Persistent AK Certificate. Is Compute API enabled?");
+        None
     }
 
     pub async fn quote(nonce_hex: &str) -> Result<AttestationResult, Box<dyn std::error::Error + Send + Sync>> {
@@ -770,6 +801,7 @@ mod tpm {
         tracing::info!("DEBUG: SNP report fetch complete");
 
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
+        let google_ak_cert_pem = fetch_google_ak_cert().await;
 
         Ok(AttestationResult {
             tpm_quote_msg: STANDARD.encode(msg),
@@ -782,6 +814,7 @@ mod tpm {
             snp_report_b64,
             auxblob_b64,
             signature_binding_pubkey_hash: "".to_string(), // Filled by caller
+            google_ak_cert_pem,
         })
     }
 }
@@ -1051,7 +1084,7 @@ struct CallbackQuery {
 // ============================================================================
 
 async fn fetch_secret_direct(secret_id: &str) -> Option<String> {
-    let client = hardened_client();
+    let client = crate::hardened_client();
     let token_resp: serde_json::Value = client
         .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
         .header("Metadata-Flavor", "Google")
