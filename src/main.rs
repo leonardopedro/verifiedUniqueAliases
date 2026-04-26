@@ -488,7 +488,7 @@ mod tpm {
             }
 
             // 2. Wait for hardware report generation (ConfigFS is asynchronous)
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::sleep(std::time::Duration::from_millis(500));
 
             // 3. Read the report
             let report = match fs::read(format!("{}/outblob", report_dir)) {
@@ -611,29 +611,46 @@ mod tpm {
     async fn fetch_google_ak_cert() -> Option<String> {
         let client = crate::hardened_client();
         
-        let token_resp: serde_json::Value = client.get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
-            .header("Metadata-Flavor", "Google").send().await.ok()?.json().await.ok()?;
+        tracing::info!("Fetching GCP Metadata Token...");
+        let token_resp: serde_json::Value = match client.get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
+            .header("Metadata-Flavor", "Google").send().await {
+                Ok(resp) => resp.json().await.ok()?,
+                Err(e) => {
+                    tracing::warn!("Failed to fetch GCP Metadata Token: {}", e);
+                    return None;
+                }
+            };
         let access_token = token_resp["access_token"].as_str()?;
         
+        tracing::info!("Fetching GCP Project ID...");
         let project: String = client.get("http://metadata.google.internal/computeMetadata/v1/project/project-id")
             .header("Metadata-Flavor", "Google").send().await.ok()?.text().await.ok()?;
             
+        tracing::info!("Fetching GCP Zone...");
         let zone_full: String = client.get("http://metadata.google.internal/computeMetadata/v1/instance/zone")
             .header("Metadata-Flavor", "Google").send().await.ok()?.text().await.ok()?;
         let zone = zone_full.split('/').last()?;
         
+        tracing::info!("Fetching GCP Instance Name...");
         let instance: String = client.get("http://metadata.google.internal/computeMetadata/v1/instance/name")
             .header("Metadata-Flavor", "Google").send().await.ok()?.text().await.ok()?;
 
         let url = format!("https://compute.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}/getShieldedInstanceIdentity", project, zone, instance);
+        tracing::info!("Calling Shielded Instance Identity API...");
         
-        let identity_resp: serde_json::Value = client.get(&url).bearer_auth(access_token).send().await.ok()?.json().await.ok()?;
+        let identity_resp: serde_json::Value = match client.get(&url).bearer_auth(access_token).send().await {
+            Ok(resp) => resp.json().await.ok()?,
+            Err(e) => {
+                tracing::warn!("Failed to call GCP Identity API: {}", e);
+                return None;
+            }
+        };
         
         if let Some(cert) = identity_resp.get("signingKey").and_then(|k| k.get("ekCert")).and_then(|c| c.as_str()) {
-            tracing::info!("Successfully fetched GCP Persistent AK Certificate");
+            tracing::info!("Successfully fetched GCP Persistent AK Certificate from API");
             return Some(cert.to_string());
         }
-        tracing::warn!("Failed to fetch GCP Persistent AK Certificate. Is Compute API enabled?");
+        tracing::warn!("GCP Identity API did not return an AK certificate (ekCert). response: {:?}", identity_resp);
         None
     }
 
@@ -771,6 +788,34 @@ mod tpm {
         nonce_bytes[..32].copy_from_slice(&bound_nonce);
 
         tracing::info!("DEBUG: SNP nonce bytes prepared");
+        // 1. Fetch Google AK Certificate (Mandatory Identity Root)
+        // Strategy A: Compute Engine API (Shielded Instance Identity)
+        let mut google_ak_cert_pem = fetch_google_ak_cert().await;
+        
+        // Strategy B: NVRAM Fallback (for air-gapped or restricted networking)
+        if google_ak_cert_pem.is_none() {
+            tracing::info!("Compute API failed for AK cert, trying NVRAM fallback...");
+            let indices = [("0x01c00002", "1184"), ("0x01c00001", "1184")];
+            for (idx, size) in &indices {
+                if let Ok(data) = run_cmd("tpm2", &["nvread", idx, "-C", "o", "-s", size]).await {
+                    if !data.is_empty() {
+                        tracing::info!("Obtained Google AK Cert from NVRAM index {}", idx);
+                        // Convert DER to PEM
+                        if let Ok(pem) = run_cmd("openssl", &["x509", "-inform", "DER", "-outform", "PEM"]).await {
+                            // Note: run_cmd doesn't support stdin easily here, but we can use a temp file
+                            let tmp_der = format!("{}/tmp_ak.der", work_dir);
+                            let _ = tokio::fs::write(&tmp_der, &data).await;
+                            if let Ok(pem_out) = run_cmd("openssl", &["x509", "-inform", "DER", "-in", &tmp_der, "-outform", "PEM"]).await {
+                                google_ak_cert_pem = Some(String::from_utf8_lossy(&pem_out).to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Fetch AMD SEV-SNP Hardware Report (Mandatory Measurement Root)
         let mut auxblob_b64 = None;
         let snp_report_raw = match snp::get_report(&nonce_bytes) {
             Some((report, aux)) => {
@@ -797,10 +842,8 @@ mod tpm {
             },
             None => None,
         };
-        tracing::info!("DEBUG: SNP report fetch complete");
 
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
-        let google_ak_cert_pem = fetch_google_ak_cert().await;
 
         Ok(AttestationResult {
             tpm_quote_msg: STANDARD.encode(msg),
