@@ -720,45 +720,8 @@ mod tpm {
                 Some(report)
             },
             None => {
-                tracing::info!("TSM ConfigFS failed, trying known GCP NVRAM handles...");
-                // v118-fix: Fallback to AK Certificate index if hardware report indices fail.
-                // This ensures compatibility with the auditor's measurement offset on GCP.
-                let indices = [
-                    ("0x01c00002", "1184"), 
-                    ("0x01400001", "1248"),
-                    ("0x01c00001", "1184")
-                ];
-                let mut data = vec![];
-                for (idx, size) in &indices {
-                    tracing::info!("DEBUG: Trying NVRAM index {} (Owner Hierarchy)", idx);
-                    // Try Owner Hierarchy (-C o) first
-                    match run_cmd("tpm2", &["nvread", idx, "-C", "o", "-s", size]).await {
-                        Ok(d) if !d.is_empty() => {
-                            tracing::info!("Obtained report from NVRAM index {} (Owner)", idx);
-                            data = d;
-                            break;
-                        },
-                        _ => {
-                            tracing::info!("DEBUG: Trying NVRAM index {} (Platform Hierarchy)", idx);
-                            // Some firmware versions put reports in Platform Hierarchy (-C p)
-                            match run_cmd("tpm2", &["nvread", idx, "-C", "p", "-s", size]).await {
-                                Ok(d) if !d.is_empty() => {
-                                    tracing::info!("Obtained report from NVRAM index {} (Platform)", idx);
-                                    data = d;
-                                    break;
-                                },
-                                _ => { tracing::debug!("Index {} not found in O or P hierarchies", idx); }
-                            }
-                        }
-                    }
-                }
-                
-                if !data.is_empty() {
-                    Some(STANDARD.encode(data))
-                } else {
-                    tracing::error!("All hardware report strategies failed. AMD SNP check will fail.");
-                    None
-                }
+                tracing::error!("TSM ConfigFS failed. Cannot securely bind session AK without native hardware report.");
+                None
             }
         };
         tracing::info!("DEBUG: SNP report fetch complete");
