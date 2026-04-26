@@ -732,19 +732,20 @@ mod tpm {
             Err(_) => None,
         };
 
-        // CRITICAL SEV-SNP FIX: Cryptographically bind the native hardware report to the vTPM Quote.
-        // We must hash the EXACT same bytes as the browser auditor's pemToBytes() function.
+        // 🔴 FIX: Cryptographically bind using raw DER bytes instead of the PEM string.
+        // PEM strings can have varying newlines which silently break the hash.
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         let ak_b64 = ak_pem_str
             .lines()
             .filter(|l| !l.starts_with("-----"))
             .collect::<String>()
             .replace(|c: char| c.is_whitespace(), "");
-        let ak_bytes = STANDARD.decode(ak_b64).unwrap_or_default();
+        let ak_der_bytes = STANDARD.decode(ak_b64).unwrap_or_default();
 
+        // Hardware SNP Report & AMD Certificates
         use sha2::Digest;
         let mut hasher = sha2::Sha256::new();
-        hasher.update(&ak_bytes);
+        hasher.update(&ak_der_bytes); // <--- HASH THE BINARY DER
         hasher.update(&hex::decode(nonce_hex).unwrap_or_default());
         let bound_nonce = hasher.finalize();
 
