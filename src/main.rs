@@ -461,6 +461,8 @@ mod tpm {
         pub snp_report_b64: Option<String>,
         pub auxblob_b64: Option<String>,
         pub signature_binding_pubkey_hash: String,
+        pub vcek_der_b64: Option<String>,
+        pub amd_chain_b64: Option<String>,
         pub google_ak_cert_pem: Option<String>,
     }
 
@@ -468,7 +470,7 @@ mod tpm {
         use std::fs;
         use base64::{engine::general_purpose::STANDARD, Engine as _};
 
-        pub fn get_report(nonce: &[u8; 64]) -> Option<(String, Option<String>)> {
+        pub fn get_report(nonce: &[u8; 64]) -> Option<(Vec<u8>, Option<String>)> {
             // v86-master: Use the modern unified TSM (Trusted Security Module) ConfigFS interface
             // This works on Linux 6.3+ and supports SEV-SNP, TDX, etc.
             let tsm_base = "/sys/kernel/config/tsm/report";
@@ -491,7 +493,7 @@ mod tpm {
             let report = match fs::read(format!("{}/outblob", report_dir)) {
                 Ok(data) => {
                     tracing::info!("Successfully read SNP report from ConfigFS outblob ({} bytes)", data.len());
-                    Some(STANDARD.encode(&data))
+                    Some(data)
                 },
                 Err(e) => {
                     tracing::error!("Failed to read outblob from ConfigFS: {}", e);
@@ -574,43 +576,33 @@ mod tpm {
     }
 
     pub async fn unseal_dek(sealed: &SealedData) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let cleanup_paths = [
-            "/tmp/dek.pub", "/tmp/dek.priv", "/tmp/primary_seal.ctx",
-            "/tmp/dek.ctx",
-        ];
-        let _ = cleanup(&cleanup_paths).await;
-
-        let pub_b = STANDARD.decode(&sealed.pub_blob)?;
-        let priv_b = STANDARD.decode(&sealed.priv_blob)?;
-        tokio::fs::write("/tmp/dek.pub", pub_b).await?;
-        tokio::fs::write("/tmp/dek.priv", priv_b).await?;
-
-        // Recreate the SAME deterministic primary using the identical template as seal_dek
-        run_cmd("tpm2_createprimary", &[
-            "-C", "o",
-            "-g", "sha256",
-            "-G", "rsa2048",
-            "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda|restricted|decrypt",
-            "-c", "/tmp/primary_seal.ctx",
-        ]).await?;
-        run_cmd("tpm2_load", &[
-            "-C", "/tmp/primary_seal.ctx",
-            "-u", "/tmp/dek.pub",
-            "-r", "/tmp/dek.priv",
-            "-c", "/tmp/dek.ctx",
-        ]).await?;
-
-        // Recreate policy for UNSEAL - this is where it's actually ENFORCED
-        run_cmd("tpm2_createpolicy", &[
-            "--policy-pcr",
-            "-l", &format!("sha256:{}", PCR_SELECTION),
-            "-L", "/tmp/policy.bin",
-        ]).await?;
-
+        let paths =["/tmp/dek.pub", "/tmp/dek.priv", "/tmp/primary_seal.ctx", "/tmp/dek.ctx", "/tmp/policy.bin"];
+        cleanup(&paths).await;
+        tokio::fs::write("/tmp/dek.pub", STANDARD.decode(&sealed.pub_blob)?).await?;
+        tokio::fs::write("/tmp/dek.priv", STANDARD.decode(&sealed.priv_blob)?).await?;
+        run_cmd("tpm2_createprimary", &["-C", "o", "-g", "sha256", "-G", "rsa2048", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda|restricted|decrypt", "-c", "/tmp/primary_seal.ctx"]).await?;
+        run_cmd("tpm2_load", &["-C", "/tmp/primary_seal.ctx", "-u", "/tmp/dek.pub", "-r", "/tmp/dek.priv", "-c", "/tmp/dek.ctx"]).await?;
+        run_cmd("tpm2_createpolicy", &["--policy-pcr", "-l", &format!("sha256:{}", PCR_SELECTION), "-L", "/tmp/policy.bin"]).await?;
         let dek = run_cmd("tpm2_unseal", &["-c", "/tmp/dek.ctx"]).await?;
-
-        let _ = cleanup(&cleanup_paths).await;
+        cleanup(&paths).await;
         Ok(dek)
+    }
+
+    async fn fetch_vcek(chip_id: &str, bl: u8, tee: u8, snp: u8, ucode: u8) -> Option<String> {
+        let client = reqwest::Client::new(); // Standard client for public KDS to avoid pinning errors
+        let url = format!("https://kdsintf.amd.com/vcek/v1/Milan/{}?blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}", chip_id, bl, tee, snp, ucode);
+        if let Ok(resp) = client.get(&url).send().await {
+            if let Ok(bytes) = resp.bytes().await { return Some(STANDARD.encode(&bytes)); }
+        }
+        None
+    }
+
+    async fn fetch_amd_chain() -> Option<String> {
+        let client = reqwest::Client::new();
+        if let Ok(resp) = client.get("https://kdsintf.amd.com/vcek/v1/Milan/cert_chain").send().await {
+            if let Ok(text) = resp.text().await { return Some(STANDARD.encode(text.as_bytes())); }
+        }
+        None
     }
 
     // 🔴 NEW: Fetch True AK Certificate from GCP API
@@ -754,7 +746,7 @@ mod tpm {
 
         tracing::info!("DEBUG: SNP nonce bytes prepared");
         let mut auxblob_b64 = None;
-        let snp_report_b64 = match snp::get_report(&nonce_bytes) {
+        let mut snp_report_raw = match snp::get_report(&nonce_bytes) {
             Some((report, aux)) => {
                 tracing::info!("Obtained SEV-SNP report via TSM ConfigFS");
                 auxblob_b64 = aux;
@@ -791,12 +783,26 @@ mod tpm {
                 }
                 
                 if !data.is_empty() {
-                    Some(STANDARD.encode(data))
+                    Some(data)
                 } else {
                     tracing::error!("All hardware report strategies failed.");
                     None
                 }
             }
+        };
+
+        let mut vcek_der_b64 = None;
+        let mut amd_chain_b64 = None;
+        let snp_report_b64 = match snp_report_raw {
+            Some(data) => {
+                if data.len() >= 1184 {
+                    let chip_id = hex::encode(&data[1024..1088]);
+                    vcek_der_b64 = fetch_vcek(&chip_id, data[16], data[17], data[22], data[23]).await;
+                    amd_chain_b64 = fetch_amd_chain().await;
+                }
+                Some(STANDARD.encode(&data))
+            },
+            None => None,
         };
         tracing::info!("DEBUG: SNP report fetch complete");
 
@@ -814,6 +820,8 @@ mod tpm {
             snp_report_b64,
             auxblob_b64,
             signature_binding_pubkey_hash: "".to_string(), // Filled by caller
+            vcek_der_b64,
+            amd_chain_b64,
             google_ak_cert_pem,
         })
     }
