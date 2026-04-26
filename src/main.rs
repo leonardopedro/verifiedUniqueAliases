@@ -413,7 +413,7 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
-    Router,
+    Json, Router,
 };
 use acme2_eab::{
     gen_rsa_private_key, AccountBuilder, AuthorizationStatus, DirectoryBuilder, OrderBuilder, Csr,
@@ -813,15 +813,12 @@ mod tpm {
                 if let Ok(data) = run_cmd("tpm2", &["nvread", idx, "-C", "o", "-s", size]).await {
                     if !data.is_empty() {
                         tracing::info!("Obtained Google AK Cert from NVRAM index {}", idx);
-                        // Convert DER to PEM
-                        if let Ok(pem) = run_cmd("openssl", &["x509", "-inform", "DER", "-outform", "PEM"]).await {
-                            // Note: run_cmd doesn't support stdin easily here, but we can use a temp file
-                            let tmp_der = format!("{}/tmp_ak.der", work_dir);
-                            let _ = tokio::fs::write(&tmp_der, &data).await;
-                            if let Ok(pem_out) = run_cmd("openssl", &["x509", "-inform", "DER", "-in", &tmp_der, "-outform", "PEM"]).await {
-                                google_ak_cert_pem = Some(String::from_utf8_lossy(&pem_out).to_string());
-                                break;
-                            }
+                        // Note: run_cmd doesn't support stdin easily here, but we can use a temp file
+                        let tmp_der = format!("{}/tmp_ak.der", work_dir);
+                        let _ = tokio::fs::write(&tmp_der, &data).await;
+                        if let Ok(pem_out) = run_cmd("openssl", &["x509", "-inform", "DER", "-in", &tmp_der, "-outform", "PEM"]).await {
+                            google_ak_cert_pem = Some(String::from_utf8_lossy(&pem_out).to_string());
+                            break;
                         }
                     }
                 }
@@ -1657,7 +1654,7 @@ async fn generate_attestation(
     let full_report = serde_json::json!({
         "attestation_report": payload,
         "enclave_signature_b64": signature,
-        "enclave_signing_public_key": if let Some(key) = &state.attestation_signing_key {
+        "enclave_signing_public_key": if let Some(_) = &state.attestation_signing_key {
             pub_key_pem
         } else {
             "N/A".to_string()
