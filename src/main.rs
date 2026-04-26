@@ -679,13 +679,9 @@ mod tpm {
             tracing::info!("DEBUG: Using pre-provisioned AK Handle: {}", ak_ctx);
         }
 
-        // Extract AK in both PEM (for report display) and standard X.509 DER (for bit-perfect hashing)
+        // Extract AK PEM for the report
         run_cmd("tpm2_readpublic", &["-c", &ak_ctx, "-f", "pem", "-o", &ak_pem]).await?;
-        // Use algorithm-agnostic openssl pkey to handle both RSA and ECC keys
-        let _ = run_cmd("openssl", &["pkey", "-pubin", "-inform", "PEM", "-in", &ak_pem, "-outform", "DER", "-out", &ak_der]).await;
-        
         let ak_pem_str = tokio::fs::read_to_string(&ak_pem).await?;
-        let ak_der_bytes = tokio::fs::read(&ak_der).await.unwrap_or_else(|_| vec![]);
 
         tracing::info!("DEBUG: TPM Quote starting with nonce 0x{}...", nonce_hex);
         run_cmd("tpm2_quote", &[
@@ -736,13 +732,19 @@ mod tpm {
             Err(_) => None,
         };
 
-        // 5. Hardware SNP Report (Firmware / Launch Measurement)
-        // CRITICAL SEV-SNP FIX: Cryptographically bind the native AMD hardware report to the vTPM Quote.
-        // We hash the TPM's Attestation Key (DER) along with the COMBINED nonce.
+        // CRITICAL SEV-SNP FIX: Cryptographically bind the native hardware report to the vTPM Quote.
+        // We must hash the EXACT same bytes as the browser auditor's pemToBytes() function.
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let ak_b64 = ak_pem_str
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect::<String>()
+            .replace(|c: char| c.is_whitespace(), "");
+        let ak_bytes = STANDARD.decode(ak_b64).unwrap_or_default();
+
         use sha2::Digest;
         let mut hasher = sha2::Sha256::new();
-        hasher.update(&ak_der_bytes);
-        // CRITICAL: We must use the same combined nonce as the TPM quote!
+        hasher.update(&ak_bytes);
         hasher.update(&hex::decode(nonce_hex).unwrap_or_default());
         let bound_nonce = hasher.finalize();
 
