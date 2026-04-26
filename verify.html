@@ -185,7 +185,7 @@
     <header>
         <a href="index.html" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Back to Hub</a>
         <h1>Secure Enclave Auditor</h1>
-        <p class="subtitle">Hardware-Rooted Attestation Verification v124</p>
+        <p class="subtitle">Hardware-Rooted Attestation Verification v125</p>
     </header>
 
     <div class="grid">
@@ -294,6 +294,31 @@
         return atob(padded);
     }
     const pemToBuffer = pemToBytes; // backward compat
+
+    // Robust cert parser (handles PEM, base64-DER, base64-PEM)
+    function parseAnyCertToForge(certInput, name) {
+        try {
+            let decoded = '';
+            try {
+                const b64 = certInput.replace(/-/g, '+').replace(/_/g, '/');
+                const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+                decoded = atob(padded);
+            } catch (e) {
+                decoded = certInput;
+            }
+
+            if (decoded.includes('-----BEGIN')) {
+                return forge.pki.certificateFromPem(decoded);
+            }
+            if (certInput.includes('-----BEGIN')) {
+                return forge.pki.certificateFromPem(certInput);
+            }
+            // Parse as DER, strict=false allows trailing padding bytes
+            return forge.pki.certificateFromAsn1(forge.asn1.fromDer(decoded, false));
+        } catch (e) {
+            throw new Error(`Failed to parse ${name} Certificate: ` + e.message);
+        }
+    }
 
     function getLeafCert(pem) {
         if (!pem) return "";
@@ -540,9 +565,7 @@
                 ecdsaSig.set(sBE, 48);
 
                 // 5c. Import VCEK public key via forge (DER → PEM → WebCrypto)
-                const vcekDerBinStr = pemToBinaryStr(hw.vcek_der_b64);
-                const asn1 = forge.asn1.fromDer(vcekDerBinStr);
-                const vcekCert = forge.pki.certificateFromAsn1(asn1);
+                const vcekCert = parseAnyCertToForge(hw.vcek_der_b64, "AMD VCEK");
                 const vcekPubPem = forge.pki.publicKeyToPem(vcekCert.publicKey);
                 const vcekKey = await crypto.subtle.importKey(
                     'spki', pemToBytes(vcekPubPem),
@@ -596,16 +619,7 @@
                 const isPemText = akDerBytes[0] === 0x2D;
 
                 if (isPemText || isDerCert) {
-                    // Parse DER or PEM certificate with forge
-                    let akCert;
-                    if (isPemText) {
-                        akCert = forge.pki.certificateFromPem(new TextDecoder().decode(akDerBytes));
-                    } else {
-                        const akDerBinStr = pemToBinaryStr(hw.snp_report_b64);
-                        akCert = forge.pki.certificateFromAsn1(
-                            forge.asn1.fromDer(akDerBinStr)
-                        );
-                    }
+                    const akCert = parseAnyCertToForge(hw.snp_report_b64, "Google AK");
 
                     // 1. Issuer check: must contain Google Confidential Computing
                     const issuer = akCert.issuer.attributes.map(a => a.value).join(', ');
