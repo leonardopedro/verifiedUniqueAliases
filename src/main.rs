@@ -482,6 +482,9 @@ mod tpm {
                 return None;
             }
 
+            // 2. Wait for hardware report generation (ConfigFS is asynchronous)
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
             // 3. Read the report
             let report = match fs::read(format!("{}/outblob", report_dir)) {
                 Ok(data) => {
