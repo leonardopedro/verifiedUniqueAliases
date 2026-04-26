@@ -1498,7 +1498,10 @@ async fn generate_attestation(
     let final_combined_nonce = hex::encode(combined_hasher.finalize());
 
     info!("Generating hardware attestation with bound public key hash: {}", pub_key_hash_hex);
-    let mut tpm_report = tpm::quote(&final_combined_nonce).await.expect("TPM quote failed");
+    let mut tpm_report = match tpm::quote(&final_combined_nonce).await {
+        Ok(r) => r,
+        Err(e) => return format!("ERROR: Failed to generate TPM Quote: {}", e),
+    };
     tpm_report.signature_binding_pubkey_hash = pub_key_hash_hex;
     
     let tpm_val = serde_json::to_value(&tpm_report).expect("Failed to value-ize tpm_report");
