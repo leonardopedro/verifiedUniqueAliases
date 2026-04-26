@@ -185,7 +185,7 @@
     <header>
         <a href="index.html" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Back to Hub</a>
         <h1>Secure Enclave Auditor</h1>
-        <p class="subtitle">Hardware-Rooted Attestation Verification v127</p>
+        <p class="subtitle">Hardware-Rooted Attestation Verification v128</p>
     </header>
 
     <div class="grid">
@@ -549,8 +549,23 @@
 
                 // 5a. Nonce binding: report_data field is bytes 80-143
                 const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('');
-                const paddedNonce = expectedNonce.padEnd(128, '0');
-                const snpBindingOk = (reportDataHex === paddedNonce);
+                
+                // CRITICAL SEV-SNP FIX: Cryptographic Binding between Native Hardware & TPM Quote
+                // The native AMD hardware report does NOT measure our software (PCRs do). To prevent
+                // an attacker from spinning up a malicious VM and signing our nonce, the SEV-SNP
+                // report is bound to the TPM's Attestation Key: SHA256(AK_PEM || expectedNonce)
+                const akPemBytes = new TextEncoder().encode(hw.ak_pub_pem);
+                const rawExpectedNonce = new Uint8Array(expectedNonce.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+                const boundBuffer = new Uint8Array(akPemBytes.length + rawExpectedNonce.length);
+                boundBuffer.set(akPemBytes);
+                boundBuffer.set(rawExpectedNonce, akPemBytes.length);
+                const boundHashBuffer = await crypto.subtle.digest('SHA-256', boundBuffer);
+                const expectedBoundNonce = Array.from(new Uint8Array(boundHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+                const paddedExpectedBoundNonce = expectedBoundNonce.padEnd(128, '0');
+                
+                const snpBindingOk = (reportDataHex === paddedExpectedBoundNonce);
+
+                const measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
 
                 // 5b. Extract P-384 ECDSA signature from SEV-SNP report
                 //     AMD spec: R at bytes 672-719, S at bytes 720-767 (48 bytes each, little-endian)
@@ -602,14 +617,6 @@
                             siliconMsg = `❌ FAKE ROOT DETECTED: ARK fingerprint ${arkFingerprint} does not match official AMD Milan ARK.`;
                         }
                     }
-                }
-
-                // CRITICAL SEV-SNP FIX: Prevent Fake Root / Malicious VM injection.
-                // Assert the launch measurement matches the known good firmware.
-                const EXPECTED_MEASUREMENT = "your_known_good_hex_string_here"; // UPDATE THIS WITH THE REAL CI MEASUREMENT
-                const measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
-                if (EXPECTED_MEASUREMENT !== "your_known_good_hex_string_here" && measurement !== EXPECTED_MEASUREMENT) {
-                    throw new Error(`CRITICAL: VM Launch Measurement does not match the official build!\nExpected: ${EXPECTED_MEASUREMENT}\nGot: ${measurement}`);
                 }
 
                 siliconOk = snpBindingOk && snpSigOk && chainOk;
