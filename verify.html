@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Enclave Audit | Confidential Attestation Verifier</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/forge/1.3.1/forge.min.js"></script>
     <style>
         :root {
             --bg: #0a0c10;
@@ -184,7 +185,7 @@
     <header>
         <a href="index.html" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Back to Hub</a>
         <h1>Secure Enclave Auditor</h1>
-        <p class="subtitle">Hardware-Rooted Attestation Verification v119-FIXED-FINAL</p>
+        <p class="subtitle">Hardware-Rooted Attestation Verification v120</p>
     </header>
 
     <div class="grid">
@@ -272,6 +273,12 @@
         const newObj = {};
         Object.keys(obj).sort().forEach(k => { newObj[k] = reorder(obj[k]); });
         return newObj;
+    }
+
+    // 2. Utility: Decode PEM (or raw base64) to Uint8Array
+    function pemToBuffer(pem) {
+        const b64 = pem.replace(/-----(BEGIN|END).*?-----|[\s\r\n]/g, '');
+        return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
     }
 
     function getLeafCert(pem) {
@@ -421,8 +428,8 @@
             document.getElementById('signTime').innerText = new Date(report.timestamp_ms).toLocaleString();
 
             // 1. Identity Binding (Nonce Generation)
-            const pubKeyPem = (rawData.enclave_signing_public_key || report.public_key_pem || "").replace(/-----(BEGIN|END) PUBLIC KEY-----|[\s\r\n]/g, '');
-            const pubKeyBuffer = Uint8Array.from(atob(pubKeyPem), c => c.charCodeAt(0));
+            const pubKeyPem = (rawData.enclave_signing_public_key || report.public_key_pem || "");
+            const pubKeyBuffer = pemToBuffer(pubKeyPem);
             const pubKeyHash = await crypto.subtle.digest('SHA-256', pubKeyBuffer);
             const paypalHash = new Uint8Array(report.paypal_user_info_raw_hash.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
             
@@ -436,34 +443,32 @@
             updateStatus('identityCheck', true, "Identity cryptographically hashed.");
 
             // 2. Enclave Signature Validation
-            const sigB64 = rawData.enclave_signature_b64 || report.signature_b64;
-            const sig = Uint8Array.from(atob(sigB64), c => c.charCodeAt(0));
+            const sig = pemToBuffer(rawData.enclave_signature_b64 || report.signature_b64);
             const enclaveKey = await crypto.subtle.importKey('spki', pubKeyBuffer, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
             const payload = new TextEncoder().encode(JSON.stringify(reorder(report)));
             const sigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, enclaveKey, sig, payload);
-            updateStatus('enclaveCheck', sigOk, sigOk ? "Report signature verified." : "Report signature invalid!");
+            updateStatus('enclaveCheck', sigOk, sigOk ? "Report mathematically verified." : "Signature invalid!");
 
             // 3. TPM Hardware Audit (Strict Binary Parsing)
             let tpmSigOk = false;
             let tpmNonceOk = false;
             let pcrDigestOk = false;
 
-            const akPubPem = hw.ak_pub_pem.replace(/-----(BEGIN|END) PUBLIC KEY-----|[\s\r\n]/g, '');
-            const akKey = await crypto.subtle.importKey('spki', Uint8Array.from(atob(akPubPem), c => c.charCodeAt(0)), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false,['verify']);
-            const tpmMsg = Uint8Array.from(atob(hw.tpm_quote_msg), c => c.charCodeAt(0));
-            const tpmSig = Uint8Array.from(atob(hw.tpm_quote_sig), c => c.charCodeAt(0));
+            const akKey = await crypto.subtle.importKey('spki', pemToBuffer(hw.ak_pub_pem), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+            const tpmMsg = pemToBuffer(hw.tpm_quote_msg);
+            const tpmSig = pemToBuffer(hw.tpm_quote_sig);
             const rsaSig = tpmSig.length > 256 ? tpmSig.slice(tpmSig.length - 256) : tpmSig;
             
             tpmSigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, akKey, rsaSig, tpmMsg);
             
             const parsedAttest = parseTpmsAttest(tpmMsg);
-            tpmNonceOk = (parsedAttest.extraDataHex === expectedNonce); // Strictly bind to our calculated nonce
+            tpmNonceOk = (parsedAttest.extraDataHex === expectedNonce);
 
             const expectedComposite = await calculatePcrCompositeDigest(hw.pcr_values);
             pcrDigestOk = (parsedAttest.pcrDigestHex === expectedComposite);
 
             const tpmFinal = tpmSigOk && tpmNonceOk && pcrDigestOk;
-            let tpmMsgText = tpmFinal ? "TPM Quote, Nonce, and PCR Digest verified." : "TPM Verification Failed: ";
+            let tpmMsgText = tpmFinal ? "TPM Quote, Nonce, and PCR Digest strictly verified." : "TPM validation failed (Forgery detected): ";
             if (!tpmSigOk) tpmMsgText += "Signature Invalid. ";
             if (!tpmNonceOk) tpmMsgText += "Nonce Mismatch. ";
             if (!pcrDigestOk) tpmMsgText += "PCR Composite Hash Mismatch. ";
@@ -495,74 +500,100 @@
             ];
             updateStatus('githubCheck', bin.success && atomic && pcr15Ok, provResults.join('<br>'));
 
-            // 5. Silicon Root of Trust (SNP Report or Google AK Certificate)
-            let hardwareAnchorOk = false;
-            let anchorType = "Unknown";
-            let anchorDetail = "No hardware proof provided.";
-            
-            if (hw.snp_report_b64) {
-                const snp = Uint8Array.from(atob(hw.snp_report_b64), c => c.charCodeAt(0));
+            // 5. Silicon Root of Trust (ECDSA P-384 AMD SEV-SNP Signature + X.509 Chain)
+            let siliconOk = false;
+            let siliconMsg = "No hardware proof provided.";
+
+            if (hw.snp_report_b64 && hw.vcek_der_b64) {
+                // Decode the raw SEV-SNP report
+                const snp = pemToBuffer(hw.snp_report_b64);
+
+                // 5a. Nonce binding: report_data field is bytes 80-143
+                const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('');
+                const paddedNonce = expectedNonce.padEnd(128, '0');
+                const snpBindingOk = (reportDataHex === paddedNonce);
+
+                // 5b. Extract P-384 ECDSA signature from SEV-SNP report
+                //     AMD spec: R at bytes 672-719, S at bytes 720-767 (48 bytes each, little-endian)
+                const rBE = new Uint8Array(48);
+                const sBE = new Uint8Array(48);
+                for (let i = 0; i < 48; i++) {
+                    rBE[i] = snp[672 + 47 - i];
+                    sBE[i] = snp[744 + 47 - i];
+                }
+                const ecdsaSig = new Uint8Array(96);
+                ecdsaSig.set(rBE, 0);
+                ecdsaSig.set(sBE, 48);
+
+                // 5c. Import VCEK public key via forge (DER → PEM → WebCrypto)
+                const vcekDer = pemToBuffer(hw.vcek_der_b64);
+                const asn1 = forge.asn1.fromDer(forge.util.createBuffer(vcekDer));
+                const vcekCert = forge.pki.certificateFromAsn1(asn1);
+                const vcekPubPem = forge.pki.publicKeyToPem(vcekCert.publicKey);
+                const vcekKey = await crypto.subtle.importKey(
+                    'spki', pemToBuffer(vcekPubPem),
+                    { name: 'ECDSA', namedCurve: 'P-384' }, false, ['verify']
+                );
+
+                // 5d. Verify ECDSA-P384-SHA384 signature over bytes 0-671 (AMD spec)
+                const snpSigOk = await crypto.subtle.verify(
+                    { name: 'ECDSA', hash: 'SHA-384' }, vcekKey, ecdsaSig, snp.slice(0, 672)
+                );
+
+                // 5e. X.509 certificate chain: VCEK → ASK → ARK (self-signed)
+                let chainOk = false;
+                if (hw.amd_chain_b64) {
+                    const chainStr = atob(hw.amd_chain_b64);
+                    const pems = chainStr.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
+                    if (pems && pems.length >= 2) {
+                        const askCert = forge.pki.certificateFromPem(pems[0]);
+                        const arkCert = forge.pki.certificateFromPem(pems[1]);
+                        const vcekVerified = askCert.verify(vcekCert);
+                        const askVerified  = arkCert.verify(askCert);
+                        chainOk = vcekVerified && askVerified;
+                    }
+                }
+
+                siliconOk = snpBindingOk && snpSigOk && chainOk;
+                siliconMsg = siliconOk
+                    ? "✅ Valid SEV-SNP P-384 Signature & X.509 Chain."
+                    : `❌ Silicon Verification Failed (binding=${snpBindingOk}, sig=${snpSigOk}, chain=${chainOk}).`;
+
+            } else if (hw.snp_report_b64) {
+                // Fallback: Google AK Certificate (DER/PEM heuristic) — no VCEK provided
+                const snp = pemToBuffer(hw.snp_report_b64);
                 const derHex = Array.from(snp).map(b => b.toString(16).padStart(2,'0')).join('');
-                
-                // Detection:
-                // - DER X.509: starts with ASN.1 SEQUENCE 0x30 0x82
-                // - PEM text: first byte is '-' (0x2D)
-                // - Raw AMD SEV-SNP report: none of the above
-                const isPemText = snp[0] === 0x2D;
                 const isDerCert = snp[0] === 0x30 && snp[1] === 0x82;
-                
+                const isPemText = snp[0] === 0x2D;
+
                 if (isPemText || isDerCert) {
-                    anchorType = isDerCert ? "Google AK Certificate (DER)" : "Google AK Certificate (PEM)";
-                    
-                    // === Verification ===
-                    // 1. Google OID check: Google's PEN is 11129. In base-128 VLQ this encodes as 0xD6 0x79.
-                    //    All Google Cloud OIDs (1.3.6.1.4.1.11129.*) contain this sequence in DER.
+                    // Google OID: PEN 11129 → DER VLQ 0xD6 0x79; ASCII "Google" = 476f6f676c65
                     const hasGooglePen = derHex.includes('d679');
-                    
-                    // 2. ASCII "Google" = 0x476f6f676c65 in hex
                     const hasGoogleStr = derHex.includes('476f6f676c65');
-                    
-                    hardwareAnchorOk = hasGooglePen || hasGoogleStr;
-                    
-                    // === Display: decode key fields from DER ===
-                    // Extract all readable ASCII strings (length > 4) from the DER blob
+                    siliconOk = hasGooglePen || hasGoogleStr;
+
+                    // Decode readable identity strings from DER blob
                     const readableStrings = [];
                     let i = 0;
                     while (i < snp.length - 4) {
                         if (snp[i] >= 0x20 && snp[i] <= 0x7E) {
-                            let j = i;
-                            let s = '';
-                            while (j < snp.length && snp[j] >= 0x20 && snp[j] <= 0x7E) {
-                                s += String.fromCharCode(snp[j]);
-                                j++;
-                            }
+                            let j = i, s = '';
+                            while (j < snp.length && snp[j] >= 0x20 && snp[j] <= 0x7E) { s += String.fromCharCode(snp[j++]); }
                             if (s.length >= 5) readableStrings.push(s);
                             i = j;
-                        } else {
-                            i++;
-                        }
+                        } else { i++; }
                     }
-                    // Filter to meaningful identity strings
                     const identityStrings = readableStrings.filter(s =>
                         s.includes('Google') || s.includes('Cloud') || s.includes('project-') ||
-                        s.includes('paypal') || s.includes('europe') || s.includes('EK') ||
-                        s.includes('vm-v')
+                        s.includes('paypal') || s.includes('europe') || s.includes('EK') || s.includes('vm-v')
                     );
-                    anchorDetail = identityStrings.slice(0, 5).join('<br>') || `DER cert (${snp.length} bytes)`;
-                    
-                } else if (snp.length >= 1184) {
-                    // Raw AMD SEV-SNP binary report
-                    anchorType = "AMD SEV-SNP";
-                    const measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2,'0')).join('');
-                    const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('');
-                    const paddedNonce = expectedNonce.padEnd(128, '0');
-                    hardwareAnchorOk = (reportDataHex === paddedNonce);
-                    anchorDetail = `Measurement: ${measurement}`;
+                    const anchorType = isDerCert ? "Google AK Certificate (DER)" : "Google AK Certificate (PEM)";
+                    const detail = identityStrings.slice(0, 5).join('<br>') || `DER cert (${snp.length} bytes)`;
+                    siliconMsg = (siliconOk ? `✅ Valid ${anchorType} Anchor` : `❌ ${anchorType} Anchor Failed`) + `<br>${detail}`;
                 }
             }
-            
-            const bindingStatus = hardwareAnchorOk ? `✅ Valid ${anchorType} Anchor` : `❌ ${anchorType} Anchor Failed`;
-            updateStatus('firmwareCheck', hardwareAnchorOk && tpmFinal, `Silicon Audit: ${bindingStatus}<br>${anchorDetail}`);
+
+            updateStatus('firmwareCheck', siliconOk && tpmFinal, siliconMsg);
 
             // 6. TLS Binding
             const certInput = document.getElementById('certInput').value;
