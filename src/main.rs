@@ -459,6 +459,7 @@ mod tpm {
         pub pcr_values: std::collections::BTreeMap<String, String>,
         pub nonce_hex: String,
         pub snp_report_b64: Option<String>,
+        pub auxblob_b64: Option<String>,
         pub signature_binding_pubkey_hash: String,
     }
 
@@ -466,7 +467,7 @@ mod tpm {
         use std::fs;
         use base64::{engine::general_purpose::STANDARD, Engine as _};
 
-        pub fn get_report(nonce: &[u8; 64]) -> Option<String> {
+        pub fn get_report(nonce: &[u8; 64]) -> Option<(String, Option<String>)> {
             // v86-master: Use the modern unified TSM (Trusted Security Module) ConfigFS interface
             // This works on Linux 6.3+ and supports SEV-SNP, TDX, etc.
             let tsm_base = "/sys/kernel/config/tsm/report";
@@ -496,10 +497,17 @@ mod tpm {
                     None
                 }
             };
-            
-            // Cleanup
-            let _ = fs::remove_dir(&report_dir);
-            report
+
+            let auxblob = match fs::read(format!("{}/auxblob", report_dir)) {
+                Ok(data) if !data.is_empty() => {
+                    tracing::info!("Successfully read SNP auxblob from ConfigFS ({} bytes)", data.len());
+                    Some(STANDARD.encode(&data))
+                },
+                _ => None,
+            };
+
+            let _ = fs::remove_dir_all(&report_dir);
+            report.map(|r| (r, auxblob))
         }
     }
 
@@ -714,14 +722,49 @@ mod tpm {
         nonce_bytes[..32].copy_from_slice(&bound_nonce);
 
         tracing::info!("DEBUG: SNP nonce bytes prepared");
+        let mut auxblob_b64 = None;
         let snp_report_b64 = match snp::get_report(&nonce_bytes) {
-            Some(report) => {
+            Some((report, aux)) => {
                 tracing::info!("Obtained SEV-SNP report via TSM ConfigFS");
+                auxblob_b64 = aux;
                 Some(report)
             },
             None => {
-                tracing::error!("TSM ConfigFS failed. Cannot securely bind session AK without native hardware report.");
-                None
+                tracing::info!("TSM ConfigFS failed or unsupported, trying known GCP NVRAM handles...");
+                let indices = [
+                    ("0x01c00002", "1184"), 
+                    ("0x01400001", "1248"),
+                    ("0x01c00001", "1184")
+                ];
+                let mut data = vec![];
+                for (idx, size) in &indices {
+                    tracing::info!("DEBUG: Trying NVRAM index {} (Owner Hierarchy)", idx);
+                    match run_cmd("tpm2", &["nvread", idx, "-C", "o", "-s", size]).await {
+                        Ok(d) if !d.is_empty() => {
+                            tracing::info!("Obtained report from NVRAM index {} (Owner)", idx);
+                            data = d;
+                            break;
+                        },
+                        _ => {
+                            tracing::info!("DEBUG: Trying NVRAM index {} (Platform Hierarchy)", idx);
+                            match run_cmd("tpm2", &["nvread", idx, "-C", "p", "-s", size]).await {
+                                Ok(d) if !d.is_empty() => {
+                                    tracing::info!("Obtained report from NVRAM index {} (Platform)", idx);
+                                    data = d;
+                                    break;
+                                },
+                                _ => { tracing::debug!("Index {} not found in O or P hierarchies", idx); }
+                            }
+                        }
+                    }
+                }
+                
+                if !data.is_empty() {
+                    Some(STANDARD.encode(data))
+                } else {
+                    tracing::error!("All hardware report strategies failed.");
+                    None
+                }
             }
         };
         tracing::info!("DEBUG: SNP report fetch complete");
@@ -737,6 +780,7 @@ mod tpm {
             pcr_values,
             nonce_hex: nonce_hex.to_string(),
             snp_report_b64,
+            auxblob_b64,
             signature_binding_pubkey_hash: "".to_string(), // Filled by caller
         })
     }
