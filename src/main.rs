@@ -707,46 +707,97 @@ mod tpm {
         // 1. Find the persistent AK handle dynamically from the GCP vTPM
         let mut ak_ctx = String::new();
         
-        // v121: Try standard GCP AK handles directly first for speed and reliability
-        for h in ["0x81010002", "0x81010001", "0x81000001", "0x81000002"] {
-            if let Ok(pub_out) = run_cmd("tpm2_readpublic", &["-c", h]).await {
-                let pub_str = String::from_utf8_lossy(&pub_out);
-                if pub_str.contains("sign") && pub_str.contains("restricted") {
-                    tracing::info!("DEBUG: Found standard AK handle: {}", h);
-                    ak_ctx = h.to_string();
-                    break;
+        // v143: Aggressive 'Shotgun' AK Discovery with explicit error logging
+        let standard_handles = ["0x81010002", "0x81010001", "0x81000001", "0x81000002"];
+        for h in &standard_handles {
+            // Try both tpm2_readpublic and tpm2 readpublic
+            for cmd in ["tpm2_readpublic", "tpm2"] {
+                let args = if cmd == "tpm2" { vec!["readpublic", "-c", h] } else { vec!["-c", h] };
+                match run_cmd(cmd, &args).await {
+                    Ok(pub_out) => {
+                        let pub_str = String::from_utf8_lossy(&pub_out).to_lowercase();
+                        if pub_str.contains("sign") {
+                            tracing::info!("DEBUG: Successfully anchored to hardware AK handle: {} (via {})", h, cmd);
+                            ak_ctx = h.to_string();
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("DEBUG: Failed to read handle {} via {}: {}", h, cmd, e);
+                    }
+                }
+            }
+            if !ak_ctx.is_empty() { break; }
+        }
+
+        if ak_ctx.is_empty() {
+            tracing::error!("Standard handles failed. SYSTEMATIC SEARCH of persistent handles...");
+            // Try systemically searching a wider range if the cap list fails
+            for i in 0..10 {
+                let h = format!("0x8101000{:x}", i);
+                if let Ok(pub_out) = run_cmd("tpm2_readpublic", &["-c", &h]).await {
+                    if String::from_utf8_lossy(&pub_out).to_lowercase().contains("sign") {
+                        ak_ctx = h;
+                        break;
+                    }
                 }
             }
         }
 
         if ak_ctx.is_empty() {
-            if let Ok(handles_out) = run_cmd("tpm2_getcap", &["handles-persistent"]).await {
-                let str_out = String::from_utf8_lossy(&handles_out);
-                // v122: More robust parsing for handles-persistent output (handles YAML and lists)
-                for part in str_out.split(|c: char| !c.is_alphanumeric() && c != 'x') {
-                    if part.starts_with("0x81") {
-                        let h_str = part.to_string();
-                        if let Ok(pub_out) = run_cmd("tpm2_readpublic", &["-c", &h_str]).await {
-                            let pub_str = String::from_utf8_lossy(&pub_out);
-                            if pub_str.contains("sign") {
-                                ak_ctx = h_str;
-                                break;
+            tracing::warn!("Systematic search failed. Attempting capability discovery...");
+            for cmd in ["tpm2_getcap", "tpm2"] {
+                let args = if cmd == "tpm2" { vec!["getcap", "handles-persistent"] } else { vec!["handles-persistent"] };
+                match run_cmd(cmd, &args).await {
+                    Ok(handles_out) => {
+                        let str_out = String::from_utf8_lossy(&handles_out);
+                        tracing::info!("Discovered persistent handles via {}: {}", cmd, str_out);
+                        for part in str_out.split(|c: char| !c.is_alphanumeric() && c != 'x') {
+                            if part.starts_with("0x81") {
+                                let h_str = part.to_string();
+                                if let Ok(pub_out) = run_cmd("tpm2_readpublic", &["-c", &h_str]).await {
+                                    if String::from_utf8_lossy(&pub_out).to_lowercase().contains("sign") {
+                                        ak_ctx = h_str;
+                                        break;
+                                    }
+                                }
                             }
                         }
-                    }
+                    },
+                    Err(e) => tracing::error!("Capability discovery failed via {}: {}", cmd, e),
                 }
+                if !ak_ctx.is_empty() { break; }
             }
         }
         
-        // If we still didn't find one, fallback to generating a Session AK
+        // v145: GCP vTPM Architecture — Session AK for Signing
+        // The Google EK Cert (NVRAM) proves hardware identity. The TPM Quote is signed
+        // by a fresh session signing key (session AK), created via tpm2_createprimary.
+        // These are intentionally different keys — EK = silicon proof, session AK = quote signer.
         if ak_ctx.is_empty() {
-            tracing::warn!("DEBUG: Could not find pre-provisioned AK. Regenerating Session AK via tpm2_createprimary...");
-            ak_ctx = format!("{}/ak.ctx", work_dir);
-            // v122: Create a simple primary signing key. 
-            // Non-restricted signing keys avoid the complex template requirements that cause 0x2D6/0x2D2 errors.
-            run_cmd("tpm2_createprimary", &["-C", "e", "-g", "sha256", "-G", "rsa2048", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign", "-c", &ak_ctx]).await?;
-        } else {
-            tracing::info!("DEBUG: Using AK Handle: {}", ak_ctx);
+            tracing::info!("Creating session signing AK via tpm2_createprimary...");
+            let ak_ctx_file = format!("{}/ak.ctx", work_dir);
+            for cmd in ["tpm2_createprimary", "tpm2"] {
+                let args = if cmd == "tpm2" {
+                    vec!["createprimary", "-C", "e", "-g", "sha256", "-G", "rsa2048", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign", "-c", &ak_ctx_file]
+                } else {
+                    vec!["-C", "e", "-g", "sha256", "-G", "rsa2048", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign", "-c", &ak_ctx_file]
+                };
+                match run_cmd(cmd, &args).await {
+                    Ok(_) => {
+                        tracing::info!("Session signing AK created via {}", cmd);
+                        ak_ctx = ak_ctx_file;
+                        break;
+                    },
+                    Err(e) => tracing::error!("createprimary failed via {}: {}", cmd, e),
+                }
+            }
+        }
+
+        
+        // Final fallback: Failure
+        if ak_ctx.is_empty() {
+            return Err("CRITICAL: Could not find or derive a hardware-bound AK. Identity cannot be verified.".into());
         }
 
         // Extract AK PEM for the report
