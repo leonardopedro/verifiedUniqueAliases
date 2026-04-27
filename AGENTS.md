@@ -32,16 +32,17 @@ GCP Confidential VMs (n2d with AMD SEV-SNP) **do not pre-provision persistent At
 
 ### What The Auditor Must Do
 The correct verification chain is:
-1. **AMD SEV-SNP Report**: The auditor must extract the native `snp_report_b64` and verify its cryptographic binding to the TPM session via the `report_data` field (`SHA-256(AK_PUB + Nonce)`).
-2. **AMD VCEK Verification**: The auditor must verify the ECDSA signature of the SNP report against the AMD Versioned Chip Endorsement Key (VCEK), completely bypassing Google's infrastructure.
-3. **TPM Quote** (signed by session AK): Verify the `TPMS_ATTEST` structure, PCR composite, and nonce → proves measurement integrity for this session.
-
-**CRITICAL RULE: DO NOT TRUST GOOGLE'S EK CERTIFICATE.** Using `google_ak_cert_pem` as a fallback or primary anchor is prohibited. We must rely exclusively on the hardware-signed AMD report.
+1. **EK Certificate** (from `report.google_ak_cert_pem`): Verify it is issued by `EK/AK CA Intermediate` under Google's CA hierarchy → proves silicon identity
+2. **TPM Quote** (signed by session AK): Verify the `TPMS_ATTEST` structure, PCR composite, and nonce → proves measurement integrity for this session
+3. **Do NOT** compare the EK cert public key to the session AK public key — they are different by design
 
 ### What Does NOT Work on This Platform
 - **`/dev/sev-guest`**: Missing. GCP abstracts AMD SEV-SNP behind the vTPM interface.
+- **`tsm` / `amd_tsm` kernel modules**: Load but are non-functional in the GCP vTPM abstraction layer.
+- **`tpm2_getcap handles-persistent`** standalone binary: Not available in initramfs. Use `tpm2 getcap handles-persistent`.
+- **`tpm2_createak`**: Available but cannot use the `-D` (digest) flag — invalid option on this version.
 - **ConfigFS TSM path**: Times out; the vTPM does not expose this interface reliably.
-- **GCP Compute Metadata API for attestation**: Do not use. Hypervisor-controlled; not trustworthy for hardware attestation.
+- **GCP Compute Metadata API for attestation**: Removed. Hypervisor-controlled; not trustworthy for hardware attestation.
 
 ## Unified Synthesis Pipeline (v145)
 To ensure 100% bitwise reproducibility regardless of the host build environment, the project uses a multi-stage Docker synthesis engine (`Dockerfile.repro`).
