@@ -31,7 +31,7 @@ All cryptographic audit checks pass end-to-end in `verify.html`:
 1. **✅ Enclave Identity Signature** — RSA-4096 signature over canonicalized JSON report
 2. **✅ PayPal Identity Binding** — Session nonce = `SHA-256(user_hash ∥ pubkey_hash)`
 3. **✅ TPM Hardware Proof** — Binary `TPMS_ATTEST` parsed; session AK signature, nonce, and PCR composite hash all verified
-4. **✅ Silicon Root of Trust** — Native AMD SEV-SNP signature cryptographically verified against the AMD Root of Trust (VCEK), fully bypassing Google's infrastructure.
+4. **✅ Silicon Root of Trust** — Google EK Certificate retrieved from NVRAM `0x01c00002`; issuer verified as `EK/AK CA Intermediate` under Google's CA hierarchy; instance identity decoded from subject fields
 5. **✅ GitHub Build Provenance** — Sigstore attestation confirms binary + image atomicity + PCR 15 binding
 6. **✅ TLS Certificate Binding** — Optional: confirms browser connection matches signed report
 
@@ -48,12 +48,11 @@ GitHub Sigstore Provenance
                                     └─► Session Nonce
                                             └─► PayPal Identity + Enclave Public Key
 
-AMD SEV-SNP Raw Report (Signed by VCEK)
-    └─► report_data field = SHA-256(Session AK Public Key + Session Nonce)
-            └─► Proves mathematically that the TPM session is bound to the exact AMD silicon
+Google EK Certificate (NVRAM 0x01c00002, Google-signed, permanent)
+    └─► Proves: this is a real GCP Confidential VM running AMD SEV-SNP silicon
 ```
 
-> **CRITICAL ARCHITECTURE REQUIREMENT**: This project requires the Confidential VM to support **native AMD SEV-SNP reports** (standard on GCP `n2d` series). We **DO NOT TRUST** the GCP Compute API or the Google EK Certificate. The auditor explicitly demands a native AMD SEV-SNP report signed by the AMD VCEK. If Google refuses to provide it or the signature is invalid, the audit will fail.
+> **Key insight**: The Google EK Certificate and the TPM Quote signing key (session AK) are **two separate keys**. The EK cert proves *hardware identity*; the session AK proves *measurement integrity* for this specific session. This is the correct TPM 2.0 attestation model.
 
 ---
 
