@@ -920,7 +920,17 @@ mod tpm {
                     if v >= 1 && v <= 4 {
                         let end = (offset + 1184).min(data.len());
                         if end - offset >= 1088 {
-                            return Some(data[offset..end].to_vec());
+                            let snp_slice = &data[offset..end];
+                            if snp_slice.len() >= 1088 {
+                                let chip_id = hex::encode(&snp_slice[1024..1088]);
+                                let bl = snp_slice.get(16).copied().unwrap_or(0);
+                                let tee = snp_slice.get(17).copied().unwrap_or(0);
+                                let snp_val = snp_slice.get(22).copied().unwrap_or(0);
+                                let ucode = snp_slice.get(23).copied().unwrap_or(0);
+                                tracing::info!("AMD TCB Info - ChipID: {}, BL: {}, TEE: {}, SNP: {}, UCode: {}", 
+                                    &chip_id[..16], bl, tee, snp_val, ucode);
+                            }
+                            return Some(snp_slice.to_vec());
                         }
                     }
                 }
