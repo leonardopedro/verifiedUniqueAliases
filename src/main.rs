@@ -946,24 +946,37 @@ mod tpm {
 
         'nvram: for idx in &discovered_handles {
             let data = if let Ok(d) = run_cmd("tpm2_nvread", &["-C", "o", idx]).await { d }
+                       else if let Ok(d) = run_cmd("tpm2_nvread", &["-C", "p", idx]).await { d }
+                       else if let Ok(d) = run_cmd("tpm2_nvread", &["-C", "e", idx]).await { d }
                        else if let Ok(d) = run_cmd("tpm2", &["nvread", idx]).await { d }
                        else { continue; };
 
             if data.len() < 32 { continue; }
             tracing::info!("v136: NVRAM {} returned {} bytes", idx, data.len());
-            auxblob_b64 = Some(STANDARD.encode(&data));
+            
+            // v147: Chip ID Hunter — scan for SNP report header (0x01) at any offset
+            for offset in (0..data.len().saturating_sub(1088)).step_by(8) {
+                if let Some(snp) = try_parse_snp(&data[offset..]) {
+                    tracing::info!("v147: Found SNP report at NVRAM {} offset {}", idx, offset);
+                    let chip_id = hex::encode(&snp[1024..1088]);
+                    tracing::info!("v147: AMD Chip ID: {}", &chip_id[..16]);
+                    vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
+                    amd_chain_b64 = fetch_amd_chain().await;
+                    snp_report_b64 = Some(STANDARD.encode(&snp));
+                    break 'nvram;
+                }
+            }
+            
+            // Fallback for smaller/truncated reports in auxblob
             if let Some(snp) = try_parse_snp(&data) {
                 tracing::info!("v136: Parsed SNP report ({} bytes) from NVRAM {}", snp.len(), idx);
                 if snp.len() >= 1088 {
                     let chip_id = hex::encode(&snp[1024..1088]);
-                    tracing::info!("v136: AMD Chip ID: {}", &chip_id[..16]);
                     vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
                     amd_chain_b64 = fetch_amd_chain().await;
                 }
                 snp_report_b64 = Some(STANDARD.encode(&snp));
                 break 'nvram;
-            } else {
-                tracing::warn!("v136: NVRAM {} data has no valid SNP version header", idx);
             }
         }
 
@@ -974,14 +987,29 @@ mod tpm {
                 if !raw.is_empty() {
                     tracing::info!("v136: auxblob {} bytes", raw.len());
                     if auxblob_b64.is_none() { auxblob_b64 = Some(STANDARD.encode(&raw)); }
-                    if let Some(snp) = try_parse_snp(&raw) {
-                        if snp.len() >= 1088 {
+                    
+                    // v147: Chip ID Hunter in auxblob
+                    for offset in (0..raw.len().saturating_sub(1088)).step_by(8) {
+                        if let Some(snp) = try_parse_snp(&raw[offset..]) {
+                            tracing::info!("v147: Found SNP report in auxblob at offset {}", offset);
                             let chip_id = hex::encode(&snp[1024..1088]);
                             vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
                             amd_chain_b64 = fetch_amd_chain().await;
+                            snp_report_b64 = Some(STANDARD.encode(&snp));
+                            break;
                         }
-                        snp_report_b64 = Some(STANDARD.encode(&snp));
-                        tracing::info!("v136: Found SNP report in auxblob");
+                    }
+
+                    if snp_report_b64.is_none() {
+                        if let Some(snp) = try_parse_snp(&raw) {
+                            if snp.len() >= 1088 {
+                                let chip_id = hex::encode(&snp[1024..1088]);
+                                vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
+                                amd_chain_b64 = fetch_amd_chain().await;
+                            }
+                            snp_report_b64 = Some(STANDARD.encode(&snp));
+                            tracing::info!("v136: Found SNP report in auxblob");
+                        }
                     }
                 }
             }
@@ -1831,7 +1859,11 @@ fn hardened_client() -> reqwest::Client {
     use reqwest::Certificate;
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .use_rustls_tls();
+        .use_rustls_tls()
+        // v151: DNS Egress Hardening (Prevent DNS Hijacking)
+        // Hardcode PayPal API production IP to bypass OS resolver.
+        .resolve("api-m.paypal.com", std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(104, 16, 124, 74)), 443))
+        .resolve("api-m.sandbox.paypal.com", std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(146, 75, 123, 1)), 443));
     
     // Pin PayPal Root CA (Embedded)
     if let Ok(cert) = Certificate::from_pem(PAYPAL_CA_PEM) {
