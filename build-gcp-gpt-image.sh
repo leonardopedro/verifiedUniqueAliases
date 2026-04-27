@@ -59,7 +59,7 @@ cat <<EOF > grub.cfg
 set default=0
 set timeout=0
 menuentry "GCP Confidential PayPal Auth (Secure & Measured)" {
-    linux /EFI/BOOT/vmlinuz root=tmpfs rootok=1 console=ttyS0 selinux=0 panic=1 net.ifnames=0 biosdevname=0 rd.debug
+    linux /EFI/BOOT/vmlinuz root=tmpfs rootok=1 console=ttyS0 selinux=0 panic=1 net.ifnames=0 biosdevname=0 mem_encryption=on sev=on rd.debug
     initrd /EFI/BOOT/initrd.img
 }
 EOF

@@ -133,6 +133,11 @@ fi
 echo "🚀 Installing Enclave Init..."
 # Use our robust helper to ensure all shared libraries (libc, libssl, libcrypto, etc.) are included
 copy_bin_and_deps "$BIN_PATH"
+copy_bin_and_deps "tpm2"
+copy_bin_and_deps "tpm2_nvread"
+copy_bin_and_deps "tpm2_createprimary"
+copy_bin_and_deps "tpm2_quote"
+copy_bin_and_deps "tpm2_createak"
 
 # Now symlink the binary to /init as expected by the kernel
 ln -sf "$BIN_PATH" ./init
