@@ -43,6 +43,8 @@ mod enclave_init {
         modprobe("configfs");
         let _ = std::process::Command::new("/bin/mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
         
+        modprobe("virt_anchor");
+        modprobe("coco");
         modprobe("tsm");
         modprobe("amd_tsm");
         modprobe("amd-tsm");
@@ -231,7 +233,7 @@ mod enclave_init {
             if let Ok(output) = std::process::Command::new(path).args(["/lib/modules", "-name", "*.ko"]).output() {
                 let s = String::from_utf8_lossy(&output.stdout);
                 for line in s.lines() {
-                    if line.contains("tsm") || line.contains("sev") || line.contains("coco") || line.contains("virtio") || line.contains("gve") || line.contains("configfs") {
+                    if line.contains("tsm") || line.contains("sev") || line.contains("coco") || line.contains("anchor") || line.contains("virtio") || line.contains("gve") || line.contains("configfs") {
                         kmsg(&format!("insmod {}", line));
                         let _ = std::process::Command::new("/sbin/insmod").arg(line).status();
                     }
