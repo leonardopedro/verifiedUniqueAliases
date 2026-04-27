@@ -930,15 +930,26 @@ mod tpm {
 
         // PATH 1: GCP vTPM NVRAM — AMD SNP report provisioned by hypervisor at boot
         // Index 0x01400001 is the well-known GCP location for the hardware SNP report.
-        tracing::info!("v136: PATH 1 — NVRAM index 0x01400001 (GCP SEV-SNP standard)");
-        'nvram: for idx in &["0x01400001", "0x01400002"] {
+        tracing::info!("v136: PATH 1 — NVRAM discovery and systematic scan");
+        let mut discovered_handles = vec!["0x01400001".to_string(), "0x01400002".to_string(), "0x01c00003".to_string()];
+        if let Ok(output) = run_cmd("tpm2", &["getcap", "handles-nv-indices"]).await {
+             let s = String::from_utf8_lossy(&output);
+             for line in s.lines() {
+                 if let Some(h) = line.split_whitespace().find(|s| s.starts_with("0x")) {
+                     discovered_handles.push(h.to_string());
+                 }
+             }
+        }
+        discovered_handles.sort();
+        discovered_handles.dedup();
+        tracing::info!("v136: Scanning discovered NV handles: {:?}", discovered_handles);
+
+        'nvram: for idx in &discovered_handles {
             let data = if let Ok(d) = run_cmd("tpm2_nvread", &["-C", "o", idx]).await { d }
                        else if let Ok(d) = run_cmd("tpm2", &["nvread", idx]).await { d }
-                       else { tracing::warn!("v136: NVRAM {} read failed", idx); continue; };
-            if data.len() < 100 {
-                tracing::warn!("v136: NVRAM {} too small ({} bytes)", idx, data.len());
-                continue;
-            }
+                       else { continue; };
+
+            if data.len() < 32 { continue; }
             tracing::info!("v136: NVRAM {} returned {} bytes", idx, data.len());
             auxblob_b64 = Some(STANDARD.encode(&data));
             if let Some(snp) = try_parse_snp(&data) {
