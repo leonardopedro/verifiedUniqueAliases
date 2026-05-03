@@ -1,0 +1,141 @@
+============================================================
+🚀 Deploying GCP Confidential Auth VM (End-to-End)
+============================================================
+✅ Configuration Loaded:
+   - Project: project-ae136ba1-3cc9-42cf-a48
+   - Target VM: paypal-auth-vm-v60 (34.7.107.227)
+
+🏗️  [0/3] Rotating Google Public CA EAB Keys...
+Created an external account key
+[b64MacKey: ssp1tX1TY1sIyNj5aWTF9Rk21P93KIJ2u9-v8buob5z-5zRkxtZMRQa_SOKy7v2XQNhNtqJ7kesBv59WrnYj7UA
+keyId: 1f256eb7b209f4de9a1b07a2a770c392]
+
+   - New Key ID: 1f256eb7b209f4de9a1b07a2a770c392
+Created version [223] of the secret [EAB_KEY_ID].
+Created version [223] of the secret [EAB_HMAC_KEY].
+✅ EAB Secrets Updated.
+
+🔑 [0.5/3] Checking Attestation Signing Keys...
+   ✅ PAYPAL_AUTH_PRODUCTION: Signature key already exists.
+   ✅ PAYPAL_AUTH_STAGING: Signature key already exists.
+
+📦 [1/6] Building reproducing Rust binary and Disk locally...
+[1/2] STEP 1/13: FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a AS rust-builder
+[1/2] STEP 2/13: ENV DEBIAN_FRONTEND=noninteractive
+--> Using cache 7835220ec7d25172586c3dc7dd61cb22541f4d69832876e499b2ef824cbcd43d
+--> 7835220ec7d2
+[1/2] STEP 3/13: RUN echo 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/20260406T000000Z\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/20260406T000000Z\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp' > /etc/apt/sources.list.d/debian.sources
+--> Using cache 8888e0ae3cc4eb4efa9bdd95d9c81930f50b1eb54d42ac6744e4e7e1237a9b31
+--> 8888e0ae3cc4
+[1/2] STEP 4/13: RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends     curl ca-certificates gcc g++ make pkg-config libssl-dev     && rm -rf /var/lib/apt/lists/*
+--> Using cache 68745f0594f967726dd70d4f2613771be300dbe820395455569eef4a97c363fe
+--> 68745f0594f9
+[1/2] STEP 5/13: ARG RUST_VERSION=1.91.1
+--> Using cache cbeda664c23912fa8b3b68a291b4f2ef5096edc13679b563606898a3ccf2ce46
+--> cbeda664c239
+[1/2] STEP 6/13: ENV RUSTUP_HOME=/usr/local/rustup     CARGO_HOME=/usr/local/cargo     PATH=/usr/local/cargo/bin:$PATH
+--> Using cache 69792b711df725ce8a140a5667c97941da2851b89436718e75e030cc59d2296d
+--> 69792b711df7
+[1/2] STEP 7/13: RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs     | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal --no-modify-path     && . /usr/local/cargo/env     && export RUST_MIN_STACK=16777216     && cargo install -j 1 --root /usr --locked add-determinism     && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
+--> Using cache ebacf8cb8f11fc9fbb1ae2f46abc1fcd7db5649efbbe5f830f91ead4b6cd8963
+--> ebacf8cb8f11
+[1/2] STEP 8/13: WORKDIR /app
+--> Using cache 88748361bad44a092d3e52debe3f5e539b7b187be0b2a77dac975b791def58ee
+--> 88748361bad4
+[1/2] STEP 9/13: COPY Cargo.toml Cargo.lock ./
+--> Using cache e1da0ef4b1ce0449479ae9316de6b48069df9ed5679fa51cbdb75c4a67e2a48a
+--> e1da0ef4b1ce
+[1/2] STEP 10/13: ENV RUSTFLAGS="-C target-cpu=generic -C strip=symbols"
+--> Using cache e4d4c57d6d3426f964dfbdc462168fa13368586821bc5fdb13b768c1374032b3
+--> e4d4c57d6d34
+[1/2] STEP 11/13: RUN bash -c ". /usr/local/cargo/env &&     set -euo pipefail &&     mkdir -p src &&     echo 'fn main() {}' > src/main.rs &&     cargo build --release --target x86_64-unknown-linux-gnu &&     rm -f target/x86_64-unknown-linux-gnu/release/deps/paypal_auth_vm*           target/x86_64-unknown-linux-gnu/release/paypal_auth_vm*           target/x86_64-unknown-linux-gnu/release/deps/paypal-auth-vm*"
+--> Using cache 7cd3aecfd123e7b1652cbda1b32e89db2101914a0b9a313a2e289e7c3ef5010e
+--> 7cd3aecfd123
+[1/2] STEP 12/13: COPY src ./src
+--> Using cache 3b421bb1154057af799a5f39c3d14c9f80c883bdd7af15e38439de5ea2e5dde0
+--> 3b421bb11540
+[1/2] STEP 13/13: RUN bash -c ". /usr/local/cargo/env &&     set -euo pipefail &&     cargo build --release --target x86_64-unknown-linux-gnu &&     cp target/x86_64-unknown-linux-gnu/release/paypal-auth-vm /paypal-auth-vm-bin"
+--> Using cache 5bde165d10b14e91000b4a3ab8534e345454c088439339bcf2eaa2ab24d0fad4
+--> 5bde165d10b1
+[2/2] STEP 1/15: FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a AS image-builder
+[2/2] STEP 2/15: ENV DEBIAN_FRONTEND=noninteractive
+--> Using cache 7835220ec7d25172586c3dc7dd61cb22541f4d69832876e499b2ef824cbcd43d
+--> 7835220ec7d2
+[2/2] STEP 3/15: ENV SOURCE_DATE_EPOCH=1712260800
+--> Using cache 735f416e7df9fc0406ce9ba74ab113b2bef48b3533240dc55351905909b5d312
+--> 735f416e7df9
+[2/2] STEP 4/15: ENV TZ=UTC
+--> Using cache 83625df32a246fb1b5582e70614378098f25c217fe5a0fc1dc77250acb5b86ae
+--> 83625df32a24
+[2/2] STEP 5/15: ENV LC_ALL=C.UTF-8
+--> Using cache d0ce697f646d43aa6dd889d5d93a4a5ce83bf01dc45816cfebea440829630853
+--> d0ce697f646d
+[2/2] STEP 6/15: RUN echo 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/20260406T000000Z\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/20260406T000000Z\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp' > /etc/apt/sources.list.d/debian.sources
+--> Using cache 38ab477062af762a02e91535caf579ce63221f3b29f1aab0a6af5991d3c4e6bc
+--> 38ab477062af
+[2/2] STEP 7/15: RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends     curl ca-certificates gcc g++ make pkg-config libssl-dev     cpio xz-utils zstd qemu-utils mtools gdisk binutils initramfs-tools     linux-image-cloud-amd64 shim-signed grub-efi-amd64-signed     tpm2-tools iproute2 kmod python3 file dosfstools bash nftables     pciutils     && rm -rf /var/lib/apt/lists/*
+--> Using cache 7a5bf72d373aeced570abcc8c4756e95197fb3e1b679b82015187622d25d4c29
+--> 7a5bf72d373a
+[2/2] STEP 8/15: WORKDIR /build
+--> Using cache fea7090df95357f38a3f3c7ae9b20dc8e6f1901f722db98c141142e27010c175
+--> fea7090df953
+[2/2] STEP 9/15: COPY --from=rust-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin
+--> Using cache b45452323ca52852c49beb472591c0d6ded1ecc5b1d07ddd6a14e6af81d2fd4f
+--> b45452323ca5
+[2/2] STEP 10/15: COPY --from=rust-builder /usr/bin/add-det /usr/bin/add-det
+--> Using cache 1fa40b0ec0df8fe0ad69c5f10df32777cf78669c7eb6531fe59a4c87fbd859d6
+--> 1fa40b0ec0df
+[2/2] STEP 11/15: COPY build-initramfs-tools.sh build-gcp-gpt-image.sh ./
+--> Using cache fe661af71d5000500b9117623431fe701388d0813999fc1578a308f84acfcdf1
+--> fe661af71d50
+[2/2] STEP 12/15: COPY src ./src
+--> Using cache 6e3419df41d7fd4250f78f80e81e7489bcaa532172768c315f2b3ec249018089
+--> 6e3419df41d7
+[2/2] STEP 13/15: RUN chmod +x build-initramfs-tools.sh build-gcp-gpt-image.sh &&     dpkg-query -W -f='${Package} ${Version} ${Architecture}\n' | sort > /build/packages.txt &&     echo "=== Installed Package Manifest ===" && cat /build/packages.txt &&     ./build-initramfs-tools.sh &&     ./build-gcp-gpt-image.sh
+--> Using cache 20be63eb3a0d87eddc85013d37e5ae51dca05e0f8c85392537f35bc4ad013bb6
+--> 20be63eb3a0d
+[2/2] STEP 14/15: RUN cp /build/disk.tar.gz /disk.tar.gz &&     cp /build/output/initramfs-paypal-auth.img /initramfs-paypal-auth.img &&     cp /build/output/grub.cfg /grub.cfg &&     cp /build/packages.txt /packages.txt &&     echo "Build Hashes:" &&     sha256sum /disk.tar.gz /initramfs-paypal-auth.img /grub.cfg
+--> Using cache c65f5f753e5086af269029b74a9e82e203c8ea10bb19eb96926544d3b7c1899a
+--> c65f5f753e50
+[2/2] STEP 15/15: CMD ["/bin/bash"]
+--> Using cache 0523f2ad0e39c76c37113744ed5e498ec24d0f503da7d70ae153eb272d36fc61
+[2/2] COMMIT paypal-auth-vm-repro
+--> 0523f2ad0e39
+Successfully tagged localhost/paypal-auth-vm-repro:latest
+0523f2ad0e39c76c37113744ed5e498ec24d0f503da7d70ae153eb272d36fc61
+📥 Extracting disk.tar.gz from reproducing container...
+2b962918c27441f707c0773b7a431120450a0dce5f2cf3dd6e46235d6f26b62c
+tmp_disk
+
+📤 Uploading disk.tar.gz to GCS Bucket (gs://project-ae136ba1-3cc9-42cf-a48-images)...
+Copying file://./disk.tar.gz [Content-Type=application/x-tar]...
+/ [0 files][    0.0 B/ 33.1 MiB]                                                -- [0 files][ 13.7 MiB/ 33.1 MiB]                                                \|| [0 files][ 26.8 MiB/ 33.1 MiB]                                                | [1 files][ 33.1 MiB/ 33.1 MiB]                                                /
+Operation completed over 1 objects/33.1 MiB.                                     
+
+💿 [2/3] Registering GCP Custom Image...
+Removing old image (if exists)...
+Deleted [https://www.googleapis.com/compute/v1/projects/project-ae136ba1-3cc9-42cf-a48/global/images/paypal-auth-custom-v28].
+Creating new custom image...
+Created [https://www.googleapis.com/compute/v1/projects/project-ae136ba1-3cc9-42cf-a48/global/images/paypal-auth-custom-v28].
+NAME                    PROJECT                         FAMILY  DEPRECATED  STATUS
+paypal-auth-custom-v28  project-ae136ba1-3cc9-42cf-a48                      READY
+🔓 Making image public for auditability and transparency...
+Updated IAM policy for image [paypal-auth-custom-v28].
+bindings:
+- members:
+  - allAuthenticatedUsers
+  role: roles/compute.imageUser
+etag: BwZQbNqG_Kc=
+version: 1
+
+🛡️  [2.5/3] Hardening VPC Egress (Deny-by-Default)...
+
+🔒 [3/3] Launching Confidential VM...
+Ensuring Confidential Computing API is enabled...
+Releasing Static IP (34.7.107.227) from any previous instances...
+No existing instances found holding IP 34.7.107.227.
+Provisioning AMD SEV-SNP Enclave (Spot n2d-highcpu-2, Netherlands)...
+ERROR: (gcloud.compute.instances.create) unrecognized arguments: --confidential-instance-config=confidential-compute-type=SEV_SNP,enable-guest-attributes=TRUE (did you mean '--confidential-compute'?) 
+
+To search the help text of gcloud commands, run:
+  gcloud help -- SEARCH_TERMS
