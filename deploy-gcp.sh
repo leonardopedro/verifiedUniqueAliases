@@ -152,6 +152,9 @@ gcloud compute firewall-rules create enclave-egress-allow-https \
 # --- Phase 6: Launching the Confidential VM ---
 echo ""
 echo "🔒 [3/3] Launching Confidential VM..."
+echo "Ensuring Confidential Computing API is enabled..."
+gcloud services enable confidentialcomputing.googleapis.com --project=${PROJECT_ID} || true
+
 echo "Releasing Static IP ($STATIC_IP) from any previous instances..."
 OLD_INSTANCE=$(gcloud compute instances list --project=${PROJECT_ID} --filter="networkInterfaces.accessConfigs.natIP=${STATIC_IP}" --format="value(name)")
 if [ -n "$OLD_INSTANCE" ]; then
@@ -162,6 +165,8 @@ else
     echo "No existing instances found holding IP $STATIC_IP."
 fi
 echo "Provisioning AMD SEV-SNP Enclave (Spot n2d-highcpu-2, Netherlands)..."
+# CRITICAL FIX: enable-guest-attributes=TRUE in metadata is REQUIRED for sev-guest driver
+# The google guest daemon reads this metadata to enable hardware attestation interfaces
 # We explicitly set the TLS_CACHE_SECRET tee-env attribute so the service knows where to find/store the sealed DEK
 gcloud compute instances create ${VM_NAME} \
     --project=${PROJECT_ID} \
@@ -177,7 +182,7 @@ gcloud compute instances create ${VM_NAME} \
     --address=${STATIC_IP} \
     --scopes=cloud-platform \
     --tags=http-server,https-server,egress-hardened \
-    --metadata=tee-env-TLS_CACHE_SECRET=projects/${PROJECT_ID}/secrets/PAYPAL_TLS_CACHE,tee-env-FORCE_SANDBOX=true
+    --metadata=enable-guest-attributes=TRUE,tee-env-TLS_CACHE_SECRET=projects/${PROJECT_ID}/secrets/PAYPAL_TLS_CACHE,tee-env-FORCE_SANDBOX=true
 
 echo "============================================================"
 echo "🎉 Deployment Complete!"
