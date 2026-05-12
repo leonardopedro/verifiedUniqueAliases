@@ -2,7 +2,7 @@
 set -eo pipefail
 
 echo "============================================================"
-echo "🚀 Deploying Alibaba Cloud Confidential Auth VM (SEV-SNP)"
+echo "🚀 Deploying Alibaba Cloud Confidential Auth VM (Intel TDX)"
 echo "============================================================"
 
 # --- Configuration ---
@@ -20,13 +20,12 @@ ZONE="cn-hangzhou-j"
 VM_NAME="paypal-auth-ali-v1"
 IMAGE_ID="" # IMPORTANT: You must provide a Custom Image ID from your OSS bucket import
 SECURITY_GROUP_ID=${SECURITY_GROUP_ID:-sg-xxxxxxxxxxxx} # Ensure Port 80, 443 are allowed
-NETWORK_ZONE_ID="" # Optional: Specific Subnet ID
 SPOT_PRICE_LIMIT="2.0" # Max hourly USD limit 
 
 echo "✅ Configuration Loaded:"
 echo "   - Region: $REGION ($ZONE)"
-echo "   - Instance Type: ecs.r9i.xlarge (AMD EPYC 9004)"
-echo "   - Hardware Root-of-Trust: SEV-SNP (Equivalent to TDX protection) "
+echo "   - Instance Type: ecs.r9i.xlarge (Intel Xeon Platinum 8475L)"
+echo "   - Hardware Root-of-Trust: Intel TDX (Trust Domain Extensions)"
 
 # Prerequisites validation
 if [[ -z "$ACCESS_KEY" || -z "$SECRET_KEY" ]]; then
@@ -41,7 +40,7 @@ if ! command -v aliyun &> /dev/null; then
 fi
 
 echo ""
-echo "🛡️  [2/4] Launching SEV-SNP Spot Instance (Minimal Duration)..."
+echo "🛡️  [2/4] Launching Intel TDX Spot Instance (Minimal Duration)..."
 
 # Export keys for the CLI
 export ALIBABA_ACCESS_KEY_ID="$ACCESS_KEY"
@@ -95,7 +94,4 @@ if command -v aliyun &> /dev/null; then
     fi
 else
     echo "--- Manual Setup Required Since CLI Missing ---"
-    # Provide raw CURL equivalent here for manual testing
-    curl "https://ecs.aliyuncs.com/?InstanceName=$VM_NAME&RegionId=$REGION&ZoneId=$ZONE&InstanceType=ecs.r9i.xlarge&InternetMaxBandwidthOut=10&IoOptimized=enhanced&SpotStrategy=SpotAsPriceGo&SpotPriceLimit=$(curl -s http://100.100.100.200/latest/meta-data/system/configuration/spot-price-limit)&SystemDisk.Size=40&SystemDisk.Category=cloud_essd&Format=json" \
-     -X POST 2>&1
 fi
