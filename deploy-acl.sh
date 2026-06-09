@@ -1,97 +1,25 @@
 #!/bin/bash
+# ==============================================================================
+# deploy-acl.sh - Deploy PayPal Auth Confidential VM to Alibaba Cloud ECS
+# ==============================================================================
+#
+# This is a legacy wrapper — see deploy-alibaba.sh for the full-featured version.
+#
+# Quick start:
+#   export ALI_ACCESS_KEY_ID=xxx ALI_ACCESS_KEY_SECRET=xxx
+#   export ALI_IMAGE_ID=m-xxx ALI_VPC_ID=vpc-xxx ALI_VSWITCH_ID=vsw-xxx
+#   export ALI_SECURITY_GROUP_ID=sg-xxx DOMAIN=your-domain.example.com
+#   export PAYPAL_CLIENT_ID=xxx PAYPAL_CLIENT_SECRET=xxx
+#   bash deploy-acl.sh
+# ==============================================================================
 set -eo pipefail
 
-echo "============================================================"
-echo "🚀 Deploying Alibaba Cloud Confidential Auth VM (Intel TDX)"
-echo "============================================================"
-
-# --- Configuration ---
-ALIBABA_USER_ID="${ALIBABA_USER_ID}"
-ACCESS_KEY="${ALIBABA_ACCESS_KEY}"
-SECRET_KEY="${ALIBABA_SECRET_KEY}"
-REGION="cn-hangzhou"
-ZONE="cn-hangzhou-j"
-
-# NOTE: 
-# 1. To support "No Minimum Duration", we use 'SpotAsPriceGo'.
-#    Spot instances are terminated when price exceeds SpotPriceLimit or capacity runs out.
-# 2. We configure SystemDiskSize to 40GiB (minimal for Alpine/Debian custom images).
-
-VM_NAME="paypal-auth-ali-v1"
-IMAGE_ID="" # IMPORTANT: You must provide a Custom Image ID from your OSS bucket import
-SECURITY_GROUP_ID=${SECURITY_GROUP_ID:-sg-xxxxxxxxxxxx} # Ensure Port 80, 443 are allowed
-SPOT_PRICE_LIMIT="2.0" # Max hourly USD limit 
-
-echo "✅ Configuration Loaded:"
-echo "   - Region: $REGION ($ZONE)"
-echo "   - Instance Type: ecs.r9i.xlarge (Intel Xeon Platinum 8475L)"
-echo "   - Hardware Root-of-Trust: Intel TDX (Trust Domain Extensions)"
-
-# Prerequisites validation
-if [[ -z "$ACCESS_KEY" || -z "$SECRET_KEY" ]]; then
-    echo "❌ CRITICAL: Set ALIBABA_ACCESS_KEY and SECRET_KEY environment variables before proceeding."
+if [[ ! -f "$(dirname "$0")/deploy-alibaba.sh" ]]; then
+    echo "❌ deploy-alibaba.sh not found"
     exit 1
 fi
 
+echo "⚠️ deploy-acl.sh is deprecated — forwarding to deploy-alibaba.sh"
 echo ""
-echo "⏳ [1/4] Checking Aliyun CLI availability..."
-if ! command -v aliyun &> /dev/null; then
-    echo "⚠️ Warning: 'aliyun' CLI not found. Please install via: pip install aliyun-cli or use curl-based API calls."
-fi
 
-echo ""
-echo "🛡️  [2/4] Launching Intel TDX Spot Instance (Minimal Duration)..."
-
-# Export keys for the CLI
-export ALIBABA_ACCESS_KEY_ID="$ACCESS_KEY"
-export ALIBABA_ACCESS_KEY_SECRET="$SECRET_KEY"
-
-if command -v aliyun &> /dev/null; then
-    OUTPUT=$(aliyun ecs RunInstances \
-        --RegionId $REGION \
-        --ZoneId $ZONE \
-        --InstanceName $VM_NAME \
-        --SecurityGroupId $SECURITY_GROUP_ID \
-        --ImageId $IMAGE_ID \
-        --InstanceType ecs.r9i.xlarge \
-        --InternetMaxBandwidthOut 10 \
-        --IoOptimized enhanced \
-        --SpotStrategy SpotAsPriceGo \
-        --SpotPriceLimit $SPOT_PRICE_LIMIT \
-        --SystemDisk.Size 40 \
-        --SystemDisk.Category cloud_essd \
-        --Output json \
-        2>&1)
-
-    INSTANCE_ID=$(echo "$OUTPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['InstanceIdSets']['InstanceidSet'][0])" 2>/dev/null || echo "")
-    
-    if [[ -n "$INSTANCE_ID" ]]; then
-        echo "   ✅ VM Provisioned. Waiting for IP allocation..."
-        
-        # Wait for public IP
-        for i in {1..30}; do
-            sleep 5
-            STATUS_OUT=$(aliyun ecs DescribeInstanceStatus --InstanceId $INSTANCE_ID --Output json 2>/dev/null || echo "{}")
-            PUBLIC_IP=$(echo "$STATUS_OUT" | grep -oP '"InternetIpAddress"\s*:\s*\[\{\"InternetChargeType":"PayByTraffic","IpAddress":"\K[^"]+' 2>/dev/null || echo "")
-            
-            if [[ -n "$PUBLIC_IP" ]]; then
-                echo ""
-                echo "============================================================"
-                echo "🎉 Deployment Complete!"
-                echo "   Instance ID: $INSTANCE_ID"
-                echo "   Endpoint : https://$PUBLIC_IP/"
-                echo "============================================================"
-                break
-            fi
-            
-            if [ $i -eq 30 ]; then
-                echo "[ERROR] Failed to retrieve public IP within timeout window"
-            fi
-        done
-    else
-        echo "❌ Error creating instance:"
-        echo "$OUTPUT"
-    fi
-else
-    echo "--- Manual Setup Required Since CLI Missing ---"
-fi
+exec bash "$(dirname "$0")/deploy-alibaba.sh"

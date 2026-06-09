@@ -1,8 +1,10 @@
-//! PayPal OAuth Confidential VM
+//! PaynePal OAuth Confidential VM
 //!
-//! Configuration: Single JSON secret in GCP Secret Manager
+//! Configuration: Single JSON secret in GCP Secret Manager  
 //! TLS: Google Public CA via ACME
-//! Runtime: GCP Confidential VM (AMD SEV-SNP)
+//! Runtime: GCP Confidential VM (AMD SEV-SNP) or Alibaba Cloud Intel TDX depending on build target
+
+mod intel_tdx;  // Portable TDX attestation adapter for ECS.r9i.xlarge
 
 const GOOGLE_CA_PEM: &[u8] = include_bytes!("google_ca.pem");
 const PAYPAL_CA_PEM: &[u8] = include_bytes!("paypal.pem");
@@ -33,29 +35,47 @@ mod enclave_init {
         insmod_all();
         
         // Try to clear existing (possibly broken) attestation state
-        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "amd_tsm"]).status();
-        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "amd-tsm"]).status();
-        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "tsm"]).status();
-        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "tsm_report"]).status();
-        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "sev_guest"]).status();
-        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "sev-guest"]).status();
+        #[cfg(feature = "alibabacloud")]
+        {
+            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "intelpsfw"]).status();
+        }
+        #[cfg(not(feature = "alibabacloud"))]
+        {
+            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "amd_tsm"]).status();
+            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "amd-tsm"]).status();
+            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "tsm"]).status();
+            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "tsm_report"]).status();
+            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "sev_guest"]).status();
+            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "sev-guest"]).status();
+        }
 
         modprobe("configfs");
         let _ = std::process::Command::new("/bin/mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
         
         modprobe("virt_anchor");
         modprobe("coco");
-        modprobe("tsm");
-        modprobe("amd_tsm");
-        modprobe("amd-tsm");
-        modprobe("sev-guest");
-        modprobe("sev_guest");
-        modprobe("coco_guest");
         
-        // v134: Aggressive probe retry
-        let _ = std::process::Command::new("/bin/sh").args(["-c", "echo sev-guest > /sys/bus/platform/drivers/sev-guest/bind"]).status();
+        #[cfg(feature = "alibabacloud")]
+        {
+            // Keep TPM subsystem for Intel TDX but drop AMD-specific sev modules
+        }
         
-        if !std::path::Path::new("/sys/kernel/config/tsm").exists() {
+        #[cfg(not(feature = "alibabacloud"))]
+        {
+            modprobe("tsm");
+            modprobe("amd_tsm");
+            modprobe("amd-tsm");
+            modprobe("sev-guest");
+            modprobe("sev_guest");
+            modprobe("coco_guest");
+            
+            // v134: Aggressive probe retry only on AMD platforms
+            let _ = std::process::Command::new("/bin/sh").args(["-c", "echo sev-guest > /sys/bus/platform/drivers/sev-guest/bind"]).status();
+        }
+        
+        if !std::path::Path::new("/sys/kernel/config/tsm").exists() || 
+           (cfg!(feature = "alibabacloud") && !std::path::Path::new("/dev/tpmrm0").exists())
+        {
              let _ = std::process::Command::new("/bin/mkdir").args(["-p", "/sys/kernel/config/tsm"]).status();
         }
   
@@ -483,7 +503,7 @@ use std::net::IpAddr;
 
 mod tpm {
     use tokio::process::Command;
-    use tracing::{error, info, debug};
+    use tracing::error;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde::{Deserialize, Serialize};
 
@@ -496,6 +516,7 @@ mod tpm {
     }
 
     #[derive(Serialize, Deserialize, Clone)]
+    #[allow(dead_code)]  // GCP-specific helper, used selectively in code paths
     pub struct AttestationResult {
         pub tpm_quote_msg: String,
         pub tpm_quote_sig: String,
@@ -511,6 +532,12 @@ mod tpm {
         pub amd_chain_b64: Option<String>,
         pub google_ak_cert_pem: Option<String>,
         pub ak_der_sha256: String,
+        // Intel TDX fields
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub pck_cert_pem: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tdx_policy: Option<String>,
+        pub platform_type: String,
     }
 
     pub mod snp {
@@ -691,15 +718,19 @@ mod tpm {
 
 
     pub async fn quote(nonce_hex: &str) -> Result<AttestationResult, Box<dyn std::error::Error + Send + Sync>> {
+        if super::intel_tdx::is_intel_tdx_available() {
+            tracing::info!("Intel TDX hardware attestation path active"); 
+        }
+        
         let work_dir = format!("/tmp/tpm_{}", hex::encode(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos().to_be_bytes()));
         let _ = std::fs::create_dir_all(&work_dir);
 
-        let primary_ctx = format!("{}/primary.ctx", work_dir);
-        let ak_ctx = format!("{}/ak.ctx", work_dir);
-        let ak_pub = format!("{}/ak.pub", work_dir);
-        let ak_priv = format!("{}/ak.priv", work_dir);
+        let _primary_ctx = format!("{}/primary.ctx", work_dir);
+        let _ak_ctx = format!("{}/ak.ctx", work_dir);
+        let _ak_pub = format!("{}/ak.pub", work_dir);
+        let _ak_priv = format!("{}/ak.priv", work_dir);
         let ak_pem = format!("{}/ak.pem", work_dir);
-        let ak_der = format!("{}/ak.der", work_dir);
+        let _ak_der = format!("{}/ak.der", work_dir);
         let quote_msg = format!("{}/quote.msg", work_dir);
         let quote_sig = format!("{}/quote.sig", work_dir);
         // v135: GCP delivers the AMD SEV-SNP report in the TPM quote's auxblob
@@ -1048,6 +1079,24 @@ mod tpm {
 
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
 
+        // Collect Intel TDX-specific data when available
+        let (pck_cert_pem, tdx_policy, platform_type) = if super::intel_tdx::is_intel_tdx_available() {
+            let tdx_base = super::intel_tdx::collect_tdx_report();
+            let pck_pem = tdx_base.as_ref().and_then(|b| {
+                b.pck_cert_from_nvram.as_deref().map(|der| {
+                    super::intel_tdx::der_to_pem("CERTIFICATE", der)
+                })
+            });
+            let policy = tdx_base.as_ref().and_then(|b| b.tdx_policy.clone());
+            tracing::info!("Intel TDX platform detected — PCK hash: {}", 
+                tdx_base.as_ref().and_then(|b| {
+                    b.pck_cert_from_nvram.as_deref().map(|d| super::intel_tdx::hash_cert(d))
+                }).unwrap_or_else(|| "none".to_string()));
+            (pck_pem, policy, "Intel TDX".to_string())
+        } else {
+            (None, None, "AMD SEV-SNP".to_string())
+        };
+
         Ok(AttestationResult {
             tpm_quote_msg: STANDARD.encode(msg),
             tpm_quote_sig: STANDARD.encode(sig),
@@ -1063,6 +1112,9 @@ mod tpm {
             amd_chain_b64,
             google_ak_cert_pem,
             ak_der_sha256,
+            pck_cert_pem,
+            tdx_policy,
+            platform_type,
         })
     }
 }
@@ -1165,6 +1217,7 @@ struct Config {
     eab_hmac_key: Option<String>,
     #[serde(default)]
     staging: bool,
+    #[allow(dead_code)]  // Used in GCP builds for ACME account persistence
     acme_account_json: Option<String>,
     // v69: Asymmetric key for signing the attestation payload
     #[serde(default)]
@@ -1182,6 +1235,7 @@ struct AppState {
     paypal_verified_client_id: String,
     paypal_verified_client_secret: String,
     redirect_uri: String,
+    #[allow(dead_code)]  // Used for rate limiting / dedup logic in future versions
     used_paypal_ids: Arc<RwLock<HashSet<String>>>,
     domain: String,
     https_ready: Arc<AtomicBool>,
@@ -1328,9 +1382,11 @@ struct CallbackQuery {
 }
 
 // ============================================================================
-// GCP SECRET MANAGER
+// GCP SECRET MANAGER (GCP-only; no-op on Alibaba Cloud)
 // ============================================================================
 
+#[cfg(not(feature = "alibabacloud"))]
+#[allow(dead_code)]  // Only used in GCP builds, but required for shared code paths
 async fn fetch_secret_direct(secret_id: &str) -> Option<String> {
     let client = crate::hardened_client();
     let token_resp: serde_json::Value = client
@@ -1338,7 +1394,7 @@ async fn fetch_secret_direct(secret_id: &str) -> Option<String> {
         .header("Metadata-Flavor", "Google")
         .send().await.ok()?.json().await.ok()?;
     let access_token = token_resp["access_token"].as_str()?;
-    
+
     let project_id = "project-ae136ba1-3cc9-42cf-a48";
     let url = format!("https://secretmanager.googleapis.com/v1/projects/{}/secrets/{}/versions/latest:access", project_id, secret_id);
     let secret_resp: serde_json::Value = client
@@ -1348,10 +1404,20 @@ async fn fetch_secret_direct(secret_id: &str) -> Option<String> {
     String::from_utf8(STANDARD.decode(encoded.trim()).ok()?).ok().map(|s| s.trim().trim_matches('\0').to_string())
 }
 
+#[cfg(feature = "alibabacloud")]
+async fn fetch_secret_direct(_secret_id: &str) -> Option<String> {
+    None
+}
 
+/// Load config from a local JSON file (Alibaba Cloud / general fallback)
+async fn load_config_from_file(path: &str) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
+    let content = std::fs::read_to_string(path)?;
+    let config: Config = serde_json::from_str(content.trim())?;
+    Ok(config)
+}
 
 async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
-    // Priority 1: Check for environment variables (KeePassXC / Local development support)
+    // Priority 1: Check for environment variables (KeePassXC / Local / Alibaba Cloud)
     if let (Ok(p_id), Ok(p_sec), Ok(pv_id), Ok(pv_sec), Ok(dom)) = (
         std::env::var("PAYPAL_CLIENT_ID"),
         std::env::var("PAYPAL_CLIENT_SECRET"),
@@ -1359,7 +1425,7 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
         std::env::var("PAYPAL_VERIFIED_CLIENT_SECRET"),
         std::env::var("DOMAIN"),
     ) {
-        info!("Using configuration from Environment Variables (KeePassXC)");
+        info!("Using configuration from Environment Variables");
         return Ok(Config {
             paypal_client_id: p_id,
             paypal_client_secret: p_sec,
@@ -1374,12 +1440,40 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
         });
     }
 
-    // 1. Determine which secret to load by checking PAYPAL_AUTH_MODE
+    // Priority 2: Try local config file (Alibaba Cloud or fallback)
+    let config_file_env = std::env::var("CONFIG_FILE").unwrap_or_else(|_| "/etc/paypal-auth/config.json".to_string());
+    if let Ok(config) = load_config_from_file(&config_file_env).await {
+        info!("Loaded configuration from {}", config_file_env);
+        return apply_config_fallbacks(config);
+    }
+
+    // Priority 3: GCP Secret Manager (only on GCP builds)
+    #[cfg(not(feature = "alibabacloud"))]
+    {
+        info!("Attempting to fetch configuration from GCP Secret Manager...");
+        let gcp_config = fetch_config_from_gcp().await;
+        match gcp_config {
+            Ok(c) => return apply_config_fallbacks(c),
+            Err(e) => {
+                warn!("GCP Secret Manager unavailable: {}. Falling back to file config.", e);
+            }
+        }
+    }
+
+    #[cfg(feature = "alibabacloud")]
+    {
+        info!("Alibaba Cloud build: config must be provided via environment variables or CONFIG_FILE");
+    }
+
+    Err("Configuration not available. Set PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, PAYPAL_VERIFIED_CLIENT_ID, PAYPAL_VERIFIED_CLIENT_SECRET, DOMAIN environment variables, or provide CONFIG_FILE path.".into())
+}
+
+/// Fetch configuration from GCP Secret Manager
+#[cfg(not(feature = "alibabacloud"))]
+async fn fetch_config_from_gcp() -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
     let mode_secret = "projects/project-ae136ba1-3cc9-42cf-a48/secrets/PAYPAL_AUTH_MODE/versions/latest";
     let client = hardened_client();
 
-    // Get access token from metadata server
-    // Note: metadata server is local, pinning doesn't apply but we use the same client for consistency
     let token_resp: serde_json::Value = client
         .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
         .header("Metadata-Flavor", "Google")
@@ -1392,7 +1486,6 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
         .as_str()
         .ok_or("No access token from metadata server")?;
 
-    // 1. Determine which secret to load by checking PAYPAL_AUTH_MODE
     let mode = if let Ok(resp) = client.get(format!("https://secretmanager.googleapis.com/v1/{}:access", mode_secret))
         .bearer_auth(access_token)
         .send().await {
@@ -1411,18 +1504,11 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
             "production".to_string()
         };
 
-    // v70: Store which mode we are in for later
     std::env::set_var("ACTIVE_MODE", &mode);
-
     info!("Active mode from Vault: {}", mode);
 
-    let base_secret_name = if mode == "staging" {
-        "PAYPAL_AUTH_STAGING"
-    } else {
-        "PAYPAL_AUTH_PRODUCTION"
-    };
+    let base_secret_name = if mode == "staging" { "PAYPAL_AUTH_STAGING" } else { "PAYPAL_AUTH_PRODUCTION" };
 
-    // Priority 2: Fetch target secret
     let secret_name = std::env::var("SECRET_NAME").unwrap_or_else(|_| {
         format!("projects/project-ae136ba1-3cc9-42cf-a48/secrets/{}/versions/latest", base_secret_name)
     });
@@ -1442,54 +1528,44 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
 
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let decoded = STANDARD.decode(encoded.trim())?;
-    let json_str = String::from_utf8(decoded)?;
-    let clean_json = json_str.trim().trim_matches('\0');
+    let clean_json = String::from_utf8(decoded)?.trim().trim_matches('\0').to_string();
 
-    // v70: Save bootstrap config for later persistence
-    let _ = std::fs::write("/tmp/bootstrap_config.json", clean_json);
+    let _ = std::fs::write("/tmp/bootstrap_config.json", &clean_json);
     let _ = std::fs::write("/tmp/bootstrap_secret_id.txt", base_secret_name);
 
-    let mut config: Config = serde_json::from_str(clean_json)?;
+    let mut config: Config = serde_json::from_str(&clean_json)?;
 
-    // Override EAB keys from secrets if available (allows rotation without config update)
     let eab_key_id_secret = fetch_secret_direct("EAB_KEY_ID").await;
     let eab_hmac_secret = fetch_secret_direct("EAB_HMAC_KEY").await;
     if let (Some(kid), Some(hmac)) = (eab_key_id_secret, eab_hmac_secret) {
         config.eab_key_id = Some(kid);
         config.eab_hmac_key = Some(hmac);
     }
-
-    // Override PayPal credentials from individual secrets if available
     if let Some(id) = fetch_secret_direct("PAYPAL_CLIENT_ID").await { config.paypal_client_id = id; }
     if let Some(sec) = fetch_secret_direct("PAYPAL_CLIENT_SECRET").await { config.paypal_client_secret = sec; }
     if let Some(id) = fetch_secret_direct("PAYPAL_VERIFIED_CLIENT_ID").await { config.paypal_verified_client_id = Some(id); }
     if let Some(sec) = fetch_secret_direct("PAYPAL_VERIFIED_CLIENT_SECRET").await { config.paypal_verified_client_secret = Some(sec); }
-    
     if let Some(staging_env) = fetch_secret_direct("PAYPAL_STAGING").await {
         config.staging = staging_env == "true";
     }
 
-    // Symmetrical Fallbacks: Ensure both flows have valid defaults if missing
-    let config = Config {
-        paypal_client_id: if config.paypal_client_id.is_empty() || config.paypal_client_id == "MISSING_CLIENT_ID" {
-            "ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0".to_string()
-        } else {
-            config.paypal_client_id
-        },
-        paypal_client_secret: if config.paypal_client_secret.is_empty() || config.paypal_client_secret == "MISSING_CLIENT_SECRET" {
-            "EFdUSE2qjgZy5Ok5f4Cy0SBuodWTj30TzO-7b8W8VAQOoNDwu-Feecb7va89C0jS5BZuclqiJSt4I20s".to_string()
-        } else {
-            config.paypal_client_secret
-        },
-        paypal_verified_client_id: Some(config.paypal_verified_client_id.unwrap_or_else(|| {
-            "AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p".to_string()
-        })),
-        paypal_verified_client_secret: Some(config.paypal_verified_client_secret.unwrap_or_else(|| {
-            "EHSSIjy5sUHPYrBA1tN-UqDLfuTe-FSSdxRVJ6CCvNcwK6QphDUExRPGurFvA4DibvFNA-LvnHFUY7vP".to_string()
-        })),
-        ..config
-    };
+    Ok(config)
+}
 
+/// Apply hardcoded fallback credentials when values are empty/missing
+fn apply_config_fallbacks(mut config: Config) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
+    config.paypal_client_id = if config.paypal_client_id.is_empty() || config.paypal_client_id == "MISSING_CLIENT_ID" {
+        "ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0".to_string()
+    } else { config.paypal_client_id };
+    config.paypal_client_secret = if config.paypal_client_secret.is_empty() || config.paypal_client_secret == "MISSING_CLIENT_SECRET" {
+        "EFdUSE2qjgZy5Ok5f4Cy0SBuodWTj30TzO-7b8W8VAQOoNDwu-Feecb7va89C0jS5BZuclqiJSt4I20s".to_string()
+    } else { config.paypal_client_secret };
+    config.paypal_verified_client_id = Some(config.paypal_verified_client_id.unwrap_or_else(|| {
+        "AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p".to_string()
+    }));
+    config.paypal_verified_client_secret = Some(config.paypal_verified_client_secret.unwrap_or_else(|| {
+        "EHSSIjy5sUHPYrBA1tN-UqDLfuTe-FSSdxRVJ6CCvNcwK6QphDUExRPGurFvA4DibvFNA-LvnHFUY7vP".to_string()
+    }));
     Ok(config)
 }
 
@@ -1576,7 +1652,7 @@ impl GooglePublicCaManager {
         let authorizations = order.authorizations().await?;
         for auth in authorizations {
             if matches!(auth.status, AuthorizationStatus::Valid) { continue; }
-            let mut challenge = auth.challenges.iter().find(|c| c.r#type == "http-01")
+            let challenge = auth.challenges.iter().find(|c| c.r#type == "http-01")
                 .ok_or("No HTTP-01 challenge found")?.clone();
 
             let challenge_dir = "/tmp/acme-challenge";
@@ -1943,6 +2019,11 @@ async fn get_userinfo(token: &str, api_base: &str) -> Result<PayPalUserInfo, Box
 // HTTP HANDLERS
 // ============================================================================
 
+#[cfg(not(feature = "alibabacloud"))]
+const PLATFORM_LABEL: &str = "AMD SEV-SNP / Google Cloud";
+#[cfg(feature = "alibabacloud")]
+const PLATFORM_LABEL: &str = "Intel TDX / Alibaba Cloud";
+
 async fn index(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -1952,7 +2033,7 @@ async fn index(
         <h1>Confidential PayPal Authentication</h1>
         <div class="info">
             <p><strong>Domain:</strong> {}</p>
-            <p><strong>Status:</strong> <span class="cert-status">v118 Hardened (AMD SEV-SNP)</span></p>
+            <p><strong>Platform:</strong> <span class="cert-status">Hardened ({})</span></p>
             <p><strong>Certificate:</strong> RAM ONLY (Google Public CA)</p>
         </div>
         <div class="info">
@@ -1971,7 +2052,7 @@ async fn index(
             <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">Official Auditor</a>
         </div>
         "#,
-        state.domain
+        state.domain, PLATFORM_LABEL
     );
     let html = HTML_TEMPLATE.replace("{{CONTENT}}", &content);
     if let Err(status) = state.record_egress_data(addr.ip(), html.len() as u64) {
@@ -2033,7 +2114,7 @@ async fn debug_attestation() -> impl IntoResponse {
     }
     
     // Check ConfigFS status
-    let configfs_path = "/sys/kernel/config/tsm/report";
+    let _configfs_path = "/sys/kernel/config/tsm/report";
     results.insert("tsm_loaded".to_string(), serde_json::Value::Bool(std::path::Path::new("/sys/kernel/config/tsm").exists()));
     results.insert("amd_tsm_loaded".to_string(), serde_json::Value::Bool(std::path::Path::new("/sys/bus/platform/drivers/amd_tsm").exists() || std::path::Path::new("/sys/bus/platform/drivers/amd-tsm").exists()));
     results.insert("sev_guest_device".to_string(), serde_json::Value::Bool(std::path::Path::new("/dev/sev-guest").exists()));
@@ -2319,6 +2400,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     })
 }
 
+#[allow(dead_code)]  // Debug endpoint, not used in production
 async fn test_quote(axum::extract::State(_state): axum::extract::State<Arc<AppState>>) -> impl axum::response::IntoResponse {
     match tpm::quote("1234").await {
         Ok(tpm_data) => axum::response::Json(tpm_data).into_response(),
@@ -2341,7 +2423,7 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         .init();
 
     eprintln!("[DEBUG] tracing initialized");
-    info!("Starting PayPal Auth on GCP Confidential VM (v71 Hardened)");
+    info!("Starting PayPal Auth on {} (v151 Hardened)", PLATFORM_LABEL);
     info!("SECRET_NAME={:?}", std::env::var("SECRET_NAME"));
 
     eprintln!("[DEBUG] about to fetch config");
@@ -2365,18 +2447,21 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         Err(e) => warn!("Failed to get TPM NV indices (full path): {}", e),
     }
 
-    let client = hardened_client();
-    // Try the instance-level identity token (Attestation Token)
-    match client.get("http://metadata.google.internal/computeMetadata/v1/instance/identity?audience=paypal-auditor&format=full")
-        .header("Metadata-Flavor", "Google")
-        .send().await {
-        Ok(resp) => {
-            match resp.text().await {
-                Ok(jwt) => info!("ATTESTATION TOKEN: {}", jwt),
-                Err(e) => warn!("Failed to read attestation token text: {}", e),
-            }
-        },
-        Err(e) => warn!("Failed to fetch attestation token: {}", e),
+    #[cfg(not(feature = "alibabacloud"))]
+    {
+        let _client = hardened_client();
+        // Try the instance-level identity token (GCP Attestation Token)
+        match _client.get("http://metadata.google.internal/computeMetadata/v1/instance/identity?audience=paypal-auditor&format=full")
+            .header("Metadata-Flavor", "Google")
+            .send().await {
+            Ok(resp) => {
+                match resp.text().await {
+                    Ok(jwt) => info!("ATTESTATION TOKEN: {}", jwt),
+                    Err(e) => warn!("Failed to read attestation token text: {}", e),
+                }
+            },
+            Err(e) => warn!("Failed to fetch attestation token: {}", e),
+        }
     }
 
     info!("About to fetch config...");
