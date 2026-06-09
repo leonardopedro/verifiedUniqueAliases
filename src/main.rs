@@ -48,9 +48,7 @@ mod enclave_init {
         modprobe("tsm");
         modprobe("amd_tsm");
         modprobe("amd-tsm");
-        // Intel TDX platform drivers
-        let _ = std::process::Command::new("modprobe").args(["intelpsfw"]).status();
-        let _ = std::process::Command::new("modprobe").args(["tdx"]).status();
+        modprobe("sev-guest");
         modprobe("sev_guest");
         modprobe("coco_guest");
         
@@ -489,36 +487,6 @@ mod tpm {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde::{Deserialize, Serialize};
 
-// ================================================================
-// INTEL TDX ATTESTATION MODULE (Main branch - Alibaba Cloud focus)
-// ================================================================
-mod intel_tdx {
-    use std::process::Command;
-    use tracing::{info, warn};
-    
-    /// Intel TDX uses vTPM 2.0 for attestation reports
-    pub fn get_attestation_quote(nonce_hex: &str) -> Result<TDXQuoteResult, String> {   
-        // Ensure TPM device exists and responds
-        // Note: On Intel TDX platforms, the host provides access through the standard vTPM interface
-        if !std::path::Path::new("/dev/tpmrm0").exists() {
-            return Err("No Intel TDX TPM device found".into());
-        }
-        
-        let mut res = TDXQuoteResult::default();
-        res.nonce_hex = nonce_hex.to_string();
-        let _ = res;
-        Ok(res)
-    }
-    
-    #[derive(Default)]
-    pub struct TDXQuoteResult {
-        pub pcr_values: std::collections::BTreeMap<usize, Vec<u8>>,
-        pub quote_data: Vec<u8>,
-        pub signature: Vec<u8>,
-        pub pck_cert_sha256: Option<String>,
-        pub nonce_hex: String,
-    }
-}
     pub const PCR_SELECTION: &str = "0,4,8,9,15";
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -722,6 +690,381 @@ mod intel_tdx {
     }
 
 
+    pub async fn quote(nonce_hex: &str) -> Result<AttestationResult, Box<dyn std::error::Error + Send + Sync>> {
+        let work_dir = format!("/tmp/tpm_{}", hex::encode(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos().to_be_bytes()));
+        let _ = std::fs::create_dir_all(&work_dir);
+
+        let primary_ctx = format!("{}/primary.ctx", work_dir);
+        let ak_ctx = format!("{}/ak.ctx", work_dir);
+        let ak_pub = format!("{}/ak.pub", work_dir);
+        let ak_priv = format!("{}/ak.priv", work_dir);
+        let ak_pem = format!("{}/ak.pem", work_dir);
+        let ak_der = format!("{}/ak.der", work_dir);
+        let quote_msg = format!("{}/quote.msg", work_dir);
+        let quote_sig = format!("{}/quote.sig", work_dir);
+        // v135: GCP delivers the AMD SEV-SNP report in the TPM quote's auxblob
+        // This is the ONLY way to get AMD hardware-signed data on GCP.
+        let auxblob_path = format!("{}/auxblob.bin", work_dir);
+
+        // 1. Find the persistent AK handle dynamically from the GCP vTPM
+        let mut ak_ctx = String::new();
+        
+        // v143: Aggressive 'Shotgun' AK Discovery with explicit error logging
+        let standard_handles = ["0x81010002", "0x81010001", "0x81000001", "0x81000002"];
+        for h in &standard_handles {
+            // Try both tpm2_readpublic and tpm2 readpublic
+            for cmd in ["tpm2_readpublic", "tpm2"] {
+                let args = if cmd == "tpm2" { vec!["readpublic", "-c", h] } else { vec!["-c", h] };
+                match run_cmd(cmd, &args).await {
+                    Ok(pub_out) => {
+                        let pub_str = String::from_utf8_lossy(&pub_out).to_lowercase();
+                        if pub_str.contains("sign") {
+                            tracing::info!("DEBUG: Successfully anchored to hardware AK handle: {} (via {})", h, cmd);
+                            ak_ctx = h.to_string();
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("DEBUG: Failed to read handle {} via {}: {}", h, cmd, e);
+                    }
+                }
+            }
+            if !ak_ctx.is_empty() { break; }
+        }
+
+        if ak_ctx.is_empty() {
+            tracing::error!("Standard handles failed. SYSTEMATIC SEARCH of persistent handles...");
+            // Try systemically searching a wider range if the cap list fails
+            for i in 0..10 {
+                let h = format!("0x8101000{:x}", i);
+                if let Ok(pub_out) = run_cmd("tpm2_readpublic", &["-c", &h]).await {
+                    if String::from_utf8_lossy(&pub_out).to_lowercase().contains("sign") {
+                        ak_ctx = h;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if ak_ctx.is_empty() {
+            tracing::warn!("Systematic search failed. Attempting capability discovery...");
+            for cmd in ["tpm2_getcap", "tpm2"] {
+                let args = if cmd == "tpm2" { vec!["getcap", "handles-persistent"] } else { vec!["handles-persistent"] };
+                match run_cmd(cmd, &args).await {
+                    Ok(handles_out) => {
+                        let str_out = String::from_utf8_lossy(&handles_out);
+                        tracing::info!("Discovered persistent handles via {}: {}", cmd, str_out);
+                        for part in str_out.split(|c: char| !c.is_alphanumeric() && c != 'x') {
+                            if part.starts_with("0x81") {
+                                let h_str = part.to_string();
+                                if let Ok(pub_out) = run_cmd("tpm2_readpublic", &["-c", &h_str]).await {
+                                    if String::from_utf8_lossy(&pub_out).to_lowercase().contains("sign") {
+                                        ak_ctx = h_str;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    Err(e) => tracing::error!("Capability discovery failed via {}: {}", cmd, e),
+                }
+                if !ak_ctx.is_empty() { break; }
+            }
+        }
+        
+        // v145: GCP vTPM Architecture — Session AK for Signing
+        // The Google EK Cert (NVRAM) proves hardware identity. The TPM Quote is signed
+        // by a fresh session signing key (session AK), created via tpm2_createprimary.
+        // These are intentionally different keys — EK = silicon proof, session AK = quote signer.
+        if ak_ctx.is_empty() {
+            tracing::info!("Creating session signing AK via tpm2_createprimary...");
+            let ak_ctx_file = format!("{}/ak.ctx", work_dir);
+            for cmd in ["tpm2_createprimary", "tpm2"] {
+                let args = if cmd == "tpm2" {
+                    vec!["createprimary", "-C", "e", "-g", "sha256", "-G", "rsa2048", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign", "-c", &ak_ctx_file]
+                } else {
+                    vec!["-C", "e", "-g", "sha256", "-G", "rsa2048", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign", "-c", &ak_ctx_file]
+                };
+                match run_cmd(cmd, &args).await {
+                    Ok(_) => {
+                        tracing::info!("Session signing AK created via {}", cmd);
+                        ak_ctx = ak_ctx_file;
+                        break;
+                    },
+                    Err(e) => tracing::error!("createprimary failed via {}: {}", cmd, e),
+                }
+            }
+        }
+
+        
+        // Final fallback: Failure
+        if ak_ctx.is_empty() {
+            return Err("CRITICAL: Could not find or derive a hardware-bound AK. Identity cannot be verified.".into());
+        }
+
+        // Extract AK PEM for the report
+        run_cmd("tpm2_readpublic", &["-c", &ak_ctx, "-f", "pem", "-o", &ak_pem]).await?;
+        let ak_pem_str = tokio::fs::read_to_string(&ak_pem).await?;
+
+        tracing::info!("DEBUG: TPM Quote starting with nonce 0x{}...", nonce_hex);
+        run_cmd("tpm2_quote", &[
+            "-c", &ak_ctx,
+            "-l", &format!("sha256:{}", PCR_SELECTION),
+            "-q", &nonce_hex,
+            "-m", &quote_msg,
+            "-s", &quote_sig,
+            // v135: Request the GCP SNP auxblob — this contains the AMD hardware-signed report
+            "-o", &auxblob_path,
+        ]).await?;
+        tracing::info!("DEBUG: TPM Quote done.");
+
+        // v117: Capture the public key hash that was bound to this nonce (if any)
+        // Note: The nonce_hex passed here is already the combined hash.
+        let msg = tokio::fs::read(&quote_msg).await?;
+        let sig = tokio::fs::read(&quote_sig).await?;
+
+        let pcr_out = match run_cmd("tpm2_pcrread", &[&format!("sha256:{}", PCR_SELECTION)]).await {
+            Ok(out) => out,
+            Err(e) => {
+                error!("TPM tpm2 pcrread FAILED: {}", e);
+                vec![]
+            }
+        };
+        let pcr_str = String::from_utf8_lossy(&pcr_out);
+        tracing::info!("TPM PCRREAD OUT: {}", pcr_str);
+        tracing::info!("TPM PCR SELECTION WAS: {}", PCR_SELECTION);
+        let mut pcr_values = std::collections::BTreeMap::new();
+        for line in pcr_str.lines() {
+            if line.contains(':') && !line.trim().is_empty() {
+                let parts: Vec<&str> = line.split(':').collect();
+                if parts.len() >= 2 {
+                    let idx = parts[0].trim_matches(|c: char| !c.is_numeric()).to_string();
+                    let val = parts[1].trim().to_string();
+                    if !idx.is_empty() && !val.is_empty() {
+                        pcr_values.insert(format!("pcr_{}", idx), val);
+                    }
+                }
+            }
+        }
+
+        let ek_cert = match run_cmd("tpm2_readpublic", &["-c", "0x81010001", "-f", "pem", "-o", &format!("{}/ek.pub", work_dir)]).await {
+            Ok(_) => {
+                match run_cmd("tpm2_getekcertificate", &["-X", "-o", &format!("{}/ek.cert", work_dir)]).await {
+                    Ok(cert_der) => Some(STANDARD.encode(cert_der)),
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        };
+
+        // 🔴 FIX: Cryptographically bind using raw DER bytes instead of the PEM string.
+        // PEM strings can have varying newlines which silently break the hash.
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let ak_b64 = ak_pem_str
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect::<String>()
+            .replace(|c: char| c.is_whitespace(), "");
+        let ak_der_bytes = STANDARD.decode(ak_b64).unwrap_or_default();
+
+        // Hardware SNP Report & AMD Certificates
+        use sha2::Digest;
+        let ak_der_sha256 = hex::encode(sha2::Sha256::digest(&ak_der_bytes));
+
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&ak_der_bytes);
+        hasher.update(&hex::decode(nonce_hex).unwrap_or_default());
+        let bound_nonce = hasher.finalize();
+
+        let mut nonce_bytes = [0u8; 64];
+        nonce_bytes[..32].copy_from_slice(&bound_nonce);
+
+        tracing::info!("DEBUG: SNP nonce bytes prepared");
+        // 1. Fetch Google AK Certificate (Mandatory Identity Root)
+        // v137: Directly fetch from TPM NVRAM (primary path) with enlarged buffer (2048 bytes)
+        // to prevent truncation of the hardware-bound AMD SNP extensions.
+        let mut google_ak_cert_pem = None;
+        tracing::info!("Retrieving Google AK Certificate from hardware NVRAM...");
+        let indices = [("0x01c00002", "2048"), ("0x01c00001", "2048")];
+        for (idx, _size_hint) in &indices {
+            if let Ok(data) = run_cmd("tpm2", &["nvread", idx, "-C", "o"]).await {
+                if !data.is_empty() {
+                    tracing::info!("Obtained Google AK Cert from NVRAM index {} ({} bytes)", idx, data.len());
+                    // v125: Manually wrap Base64 in PEM headers to avoid dependency on openssl in initramfs
+                    let b64 = STANDARD.encode(&data);
+                    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+                    for chunk in b64.as_bytes().chunks(64) {
+                        pem.push_str(std::str::from_utf8(chunk).unwrap());
+                        pem.push('\n');
+                    }
+                    pem.push_str("-----END CERTIFICATE-----\n");
+                    google_ak_cert_pem = Some(pem);
+                    break;
+                }
+            }
+        }
+
+        // v136: AMD SEV-SNP Hardware Report — Three-Path Acquisition Strategy
+        // The AMD hardware root of trust: report signed by VCEK (fused AMD silicon key).
+        // Independently verifiable against AMD's KDS without trusting Google.
+        let mut auxblob_b64 = None;
+        let mut vcek_der_b64 = None;
+        let mut amd_chain_b64 = None;
+        let mut snp_report_b64 = None;
+
+        // Helper closure to try parsing SNP report from a byte slice
+        let try_parse_snp = |data: &[u8]| -> Option<Vec<u8>> {
+            for &offset in &[0usize, 4, 8, 16, 32, 64] {
+                if data.len() >= offset + 1088 {
+                    let v = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+                    if v >= 1 && v <= 4 {
+                        let end = (offset + 1184).min(data.len());
+                        if end - offset >= 1088 {
+                            let snp_slice = &data[offset..end];
+                            if snp_slice.len() >= 1088 {
+                                let chip_id = hex::encode(&snp_slice[1024..1088]);
+                                let bl = snp_slice.get(16).copied().unwrap_or(0);
+                                let tee = snp_slice.get(17).copied().unwrap_or(0);
+                                let snp_val = snp_slice.get(22).copied().unwrap_or(0);
+                                let ucode = snp_slice.get(23).copied().unwrap_or(0);
+                                tracing::info!("AMD TCB Info - ChipID: {}, BL: {}, TEE: {}, SNP: {}, UCode: {}", 
+                                    &chip_id[..16], bl, tee, snp_val, ucode);
+                            }
+                            return Some(snp_slice.to_vec());
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        // PATH 1: GCP vTPM NVRAM — AMD SNP report provisioned by hypervisor at boot
+        // Index 0x01400001 is the well-known GCP location for the hardware SNP report.
+        tracing::info!("v136: PATH 1 — NVRAM discovery and systematic scan");
+        let mut discovered_handles = vec!["0x01400001".to_string(), "0x01400002".to_string(), "0x01c00003".to_string()];
+        if let Ok(output) = run_cmd("tpm2", &["getcap", "handles-nv-indices"]).await {
+             let s = String::from_utf8_lossy(&output);
+             for line in s.lines() {
+                 if let Some(h) = line.split_whitespace().find(|s| s.starts_with("0x")) {
+                     discovered_handles.push(h.to_string());
+                 }
+             }
+        }
+        discovered_handles.sort();
+        discovered_handles.dedup();
+        tracing::info!("v136: Scanning discovered NV handles: {:?}", discovered_handles);
+
+        'nvram: for idx in &discovered_handles {
+            let data = if let Ok(d) = run_cmd("tpm2_nvread", &["-C", "o", idx]).await { d }
+                       else if let Ok(d) = run_cmd("tpm2_nvread", &["-C", "p", idx]).await { d }
+                       else if let Ok(d) = run_cmd("tpm2_nvread", &["-C", "e", idx]).await { d }
+                       else if let Ok(d) = run_cmd("tpm2", &["nvread", idx]).await { d }
+                       else { continue; };
+
+            if data.len() < 32 { continue; }
+            tracing::info!("v136: NVRAM {} returned {} bytes", idx, data.len());
+            
+            // v147: Chip ID Hunter — scan for SNP report header (0x01) at any offset
+            for offset in (0..data.len().saturating_sub(1088)).step_by(8) {
+                if let Some(snp) = try_parse_snp(&data[offset..]) {
+                    tracing::info!("v147: Found SNP report at NVRAM {} offset {}", idx, offset);
+                    let chip_id = hex::encode(&snp[1024..1088]);
+                    tracing::info!("v147: AMD Chip ID: {}", &chip_id[..16]);
+                    vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
+                    amd_chain_b64 = fetch_amd_chain().await;
+                    snp_report_b64 = Some(STANDARD.encode(&snp));
+                    break 'nvram;
+                }
+            }
+            
+            // Fallback for smaller/truncated reports in auxblob
+            if let Some(snp) = try_parse_snp(&data) {
+                tracing::info!("v136: Parsed SNP report ({} bytes) from NVRAM {}", snp.len(), idx);
+                if snp.len() >= 1088 {
+                    let chip_id = hex::encode(&snp[1024..1088]);
+                    vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
+                    amd_chain_b64 = fetch_amd_chain().await;
+                }
+                snp_report_b64 = Some(STANDARD.encode(&snp));
+                break 'nvram;
+            }
+        }
+
+        // PATH 2: TPM quote auxblob (PCR qualification data — may contain SNP embedding)
+        if snp_report_b64.is_none() {
+            tracing::info!("v136: PATH 2 — TPM quote auxblob");
+            if let Ok(raw) = tokio::fs::read(&auxblob_path).await {
+                if !raw.is_empty() {
+                    tracing::info!("v136: auxblob {} bytes", raw.len());
+                    if auxblob_b64.is_none() { auxblob_b64 = Some(STANDARD.encode(&raw)); }
+                    
+                    // v147: Chip ID Hunter in auxblob
+                    for offset in (0..raw.len().saturating_sub(1088)).step_by(8) {
+                        if let Some(snp) = try_parse_snp(&raw[offset..]) {
+                            tracing::info!("v147: Found SNP report in auxblob at offset {}", offset);
+                            let chip_id = hex::encode(&snp[1024..1088]);
+                            vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
+                            amd_chain_b64 = fetch_amd_chain().await;
+                            snp_report_b64 = Some(STANDARD.encode(&snp));
+                            break;
+                        }
+                    }
+
+                    if snp_report_b64.is_none() {
+                        if let Some(snp) = try_parse_snp(&raw) {
+                            if snp.len() >= 1088 {
+                                let chip_id = hex::encode(&snp[1024..1088]);
+                                vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
+                                amd_chain_b64 = fetch_amd_chain().await;
+                            }
+                            snp_report_b64 = Some(STANDARD.encode(&snp));
+                            tracing::info!("v136: Found SNP report in auxblob");
+                        }
+                    }
+                }
+            }
+        }
+
+        // PATH 3: ConfigFS TSM interface (requires sev-guest.ko)
+        if snp_report_b64.is_none() {
+            tracing::info!("v136: PATH 3 — ConfigFS TSM");
+            if let Some((report, aux)) = snp::get_report(&nonce_bytes) {
+                if aux.is_some() { auxblob_b64 = aux; }
+                if report.len() >= 1088 {
+                    let chip_id = hex::encode(&report[1024..1088]);
+                    vcek_der_b64 = fetch_vcek(&chip_id, report[16], report[17], report[22], report[23]).await;
+                    amd_chain_b64 = fetch_amd_chain().await;
+                }
+                snp_report_b64 = Some(STANDARD.encode(&report));
+                tracing::info!("v136: Got SNP report via ConfigFS ({} bytes)", report.len());
+            }
+        }
+
+        if snp_report_b64.is_some() {
+            tracing::info!("v136: AMD hardware root established!");
+        } else {
+            tracing::error!("v136: ALL SNP paths failed — AMD hardware root unavailable");
+        }
+
+        let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+        Ok(AttestationResult {
+            tpm_quote_msg: STANDARD.encode(msg),
+            tpm_quote_sig: STANDARD.encode(sig),
+            ak_pub_pem: ak_pem_str,
+            ek_cert,
+            pcrs: PCR_SELECTION.to_string(),
+            pcr_values,
+            nonce_hex: nonce_hex.to_string(),
+            snp_report_b64,
+            auxblob_b64,
+            signature_binding_pubkey_hash: "".to_string(), // Filled by caller
+            vcek_der_b64,
+            amd_chain_b64,
+            google_ak_cert_pem,
+            ak_der_sha256,
+        })
+    }
 }
 
 mod crypto {
@@ -2320,50 +2663,3 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
 }
 
 // PROD: Debug handlers removed
-
-    pub async fn quote(nonce_hex: &str) -> Result<AttestationResult, Box<dyn std::error::Error + Send + Sync>> {
-        use tokio::process::Command;
-        use serde_json::{json, Map};
-        let at = tdx_attestation::get_attestation_quote(nonce_hex)?;
-        
-        // Extract PCK certificate from Intel PSI or trusted vTPM
-        let pck_bytes = if let Ok(output) = Command::new("tpm2").arg("readpublic").arg("-c").arg("0x81010101").output().await {
-            output.stdout
-        } else {
-            warn!("Intel PCK not found in vTPM");
-            vec::[]  // Graceful degradation: continue without full hardware attestation
-        };
-        
-        // Verify Intel PCK signature against Intel PKI
-        let verified_pck = verify_intel_pck(&pck_bytes).await.unwrap_or(false);
-        
-        Ok(AttestationResult {
-            nonce_hex: nonce_hex.to_string(),
-            quote_data_base64: base64.encode(&at.quote_data),
-            signature_base64: base64.encode(&at.signature),
-            pck_sha256: Some(hex::encode(sha2::Sha256::digest(&pck_bytes))),
-            verified_pck: verified_pck,
-            
-            // Populate remaining required fields 
-            ak_pub_pem: String::new(),  // Will be populated by caller
-            ek_cert: None,              // Not used in secure Intel path  
-            snp_report_b64: None,      // Only AMD platform has SNR reports
-            auxblob_b64: None,          // Only GCP provides auxdata
-            
-            ...default field initialization...
-        })
-    }
-    
-    // Intel PCK verification using Intel's PKI chain
-async fn verify_intel_pck(pck_der: &[u8]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    // Fetch Intel Root CA certificates via KDS (Kernel Data Store)
-    let client = reqwest::Client::builder()
-        .add_root(CA_CERT_FILE_PATH.into())
-        .build()?;
-        
-    let response = client.get(format!("https://kds-intel.amd.com/vcek/Milan/{:?}", chip_id))
-        .send().await?;
-        
-    // Parse and verify PCK certificate against Intel PKI hierarchy
-    Ok(true)
-}
