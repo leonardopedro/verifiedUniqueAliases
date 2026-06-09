@@ -27,6 +27,7 @@ legacy/
 *.uncompressed
 *.tmp
 *.sha256
+*.tgz
 
 add-det
 # GCP Synthesis Intermediate Files
