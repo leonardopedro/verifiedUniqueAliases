@@ -53,3 +53,9 @@ lto = false
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[features]
+# Default: Google Cloud Confidential VM (AMD SEV-SNP attestation root of trust)
+default = []
+# Enable Intel TDX attestation support for Alibaba Cloud ECS.r9i.xlarge instances
+alibabacloud = []

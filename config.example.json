@@ -1,0 +1,12 @@
+{
+    "paypal_client_id": "YOUR_PAYPAL_CLIENT_ID",
+    "paypal_client_secret": "YOUR_PAYPAL_CLIENT_SECRET",
+    "paypal_verified_client_id": "YOUR_PAYPAL_VERIFIED_CLIENT_ID",
+    "paypal_verified_client_secret": "YOUR_PAYPAL_VERIFIED_CLIENT_SECRET",
+    "domain": "your-domain.example.com",
+    "eab_key_id": "YOUR_EAB_KEY_ID",
+    "eab_hmac_key": "YOUR_EAB_HMAC_KEY",
+    "staging": false,
+    "acme_account_json": "",
+    "attestation_signing_key": "YOUR_RSA_PRIVATE_KEY_PEM"
+}

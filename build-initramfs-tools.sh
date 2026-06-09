@@ -88,26 +88,22 @@ echo "🔍 Using kernel version: $KERNEL_VERSION"
 touch /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
 chmod 644 /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
 
-# Force inclusion of GCP network and hardware modules in the base image
-echo "gve" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "virtio_net" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "virtio_scsi" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "virtio_blk" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "nvme" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "nvme_core" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "sev_guest" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "sev-guest" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "vfat" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "nls_cp437" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "nls_ascii" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "nf_tables" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "nft_chain_filter" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "nft_reject_ipv4" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "nft_limit" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "nf_conntrack" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "nft_ct" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "tsm" | tee -a /etc/initramfs-tools/modules >/dev/null
-echo "amd_tsm" | tee -a /etc/initramfs-tools/modules >/dev/null
+# Platform-specific hardware modules detection
+# Default: GCP AMD SEV-SNP
+PLATFORM_MODULES="sev_guest sev-guest amd_tsm tsm gve virtio_net virtio_scsi virtio_blk nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct configfs coco virt_anchor"
+
+if [[ "${BUILD_FEATURE:-}" == "alibabacloud" ]]; then
+    # Intel TDX / Alibaba Cloud: drop GCP-specific modules, add TDX support
+    PLATFORM_MODULES="tdx virtio_net virtio_scsi virtio_blk nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct configfs"
+    echo "🏗️ Building initramfs for Alibaba Cloud Intel TDX"
+else
+    echo "🏗️ Building initramfs for GCP AMD SEV-SNP"
+fi
+
+# Force inclusion of hardware modules
+for mod in $PLATFORM_MODULES; do
+    echo "$mod" | tee -a /etc/initramfs-tools/modules >/dev/null
+done
 
 echo "🔨 Generating base mkinitramfs..."
 BASE_IMG="/tmp/base-initrd.img"
@@ -143,11 +139,11 @@ copy_bin_and_deps "tpm2_createak"
 ln -sf "$BIN_PATH" ./init
 chmod 755 ./init
 
-# 5b. Forcefully inject attestation modules (tsm, amd_tsm, sev-guest, virtio_net, gve)
+# 5b. Forcefully inject hardware modules (platform-dependent)
 # mkinitramfs may skip these if not running on the target hardware.
 echo "🛡️  Injecting hardware and network modules..."
 MODULES_BASE="/lib/modules/$KERNEL_VERSION"
-for modname in configfs tsm amd_tsm sev_guest sev-guest coco virt_anchor gve virtio_net virtio_pci virtio_blk virtio_scsi nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct; do
+for modname in $PLATFORM_MODULES; do
     # Find the module file (could be .ko, .ko.gz, .ko.xz, or .ko.zst)
     # Search deeper to find all variants (handle hyphen/underscore mismatch)
     altname="${modname//_/-}"
