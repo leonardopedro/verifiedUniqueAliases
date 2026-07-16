@@ -12,6 +12,17 @@ jobs:
       attestations: write
       contents: read
       id-token: write
+    strategy:
+      matrix:
+        include:
+          - platform: gcp
+            dockerfile: Dockerfile.repro
+            features: ""
+            label: "GCP AMD SEV-SNP"
+          - platform: alibabacloud
+            dockerfile: Dockerfile.alibaba
+            features: "alibabacloud"
+            label: "Alibaba Cloud Intel TDX"
 
     steps:
       - uses: actions/checkout@v4
@@ -20,60 +31,65 @@ jobs:
 
       - name: Build and extract artifacts
         run: |
-          docker build --no-cache --load --target image-builder -f Dockerfile.repro -t paypal-auth-vm .
-          CONTAINER_ID=$(docker create paypal-auth-vm)
-          docker cp $CONTAINER_ID:/build/paypal-auth-vm-bin ./paypal-auth-vm.bin
-          docker cp $CONTAINER_ID:/build/output/vmlinuz ./vmlinuz
-          docker cp $CONTAINER_ID:/build/output/initramfs-paypal-auth.img ./initramfs.img
-          docker cp $CONTAINER_ID:/build/output/shimx64.efi ./shimx64.efi
-          docker cp $CONTAINER_ID:/build/output/grubx64.efi ./grubx64.efi
-          docker cp $CONTAINER_ID:/grub.cfg ./grub.cfg
-          docker cp $CONTAINER_ID:/disk.tar.gz ./disk.tar.gz
-          docker cp $CONTAINER_ID:/packages.txt ./packages.txt
+          docker build --no-cache --load --target image-builder -f ${{ matrix.dockerfile }} -t paypal-auth-vm:${{ matrix.platform }} .
+          CONTAINER_ID=$(docker create paypal-auth-vm:${{ matrix.platform }})
+          docker cp $CONTAINER_ID:/build/paypal-auth-vm-bin ./paypal-auth-vm-${{ matrix.platform }}.bin || docker cp $CONTAINER_ID:/paypal-auth-vm-bin ./paypal-auth-vm-${{ matrix.platform }}.bin
+          docker cp $CONTAINER_ID:/build/output/vmlinuz ./vmlinuz-${{ matrix.platform }} || true
+          docker cp $CONTAINER_ID:/build/output/initramfs-paypal-auth.img ./initramfs-${{ matrix.platform }}.img || docker cp $CONTAINER_ID:/initramfs-paypal-auth.img ./initramfs-${{ matrix.platform }}.img || true
+          docker cp $CONTAINER_ID:/build/output/shimx64.efi ./shimx64-${{ matrix.platform }}.efi || true
+          docker cp $CONTAINER_ID:/build/output/grubx64.efi ./grubx64-${{ matrix.platform }}.efi || true
+          docker cp $CONTAINER_ID:/grub.cfg ./grub-${{ matrix.platform }}.cfg || true
+          docker cp $CONTAINER_ID:/disk.tar.gz ./disk-${{ matrix.platform }}.tar.gz || true
+          docker cp $CONTAINER_ID:/packages.txt ./packages-${{ matrix.platform }}.txt || true
+          docker cp $CONTAINER_ID:/build/packages.txt ./packages-${{ matrix.platform }}.txt || true
           docker rm $CONTAINER_ID
-          echo "==== ARTIFACT HASHES ===="
-          sha256sum paypal-auth-vm.bin vmlinuz initramfs.img shimx64.efi grubx64.efi grub.cfg disk.tar.gz
+          echo "==== ARTIFACT HASHES (${{ matrix.label }}) ===="
+          sha256sum paypal-auth-vm-${{ matrix.platform }}.bin vmlinuz-${{ matrix.platform }} initramfs-${{ matrix.platform }}.img shimx64-${{ matrix.platform }}.efi grubx64-${{ matrix.platform }}.efi grub-${{ matrix.platform }}.cfg disk-${{ matrix.platform }}.tar.gz 2>/dev/null
           echo "========================="
 
       - name: Attest Enclave Binary
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: Enclave Binary
-          subject-path: paypal-auth-vm.bin
+          subject-name: Enclave Binary (${{ matrix.label }})
+          subject-path: paypal-auth-vm-${{ matrix.platform }}.bin
 
       - name: Attest Kernel
+        if: matrix.platform == 'gcp'
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: Linux Kernel
-          subject-path: vmlinuz
+          subject-name: Linux Kernel (${{ matrix.label }})
+          subject-path: vmlinuz-${{ matrix.platform }}
 
       - name: Attest Initrd
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: Initramfs
-          subject-path: initramfs.img
+          subject-name: Initramfs (${{ matrix.label }})
+          subject-path: initramfs-${{ matrix.platform }}.img
 
       - name: Attest Bootloader
+        if: matrix.platform == 'gcp'
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: EFI Bootloader
+          subject-name: EFI Bootloader (${{ matrix.label }})
           subject-path: |
-            shimx64.efi
-            grubx64.efi
-            grub.cfg
+            shimx64-${{ matrix.platform }}.efi
+            grubx64-${{ matrix.platform }}.efi
+            grub-${{ matrix.platform }}.cfg
 
       - name: Attest VM Disk Image
+        if: matrix.platform == 'gcp'
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: VM Disk Image
-          subject-path: disk.tar.gz
+          subject-name: VM Disk Image (${{ matrix.label }})
+          subject-path: disk-${{ matrix.platform }}.tar.gz
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vm-artifacts
+          name: vm-artifacts-${{ matrix.platform }}
           path: |
-            disk.tar.gz
-            initramfs.img
-            vmlinuz
+            paypal-auth-vm-${{ matrix.platform }}.bin
+            initramfs-${{ matrix.platform }}.img
+            vmlinuz-${{ matrix.platform }}
+            disk-${{ matrix.platform }}.tar.gz
           retention-days: 7
