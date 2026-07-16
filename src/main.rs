@@ -452,12 +452,37 @@ mod enclave_init {
             .status();
 
         // SYNC TIME from trusted source over PINNED TLS
-        // Because clock is >= 2026, the TLS handshake to Google will succeed.
-        if let Ok(resp) = crate::hardened_client().get("https://www.google.com").send().await {
-            if let Some(date_str) = resp.headers().get("Date") {
-                if let Ok(date) = date_str.to_str() {
-                    let _ = std::process::Command::new("/bin/date").args(["-s", date]).status();
-                    kmsg(&format!("System time cryptographically synced to: {}", date));
+        // Because clock is >= 2026, the TLS handshake will succeed.
+        #[cfg(not(feature = "alibabacloud"))]
+        {
+            // GCP: Use Google as time source
+            if let Ok(resp) = crate::hardened_client().get("https://www.google.com").send().await {
+                if let Some(date_str) = resp.headers().get("Date") {
+                    if let Ok(date) = date_str.to_str() {
+                        let _ = std::process::Command::new("/bin/date").args(["-s", date]).status();
+                        kmsg(&format!("System time cryptographically synced to: {}", date));
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "alibabacloud")]
+        {
+            // Alibaba Cloud: Use curl to fetch Date header (Google may be unreachable from CN regions)
+            let time_sources = ["https://www.cloudflare.com", "https://www.aliyun.com"];
+            for src in &time_sources {
+                let output = std::process::Command::new("/usr/bin/curl")
+                    .args(["-sI", "--max-time", "5", src])
+                    .output();
+                if let Ok(out) = output {
+                    let headers = String::from_utf8_lossy(&out.stdout);
+                    for line in headers.lines() {
+                        if line.to_lowercase().starts_with("date:") {
+                            let date = line[5..].trim();
+                            let _ = std::process::Command::new("/bin/date").args(["-s", date]).status();
+                            kmsg(&format!("System time synced from {}: {}", src, date));
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -538,6 +563,8 @@ mod tpm {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub tdx_policy: Option<String>,
         pub platform_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub td_info: Option<serde_json::Value>,
     }
 
     pub mod snp {
@@ -718,7 +745,7 @@ mod tpm {
 
 
     pub async fn quote(nonce_hex: &str) -> Result<AttestationResult, Box<dyn std::error::Error + Send + Sync>> {
-        if super::intel_tdx::is_intel_tdx_available() {
+        if crate::intel_tdx::is_intel_tdx_available() {
             tracing::info!("Intel TDX hardware attestation path active"); 
         }
         
@@ -1080,7 +1107,7 @@ mod tpm {
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
 
         // Collect Intel TDX-specific data when available
-        let (pck_cert_pem, tdx_policy, platform_type) = if super::intel_tdx::is_intel_tdx_available() {
+        let (pck_cert_pem, tdx_policy, platform_type, td_info_json) = if super::intel_tdx::is_intel_tdx_available() {
             let tdx_base = super::intel_tdx::collect_tdx_report();
             let pck_pem = tdx_base.as_ref().and_then(|b| {
                 b.pck_cert_from_nvram.as_deref().map(|der| {
@@ -1088,13 +1115,26 @@ mod tpm {
                 })
             });
             let policy = tdx_base.as_ref().and_then(|b| b.tdx_policy.clone());
+            let td_info = tdx_base.as_ref().and_then(|b| {
+                b.td_info.as_ref().map(|info| serde_json::json!({
+                    "attributes": info.attributes,
+                    "mrtd": info.mrtd,
+                    "rtmr0": info.rtmr0,
+                    "rtmr1": info.rtmr1,
+                    "rtmr2": info.rtmr2,
+                    "rtmr3": info.rtmr3,
+                }))
+            });
             tracing::info!("Intel TDX platform detected — PCK hash: {}", 
                 tdx_base.as_ref().and_then(|b| {
                     b.pck_cert_from_nvram.as_deref().map(|d| super::intel_tdx::hash_cert(d))
                 }).unwrap_or_else(|| "none".to_string()));
-            (pck_pem, policy, "Intel TDX".to_string())
+            if td_info.is_some() {
+                tracing::info!("Intel TDX TDINFO measurements available");
+            }
+            (pck_pem, policy, "Intel TDX".to_string(), td_info)
         } else {
-            (None, None, "AMD SEV-SNP".to_string())
+            (None, None, "AMD SEV-SNP".to_string(), None)
         };
 
         Ok(AttestationResult {
@@ -1115,6 +1155,7 @@ mod tpm {
             pck_cert_pem,
             tdx_policy,
             platform_type,
+            td_info: td_info_json,
         })
     }
 }
@@ -1155,6 +1196,7 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 50;
 const GLOBAL_EGRESS_BYTES_PER_HOUR: u64 = 512 * 1024 * 1024; // 512 MB
 const IP_EGRESS_BYTES_PER_HOUR: u64 = 25 * 1024 * 1024;     // 25 MB
 const GOOGLE_PUBLIC_CA_DIRECTORY: &str = "https://dv.acme-v02.api.pki.goog/directory";
+const LETSENCRYPT_CA_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
 
 const PAYPAL_PRODUCTION_API: &str = "https://api-m.paypal.com";
 const PAYPAL_SANDBOX_API: &str = "https://api-m.sandbox.paypal.com";
@@ -1462,7 +1504,7 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
 
     #[cfg(feature = "alibabacloud")]
     {
-        info!("Alibaba Cloud build: config must be provided via environment variables or CONFIG_FILE");
+        info!("Alibaba Cloud build: config provided via environment variables or CONFIG_FILE");
     }
 
     Err("Configuration not available. Set PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, PAYPAL_VERIFIED_CLIENT_ID, PAYPAL_VERIFIED_CLIENT_SECRET, DOMAIN environment variables, or provide CONFIG_FILE path.".into())
@@ -1570,7 +1612,7 @@ fn apply_config_fallbacks(mut config: Config) -> Result<Config, Box<dyn std::err
 }
 
 // ============================================================================
-// GOOGLE PUBLIC CA
+// ACME CERTIFICATE MANAGER (Google Public CA on GCP, Let's Encrypt on Alibaba)
 // ============================================================================
 
 struct GooglePublicCaManager {
@@ -1579,7 +1621,7 @@ struct GooglePublicCaManager {
     eab_hmac_key: Option<String>,
     // NOTE: `staging` is intentionally absent here.
     // The `staging` flag in the Vault secret controls PayPal Sandbox mode only.
-    // ACME/TLS certificates always use the Google Public CA PRODUCTION endpoint.
+    // ACME/TLS certificates always use the production CA endpoint.
     acme_account_json: Option<String>,
 }
 
@@ -1593,6 +1635,28 @@ impl GooglePublicCaManager {
         }
     }
 
+    /// Select the appropriate ACME directory based on platform and EAB availability
+    fn acme_directory(&self) -> &str {
+        #[cfg(feature = "alibabacloud")]
+        {
+            // Alibaba Cloud: Use Let's Encrypt (no EAB required)
+            LETSENCRYPT_CA_DIRECTORY
+        }
+        #[cfg(not(feature = "alibabacloud"))]
+        {
+            // GCP: Use Google Public CA (requires EAB)
+            GOOGLE_PUBLIC_CA_DIRECTORY
+        }
+    }
+
+    /// Whether this CA requires External Account Binding (EAB) credentials
+    fn requires_eab(&self) -> bool {
+        #[cfg(feature = "alibabacloud")]
+        { false }
+        #[cfg(not(feature = "alibabacloud"))]
+        { true }
+    }
+
     async fn ensure_certificate(&self) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
         info!("Checking for cached TLS credentials in Vault...");
         if let Some((cert, key, acme_key)) = Self::fetch_cached_tls().await {
@@ -1603,8 +1667,8 @@ impl GooglePublicCaManager {
             return Ok((cert, key));
         }
 
-        info!("Obtaining TLS certificate from Google Public CA...");
-        let acme_url = GOOGLE_PUBLIC_CA_DIRECTORY;
+        info!("Obtaining TLS certificate via ACME...");
+        let acme_url = self.acme_directory();
         let account_path = "/tmp/acme-account.json";
         
         // ... (rest of account logic)
@@ -1616,7 +1680,7 @@ impl GooglePublicCaManager {
             let mut builder = AccountBuilder::new(dir);
             builder.private_key(priv_pem);
             builder.build().await?
-        } else {
+        } else if self.requires_eab() {
             let kid = self.eab_key_id.as_ref().ok_or("Missing EAB key ID")?;
             info!("Creating new ACME account with EAB Key ID: {}...", &kid[..8.min(kid.len())]);
             let hmac_str = self.eab_hmac_key.as_ref().ok_or("Missing EAB HMAC key")?;
@@ -1636,6 +1700,18 @@ impl GooglePublicCaManager {
             builder.external_account_binding(kid.clone(), hmac_pkey);
             let account = builder.build().await?;
 
+            if let Ok(priv_pem) = account.private_key().private_key_to_pem_pkcs8() {
+                let _ = tokio::fs::write(account_path, priv_pem).await;
+            }
+            account
+        } else {
+            // No EAB required (Let's Encrypt / Alibaba Cloud)
+            info!("Creating new ACME account (no EAB)...");
+            let dir = DirectoryBuilder::new(acme_url.to_string()).build().await?;
+            let mut builder = AccountBuilder::new(dir);
+            builder.contact(vec![format!("mailto:admin@{}", self.domain)]);
+            builder.terms_of_service_agreed(true);
+            let account = builder.build().await?;
             if let Ok(priv_pem) = account.private_key().private_key_to_pem_pkcs8() {
                 let _ = tokio::fs::write(account_path, priv_pem).await;
             }
@@ -1690,6 +1766,14 @@ impl GooglePublicCaManager {
     }
 
     async fn fetch_cached_tls() -> Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
+        // TLS caching relies on cloud KMS — only available on GCP builds
+        #[cfg(feature = "alibabacloud")]
+        {
+            info!("TLS cache via GCP Secret Manager not available on Alibaba Cloud builds");
+            return None;
+        }
+        #[cfg(not(feature = "alibabacloud"))]
+        {
         let secret_name = std::env::var("TLS_CACHE_SECRET").ok()?;
         info!("Attempting to restore TLS from cache: {}", secret_name);
         let client = reqwest::Client::new();
@@ -1732,9 +1816,19 @@ impl GooglePublicCaManager {
         
         info!("Successfully restored and unsealed TLS private key from cache (cert and ACME account unsealed)");
         Some((cert, key, acme_key))
+        } // end cfg(not(alibabacloud))
     }
 
     async fn store_cached_tls(cert: &[u8], key: &[u8], acme_key: Option<&[u8]>) {
+        // TLS cache store only works on GCP builds (uses GCP Secret Manager)
+        #[cfg(feature = "alibabacloud")]
+        {
+            let _ = (cert, key, acme_key);
+            info!("TLS cache storage skipped on Alibaba Cloud build");
+            return;
+        }
+        #[cfg(not(feature = "alibabacloud"))]
+        {
         if let Ok(secret_name) = std::env::var("TLS_CACHE_SECRET") {
             use base64::{engine::general_purpose::STANDARD, Engine as _};
             let dek = crypto::generate_dek();
@@ -1777,6 +1871,7 @@ impl GooglePublicCaManager {
                 }
             }
         }
+        } // end cfg(not(alibabacloud))
     }
 }
 
@@ -2345,6 +2440,34 @@ async fn load_tls_config(
     Ok(Arc::new(builder.build()))
 }
 
+/// Generate a self-signed TLS certificate using rcgen (fallback for Alibaba Cloud
+/// when ACME is unreachable due to DNS/network constraints)
+#[cfg(feature = "alibabacloud")]
+fn generate_self_signed_cert(domain: &str) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+
+    info!("Generating self-signed TLS certificate for domain: {}", domain);
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, domain);
+    dn.push(DnType::OrganizationName, "PayPal Auth Confidential VM");
+    params.distinguished_name = dn;
+    params.subject_alt_names = vec![
+        SanType::DnsName(domain.to_string().try_into()?),
+    ];
+    // 90-day validity
+    params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2027, 1, 1);
+
+    let key_pair = KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
+    let cert_pem = cert.pem().into_bytes();
+    let key_pem = key_pair.serialize_pem().into_bytes();
+
+    info!("Self-signed certificate generated ({} bytes cert, {} bytes key)", cert_pem.len(), key_pem.len());
+    Ok((cert_pem, key_pem))
+}
+
 // ============================================================================
 // MAIN
 // ============================================================================
@@ -2377,10 +2500,25 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .status();
     }
 
-    if std::path::Path::new("/dev/sev-guest").exists() {
-        enclave_init::kmsg("Hardware interface /dev/sev-guest is PRESENT (likely built-in)");
-    } else {
-        enclave_init::kmsg("Hardware interface /dev/sev-guest is MISSING");
+    // Platform-specific hardware interface check
+    #[cfg(not(feature = "alibabacloud"))]
+    {
+        if std::path::Path::new("/dev/sev-guest").exists() {
+            enclave_init::kmsg("Hardware interface /dev/sev-guest is PRESENT (likely built-in)");
+        } else {
+            enclave_init::kmsg("Hardware interface /dev/sev-guest is MISSING");
+        }
+    }
+    #[cfg(feature = "alibabacloud")]
+    {
+        if std::path::Path::new("/dev/tpmrm0").exists() {
+            enclave_init::kmsg("TPM device /dev/tpmrm0 is PRESENT (Intel TDX standard TPM)");
+        } else {
+            enclave_init::kmsg("WARNING: /dev/tpmrm0 is MISSING — TPM attestation unavailable");
+        }
+        if std::path::Path::new("/sys/bus/platform/drivers/tdx").exists() {
+            enclave_init::kmsg("Intel TDX driver is loaded");
+        }
     }
 
     // 2. Initialize the Tokio runtime now that the environment is sane
@@ -2461,6 +2599,30 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
                 }
             },
             Err(e) => warn!("Failed to fetch attestation token: {}", e),
+        }
+    }
+
+    #[cfg(feature = "alibabacloud")]
+    {
+        // Alibaba Cloud: Fetch instance identity document from metadata service
+        let meta_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build().unwrap_or_else(|_| reqwest::Client::new());
+        match meta_client.get("http://100.100.100.200/latest/dynamic/instance-identity/document")
+            .send().await {
+            Ok(resp) => {
+                match resp.text().await {
+                    Ok(identity_doc) => info!("Alibaba Cloud Instance Identity: {}", &identity_doc[..identity_doc.len().min(200)]),
+                    Err(e) => warn!("Failed to read Alibaba instance identity: {}", e),
+                }
+            },
+            Err(e) => warn!("Alibaba Cloud metadata service unavailable: {}", e),
+        }
+        // Check Intel TDX availability
+        if crate::intel_tdx::is_intel_tdx_available() {
+            info!("Intel TDX hardware attestation available on this Alibaba Cloud instance");
+        } else {
+            warn!("Intel TDX not detected — falling back to standard TPM attestation");
         }
     }
 
@@ -2626,22 +2788,41 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
 
     // Obtain TLS certificate (HTTP-01 challenge served by the running HTTP server)
     eprintln!("[DEBUG] starting ACME cert obtain");
-    info!("Obtaining TLS certificate from Google Public CA...");
+    info!("Obtaining TLS certificate via ACME...");
     let ca = GooglePublicCaManager::new(&config);
     let (cert_pem, key_pem) = match ca.ensure_certificate().await {
         Ok(r) => {
-            info!("Certificate obtained");
+            info!("Certificate obtained via ACME");
             https_ready.store(true, Ordering::Relaxed);
             *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&r.0).to_string());
             r
         }
         Err(e) => {
-            error!(
-                "Failed to get certificate: {}. Keeping process alive for debugging...",
-                e
-            );
-            loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
+            #[cfg(feature = "alibabacloud")]
+            {
+                error!("ACME certificate failed: {}. Generating self-signed certificate as fallback...", e);
+                match generate_self_signed_cert(&config.domain) {
+                    Ok(r) => {
+                        warn!("Using SELF-SIGNED certificate — not suitable for production without a reverse proxy");
+                        https_ready.store(true, Ordering::Relaxed);
+                        *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&r.0).to_string());
+                        r
+                    }
+                    Err(e2) => {
+                        error!("Self-signed cert also failed: {}. Keeping process alive for debugging...", e2);
+                        loop { tokio::time::sleep(Duration::from_secs(3600)).await; }
+                    }
+                }
+            }
+            #[cfg(not(feature = "alibabacloud"))]
+            {
+                error!(
+                    "Failed to get certificate: {}. Keeping process alive for debugging...",
+                    e
+                );
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
             }
         }
     };
