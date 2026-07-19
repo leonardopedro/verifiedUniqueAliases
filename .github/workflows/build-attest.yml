@@ -92,23 +92,22 @@ jobs:
           name: vm-artifacts-alibabacloud
           path: /tmp/disk-out
 
-      - name: Publish disk to repo (LFS)
+      - name: Publish disk to repo (plain blob, no LFS)
         if: success()
         run: |
           set -e
-          sudo apt-get update -y && sudo apt-get install -y git-lfs 2>&1 | tail -2
-          git lfs install 2>&1
           cp /tmp/disk-out/disk-alibabacloud.raw disk-alibaba.raw
           ls -la disk-alibaba.raw
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config lfs.url "https://github.com/${{ github.repository }}.git/info/lfs"
-          git lfs track "disk-alibaba.raw"
-          git add .gitattributes disk-alibaba.raw
+          # Commit as a plain blob (bypass LFS smudge/filter for this file)
+          git -c filter.lfs.smudge= -c filter.lfs.required=false \
+              -c filter.lfs.clean= add disk-alibaba.raw
           git status --short
-          git commit -m "chore: update reproducible disk-alibaba.raw ($(sha256sum disk-alibaba.raw | cut -d' ' -f1)) [skip ci]" || echo "nothing to commit"
+          git commit -m "chore: update reproducible disk-alibaba.raw ($(sha256sum disk-alibaba.raw | cut -d' ' -f1)) [skip ci]" \
+            && echo "COMMITTED" || echo "NOTHING_TO_COMMIT"
           git push origin HEAD:l-branch-1 2>&1 | tee publish.log
-          git lfs push origin HEAD:l-branch-1 2>&1 | tee -a publish.log || true
+          echo "PUSH_DONE"
 
       - name: Upload publish log
         if: always()
