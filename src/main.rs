@@ -753,6 +753,45 @@ async fn fetch_secret_direct(secret_id: &str) -> Option<String> {
 
 
 
+/// Probe the Alibaba Cloud instance metadata user-data endpoint and export any
+/// `KEY=VALUE` lines as environment variables. This lets launch-time UserData
+/// (CLOUD_PROVIDER, DOMAIN, ALI_*) reach our config loader without cloud-init.
+async fn load_alibaba_metadata_env() {
+    let endpoints = [
+        "http://100.100.100.200/latest/user-data",
+        "http://100.100.100.200/2016-01-01/user-data",
+    ];
+    let client = reqwest::Client::new();
+    for ep in endpoints {
+        if let Ok(resp) = client.get(ep).send().await {
+            if let Ok(body) = resp.text().await {
+                if body.trim().is_empty() {
+                    continue;
+                }
+                let mut found = false;
+                for line in body.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((k, v)) = line.split_once('=') {
+                        let k = k.trim();
+                        let v = v.trim().trim_matches('"');
+                        if !k.is_empty() {
+                            std::env::set_var(k, v);
+                            found = true;
+                        }
+                    }
+                }
+                if found {
+                    info!("Loaded Alibaba instance metadata user-data from {}", ep);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
     let cloud_provider = std::env::var("CLOUD_PROVIDER").unwrap_or_else(|_| "gcp".to_string());
 
@@ -1761,6 +1800,16 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     eprintln!("[DEBUG] tracing initialized");
+
+    // --- ALIBABA METADATA BOOTSTRAP ---
+    // Our custom init does not run cloud-init, so Alibaba UserData (passed at
+    // instance launch) is delivered via the instance metadata service instead.
+    // If CLOUD_PROVIDER is not already set in the environment, probe the Alibaba
+    // metadata user-data endpoint and export any KEY=VALUE lines as env vars.
+    if std::env::var("CLOUD_PROVIDER").is_err() {
+        load_alibaba_metadata_env().await;
+    }
+
     let cloud_provider = std::env::var("CLOUD_PROVIDER").unwrap_or_else(|_| "gcp".to_string());
     if cloud_provider == "alibaba" {
         info!("Starting PayPal Auth on Alibaba Cloud Confidential VM (Intel TDX, v71 Hardened)");
