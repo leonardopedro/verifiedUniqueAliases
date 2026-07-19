@@ -105,7 +105,7 @@ jobs:
             cp /tmp/disk-out/disk-alibabacloud.raw disk-alibaba.raw 2>&1
             SHA=$(sha256sum disk-alibaba.raw | cut -d' ' -f1)
             echo "$SHA  disk-alibaba.raw" > disk-alibaba.raw.sha256
-            git add disk-alibaba.raw disk-alibaba.raw.sha256 2>&1
+            git add -f disk-alibaba.raw disk-alibaba.raw.sha256 2>&1
             git status --short 2>&1
             git commit -m "chore: update reproducible disk-alibaba.raw ($SHA) [skip ci]" 2>&1
             git push origin l-branch-1 --force-with-lease 2>&1
