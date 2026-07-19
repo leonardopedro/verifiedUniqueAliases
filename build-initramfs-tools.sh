@@ -223,11 +223,27 @@ if [ -n "$KERNEL_VER" ] && [ -d "./usr/lib/modules/$KERNEL_VER" ]; then
         fi
     done
 
+    # Explicitly pull in NVMe host + PCIe transport so the image is detected
+    # as NVMe-capable on 9th-gen (TDX) instance families (c9i/g9i/r9i).
+    NVME_BASE="./usr/lib/modules/$KERNEL_VER/kernel/drivers/nvme"
+    for nm in \
+        "$NVME_BASE/host/nvme-core.ko.zst" \
+        "$NVME_BASE/host/nvme.ko.zst" \
+        "$NVME_BASE/host/nvme-fabrics.ko.zst" \
+        "$NVME_BASE/host/nvme-pci.ko.zst"; do
+        if [ -f "$nm" ]; then
+            ko_out="${nm%.zst}"
+            echo "  decompressing $(basename "$nm")"
+            zstd -d -f "$nm" -o "$ko_out" 2>/dev/null || true
+        fi
+    done
+
     # Also search for any other .ko.zst in the gve and virtio directories
     # and decompress them (dependencies of gve like gve_drv if present)
     for dir in \
         "./usr/lib/modules/$KERNEL_VER/kernel/drivers/net/ethernet/google/gve" \
-        "./usr/lib/modules/$KERNEL_VER/kernel/drivers/virtio"; do
+        "./usr/lib/modules/$KERNEL_VER/kernel/drivers/virtio" \
+        "./usr/lib/modules/$KERNEL_VER/kernel/drivers/nvme"; do
         if [ -d "$dir" ]; then
             for zst in "$dir"/*.ko.zst; do
                 [ -f "$zst" ] || continue

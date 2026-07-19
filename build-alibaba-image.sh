@@ -57,7 +57,7 @@ cat > "$OUTPUT_DIR/grub.cfg" <<GRUBEOF
 set default=0
 set timeout=0
 menuentry "PayPal Auth VM (Alibaba Cloud TDX)" {
-    linux /EFI/BOOT/vmlinuz root=/dev/vda1 console=tty0 console=ttyS0,115200n8 net.ifnames=0 biosdevname=0
+    linux /EFI/BOOT/vmlinuz root=PARTUUID=00000000-0000-0000-0000-000000000002 console=tty0 console=ttyS0,115200n8 net.ifnames=0 biosdevname=0
     initrd /EFI/BOOT/initrd.img
 }
 GRUBEOF
