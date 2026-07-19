@@ -556,7 +556,7 @@ const USER_AGREEMENT: &str = r#"
 // CONFIG (single JSON secret)
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Config {
     paypal_client_id: String,
     paypal_client_secret: String,
@@ -754,6 +754,32 @@ async fn fetch_secret_direct(secret_id: &str) -> Option<String> {
 
 
 async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
+    let cloud_provider = std::env::var("CLOUD_PROVIDER").unwrap_or_else(|_| "gcp".to_string());
+
+    // Alibaba Cloud: configuration is supplied via environment variables at launch
+    // (or baked into the image). No GCP metadata server / Secret Manager is available,
+    // so we short-circuit the GCP-only paths below.
+    if cloud_provider == "alibaba" {
+        info!("Cloud provider: Alibaba Cloud (TDX). Using environment / built-in config.");
+        let dom = std::env::var("DOMAIN").unwrap_or_else(|_| "localhost".to_string());
+        return Ok(Config {
+            paypal_client_id: std::env::var("PAYPAL_CLIENT_ID")
+                .unwrap_or_else(|_| "ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0".to_string()),
+            paypal_client_secret: std::env::var("PAYPAL_CLIENT_SECRET")
+                .unwrap_or_else(|_| "EFdUSE2qjgZy5Ok5f4Cy0SBuodWTj30TzO-7b8W8VAQOoNDwu-Feecb7va89C0jS5BZuclqiJSt4I20s".to_string()),
+            paypal_verified_client_id: Some(std::env::var("PAYPAL_VERIFIED_CLIENT_ID")
+                .unwrap_or_else(|_| "AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p".to_string())),
+            paypal_verified_client_secret: Some(std::env::var("PAYPAL_VERIFIED_CLIENT_SECRET")
+                .unwrap_or_else(|_| "EHSSIjy5sUHPYrBA1tN-UqDLfuTe-FSSdxRVJ6CCvNcwK6QphDUExRPGurFvA4DibvFNA-LvnHFUY7vP".to_string())),
+            domain: dom,
+            eab_key_id: std::env::var("EAB_KEY_ID").ok(),
+            eab_hmac_key: std::env::var("EAB_HMAC_KEY").ok(),
+            staging: std::env::var("STAGING").map(|s| s == "true").unwrap_or(false),
+            acme_account_json: std::env::var("ACME_ACCOUNT_JSON").ok(),
+            attestation_signing_key: std::env::var("ATTESTATION_SIGNING_KEY").ok(),
+        });
+    }
+
     // Priority 1: Check for environment variables (KeePassXC / Local development support)
     if let (Ok(p_id), Ok(p_sec), Ok(pv_id), Ok(pv_sec), Ok(dom)) = (
         std::env::var("PAYPAL_CLIENT_ID"),
@@ -1119,6 +1145,223 @@ impl GooglePublicCaManager {
 }
 
 // ============================================================================
+// ALIBABA CLOUD CAS (Certificate Management Service)
+// Issues a real, publicly-trusted DV certificate using the RAM/STS credentials
+// that the instance already possesses. Domain ownership is proven automatically
+// via the FILE verification method, served by the existing
+// /.well-known/acme-challenge/ route (port 80).
+// ============================================================================
+
+/// Sign an Alibaba Cloud RPC request (HMAC-SHA1, flat params) and return the
+/// full query string including the Signature.
+fn alibaba_rpc_sign(
+    params: &mut std::collections::BTreeMap<String, String>,
+    access_key_secret: &str,
+) -> String {
+    use base64::engine::general_purpose::BASE64_STANDARD as B64;
+    use base64::Engine as _;
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+
+    let canonical = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let string_to_sign = format!("GET&{}&{}", percent_encode("/"), percent_encode(&canonical));
+    type HmacSha1 = Hmac<Sha1>;
+    let mut mac = HmacSha1::new_from_slice((access_key_secret.to_string() + "&").as_bytes())
+        .expect("HMAC can take key of any size");
+    mac.update(string_to_sign.as_bytes());
+    let signature = B64.encode(mac.finalize().into_bytes());
+    let mut q = canonical;
+    q.push_str(&format!("&Signature={}", percent_encode(&signature)));
+    q
+}
+
+fn percent_encode(input: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for b in input.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                let _ = write!(out, "%{:02X}", b);
+            }
+        }
+    }
+    out
+}
+
+struct AlibabaCasManager {
+    domain: String,
+    region_id: String,
+    access_key_id: String,
+    access_key_secret: String,
+    security_token: String,
+}
+
+impl AlibabaCasManager {
+    async fn new(domain: String) -> Option<Self> {
+        let access_key_id = std::env::var("ALI_ACCESS_KEY_ID").ok()?;
+        let access_key_secret = std::env::var("ALI_ACCESS_KEY_SECRET").ok()?;
+        let security_token = std::env::var("ALI_SECURITY_TOKEN").ok()?;
+        let region_id = std::env::var("ALI_REGION_ID").unwrap_or_else(|_| "cn-hangzhou".to_string());
+        Some(Self {
+            domain,
+            region_id,
+            access_key_id,
+            access_key_secret,
+            security_token,
+        })
+    }
+
+    async fn rpc(
+        &self,
+        action: &str,
+        version: &str,
+        mut params: std::collections::BTreeMap<String, String>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        params.insert("Action".to_string(), action.to_string());
+        params.insert("Format".to_string(), "JSON".to_string());
+        params.insert("Version".to_string(), version.to_string());
+        params.insert("AccessKeyId".to_string(), self.access_key_id.clone());
+        params.insert("SignatureMethod".to_string(), "HMAC-SHA1".to_string());
+        params.insert("SignatureVersion".to_string(), "1.0".to_string());
+        params.insert(
+            "Timestamp".to_string(),
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        );
+        params.insert(
+            "SignatureNonce".to_string(),
+            format!("{:?}", std::time::SystemTime::now()),
+        );
+        params.insert("SecurityToken".to_string(), self.security_token.clone());
+        params.insert("RegionId".to_string(), self.region_id.clone());
+
+        let query = alibaba_rpc_sign(&mut params, &self.access_key_secret);
+        let url = format!("https://cas.aliyuncs.com/?{}", query);
+        let resp = reqwest::Client::new().get(&url).send().await?;
+        let text = resp.text().await?;
+        let json: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("CAS JSON parse error ({}): {}", e, text))?;
+        if let Some(code) = json.get("Code").and_then(|c| c.as_str()) {
+            if code != "Success" && code != "200" {
+                return Err(format!("CAS {} failed: {:?}", action, json).into());
+            }
+        }
+        Ok(json)
+    }
+
+    async fn ensure_certificate(
+        &self,
+    ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+        info!("Issuing TLS certificate via Alibaba Cloud CAS for {}...", self.domain);
+
+        // 1. Submit DV certificate request (free DigiCert single-domain)
+        let mut req_params = std::collections::BTreeMap::new();
+        req_params.insert("ProductCode".to_string(), "digicert-free-1-free".to_string());
+        req_params.insert("Domain".to_string(), self.domain.clone());
+        req_params.insert("Username".to_string(), "admin".to_string());
+        req_params.insert("Email".to_string(), format!("admin@{}", self.domain));
+        let create = self
+            .rpc("CreateCertificateRequest", "2020-04-07", req_params)
+            .await?;
+
+        let cert_id = create
+            .get("CertificateId")
+            .and_then(|v| v.as_str())
+            .ok_or("No CertificateId returned by CreateCertificateRequest")?
+            .to_string();
+        info!("CAS CertificateId={}", cert_id);
+
+        // 2. Poll DescribeCertificateState for verification challenge (FILE method)
+        let challenge_path;
+        let challenge_content;
+        loop {
+            let mut st_params = std::collections::BTreeMap::new();
+            st_params.insert("CertificateId".to_string(), cert_id.clone());
+            let st = self
+                .rpc("DescribeCertificateState", "2020-04-07", st_params)
+                .await?;
+            let typ = st.get("Type").and_then(|v| v.as_str()).unwrap_or("");
+            if typ == "FILE" {
+                challenge_path = st
+                    .get("Path")
+                    .and_then(|v| v.as_str())
+                    .ok_or("CAS FILE challenge missing Path")?
+                    .to_string();
+                challenge_content = st
+                    .get("Content")
+                    .and_then(|v| v.as_str())
+                    .ok_or("CAS FILE challenge missing Content")?
+                    .to_string();
+                break;
+            } else if typ == "issued" || typ == "ISSUED" {
+                // already issued, skip verification
+                challenge_path = String::new();
+                challenge_content = String::new();
+                break;
+            }
+            info!("CAS state: {:?}, waiting for FILE verification...", st);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+
+        // 3. Serve the verification file via the existing acme-challenge route
+        if !challenge_path.is_empty() {
+            let fname = challenge_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&challenge_path)
+                .to_string();
+            let dir = "/tmp/acme-challenge";
+            tokio::fs::create_dir_all(dir).await.ok();
+            tokio::fs::write(format!("{}/{}", dir, fname), challenge_content.as_bytes()).await.ok();
+            info!("CAS FILE verification served at /.well-known/acme-challenge/{}", fname);
+
+            // Wait for CA to pick it up
+            for _ in 0..60 {
+                let mut st_params = std::collections::BTreeMap::new();
+                st_params.insert("CertificateId".to_string(), cert_id.clone());
+                let st = self
+                    .rpc("DescribeCertificateState", "2020-04-07", st_params)
+                    .await?;
+                let typ = st.get("Type").and_then(|v| v.as_str()).unwrap_or("");
+                if typ == "issued" || typ == "ISSUED" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+
+        // 4. Download the issued certificate (PEM + private key)
+        let mut dl_params = std::collections::BTreeMap::new();
+        dl_params.insert("CertificateId".to_string(), cert_id.clone());
+        let dl = self
+            .rpc("DescribeCertificate", "2020-04-07", dl_params)
+            .await?;
+
+        let cert_pem = dl
+            .get("CertificatePem")
+            .and_then(|v| v.as_str())
+            .or_else(|| dl.get("CertPem").and_then(|v| v.as_str()))
+            .ok_or("No CertificatePem in DescribeCertificate response")?
+            .to_string();
+        let key_pem = dl
+            .get("PrivateKey")
+            .and_then(|v| v.as_str())
+            .or_else(|| dl.get("KeyPem").and_then(|v| v.as_str()))
+            .ok_or("No PrivateKey in DescribeCertificate response")?
+            .to_string();
+
+        info!("CAS certificate issued successfully for {}", self.domain);
+        Ok((cert_pem.into_bytes(), key_pem.into_bytes()))
+    }
+}
+
+// ============================================================================
 // ATTESTATION
 // ============================================================================
 
@@ -1278,8 +1521,8 @@ async fn index(
         <h1>Confidential PayPal Authentication</h1>
         <div class="info">
             <p><strong>Domain:</strong> {}</p>
-            <p><strong>Status:</strong> <span class="cert-status">v71 Hardened (AMD SEV-SNP)</span></p>
-            <p><strong>Certificate:</strong> RAM ONLY (Google Public CA)</p>
+            <p><strong>Status:</strong> <span class="cert-status">v71 Hardened (Intel TDX)</span></p>
+            <p><strong>Certificate:</strong> RAM ONLY (Alibaba Cloud CAS)</p>
         </div>
         <div class="info">
             <p><strong>Verified Candidate Login (Recommended First):</strong></p>
@@ -1518,7 +1761,12 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     eprintln!("[DEBUG] tracing initialized");
-    info!("Starting PayPal Auth on GCP Confidential VM (v71 Hardened)");
+    let cloud_provider = std::env::var("CLOUD_PROVIDER").unwrap_or_else(|_| "gcp".to_string());
+    if cloud_provider == "alibaba" {
+        info!("Starting PayPal Auth on Alibaba Cloud Confidential VM (Intel TDX, v71 Hardened)");
+    } else {
+        info!("Starting PayPal Auth on GCP Confidential VM (v71 Hardened)");
+    }
     info!("SECRET_NAME={:?}", std::env::var("SECRET_NAME"));
 
     eprintln!("[DEBUG] about to fetch config");
@@ -1678,24 +1926,53 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    // Obtain TLS certificate (HTTP-01 challenge served by the running HTTP server)
-    eprintln!("[DEBUG] starting ACME cert obtain");
-    info!("Obtaining TLS certificate from Google Public CA...");
-    let ca = GooglePublicCaManager::new(&config);
-    let (cert_pem, key_pem) = match ca.ensure_certificate().await {
-        Ok(r) => {
-            info!("Certificate obtained");
-            https_ready.store(true, Ordering::Relaxed);
-            *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&r.0).to_string());
-            r
+    // Obtain TLS certificate (HTTP-01 / FILE challenge served by the running HTTP server)
+    eprintln!("[DEBUG] starting cert obtain");
+    let cloud_provider = std::env::var("CLOUD_PROVIDER").unwrap_or_else(|_| "gcp".to_string());
+    let (cert_pem, key_pem) = if cloud_provider == "alibaba" {
+        info!("Obtaining TLS certificate via Alibaba Cloud CAS...");
+        match AlibabaCasManager::new(config.domain.clone()).await {
+            Some(ca) => match ca.ensure_certificate().await {
+                Ok(r) => {
+                    info!("CAS certificate obtained");
+                    https_ready.store(true, Ordering::Relaxed);
+                    *state.tls_cert_pem.write() =
+                        Some(String::from_utf8_lossy(&r.0).to_string());
+                    r
+                }
+                Err(e) => {
+                    error!("Failed to get CAS certificate: {}. Holding for debug...", e);
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                    }
+                }
+            },
+            None => {
+                error!("CLOUD_PROVIDER=alibaba but ALI_* credentials missing. Holding for debug...");
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+            }
         }
-        Err(e) => {
-            error!(
-                "Failed to get certificate: {}. Keeping process alive for debugging...",
-                e
-            );
-            loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
+    } else {
+        info!("Obtaining TLS certificate from Google Public CA...");
+        let ca = GooglePublicCaManager::new(&config);
+        match ca.ensure_certificate().await {
+            Ok(r) => {
+                info!("Certificate obtained");
+                https_ready.store(true, Ordering::Relaxed);
+                *state.tls_cert_pem.write() =
+                    Some(String::from_utf8_lossy(&r.0).to_string());
+                r
+            }
+            Err(e) => {
+                error!(
+                    "Failed to get certificate: {}. Keeping process alive for debugging...",
+                    e
+                );
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
             }
         }
     };
@@ -1769,14 +2046,25 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("[DEBUG] HTTPS server spawned");
 
     // Certificate renewal loop (renew every 12 hours)
-    let ca = GooglePublicCaManager::new(&config);
+    let renew_cloud = std::env::var("CLOUD_PROVIDER").unwrap_or_else(|_| "gcp".to_string());
+    let renew_config = config.clone();
+    let renew_domain = config.domain.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(12 * 3600));
         interval.tick().await;
         loop {
             interval.tick().await;
             info!("Attempting certificate renewal...");
-            match ca.ensure_certificate().await {
+            let result = if renew_cloud == "alibaba" {
+                match AlibabaCasManager::new(renew_domain.clone()).await {
+                    Some(ca) => ca.ensure_certificate().await,
+                    None => Err("ALI_* credentials missing for renewal".into()),
+                }
+            } else {
+                let ca = GooglePublicCaManager::new(&renew_config);
+                ca.ensure_certificate().await
+            };
+            match result {
                 Ok(_) => {
                     info!("Certificate renewed successfully (restart needed for full effect)");
                 }
