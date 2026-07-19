@@ -24,13 +24,13 @@ jobs:
           set -o pipefail
           docker build --no-cache --load --target assembler -f Dockerfile.alibaba -t paypal-auth-vm:alibabacloud . 2>&1 | tee build.log
           CONTAINER_ID=$(docker create paypal-auth-vm:alibabacloud)
-          docker cp $CONTAINER_ID:/build/paypal-auth-vm-bin ./paypal-auth-vm-alibabacloud.bin
+          docker cp $CONTAINER_ID:/build/paypal-auth-vm-bin ./paypal-auth-vm-alibabacloud.bin || true
           docker cp $CONTAINER_ID:/build/output/vmlinuz ./vmlinuz-alibabacloud || true
           docker cp $CONTAINER_ID:/build/output/initramfs-paypal-auth.img ./initramfs-alibabacloud.img || true
           docker cp $CONTAINER_ID:/build/output/shimx64.efi ./shimx64-alibabacloud.efi || true
           docker cp $CONTAINER_ID:/build/output/grubx64.efi ./grubx64-alibabacloud.efi || true
           docker cp $CONTAINER_ID:/grub.cfg ./grub-alibabacloud.cfg || true
-          docker cp $CONTAINER_ID:/disk-alibaba.raw ./disk-alibabacloud.raw || true
+          docker cp $CONTAINER_ID:/disk-alibaba.raw ./disk-alibabacloud.raw
           docker cp $CONTAINER_ID:/build/packages.txt ./packages-alibabacloud.txt || true
           docker rm $CONTAINER_ID
           echo "==== ARTIFACT HASHES (Alibaba Cloud Intel TDX) ===="
