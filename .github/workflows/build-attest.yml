@@ -96,17 +96,17 @@ jobs:
         if: success()
         run: |
           set -e
+          git checkout -B l-branch-1
           cp /tmp/disk-out/disk-alibabacloud.raw disk-alibaba.raw
           ls -la disk-alibaba.raw
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Commit as a plain blob (bypass LFS smudge/filter for this file)
-          git -c filter.lfs.smudge= -c filter.lfs.required=false \
-              -c filter.lfs.clean= add disk-alibaba.raw
+          git -c filter.lfs.smudge= -c filter.lfs.required=false -c filter.lfs.clean= add disk-alibaba.raw
           git status --short
           git commit -m "chore: update reproducible disk-alibaba.raw ($(sha256sum disk-alibaba.raw | cut -d' ' -f1)) [skip ci]" \
             && echo "COMMITTED" || echo "NOTHING_TO_COMMIT"
-          git push origin HEAD:l-branch-1 2>&1 | tee publish.log
+          git push origin l-branch-1 2>&1 | tee publish.log
+          echo "PUSH_EXIT=${PIPESTATUS[0]}"
           echo "PUSH_DONE"
 
       - name: Upload publish log
