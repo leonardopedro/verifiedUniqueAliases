@@ -1158,7 +1158,7 @@ fn alibaba_rpc_sign(
     params: &mut std::collections::BTreeMap<String, String>,
     access_key_secret: &str,
 ) -> String {
-    use base64::engine::general_purpose::BASE64_STANDARD as B64;
+    use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
     use hmac::{Hmac, Mac};
     use sha1::Sha1;
