@@ -95,19 +95,35 @@ jobs:
       - name: Publish disk to repo (plain blob, no LFS)
         if: success()
         run: |
+          set +e
+          {
+            echo "=== publish start ==="
+            git checkout -B l-branch-1 2>&1
+            cp /tmp/disk-out/disk-alibabacloud.raw disk-alibaba.raw 2>&1
+            ls -la disk-alibaba.raw 2>&1
+            SHA=$(sha256sum disk-alibaba.raw | cut -d' ' -f1)
+            echo "$SHA  disk-alibaba.raw" > disk-alibaba.raw.sha256
+            git config user.name  "github-actions[bot]" 2>&1
+            git config user.email "github-actions[bot]@users.noreply.github.com" 2>&1
+            git config --list | grep -i "remote\|lfs" 2>&1
+            git add disk-alibaba.raw disk-alibaba.raw.sha256 2>&1
+            git status --short 2>&1
+            git commit -m "chore: update reproducible disk-alibaba.raw ($SHA) [skip ci]" 2>&1
+            echo "--- push ---"
+            git push origin l-branch-1 2>&1
+            echo "PUSH_EXIT=$?"
+            echo "PUBLISH_DONE"
+          } | tee publish.log
+
+      - name: Surface publish debug
+        if: always()
+        run: |
           set -e
-          git checkout -B l-branch-1
-          cp /tmp/disk-out/disk-alibabacloud.raw disk-alibaba.raw
-          SHA=$(sha256sum disk-alibaba.raw | cut -d' ' -f1)
-          echo "$SHA  disk-alibaba.raw" > disk-alibaba.raw.sha256
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # .gitattributes no longer LFS-tracks disk-alibaba.raw -> plain blob
-          git add disk-alibaba.raw disk-alibaba.raw.sha256
-          git status --short
-          git commit -m "chore: update reproducible disk-alibaba.raw ($SHA) [skip ci]"
-          git push origin l-branch-1
-          echo "### Published disk-alibaba.raw" >> "$GITHUB_STEP_SUMMARY"
-          echo "- sha256: $SHA" >> "$GITHUB_STEP_SUMMARY"
-          echo "- size: $(stat -c%s disk-alibaba.raw) bytes" >> "$GITHUB_STEP_SUMMARY"
-          echo "PUBLISH_OK"
+          git checkout --orphan ci-publish-debug 2>/dev/null || git checkout -B ci-publish-debug
+          git rm -rf . 2>/dev/null || true
+          cp publish.log ./publish.log 2>/dev/null || echo "no log" > publish.log
+          git add publish.log
+          git commit -m "ci publish debug [skip ci]" 2>&1 | tail -1
+          git push origin ci-publish-debug 2>&1 | tail -2
