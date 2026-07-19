@@ -1,0 +1,115 @@
+FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a AS rust-builder
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Pin Debian snapshots for 100% stable package versions
+RUN echo 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/20260406T000000Z\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/20260406T000000Z\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp' > /etc/apt/sources.list.d/debian.sources
+
+RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends \
+    curl ca-certificates gcc g++ make pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+ARG RUST_VERSION=1.91.1
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal --no-modify-path \
+    && . /usr/local/cargo/env \
+    && export RUST_MIN_STACK=16777216 \
+    && cargo install -j 1 --root /usr --locked add-determinism \
+    && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+
+ENV RUSTFLAGS="-C target-cpu=generic -C strip=symbols"
+
+# Layer 1: compile dependencies
+RUN bash -c ". /usr/local/cargo/env && \
+    set -euo pipefail && \
+    mkdir -p src && \
+    echo 'fn main() {}' > src/main.rs && \
+    cargo build --release --features alibabacloud --target x86_64-unknown-linux-gnu && \
+    rm -f target/x86_64-unknown-linux-gnu/release/deps/paypal_auth_vm* \
+          target/x86_64-unknown-linux-gnu/release/paypal_auth_vm* \
+          target/x86_64-unknown-linux-gnu/release/deps/paypal-auth-vm*"
+
+# Layer 2: compile our crate
+COPY src ./src
+RUN bash -c ". /usr/local/cargo/env && \
+    set -euo pipefail && \
+    cargo build --release --features alibabacloud --target x86_64-unknown-linux-gnu && \
+    cp target/x86_64-unknown-linux-gnu/release/paypal-auth-vm /paypal-auth-vm-bin"
+
+# Strip binary for determinism
+RUN /usr/bin/add-det /paypal-auth-vm-bin && \
+    rm -rf /usr/local/cargo/registry /usr/local/cargo/git
+
+
+FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a AS image-builder
+ENV DEBIAN_FRONTEND=noninteractive
+ENV SOURCE_DATE_EPOCH=1712260800
+ENV TZ=UTC
+ENV LC_ALL=C.UTF-8
+
+# Pin Debian snapshots for 100% stable package versions (Trixie is current stable)
+RUN echo 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/20260406T000000Z\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/20260406T000000Z\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp' > /etc/apt/sources.list.d/debian.sources
+
+RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends \
+    curl ca-certificates gcc g++ make pkg-config libssl-dev \
+    cpio xz-utils zstd qemu-utils mtools gdisk binutils initramfs-tools \
+    linux-image-cloud-amd64 shim-signed grub-efi-amd64-signed \
+    tpm2-tools iproute2 kmod python3 file dosfstools bash nftables \
+    pciutils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY --from=rust-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin
+COPY --from=rust-builder /usr/bin/add-det /usr/bin/add-det
+
+COPY build-initramfs-tools.sh ./
+COPY src ./src
+
+RUN chmod +x build-initramfs-tools.sh && \
+    dpkg-query -W -f='${Package} ${Version} ${Architecture}\n' | sort > /build/packages.txt && \
+    echo "=== Installed Package Manifest ===" && cat /build/packages.txt && \
+    BUILD_FEATURE=alibabacloud ./build-initramfs-tools.sh && \
+    rm -rf /usr/local/cargo/registry /usr/local/cargo/git
+
+# Copy artifacts to root for easy extraction
+RUN cp /build/output/initramfs-paypal-auth.img /initramfs-paypal-auth.img && \
+    cp /build/packages.txt /packages.txt && \
+    cp /build/paypal-auth-vm-bin /paypal-auth-vm-bin && \
+    cp /build/output/vmlinuz /vmlinuz && \
+    cp /build/output/shimx64.efi /shimx64.efi && \
+    cp /build/output/grubx64.efi /grubx64.efi && \
+    sha256sum /initramfs-paypal-auth.img
+
+# =============================================================================
+# Stage: assemble — builds the minimal reproducible EFI RAW disk INSIDE the
+# container (sgdisk/parted available here), so the disk image is a deterministic
+# build artifact rather than something assembled ad-hoc on the host.
+# =============================================================================
+FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a AS assembler
+ENV DEBIAN_FRONTEND=noninteractive
+ENV SOURCE_DATE_EPOCH=1712260800
+ENV TZ=UTC
+ENV LC_ALL=C.UTF-8
+
+RUN echo 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/20260406T000000Z\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/20260406T000000Z\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp' > /etc/apt/sources.list.d/debian.sources
+
+RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends \
+    mtools parted dosfstools util-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY --from=image-builder /initramfs-paypal-auth.img /build/output/initramfs-paypal-auth.img
+COPY --from=image-builder /vmlinuz /build/output/vmlinuz
+COPY --from=image-builder /shimx64.efi /build/output/shimx64.efi
+COPY --from=image-builder /grubx64.efi /build/output/grubx64.efi
+COPY build-alibaba-image.sh ./
+
+RUN chmod +x build-alibaba-image.sh && ./build-alibaba-image.sh && \
+    cp /build/output-alibaba/disk-alibaba.raw /disk-alibaba.raw && \
+    sha256sum /disk-alibaba.raw
+
+CMD ["/bin/bash"]
