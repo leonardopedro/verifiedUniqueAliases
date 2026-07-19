@@ -79,3 +79,10 @@ jobs:
           name: build-debug-log
           path: build.log
           retention-days: 3
+
+      - name: Show build log on failure
+        if: failure()
+        run: |
+          echo "=========== build.log ==========="
+          cat build.log || echo "no build.log"
+          echo "=========== end ==========="
