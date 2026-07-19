@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       attestations: write
-      contents: read
+      contents: write
       id-token: write
     steps:
       - uses: actions/checkout@v4
@@ -84,3 +84,24 @@ jobs:
           echo "=========== build.log ==========="
           cat build.log || echo "no build.log"
           echo "=========== end ==========="
+
+      - name: Download built disk
+        if: success()
+        uses: actions/download-artifact@v4
+        with:
+          name: vm-artifacts-alibabacloud
+          path: /tmp/disk-out
+
+      - name: Publish disk to repo (LFS)
+        if: success()
+        run: |
+          set -e
+          sudo apt-get update -y && sudo apt-get install -y git-lfs
+          git lfs install
+          cp /tmp/disk-out/disk-alibabacloud.raw disk-alibaba.raw
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git lfs track "disk-alibaba.raw"
+          git add .gitattributes disk-alibaba.raw
+          git commit -m "chore: update reproducible disk-alibaba.raw ($(sha256sum disk-alibaba.raw | cut -d' ' -f1)) [skip ci]" || echo "nothing to commit"
+          git push origin HEAD:l-branch-1
