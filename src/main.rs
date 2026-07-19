@@ -761,7 +761,10 @@ async fn load_alibaba_metadata_env() {
         "http://100.100.100.200/latest/user-data",
         "http://100.100.100.200/2016-01-01/user-data",
     ];
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     for ep in endpoints {
         if let Ok(resp) = client.get(ep).send().await {
             if let Ok(body) = resp.text().await {
@@ -1282,7 +1285,11 @@ impl AlibabaCasManager {
 
         let query = alibaba_rpc_sign(&mut params, &self.access_key_secret);
         let url = format!("https://cas.aliyuncs.com/?{}", query);
-        let resp = reqwest::Client::new().get(&url).send().await?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let resp = client.get(&url).send().await?;
         let text = resp.text().await?;
         let json: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| format!("CAS JSON parse error ({}): {}", e, text))?;
