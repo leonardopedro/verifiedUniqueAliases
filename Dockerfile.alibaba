@@ -107,6 +107,8 @@ COPY --from=image-builder /vmlinuz /build/output/vmlinuz
 COPY --from=image-builder /shimx64.efi /build/output/shimx64.efi
 COPY --from=image-builder /grubx64.efi /build/output/grubx64.efi
 COPY --from=image-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin
+COPY --from=image-builder /grub.cfg /grub.cfg
+COPY --from=image-builder /packages.txt /build/packages.txt
 COPY build-alibaba-image.sh ./
 
 RUN chmod +x build-alibaba-image.sh && ./build-alibaba-image.sh && \
