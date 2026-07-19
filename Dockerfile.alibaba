@@ -28,7 +28,7 @@ RUN bash -c ". /usr/local/cargo/env && \
     set -euo pipefail && \
     mkdir -p src && \
     echo 'fn main() {}' > src/main.rs && \
-    cargo build --release --features alibabacloud --target x86_64-unknown-linux-gnu && \
+    cargo build --release --target x86_64-unknown-linux-gnu && \
     rm -f target/x86_64-unknown-linux-gnu/release/deps/paypal_auth_vm* \
           target/x86_64-unknown-linux-gnu/release/paypal_auth_vm* \
           target/x86_64-unknown-linux-gnu/release/deps/paypal-auth-vm*"
@@ -37,7 +37,7 @@ RUN bash -c ". /usr/local/cargo/env && \
 COPY src ./src
 RUN bash -c ". /usr/local/cargo/env && \
     set -euo pipefail && \
-    cargo build --release --features alibabacloud --target x86_64-unknown-linux-gnu && \
+    cargo build --release --target x86_64-unknown-linux-gnu && \
     cp target/x86_64-unknown-linux-gnu/release/paypal-auth-vm /paypal-auth-vm-bin"
 
 # Strip binary for determinism

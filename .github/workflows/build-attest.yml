@@ -1,8 +1,8 @@
-name: Build VM Image and Attest
+name: Build Alibaba VM Image and Attest
 
 on:
   push:
-    branches: [main, l-branch-1]
+    branches: [l-branch-1]
   workflow_dispatch:
 
 jobs:
@@ -12,18 +12,6 @@ jobs:
       attestations: write
       contents: read
       id-token: write
-    strategy:
-      matrix:
-        include:
-          - platform: gcp
-            dockerfile: Dockerfile.repro
-            target: image-builder
-            label: "GCP AMD SEV-SNP"
-          - platform: alibabacloud
-            dockerfile: Dockerfile.alibaba
-            target: assembler
-            label: "Alibaba Cloud Intel TDX"
-
     steps:
       - uses: actions/checkout@v4
 
@@ -31,67 +19,49 @@ jobs:
 
       - name: Build and extract artifacts
         run: |
-          docker build --no-cache --load --target ${{ matrix.target }} -f ${{ matrix.dockerfile }} -t paypal-auth-vm:${{ matrix.platform }} .
-          CONTAINER_ID=$(docker create paypal-auth-vm:${{ matrix.platform }})
-          docker cp $CONTAINER_ID:/build/paypal-auth-vm-bin ./paypal-auth-vm-${{ matrix.platform }}.bin || docker cp $CONTAINER_ID:/paypal-auth-vm-bin ./paypal-auth-vm-${{ matrix.platform }}.bin
-          docker cp $CONTAINER_ID:/build/output/vmlinuz ./vmlinuz-${{ matrix.platform }} || true
-          docker cp $CONTAINER_ID:/build/output/initramfs-paypal-auth.img ./initramfs-${{ matrix.platform }}.img || docker cp $CONTAINER_ID:/initramfs-paypal-auth.img ./initramfs-${{ matrix.platform }}.img || true
-          docker cp $CONTAINER_ID:/build/output/shimx64.efi ./shimx64-${{ matrix.platform }}.efi || true
-          docker cp $CONTAINER_ID:/build/output/grubx64.efi ./grubx64-${{ matrix.platform }}.efi || true
-          docker cp $CONTAINER_ID:/grub.cfg ./grub-${{ matrix.platform }}.cfg || true
-          docker cp $CONTAINER_ID:/disk-alibaba.raw ./disk-${{ matrix.platform }}.raw || true
-          docker cp $CONTAINER_ID:/packages.txt ./packages-${{ matrix.platform }}.txt || true
-          docker cp $CONTAINER_ID:/build/packages.txt ./packages-${{ matrix.platform }}.txt || true
+          docker build --no-cache --load --target assembler -f Dockerfile.alibaba -t paypal-auth-vm:alibabacloud .
+          CONTAINER_ID=$(docker create paypal-auth-vm:alibabacloud)
+          docker cp $CONTAINER_ID:/build/paypal-auth-vm-bin ./paypal-auth-vm-alibabacloud.bin
+          docker cp $CONTAINER_ID:/build/output/vmlinuz ./vmlinuz-alibabacloud || true
+          docker cp $CONTAINER_ID:/build/output/initramfs-paypal-auth.img ./initramfs-alibabacloud.img || true
+          docker cp $CONTAINER_ID:/build/output/shimx64.efi ./shimx64-alibabacloud.efi || true
+          docker cp $CONTAINER_ID:/build/output/grubx64.efi ./grubx64-alibabacloud.efi || true
+          docker cp $CONTAINER_ID:/grub.cfg ./grub-alibabacloud.cfg || true
+          docker cp $CONTAINER_ID:/disk-alibaba.raw ./disk-alibabacloud.raw || true
+          docker cp $CONTAINER_ID:/build/packages.txt ./packages-alibabacloud.txt || true
           docker rm $CONTAINER_ID
-          echo "==== ARTIFACT HASHES (${{ matrix.label }}) ===="
-          sha256sum paypal-auth-vm-${{ matrix.platform }}.bin vmlinuz-${{ matrix.platform }} initramfs-${{ matrix.platform }}.img shimx64-${{ matrix.platform }}.efi grubx64-${{ matrix.platform }}.efi grub-${{ matrix.platform }}.cfg disk-${{ matrix.platform }}.raw 2>/dev/null
+          echo "==== ARTIFACT HASHES (Alibaba Cloud Intel TDX) ===="
+          sha256sum paypal-auth-vm-alibabacloud.bin vmlinuz-alibabacloud initramfs-alibabacloud.img shimx64-alibabacloud.efi grubx64-alibabacloud.efi grub-alibabacloud.cfg disk-alibabacloud.raw 2>/dev/null
           echo "========================="
 
       - name: Attest Enclave Binary
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: Enclave Binary (${{ matrix.label }})
-          subject-path: paypal-auth-vm-${{ matrix.platform }}.bin
-
-      - name: Attest Kernel
-        if: matrix.platform == 'gcp'
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: Linux Kernel (${{ matrix.label }})
-          subject-path: vmlinuz-${{ matrix.platform }}
+          subject-name: Enclave Binary (Alibaba Cloud Intel TDX)
+          subject-path: paypal-auth-vm-alibabacloud.bin
 
       - name: Attest Initrd
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: Initramfs (${{ matrix.label }})
-          subject-path: initramfs-${{ matrix.platform }}.img
-
-      - name: Attest Bootloader
-        if: matrix.platform == 'gcp'
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: EFI Bootloader (${{ matrix.label }})
-          subject-path: |
-            shimx64-${{ matrix.platform }}.efi
-            grubx64-${{ matrix.platform }}.efi
-            grub-${{ matrix.platform }}.cfg
+          subject-name: Initramfs (Alibaba Cloud Intel TDX)
+          subject-path: initramfs-alibabacloud.img
 
       - name: Attest VM Disk Image
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: VM Disk Image (${{ matrix.label }})
-          subject-path: disk-${{ matrix.platform }}.raw
+          subject-name: VM Disk Image (Alibaba Cloud Intel TDX)
+          subject-path: disk-alibabacloud.raw
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vm-artifacts-${{ matrix.platform }}
+          name: vm-artifacts-alibabacloud
           path: |
-            paypal-auth-vm-${{ matrix.platform }}.bin
-            initramfs-${{ matrix.platform }}.img
-            vmlinuz-${{ matrix.platform }}
-            disk-${{ matrix.platform }}.raw
-            shimx64-${{ matrix.platform }}.efi
-            grubx64-${{ matrix.platform }}.efi
-            grub-${{ matrix.platform }}.cfg
+            paypal-auth-vm-alibabacloud.bin
+            initramfs-alibabacloud.img
+            vmlinuz-alibabacloud
+            disk-alibabacloud.raw
+            shimx64-alibabacloud.efi
+            grubx64-alibabacloud.efi
+            grub-alibabacloud.cfg
           retention-days: 7
