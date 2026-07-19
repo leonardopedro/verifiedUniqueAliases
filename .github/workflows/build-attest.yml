@@ -95,24 +95,28 @@ jobs:
       - name: Publish disk to repo (plain blob, no LFS)
         if: success()
         run: |
-          set -e
-          git checkout -B l-branch-1
+          set +e
+          git checkout -B l-branch-1 2>&1 | tee -a publish.log
           cp /tmp/disk-out/disk-alibabacloud.raw disk-alibaba.raw
-          ls -la disk-alibaba.raw
+          ls -la disk-alibaba.raw 2>&1 | tee -a publish.log
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git -c filter.lfs.smudge= -c filter.lfs.required=false -c filter.lfs.clean= add disk-alibaba.raw
-          git status --short
-          git commit -m "chore: update reproducible disk-alibaba.raw ($(sha256sum disk-alibaba.raw | cut -d' ' -f1)) [skip ci]" \
-            && echo "COMMITTED" || echo "NOTHING_TO_COMMIT"
-          git push origin l-branch-1 2>&1 | tee publish.log
-          echo "PUSH_EXIT=${PIPESTATUS[0]}"
-          echo "PUSH_DONE"
+          git -c filter.lfs.smudge= -c filter.lfs.required=false -c filter.lfs.clean= add disk-alibaba.raw 2>&1 | tee -a publish.log
+          git status --short 2>&1 | tee -a publish.log
+          git commit -m "chore: update reproducible disk-alibaba.raw ($(sha256sum disk-alibaba.raw | cut -d' ' -f1)) [skip ci]" 2>&1 | tee -a publish.log
+          echo "--- push attempt ---" | tee -a publish.log
+          git push origin l-branch-1 2>&1 | tee -a publish.log
+          echo "PUSH_EXIT=${PIPESTATUS[0]}" | tee -a publish.log
 
-      - name: Upload publish log
+      - name: Surface publish error (readable branch)
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: publish-log
-          path: publish.log
-          retention-days: 3
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan ci-publish-debug 2>/dev/null || git checkout -B ci-publish-debug
+          git rm -rf . 2>/dev/null || true
+          cp publish.log ./publish.log 2>/dev/null || echo "no publish.log" > publish.log
+          git add publish.log
+          git commit -m "ci publish debug [skip ci]" 2>&1 | tail -2
+          git push origin ci-publish-debug 2>&1 | tail -3
