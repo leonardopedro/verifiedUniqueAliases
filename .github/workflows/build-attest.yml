@@ -96,12 +96,24 @@ jobs:
         if: success()
         run: |
           set -e
-          sudo apt-get update -y && sudo apt-get install -y git-lfs
-          git lfs install
+          sudo apt-get update -y && sudo apt-get install -y git-lfs 2>&1 | tail -2
+          git lfs install 2>&1
           cp /tmp/disk-out/disk-alibabacloud.raw disk-alibaba.raw
+          ls -la disk-alibaba.raw
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config lfs.url "https://github.com/${{ github.repository }}.git/info/lfs"
           git lfs track "disk-alibaba.raw"
           git add .gitattributes disk-alibaba.raw
+          git status --short
           git commit -m "chore: update reproducible disk-alibaba.raw ($(sha256sum disk-alibaba.raw | cut -d' ' -f1)) [skip ci]" || echo "nothing to commit"
-          git push origin HEAD:l-branch-1
+          git push origin HEAD:l-branch-1 2>&1 | tee publish.log
+          git lfs push origin HEAD:l-branch-1 2>&1 | tee -a publish.log || true
+
+      - name: Upload publish log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: publish-log
+          path: publish.log
+          retention-days: 3
