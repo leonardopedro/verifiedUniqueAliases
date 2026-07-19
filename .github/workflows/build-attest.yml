@@ -21,7 +21,8 @@ jobs:
 
       - name: Build and extract artifacts
         run: |
-          docker build --no-cache --load --target assembler -f Dockerfile.alibaba -t paypal-auth-vm:alibabacloud .
+          set -o pipefail
+          docker build --no-cache --load --target assembler -f Dockerfile.alibaba -t paypal-auth-vm:alibabacloud . 2>&1 | tee build.log
           CONTAINER_ID=$(docker create paypal-auth-vm:alibabacloud)
           docker cp $CONTAINER_ID:/build/paypal-auth-vm-bin ./paypal-auth-vm-alibabacloud.bin
           docker cp $CONTAINER_ID:/build/output/vmlinuz ./vmlinuz-alibabacloud || true
@@ -67,3 +68,11 @@ jobs:
             grubx64-alibabacloud.efi
             grub-alibabacloud.cfg
           retention-days: 7
+
+      - name: Upload debug log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-debug-log
+          path: build.log
+          retention-days: 3
