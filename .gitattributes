@@ -1,4 +1,0 @@
-*.img filter=lfs diff=lfs merge=lfs -text
-*.efi filter=lfs diff=lfs merge=lfs -text
-vmlinuz-alibaba-docker filter=lfs diff=lfs merge=lfs -text
-disk-alibaba.raw filter=lfs diff=lfs merge=lfs -text
