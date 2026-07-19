@@ -21,18 +21,23 @@ jobs:
 
       - name: Build and extract artifacts
         run: |
-          set -o pipefail
+          set +e
           docker build --no-cache --load --target assembler -f Dockerfile.alibaba -t paypal-auth-vm:alibabacloud . 2>&1 | tee build.log
+          echo "BUILD_EXIT=${PIPESTATUS[0]}"
           CONTAINER_ID=$(docker create paypal-auth-vm:alibabacloud)
-          docker cp $CONTAINER_ID:/build/paypal-auth-vm-bin ./paypal-auth-vm-alibabacloud.bin || true
-          docker cp $CONTAINER_ID:/build/output/vmlinuz ./vmlinuz-alibabacloud || true
-          docker cp $CONTAINER_ID:/build/output/initramfs-paypal-auth.img ./initramfs-alibabacloud.img || true
-          docker cp $CONTAINER_ID:/build/output/shimx64.efi ./shimx64-alibabacloud.efi || true
-          docker cp $CONTAINER_ID:/build/output/grubx64.efi ./grubx64-alibabacloud.efi || true
-          docker cp $CONTAINER_ID:/grub.cfg ./grub-alibabacloud.cfg || true
-          docker cp $CONTAINER_ID:/disk-alibaba.raw ./disk-alibabacloud.raw
-          docker cp $CONTAINER_ID:/build/packages.txt ./packages-alibabacloud.txt || true
-          docker rm $CONTAINER_ID
+          docker cp $CONTAINER_ID:/build/paypal-auth-vm-bin ./paypal-auth-vm-alibabacloud.bin 2>&1 || echo "no bin"
+          docker cp $CONTAINER_ID:/build/output/vmlinuz ./vmlinuz-alibabacloud 2>&1 || echo "no vmlinuz"
+          docker cp $CONTAINER_ID:/build/output/initramfs-paypal-auth.img ./initramfs-alibabacloud.img 2>&1 || echo "no initramfs"
+          docker cp $CONTAINER_ID:/build/output/shimx64.efi ./shimx64-alibabacloud.efi 2>&1 || echo "no shim"
+          docker cp $CONTAINER_ID:/build/output/grubx64.efi ./grubx64-alibabacloud.efi 2>&1 || echo "no grubx64"
+          docker cp $CONTAINER_ID:/grub.cfg ./grub-alibabacloud.cfg 2>&1 || echo "no grub.cfg"
+          docker cp $CONTAINER_ID:/disk-alibaba.raw ./disk-alibabacloud.raw 2>&1 || echo "no disk"
+          docker cp $CONTAINER_ID:/build/packages.txt ./packages-alibabacloud.txt 2>&1 || echo "no packages"
+          docker rm $CONTAINER_ID 2>&1 || true
+          echo "=== extracted files ==="
+          ls -la disk-alibabacloud.raw paypal-auth-vm-alibabacloud.bin initramfs-alibabacloud.img 2>&1
+          test -f disk-alibabacloud.raw || { echo "DISK MISSING"; exit 1; }
+          echo "DISK OK"
           echo "==== ARTIFACT HASHES (Alibaba Cloud Intel TDX) ===="
           sha256sum paypal-auth-vm-alibabacloud.bin vmlinuz-alibabacloud initramfs-alibabacloud.img shimx64-alibabacloud.efi grubx64-alibabacloud.efi grub-alibabacloud.cfg disk-alibabacloud.raw 2>/dev/null
           echo "========================="
