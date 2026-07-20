@@ -264,10 +264,43 @@ fi
 
 # 10. Repack the initramfs
 echo "📦 Repacking initramfs..."
-# Normalize mtimes so the cpio archive (and thus the gzip output) is byte-reproducible
-find . -exec touch -d "@$SOURCE_DATE_EPOCH" {} + 2>/dev/null || true
-# Sort entries (LC_ALL=C) so cpio order is independent of filesystem traversal order
-find . -print0 | LC_ALL=C sort -z | cpio --null --quiet -o -H newc -R 0:0 | gzip -9 -n > "$OUTPUT_FILE"
+# Build the main cpio into a temp file, then deterministically append the
+# essential /dev device nodes (console/null/random/urandom) as newc records.
+# This avoids `mknod`, which podman/buildah block for char devices even with
+# CAP_MKNOD, ensuring the archive is byte-identical across all builders
+# (including GitHub Actions' Docker runner, which creates these via mknod).
+CPIO_TMP="$(mktemp)"
+find . -print0 | LC_ALL=C sort -z | cpio --null --quiet -o -H newc > "$CPIO_TMP"
+python3 - "$CPIO_TMP" "$OUTPUT_FILE" <<'PYEOF'
+import sys
+cpio_in, out_path = sys.argv[1], sys.argv[2]
+data = open(cpio_in, "rb").read()
+DEVICES = [
+    ("dev/console", 0o600, 5, 1),
+    ("dev/null",    0o666, 1, 3),
+    ("dev/random",  0o666, 1, 8),
+    ("dev/urandom", 0o666, 1, 9),
+]
+def newc(name, mode, dev_major, dev_minor, body=b""):
+    mode |= 0o020000  # S_IFCHR
+    name_b = name.encode() + b"\x00"
+    def h(v): return b"%08X" % (v & 0xffffffff)
+    hdr = b"070701"
+    hdr += h(0)+h(mode)+h(0)+h(0)+h(1)+h(0)+h(len(body))+h(0)+h(0)+h(dev_major)+h(dev_minor)+h(len(name_b))+h(0)
+    rec = hdr + name_b
+    while len(rec) % 4: rec += b"\x00"
+    rec += body
+    while len(rec) % 4: rec += b"\x00"
+    return rec
+for name, mode, maj, min_ in DEVICES:
+    data += newc(name, mode, maj, min_)
+trailer = b"070701" + b"0"*88 + b"TRAILER!!!\x00"
+while len(trailer) % 4: trailer += b"\x00"
+data += trailer
+open(out_path, "wb").write(data)
+PYEOF
+rm -f "$CPIO_TMP"
+gzip -9 -n < "$OUTPUT_FILE" > "$OUTPUT_FILE.tmp" && mv "$OUTPUT_FILE.tmp" "$OUTPUT_FILE"
 
 # Clean up
 cd /

@@ -20,7 +20,12 @@ echo "🐳 Building Alibaba Cloud image using Docker (reproducible)"
 echo "============================================================"
 
 # Build only the 'assembler' stage (which chains rust-builder -> image-builder).
-docker build --target assembler -f Dockerfile.alibaba -t paypal-auth-vm:alibaba .
+# The local engine is podman; mknod (used to create the /dev device nodes in
+# the initramfs) is blocked by the default seccomp profile, which would
+# silently drop the device nodes and make the local initramfs differ from CI.
+# --security-opt seccomp=unconfined + --cap-add CAP_MKNOD permits mknod, matching
+# CI's privileged Docker runner so the outputs are byte-identical.
+docker build --security-opt seccomp=unconfined --cap-add CAP_MKNOD --target assembler -f Dockerfile.alibaba -t paypal-auth-vm:alibaba .
 
 # Extract the finished disk image (built deterministically inside the container)
 echo ""
