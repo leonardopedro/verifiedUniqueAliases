@@ -316,9 +316,17 @@ def norm_mtime(data):
         if i % 4 == 0 and data[i:i+6] == b"070701":
             f = parse_fields(data[i:i+110])
             # f indices: 0 ino,1 mode,2 uid,3 gid,4 nlink,5 mtime,6 filesize,7 devmaj,8 devmin,9 rdevmaj,10 rdevmin,11 namesize,12 check
-            mode, uid, gid, nlink = f[1], f[2], f[3], f[4]
-            filesize, devmajor, devminor, rdevmajor, rdevminor = f[6], f[7], f[8], f[9], f[10]
+            mode, uid, gid = f[1], f[2], f[3]
+            filesize, rdevmajor, rdevminor = f[6], f[9], f[10]
             namesize = f[11]
+            # Host-dependent fields must be normalized for cross-environment
+            # reproducibility: nlink reflects real hardlinks (none in a static
+            # initramfs) and the device numbers come from the build host's
+            # backing fs (podman overlay=253 vs Docker=48). Force deterministic
+            # values. The only real device nodes are injected separately below.
+            nlink = 1
+            devmajor = 0
+            devminor = 0
             name_b = data[i+110:i+110+namesize]
             p = i + 110 + namesize
             while p % 4: p += 1
