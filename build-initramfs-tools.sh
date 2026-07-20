@@ -306,22 +306,30 @@ def emit_record(mode, uid, gid, nlink, filesize, devmajor, devminor, rdevmajor, 
     while len(rec) % 4: rec += b"\x00"
     return rec
 def norm_mtime(data):
+    # Every newc record (header+name+body) is 4-byte aligned, so every real
+    # header begins on a 4-byte boundary. Mid-file occurrences of the magic
+    # bytes "070701" (e.g. inside the Rust binary) are NOT aligned and must be
+    # skipped by copying 4 bytes at a time, never treated as a header.
     out = bytearray()
     i = 0; n = len(data)
-    while i + 110 <= n and data[i:i+6] == b"070701":
-        f = parse_fields(data[i:i+110])
-        # f indices: 0 ino,1 mode,2 uid,3 gid,4 nlink,5 mtime,6 filesize,7 devmaj,8 devmin,9 rdevmaj,10 rdevmin,11 namesize,12 check
-        mode, uid, gid, nlink = f[1], f[2], f[3], f[4]
-        filesize, devmajor, devminor, rdevmajor, rdevminor = f[6], f[7], f[8], f[9], f[10]
-        namesize = f[11]
-        name_b = data[i+110:i+110+namesize]
-        p = i + 110 + namesize
-        while p % 4: p += 1
-        body = data[p:p+filesize]
-        out += emit_record(mode, uid, gid, nlink, filesize, devmajor, devminor, rdevmajor, rdevminor, name_b, body)
-        p += filesize
-        while p % 4: p += 1
-        i = p
+    while i + 110 <= n:
+        if i % 4 == 0 and data[i:i+6] == b"070701":
+            f = parse_fields(data[i:i+110])
+            # f indices: 0 ino,1 mode,2 uid,3 gid,4 nlink,5 mtime,6 filesize,7 devmaj,8 devmin,9 rdevmaj,10 rdevmin,11 namesize,12 check
+            mode, uid, gid, nlink = f[1], f[2], f[3], f[4]
+            filesize, devmajor, devminor, rdevmajor, rdevminor = f[6], f[7], f[8], f[9], f[10]
+            namesize = f[11]
+            name_b = data[i+110:i+110+namesize]
+            p = i + 110 + namesize
+            while p % 4: p += 1
+            body = data[p:p+filesize]
+            out += emit_record(mode, uid, gid, nlink, filesize, devmajor, devminor, rdevmajor, rdevminor, name_b, body)
+            p += filesize
+            while p % 4: p += 1
+            i = p
+        else:
+            out += data[i:i+4]
+            i += 4
     out += data[i:]
     return bytes(out)
 data = norm_mtime(data)
