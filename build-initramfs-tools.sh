@@ -270,40 +270,35 @@ echo "📦 Repacking initramfs..."
 # (including GitHub Actions' Docker runner, which creates these via mknod).
 CPIO_TMP="$(mktemp)"
 find . -print0 | LC_ALL=C sort -z | cpio --null --quiet -o -H newc > "$CPIO_TMP"
-python3 - "$CPIO_TMP" "$OUTPUT_FILE" <<'PYEOF'
+python3 - "$CPIO_TMP" "$OUTPUT_FILE" "$SOURCE_DATE_EPOCH" <<'PYEOF'
 import sys
-cpio_in, out_path = sys.argv[1], sys.argv[2]
+cpio_in, out_path, epoch = sys.argv[1], sys.argv[2], int(sys.argv[3])
 data = open(cpio_in, "rb").read()
-DEVICES = [
-    ("dev/console", 0o600, 5, 1),
-    ("dev/null",    0o666, 1, 3),
-    ("dev/random",  0o666, 1, 8),
-    ("dev/urandom", 0o666, 1, 9),
-]
-def newc(name, mode, dev_major, dev_minor, body=b""):
-    mode |= 0o020000  # S_IFCHR
+def newc(name, mode, nlink=1, dev_major=0, dev_minor=0, body=b""):
     name_b = name.encode() + b"\x00"
     def h(v): return b"%08X" % (v & 0xffffffff)
     hdr = b"070701"
-    hdr += h(0)+h(mode)+h(0)+h(0)+h(1)+h(0)+h(len(body))+h(0)+h(0)+h(dev_major)+h(dev_minor)+h(len(name_b))+h(0)
+    hdr += h(0)+h(mode)+h(0)+h(0)+h(nlink)+h(epoch)+h(len(body))+h(0)+h(0)+h(dev_major)+h(dev_minor)+h(len(name_b))+h(0)
     rec = hdr + name_b
     while len(rec) % 4: rec += b"\x00"
     rec += body
     while len(rec) % 4: rec += b"\x00"
     return rec
-# cpio -o already appended a TRAILER!!! entry; device nodes must come BEFORE it.
-# Locate the trailer by its marker, snap to the 4-byte aligned boundary.
+# Deterministic /dev entries (no mknod needed): a directory plus the 4 char devices.
+DEVICES = [
+    ("dev",         0o040755, 2, 0, 0),     # directory
+    ("dev/console", 0o020600, 1, 5, 1),
+    ("dev/null",    0o020666, 1, 1, 3),
+    ("dev/random",  0o020666, 1, 1, 8),
+    ("dev/urandom", 0o020666, 1, 1, 9),
+]
+nodes = b"".join(newc(n, m, nl, ma, mi) for n, m, nl, ma, mi in DEVICES)
+# Insert before the existing TRAILER!!! record.
 marker = data.rfind(b"TRAILER!!!")
-# newc header is 6 (magic) + 13*8 (fields) = 110 bytes, then "TRAILER!!!\x00";
-# the trailer record starts 110 bytes before the marker.
 trailer_start = marker - 110
-# align trailer_start down to 4 (all cpio records are 4-byte aligned)
 while trailer_start % 4 != 0:
     trailer_start -= 1
-idx = trailer_start
-if idx < 0:
-    idx = len(data)
-nodes = b"".join(newc(n, m, ma, mi) for n, m, ma, mi in DEVICES)
+idx = trailer_start if trailer_start >= 0 else len(data)
 data = data[:idx] + nodes + data[idx:]
 open(out_path, "wb").write(data)
 PYEOF
