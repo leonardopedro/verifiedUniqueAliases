@@ -187,13 +187,12 @@ ln -sf certs/ca-certificates.crt etc/ssl/cert.pem
 echo "hosts: files dns" > etc/nsswitch.conf
 echo "127.0.0.1 localhost" > etc/hosts
 
-# 9. Ensure critical device nodes exist
-echo "🛠️  Creating essential device nodes..."
-mkdir -p dev
-mknod -m 600 dev/console c 5 1 2>/dev/null || true
-mknod -m 666 dev/null c 1 3 2>/dev/null || true
-mknod -m 666 dev/random c 1 8 2>/dev/null || true
-mknod -m 666 dev/urandom c 1 9 2>/dev/null || true
+# 9. Critical device nodes (dev/console, dev/null, dev/random, dev/urandom)
+# are injected deterministically into the cpio archive at repack time (step 10).
+# We deliberately do NOT use `mknod` here: it is blocked by Docker/podman
+# seccomp in unprivileged build containers, and creating real device nodes in
+# the staging tree would change the `find` traversal order and break
+# cross-environment byte-reproducibility. The injection works everywhere.
 
 # 9b. Ensure kernel modules are discoverable by modprobe
 # On Ubuntu 25.10, modules live at /usr/lib/modules/ but modprobe
@@ -292,11 +291,20 @@ def newc(name, mode, dev_major, dev_minor, body=b""):
     rec += body
     while len(rec) % 4: rec += b"\x00"
     return rec
-for name, mode, maj, min_ in DEVICES:
-    data += newc(name, mode, maj, min_)
-trailer = b"070701" + b"0"*88 + b"TRAILER!!!\x00"
-while len(trailer) % 4: trailer += b"\x00"
-data += trailer
+# cpio -o already appended a TRAILER!!! entry; device nodes must come BEFORE it.
+# Locate the trailer by its marker, snap to the 4-byte aligned boundary.
+marker = data.rfind(b"TRAILER!!!")
+# newc header is 6 (magic) + 13*8 (fields) = 110 bytes, then "TRAILER!!!\x00";
+# the trailer record starts 110 bytes before the marker.
+trailer_start = marker - 110
+# align trailer_start down to 4 (all cpio records are 4-byte aligned)
+while trailer_start % 4 != 0:
+    trailer_start -= 1
+idx = trailer_start
+if idx < 0:
+    idx = len(data)
+nodes = b"".join(newc(n, m, ma, mi) for n, m, ma, mi in DEVICES)
+data = data[:idx] + nodes + data[idx:]
 open(out_path, "wb").write(data)
 PYEOF
 rm -f "$CPIO_TMP"
