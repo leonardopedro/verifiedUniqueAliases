@@ -263,6 +263,11 @@ fi
 
 # 10. Repack the initramfs
 echo "📦 Repacking initramfs..."
+# Normalize all file mtimes to SOURCE_DATE_EPOCH so the cpio headers are
+# byte-deterministic. Without this, files copied with -p (and .ko modules
+# decompressed via zstd -d, which stamp the build time) embed a per-build
+# mtime in the cpio header, breaking reproducibility across builds.
+find . -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} + 2>/dev/null || true
 # Build the main cpio into a temp file, then deterministically append the
 # essential /dev device nodes (console/null/random/urandom) as newc records.
 # This avoids `mknod`, which podman/buildah block for char devices even with
@@ -284,6 +289,42 @@ def newc(name, mode, nlink=1, dev_major=0, dev_minor=0, body=b""):
     rec += body
     while len(rec) % 4: rec += b"\x00"
     return rec
+# Normalize the mtime of EVERY existing cpio record to SOURCE_DATE_EPOCH.
+# (Relying on `touch` proved unreliable inside the build container for files
+# copied with -p / decompressed via zstd -d, which stamp the build time.)
+E_HDR = b"%08X" % epoch
+def parse_fields(hdr):
+    f = [int(hdr[o:o+8].decode(), 16) for o in range(6, 110, 8)]
+    return f  # ino, mode, uid, gid, nlink, mtime, filesize, devmajor, devminor, rdevmajor, rdevminor, namesize, check
+def emit_record(mode, uid, gid, nlink, filesize, devmajor, devminor, rdevmajor, rdevminor, name_b, body):
+    def h(v): return b"%08X" % (v & 0xffffffff)
+    hdr = b"070701"
+    hdr += h(0)+h(mode)+h(uid)+h(gid)+h(nlink)+E_HDR+h(filesize)+h(devmajor)+h(devminor)+h(rdevmajor)+h(rdevminor)+h(len(name_b))+h(0)
+    rec = hdr + name_b
+    while len(rec) % 4: rec += b"\x00"
+    rec += body
+    while len(rec) % 4: rec += b"\x00"
+    return rec
+def norm_mtime(data):
+    out = bytearray()
+    i = 0; n = len(data)
+    while i + 110 <= n and data[i:i+6] == b"070701":
+        f = parse_fields(data[i:i+110])
+        # f indices: 0 ino,1 mode,2 uid,3 gid,4 nlink,5 mtime,6 filesize,7 devmaj,8 devmin,9 rdevmaj,10 rdevmin,11 namesize,12 check
+        mode, uid, gid, nlink = f[1], f[2], f[3], f[4]
+        filesize, devmajor, devminor, rdevmajor, rdevminor = f[6], f[7], f[8], f[9], f[10]
+        namesize = f[11]
+        name_b = data[i+110:i+110+namesize]
+        p = i + 110 + namesize
+        while p % 4: p += 1
+        body = data[p:p+filesize]
+        out += emit_record(mode, uid, gid, nlink, filesize, devmajor, devminor, rdevmajor, rdevminor, name_b, body)
+        p += filesize
+        while p % 4: p += 1
+        i = p
+    out += data[i:]
+    return bytes(out)
+data = norm_mtime(data)
 # Deterministic /dev entries (no mknod needed): a directory plus the 4 char devices.
 DEVICES = [
     ("dev",         0o040755, 2, 0, 0),     # directory
