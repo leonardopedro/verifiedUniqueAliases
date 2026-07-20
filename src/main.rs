@@ -150,6 +150,108 @@ mod enclave_init {
         kmsg(&format!("Network up: {} gw={:?}", cidr, lease.gw));
     }
 
+    // ------------------------------------------------------------------------
+    // ALIBABA CLOUD NETWORK BOOTSTRAP
+    // ------------------------------------------------------------------------
+    // Alibaba Cloud ECS (incl. TDX instances) does NOT answer RFC2131 broadcast
+    // DHCP the way GCP does. The ENI's private IP, subnet, gateway and DNS are
+    // assigned by the VPC network controller and are exposed through the instance
+    // metadata service at the link-local address 100.100.100.200. We read them
+    // there and configure the interface statically. The public EIP is a NAT
+    // binding at the VPC gateway edge and requires no in-guest configuration;
+    // binding to 0.0.0.0 on the private IP is sufficient.
+    async fn configure_alibaba_network() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use std::process::Command;
+
+        modprobe("virtio_net");
+        modprobe("ena");
+
+        // Wait for the ENI to appear.
+        let iface = {
+            let mut found = None;
+            for _ in 0..60 {
+                if let Some(i) = find_interface() { found = Some(i); break; }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            found.ok_or("Alibaba: no network interface after 30s")?
+        };
+        kmsg(&format!("Alibaba: interface found: {}. Bringing UP...", iface));
+        let _ = Command::new("/sbin/ip").args(["link", "set", &iface, "up"]).status();
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let meta = "http://100.100.100.200/2016-01-01/meta-data";
+        let mac = read_mac(&iface);
+        let mac_s = format!(
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        );
+
+        async fn get_meta(client: &reqwest::Client, meta: &str, path: &str) -> Option<String> {
+            let resp = client.get(&format!("{}{}", meta, path)).send().await.ok()?;
+            let text = resp.text().await.ok()?;
+            let trimmed = text.trim().to_string();
+            if trimmed.is_empty() { None } else { Some(trimmed) }
+        }
+
+        // Primary private IPv4 (may contain a list; take the first).
+        let priv_ip = get_meta(&client, meta, &format!(
+            "/network/interfaces/macs/{}/private-ipv4s", mac_s
+        )).await.ok_or("Alibaba: could not read private-ipv4s from metadata")?;
+        let priv_ip = priv_ip.split(['\n', '\r', ' ']).next().unwrap_or("").to_string();
+        let ip: Ipv4Addr = priv_ip.parse().map_err(|_| "Alibaba: bad private IP")?;
+
+        // Subnet CIDR of the vSwitch (e.g. "172.16.0.0/24").
+        let cidr = get_meta(&client, meta, &format!(
+            "/network/interfaces/macs/{}/vswitch-cidr-block", mac_s
+        )).await.unwrap_or_else(|| format!("{}/24", ip));
+        let prefix: u8 = cidr.rsplit('/').next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(24);
+
+        // Gateway (next hop inside the VPC).
+        let gw_s = get_meta(&client, meta, &format!(
+            "/network/interfaces/macs/{}/gateway", mac_s
+        )).await.unwrap_or_else(|| ".".to_string());
+        let gw: Option<Ipv4Addr> = gw_s.parse().ok();
+
+        // DNS servers (space/newline separated).
+        let dns_s = get_meta(&client, meta, "/dns-conf/servers").await.unwrap_or_default();
+        let dns: Vec<Ipv4Addr> = dns_s
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter_map(|s| s.parse::<Ipv4Addr>().ok())
+            .collect();
+
+        // Apply static configuration.
+        let _ = Command::new("/sbin/ip").args(["addr", "flush", "dev", &iface]).status();
+        let _ = Command::new("/sbin/ip")
+            .args(["addr", "add", &format!("{}/{}", ip, prefix), "dev", &iface])
+            .status();
+
+        if let Some(g) = gw {
+            let _ = Command::new("/sbin/ip")
+                .args(["route", "add", &g.to_string(), "dev", &iface])
+                .status();
+            let _ = Command::new("/sbin/ip")
+                .args(["route", "add", "default", "via", &g.to_string()])
+                .status();
+        }
+
+        if !dns.is_empty() {
+            std::fs::create_dir_all("/etc").ok();
+            let resolv: String = dns.iter().map(|ip| format!("nameserver {}\n", ip)).collect();
+            std::fs::write("/etc/resolv.conf", resolv).ok();
+        }
+
+        kmsg(&format!(
+            "Alibaba network up: {}/{} gw={:?} dns={:?}", ip, prefix, gw, dns
+        ));
+        Ok(())
+    }
+
     async fn dhcp(iface: &str) -> Result<Lease, Box<dyn std::error::Error + Send + Sync>> {
         let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         sock.set_reuse_address(true)?;
@@ -195,6 +297,11 @@ mod enclave_init {
 
     /// Load drivers, wait for NIC, perform DHCP, apply lease.
     pub async fn configure_network() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Alibaba Cloud has no RFC2131 broadcast DHCP server; network parameters
+        // come from the instance metadata service and are applied statically.
+        if std::env::var("CLOUD_PROVIDER").unwrap_or_else(|_| "gcp".to_string()) == "alibaba" {
+            return configure_alibaba_network().await;
+        }
         modprobe("gve");
         modprobe("virtio_net");
 
@@ -1247,17 +1354,46 @@ struct AlibabaCasManager {
 
 impl AlibabaCasManager {
     async fn new(domain: String) -> Option<Self> {
-        let access_key_id = std::env::var("ALI_ACCESS_KEY_ID").ok()?;
-        let access_key_secret = std::env::var("ALI_ACCESS_KEY_SECRET").ok()?;
-        let security_token = std::env::var("ALI_SECURITY_TOKEN").ok()?;
+        // Prefer explicit (possibly short-lived STS) credentials from the env,
+        // but fall back to the instance RAM role's temporary credentials served
+        // by the Alibaba metadata service. This keeps the enclave functional
+        // beyond the ~1h expiry of a static SecurityToken without baking
+        // long-lived keys into the image.
+        if let (Ok(id), Ok(secret), Ok(token)) = (
+            std::env::var("ALI_ACCESS_KEY_ID"),
+            std::env::var("ALI_ACCESS_KEY_SECRET"),
+            std::env::var("ALI_SECURITY_TOKEN"),
+        ) {
+            let region_id = std::env::var("ALI_REGION_ID").unwrap_or_else(|_| "cn-hangzhou".to_string());
+            return Some(Self { domain, region_id, access_key_id: id, access_key_secret: secret, security_token: token });
+        }
+        Self::from_metadata(domain).await
+    }
+
+    /// Fetch a RAM role's temporary STS credentials from the instance metadata
+    /// service. The role name is taken from ALI_RAM_ROLE, otherwise the first
+    /// role advertised under `/ram/security-credentials/`.
+    async fn from_metadata(domain: String) -> Option<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let base = "http://100.100.100.200/latest/meta-data/ram/security-credentials";
+        let role = match std::env::var("ALI_RAM_ROLE") {
+            Ok(r) if !r.trim().is_empty() => r.trim().to_string(),
+            _ => {
+                let list = client.get(base).send().await.ok()?.text().await.ok()?;
+                list.lines().map(|l| l.trim().to_string()).find(|l| !l.is_empty())?
+            }
+        };
+        let json = client.get(&format!("{}/{}", base, role)).send().await.ok()?
+            .json::<serde_json::Value>().await.ok()?;
+        let access_key_id = json["AccessKeyId"].as_str()?.to_string();
+        let access_key_secret = json["AccessKeySecret"].as_str()?.to_string();
+        let security_token = json["SecurityToken"].as_str()?.to_string();
         let region_id = std::env::var("ALI_REGION_ID").unwrap_or_else(|_| "cn-hangzhou".to_string());
-        Some(Self {
-            domain,
-            region_id,
-            access_key_id,
-            access_key_secret,
-            security_token,
-        })
+        info!("Loaded Alibaba RAM role '{}' STS credentials from metadata", role);
+        Some(Self { domain, region_id, access_key_id, access_key_secret, security_token })
     }
 
     async fn rpc(
