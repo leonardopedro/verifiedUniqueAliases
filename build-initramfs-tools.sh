@@ -266,7 +266,8 @@ fi
 echo "📦 Repacking initramfs..."
 # Normalize mtimes so the cpio archive (and thus the gzip output) is byte-reproducible
 find . -exec touch -d "@$SOURCE_DATE_EPOCH" {} + 2>/dev/null || true
-find . -print0 | cpio --null --quiet -o -H newc -R 0:0 | gzip -9 -n > "$OUTPUT_FILE"
+# Sort entries (LC_ALL=C) so cpio order is independent of filesystem traversal order
+find . -print0 | LC_ALL=C sort -z | cpio --null --quiet -o -H newc -R 0:0 | gzip -9 -n > "$OUTPUT_FILE"
 
 # Clean up
 cd /
