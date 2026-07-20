@@ -264,7 +264,9 @@ fi
 
 # 10. Repack the initramfs
 echo "📦 Repacking initramfs..."
-find . -print0 | cpio --null --quiet -o -H newc | gzip -9 > "$OUTPUT_FILE"
+# Normalize mtimes so the cpio archive (and thus the gzip output) is byte-reproducible
+find . -exec touch -d "@$SOURCE_DATE_EPOCH" {} + 2>/dev/null || true
+find . -print0 | cpio --null --quiet -o -H newc -R 0:0 | gzip -9 -n > "$OUTPUT_FILE"
 
 # Clean up
 cd /

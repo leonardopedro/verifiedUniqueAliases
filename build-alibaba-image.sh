@@ -46,12 +46,16 @@ echo "mtools_skip_check=1" > "$OUTPUT_DIR/.mtoolsrc"
 export MTOOLSRC="$OUTPUT_DIR/.mtoolsrc"
 export MTOOLS_NO_CONF=1
 
+# Normalize all ESP source timestamps so the FAT image is byte-reproducible
+# across builders (mcopy -m would otherwise embed per-build mtimes).
+touch -d "@$SOURCE_DATE_EPOCH" "$SHIM" "$GRUB" "$KERNEL" "$INITRD"
+
 mmd -i "$ESP_IMAGE" ::/EFI
 mmd -i "$ESP_IMAGE" ::/EFI/BOOT
-mcopy -m -i "$ESP_IMAGE" "$SHIM"   ::/EFI/BOOT/BOOTX64.EFI
-mcopy -m -i "$ESP_IMAGE" "$GRUB"   ::/EFI/BOOT/grubx64.efi
-mcopy -m -i "$ESP_IMAGE" "$KERNEL" ::/EFI/BOOT/vmlinuz
-mcopy -m -i "$ESP_IMAGE" "$INITRD" ::/EFI/BOOT/initrd.img
+mcopy -i "$ESP_IMAGE" "$SHIM"   ::/EFI/BOOT/BOOTX64.EFI
+mcopy -i "$ESP_IMAGE" "$GRUB"   ::/EFI/BOOT/grubx64.efi
+mcopy -i "$ESP_IMAGE" "$KERNEL" ::/EFI/BOOT/vmlinuz
+mcopy -i "$ESP_IMAGE" "$INITRD" ::/EFI/BOOT/initrd.img
 
 cat > "$OUTPUT_DIR/grub.cfg" <<GRUBEOF
 set default=0
@@ -62,7 +66,7 @@ menuentry "PayPal Auth VM (Alibaba Cloud TDX)" {
 }
 GRUBEOF
 touch -d "@$SOURCE_DATE_EPOCH" "$OUTPUT_DIR/grub.cfg"
-mcopy -m -i "$ESP_IMAGE" "$OUTPUT_DIR/grub.cfg" ::/EFI/BOOT/grub.cfg
+mcopy -i "$ESP_IMAGE" "$OUTPUT_DIR/grub.cfg" ::/EFI/BOOT/grub.cfg
 
 # --- Assemble GPT RAW disk, exactly sized --------------------------------
 ESP_SECTORS=$(( ESP_BYTES / 512 ))
