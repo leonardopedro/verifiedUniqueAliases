@@ -2,9 +2,9 @@
 //!
 //! Configuration: Single JSON secret in GCP Secret Manager  
 //! TLS: Google Public CA via ACME
-//! Runtime: GCP Confidential VM (AMD SEV-SNP) or Alibaba Cloud Intel TDX depending on build target
+//! Runtime: GCP Confidential VM (AMD SEV-SNP) or Oracle Cloud OCI SEV-SNP depending on build target
 
-mod intel_tdx;  // Portable TDX attestation adapter for ECS.r9i.xlarge
+mod oci_snp;  // AMD SEV-SNP attestation adapter for OCI E5/E6 confidential instances
 
 const GOOGLE_CA_PEM: &[u8] = include_bytes!("google_ca.pem");
 const PAYPAL_CA_PEM: &[u8] = include_bytes!("paypal.pem");
@@ -34,20 +34,13 @@ mod enclave_init {
         
         insmod_all();
         
-        // Try to clear existing (possibly broken) attestation state
-        #[cfg(feature = "alibabacloud")]
-        {
-            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "intelpsfw"]).status();
-        }
-        #[cfg(not(feature = "alibabacloud"))]
-        {
-            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "amd_tsm"]).status();
-            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "amd-tsm"]).status();
-            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "tsm"]).status();
-            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "tsm_report"]).status();
-            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "sev_guest"]).status();
-            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "sev-guest"]).status();
-        }
+        // Try to clear existing (possibly broken) attestation state (AMD paths — GCP & OCI)
+        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "amd_tsm"]).status();
+        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "amd-tsm"]).status();
+        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "tsm"]).status();
+        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "tsm_report"]).status();
+        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "sev_guest"]).status();
+        let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "sev-guest"]).status();
 
         modprobe("configfs");
         let _ = std::process::Command::new("/bin/mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
@@ -55,26 +48,17 @@ mod enclave_init {
         modprobe("virt_anchor");
         modprobe("coco");
         
-        #[cfg(feature = "alibabacloud")]
-        {
-            // Keep TPM subsystem for Intel TDX but drop AMD-specific sev modules
-        }
+        modprobe("tsm");
+        modprobe("amd_tsm");
+        modprobe("amd-tsm");
+        modprobe("sev-guest");
+        modprobe("sev_guest");
+        modprobe("coco_guest");
         
-        #[cfg(not(feature = "alibabacloud"))]
-        {
-            modprobe("tsm");
-            modprobe("amd_tsm");
-            modprobe("amd-tsm");
-            modprobe("sev-guest");
-            modprobe("sev_guest");
-            modprobe("coco_guest");
-            
-            // v134: Aggressive probe retry only on AMD platforms
-            let _ = std::process::Command::new("/bin/sh").args(["-c", "echo sev-guest > /sys/bus/platform/drivers/sev-guest/bind"]).status();
-        }
+        // v134: Aggressive probe retry (AMD platforms — GCP & OCI)
+        let _ = std::process::Command::new("/bin/sh").args(["-c", "echo sev-guest > /sys/bus/platform/drivers/sev-guest/bind"]).status();
         
-        if !std::path::Path::new("/sys/kernel/config/tsm").exists() || 
-           (cfg!(feature = "alibabacloud") && !std::path::Path::new("/dev/tpmrm0").exists())
+        if !std::path::Path::new("/sys/kernel/config/tsm").exists()
         {
              let _ = std::process::Command::new("/bin/mkdir").args(["-p", "/sys/kernel/config/tsm"]).status();
         }
@@ -453,35 +437,13 @@ mod enclave_init {
 
         // SYNC TIME from trusted source over PINNED TLS
         // Because clock is >= 2026, the TLS handshake will succeed.
-        #[cfg(not(feature = "alibabacloud"))]
         {
-            // GCP: Use Google as time source
+            // GCP & OCI: Use Google as time source
             if let Ok(resp) = crate::hardened_client().get("https://www.google.com").send().await {
                 if let Some(date_str) = resp.headers().get("Date") {
                     if let Ok(date) = date_str.to_str() {
                         let _ = std::process::Command::new("/bin/date").args(["-s", date]).status();
                         kmsg(&format!("System time cryptographically synced to: {}", date));
-                    }
-                }
-            }
-        }
-        #[cfg(feature = "alibabacloud")]
-        {
-            // Alibaba Cloud: Use curl to fetch Date header (Google may be unreachable from CN regions)
-            let time_sources = ["https://www.cloudflare.com", "https://www.aliyun.com"];
-            for src in &time_sources {
-                let output = std::process::Command::new("/usr/bin/curl")
-                    .args(["-sI", "--max-time", "5", src])
-                    .output();
-                if let Ok(out) = output {
-                    let headers = String::from_utf8_lossy(&out.stdout);
-                    for line in headers.lines() {
-                        if line.to_lowercase().starts_with("date:") {
-                            let date = line[5..].trim();
-                            let _ = std::process::Command::new("/bin/date").args(["-s", date]).status();
-                            kmsg(&format!("System time synced from {}: {}", src, date));
-                            break;
-                        }
                     }
                 }
             }
@@ -557,7 +519,8 @@ mod tpm {
         pub amd_chain_b64: Option<String>,
         pub google_ak_cert_pem: Option<String>,
         pub ak_der_sha256: String,
-        // Intel TDX fields
+        // Legacy TDX schema fields — always None after the OCI migration,
+        // kept so older reports remain deserializable.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub pck_cert_pem: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -706,7 +669,9 @@ mod tpm {
 
     async fn fetch_vcek(chip_id: &str, bl: u8, tee: u8, snp: u8, ucode: u8) -> Option<String> {
         let client = reqwest::Client::new(); // Standard client for public KDS to avoid pinning errors
-        let url = format!("https://kdsintf.amd.com/vcek/v1/Milan/{}?blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}", chip_id, bl, tee, snp, ucode);
+        // Family-aware KDS endpoint (Milan / Genoa / Turin) derived from CPUID
+        let family = crate::oci_snp::amd_kds_family();
+        let url = format!("https://kdsintf.amd.com/vcek/v1/{}/{}?blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}", family, chip_id, bl, tee, snp, ucode);
         tracing::info!("v136: Fetching VCEK from {}", url);
         match client.get(&url).send().await {
             Ok(resp) => {
@@ -727,7 +692,8 @@ mod tpm {
 
     async fn fetch_amd_chain() -> Option<String> {
         let client = reqwest::Client::new();
-        match client.get("https://kdsintf.amd.com/vcek/v1/Milan/cert_chain").send().await {
+        let family = crate::oci_snp::amd_kds_family();
+        match client.get(format!("https://kdsintf.amd.com/vcek/v1/{}/cert_chain", family)).send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
                     if let Ok(text) = resp.text().await { 
@@ -745,8 +711,17 @@ mod tpm {
 
 
     pub async fn quote(nonce_hex: &str) -> Result<AttestationResult, Box<dyn std::error::Error + Send + Sync>> {
-        if crate::intel_tdx::is_intel_tdx_available() {
-            tracing::info!("Intel TDX hardware attestation path active"); 
+        #[cfg(feature = "oci")]
+        if crate::oci_snp::is_sev_snp_available() {
+            tracing::info!("AMD SEV-SNP hardware attestation path active (OCI)");
+        }
+
+        // TPM presence probe: OCI confidential instances expose NO vTPM — the SNP
+        // report is the sole hardware evidence there. GCP always has the vTPM.
+        let tpm_available = std::path::Path::new("/dev/tpmrm0").exists()
+            || std::path::Path::new("/dev/tpm0").exists();
+        if !tpm_available {
+            tracing::warn!("No TPM device present — TPM quote skipped, AMD SEV-SNP report carries hardware attestation");
         }
         
         let work_dir = format!("/tmp/tpm_{}", hex::encode(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos().to_be_bytes()));
@@ -765,10 +740,12 @@ mod tpm {
         let auxblob_path = format!("{}/auxblob.bin", work_dir);
 
         // 1. Find the persistent AK handle dynamically from the GCP vTPM
+        //    (skipped entirely when no TPM device exists — OCI confidential VMs)
         let mut ak_ctx = String::new();
         
         // v143: Aggressive 'Shotgun' AK Discovery with explicit error logging
         let standard_handles = ["0x81010002", "0x81010001", "0x81000001", "0x81000002"];
+        if tpm_available {
         for h in &standard_handles {
             // Try both tpm2_readpublic and tpm2 readpublic
             for cmd in ["tpm2_readpublic", "tpm2"] {
@@ -789,8 +766,9 @@ mod tpm {
             }
             if !ak_ctx.is_empty() { break; }
         }
+        }
 
-        if ak_ctx.is_empty() {
+        if ak_ctx.is_empty() && tpm_available {
             tracing::error!("Standard handles failed. SYSTEMATIC SEARCH of persistent handles...");
             // Try systemically searching a wider range if the cap list fails
             for i in 0..10 {
@@ -804,7 +782,7 @@ mod tpm {
             }
         }
 
-        if ak_ctx.is_empty() {
+        if ak_ctx.is_empty() && tpm_available {
             tracing::warn!("Systematic search failed. Attempting capability discovery...");
             for cmd in ["tpm2_getcap", "tpm2"] {
                 let args = if cmd == "tpm2" { vec!["getcap", "handles-persistent"] } else { vec!["handles-persistent"] };
@@ -834,7 +812,7 @@ mod tpm {
         // The Google EK Cert (NVRAM) proves hardware identity. The TPM Quote is signed
         // by a fresh session signing key (session AK), created via tpm2_createprimary.
         // These are intentionally different keys — EK = silicon proof, session AK = quote signer.
-        if ak_ctx.is_empty() {
+        if ak_ctx.is_empty() && tpm_available {
             tracing::info!("Creating session signing AK via tpm2_createprimary...");
             let ak_ctx_file = format!("{}/ak.ctx", work_dir);
             for cmd in ["tpm2_createprimary", "tpm2"] {
@@ -855,11 +833,19 @@ mod tpm {
         }
 
         
-        // Final fallback: Failure
-        if ak_ctx.is_empty() {
+        // Final fallback: Failure (only fatal when a TPM exists but no AK could be
+        // derived — i.e. the GCP path. TPM-less OCI instances continue with the
+        // SEV-SNP report as sole hardware evidence.)
+        if ak_ctx.is_empty() && tpm_available {
             return Err("CRITICAL: Could not find or derive a hardware-bound AK. Identity cannot be verified.".into());
         }
 
+        // TPM-derived evidence: AK PEM, signed quote, PCRs, EK cert.
+        // Only populated when a TPM device exists (GCP vTPM). OCI confidential
+        // instances have no vTPM — these fields stay empty and the AMD SEV-SNP
+        // report (PATH 0) carries the hardware attestation instead.
+        let (ak_pem_str, msg, sig, pcr_values, ek_cert, ak_der_bytes) =
+            if tpm_available && !ak_ctx.is_empty() {
         // Extract AK PEM for the report
         run_cmd("tpm2_readpublic", &["-c", &ak_ctx, "-f", "pem", "-o", &ak_pem]).await?;
         let ak_pem_str = tokio::fs::read_to_string(&ak_pem).await?;
@@ -917,25 +903,32 @@ mod tpm {
 
         // 🔴 FIX: Cryptographically bind using raw DER bytes instead of the PEM string.
         // PEM strings can have varying newlines which silently break the hash.
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use base64::{engine::general_purpose::STANDARD as _STANDARD2, Engine as _};
         let ak_b64 = ak_pem_str
             .lines()
             .filter(|l| !l.starts_with("-----"))
             .collect::<String>()
             .replace(|c: char| c.is_whitespace(), "");
-        let ak_der_bytes = STANDARD.decode(ak_b64).unwrap_or_default();
+        let ak_der_bytes = _STANDARD2.decode(ak_b64).unwrap_or_default();
+
+                (ak_pem_str, msg, sig, pcr_values, ek_cert, ak_der_bytes)
+            } else {
+                tracing::warn!("No TPM evidence available — proceeding with empty TPM fields (SNP report is the hardware root)");
+                (String::new(), Vec::new(), Vec::new(), std::collections::BTreeMap::new(), None, Vec::new())
+            };
 
         // Hardware SNP Report & AMD Certificates
         use sha2::Digest;
         let ak_der_sha256 = hex::encode(sha2::Sha256::digest(&ak_der_bytes));
 
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&ak_der_bytes);
-        hasher.update(&hex::decode(nonce_hex).unwrap_or_default());
-        let bound_nonce = hasher.finalize();
-
+        // Session nonce binding for the SNP report_data field (64 bytes):
+        // bytes 0..32 = combined session nonce SHA-256[paypalHash ∥ pubkeyHash],
+        // bytes 32..64 = zero. The auditor recomputes `expectedNonce` identically
+        // and requires report_data[0..32] === expectedNonce.
         let mut nonce_bytes = [0u8; 64];
-        nonce_bytes[..32].copy_from_slice(&bound_nonce);
+        let nonce_raw = hex::decode(nonce_hex).unwrap_or_default();
+        let nonce_len = nonce_raw.len().min(32);
+        nonce_bytes[..nonce_len].copy_from_slice(&nonce_raw[..nonce_len]);
 
         tracing::info!("DEBUG: SNP nonce bytes prepared");
         // 1. Fetch Google AK Certificate (Mandatory Identity Root)
@@ -970,31 +963,38 @@ mod tpm {
         let mut amd_chain_b64 = None;
         let mut snp_report_b64 = None;
 
-        // Helper closure to try parsing SNP report from a byte slice
-        let try_parse_snp = |data: &[u8]| -> Option<Vec<u8>> {
+        // Helper closure to try parsing SNP report from a byte slice.
+        // Delegates to oci_snp::parse_report — correct offsets:
+        // chip_id @ 0x1A0, reported_tcb @ 0x180 (family-aware TCB byte layout).
+        let try_parse_snp = |data: &[u8]| -> Option<crate::oci_snp::SnpReportInfo> {
             for &offset in &[0usize, 4, 8, 16, 32, 64] {
-                if data.len() >= offset + 1088 {
-                    let v = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
-                    if v >= 1 && v <= 4 {
-                        let end = (offset + 1184).min(data.len());
-                        if end - offset >= 1088 {
-                            let snp_slice = &data[offset..end];
-                            if snp_slice.len() >= 1088 {
-                                let chip_id = hex::encode(&snp_slice[1024..1088]);
-                                let bl = snp_slice.get(16).copied().unwrap_or(0);
-                                let tee = snp_slice.get(17).copied().unwrap_or(0);
-                                let snp_val = snp_slice.get(22).copied().unwrap_or(0);
-                                let ucode = snp_slice.get(23).copied().unwrap_or(0);
-                                tracing::info!("AMD TCB Info - ChipID: {}, BL: {}, TEE: {}, SNP: {}, UCode: {}", 
-                                    &chip_id[..16], bl, tee, snp_val, ucode);
-                            }
-                            return Some(snp_slice.to_vec());
-                        }
+                if data.len() > offset {
+                    if let Some(info) = crate::oci_snp::parse_report(&data[offset..]) {
+                        tracing::info!("AMD TCB Info - ChipID: {}, BL: {}, TEE: {}, SNP: {}, UCode: {}",
+                            &info.chip_id_hex[..16], info.bl, info.tee, info.snp, info.ucode);
+                        return Some(info);
                     }
                 }
             }
             None
         };
+
+        // PATH 0: OCI /dev/sev-guest — SNP_GET_REPORT, session-nonce-bound report.
+        // Primary hardware root for OCI confidential instances (no vTPM there).
+        #[cfg(feature = "oci")]
+        if snp_report_b64.is_none() {
+            tracing::info!("v136: PATH 0 — /dev/sev-guest SNP_GET_REPORT");
+            if let Some(report) = crate::oci_snp::snp_get_report(&nonce_bytes) {
+                if let Some(info) = crate::oci_snp::parse_report(&report) {
+                    tracing::info!("v136: PATH 0 report {} bytes, AMD chip {}", info.report.len(), &info.chip_id_hex[..16]);
+                    vcek_der_b64 = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await;
+                    amd_chain_b64 = fetch_amd_chain().await;
+                    snp_report_b64 = Some(STANDARD.encode(&info.report));
+                } else {
+                    tracing::error!("v136: PATH 0 produced an unparseable SNP report");
+                }
+            }
+        }
 
         // PATH 1: GCP vTPM NVRAM — AMD SNP report provisioned by hypervisor at boot
         // Index 0x01400001 is the well-known GCP location for the hardware SNP report.
@@ -1012,6 +1012,7 @@ mod tpm {
         discovered_handles.dedup();
         tracing::info!("v136: Scanning discovered NV handles: {:?}", discovered_handles);
 
+        if snp_report_b64.is_none() {
         'nvram: for idx in &discovered_handles {
             let data = if let Ok(d) = run_cmd("tpm2_nvread", &["-C", "o", idx]).await { d }
                        else if let Ok(d) = run_cmd("tpm2_nvread", &["-C", "p", idx]).await { d }
@@ -1022,30 +1023,27 @@ mod tpm {
             if data.len() < 32 { continue; }
             tracing::info!("v136: NVRAM {} returned {} bytes", idx, data.len());
             
-            // v147: Chip ID Hunter — scan for SNP report header (0x01) at any offset
+            // v147: Chip ID Hunter — scan for SNP report header at any offset
             for offset in (0..data.len().saturating_sub(1088)).step_by(8) {
-                if let Some(snp) = try_parse_snp(&data[offset..]) {
+                if let Some(info) = try_parse_snp(&data[offset..]) {
                     tracing::info!("v147: Found SNP report at NVRAM {} offset {}", idx, offset);
-                    let chip_id = hex::encode(&snp[1024..1088]);
-                    tracing::info!("v147: AMD Chip ID: {}", &chip_id[..16]);
-                    vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
+                    tracing::info!("v147: AMD Chip ID: {}", &info.chip_id_hex[..16]);
+                    vcek_der_b64 = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await;
                     amd_chain_b64 = fetch_amd_chain().await;
-                    snp_report_b64 = Some(STANDARD.encode(&snp));
+                    snp_report_b64 = Some(STANDARD.encode(&info.report));
                     break 'nvram;
                 }
             }
             
             // Fallback for smaller/truncated reports in auxblob
-            if let Some(snp) = try_parse_snp(&data) {
-                tracing::info!("v136: Parsed SNP report ({} bytes) from NVRAM {}", snp.len(), idx);
-                if snp.len() >= 1088 {
-                    let chip_id = hex::encode(&snp[1024..1088]);
-                    vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
-                    amd_chain_b64 = fetch_amd_chain().await;
-                }
-                snp_report_b64 = Some(STANDARD.encode(&snp));
+            if let Some(info) = try_parse_snp(&data) {
+                tracing::info!("v136: Parsed SNP report ({} bytes) from NVRAM {}", info.report.len(), idx);
+                vcek_der_b64 = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await;
+                amd_chain_b64 = fetch_amd_chain().await;
+                snp_report_b64 = Some(STANDARD.encode(&info.report));
                 break 'nvram;
             }
+        }
         }
 
         // PATH 2: TPM quote auxblob (PCR qualification data — may contain SNP embedding)
@@ -1058,24 +1056,20 @@ mod tpm {
                     
                     // v147: Chip ID Hunter in auxblob
                     for offset in (0..raw.len().saturating_sub(1088)).step_by(8) {
-                        if let Some(snp) = try_parse_snp(&raw[offset..]) {
+                        if let Some(info) = try_parse_snp(&raw[offset..]) {
                             tracing::info!("v147: Found SNP report in auxblob at offset {}", offset);
-                            let chip_id = hex::encode(&snp[1024..1088]);
-                            vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
+                            vcek_der_b64 = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await;
                             amd_chain_b64 = fetch_amd_chain().await;
-                            snp_report_b64 = Some(STANDARD.encode(&snp));
+                            snp_report_b64 = Some(STANDARD.encode(&info.report));
                             break;
                         }
                     }
 
                     if snp_report_b64.is_none() {
-                        if let Some(snp) = try_parse_snp(&raw) {
-                            if snp.len() >= 1088 {
-                                let chip_id = hex::encode(&snp[1024..1088]);
-                                vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
-                                amd_chain_b64 = fetch_amd_chain().await;
-                            }
-                            snp_report_b64 = Some(STANDARD.encode(&snp));
+                        if let Some(info) = try_parse_snp(&raw) {
+                            vcek_der_b64 = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await;
+                            amd_chain_b64 = fetch_amd_chain().await;
+                            snp_report_b64 = Some(STANDARD.encode(&info.report));
                             tracing::info!("v136: Found SNP report in auxblob");
                         }
                     }
@@ -1088,13 +1082,15 @@ mod tpm {
             tracing::info!("v136: PATH 3 — ConfigFS TSM");
             if let Some((report, aux)) = snp::get_report(&nonce_bytes) {
                 if aux.is_some() { auxblob_b64 = aux; }
-                if report.len() >= 1088 {
-                    let chip_id = hex::encode(&report[1024..1088]);
-                    vcek_der_b64 = fetch_vcek(&chip_id, report[16], report[17], report[22], report[23]).await;
+                if let Some(info) = crate::oci_snp::parse_report(&report) {
+                    vcek_der_b64 = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await;
                     amd_chain_b64 = fetch_amd_chain().await;
+                    snp_report_b64 = Some(STANDARD.encode(&info.report));
+                    tracing::info!("v136: Got SNP report via ConfigFS ({} bytes)", info.report.len());
+                } else {
+                    snp_report_b64 = Some(STANDARD.encode(&report));
+                    tracing::warn!("v136: ConfigFS report ({} bytes) failed strict parse — stored unparsed", report.len());
                 }
-                snp_report_b64 = Some(STANDARD.encode(&report));
-                tracing::info!("v136: Got SNP report via ConfigFS ({} bytes)", report.len());
             }
         }
 
@@ -1106,36 +1102,10 @@ mod tpm {
 
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
 
-        // Collect Intel TDX-specific data when available
-        let (pck_cert_pem, tdx_policy, platform_type, td_info_json) = if super::intel_tdx::is_intel_tdx_available() {
-            let tdx_base = super::intel_tdx::collect_tdx_report();
-            let pck_pem = tdx_base.as_ref().and_then(|b| {
-                b.pck_cert_from_nvram.as_deref().map(|der| {
-                    super::intel_tdx::der_to_pem("CERTIFICATE", der)
-                })
-            });
-            let policy = tdx_base.as_ref().and_then(|b| b.tdx_policy.clone());
-            let td_info = tdx_base.as_ref().and_then(|b| {
-                b.td_info.as_ref().map(|info| serde_json::json!({
-                    "attributes": info.attributes,
-                    "mrtd": info.mrtd,
-                    "rtmr0": info.rtmr0,
-                    "rtmr1": info.rtmr1,
-                    "rtmr2": info.rtmr2,
-                    "rtmr3": info.rtmr3,
-                }))
-            });
-            tracing::info!("Intel TDX platform detected — PCK hash: {}", 
-                tdx_base.as_ref().and_then(|b| {
-                    b.pck_cert_from_nvram.as_deref().map(|d| super::intel_tdx::hash_cert(d))
-                }).unwrap_or_else(|| "none".to_string()));
-            if td_info.is_some() {
-                tracing::info!("Intel TDX TDINFO measurements available");
-            }
-            (pck_pem, policy, "Intel TDX".to_string(), td_info)
-        } else {
-            (None, None, "AMD SEV-SNP".to_string(), None)
-        };
+        // Platform identity: both build targets are AMD SEV-SNP.
+        // (Legacy Intel TDX / PCK collection removed — OCI migration.)
+        let (pck_cert_pem, tdx_policy, platform_type, td_info_json) =
+            (None, None, "AMD SEV-SNP".to_string(), None);
 
         Ok(AttestationResult {
             tpm_quote_msg: STANDARD.encode(msg),
@@ -1424,10 +1394,10 @@ struct CallbackQuery {
 }
 
 // ============================================================================
-// GCP SECRET MANAGER (GCP-only; no-op on Alibaba Cloud)
+// GCP SECRET MANAGER (GCP-only; no-op on OCI builds)
 // ============================================================================
 
-#[cfg(not(feature = "alibabacloud"))]
+#[cfg(not(feature = "oci"))]
 #[allow(dead_code)]  // Only used in GCP builds, but required for shared code paths
 async fn fetch_secret_direct(secret_id: &str) -> Option<String> {
     let client = crate::hardened_client();
@@ -1446,12 +1416,12 @@ async fn fetch_secret_direct(secret_id: &str) -> Option<String> {
     String::from_utf8(STANDARD.decode(encoded.trim()).ok()?).ok().map(|s| s.trim().trim_matches('\0').to_string())
 }
 
-#[cfg(feature = "alibabacloud")]
+#[cfg(feature = "oci")]
 async fn fetch_secret_direct(_secret_id: &str) -> Option<String> {
     None
 }
 
-/// Load config from a local JSON file (Alibaba Cloud / general fallback)
+/// Load config from a local JSON file (OCI / general fallback)
 async fn load_config_from_file(path: &str) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
     let content = std::fs::read_to_string(path)?;
     let config: Config = serde_json::from_str(content.trim())?;
@@ -1459,7 +1429,7 @@ async fn load_config_from_file(path: &str) -> Result<Config, Box<dyn std::error:
 }
 
 async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
-    // Priority 1: Check for environment variables (KeePassXC / Local / Alibaba Cloud)
+    // Priority 1: Check for environment variables (KeePassXC / Local / OCI)
     if let (Ok(p_id), Ok(p_sec), Ok(pv_id), Ok(pv_sec), Ok(dom)) = (
         std::env::var("PAYPAL_CLIENT_ID"),
         std::env::var("PAYPAL_CLIENT_SECRET"),
@@ -1482,7 +1452,7 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
         });
     }
 
-    // Priority 2: Try local config file (Alibaba Cloud or fallback)
+    // Priority 2: Try local config file (OCI or fallback)
     let config_file_env = std::env::var("CONFIG_FILE").unwrap_or_else(|_| "/etc/paypal-auth/config.json".to_string());
     if let Ok(config) = load_config_from_file(&config_file_env).await {
         info!("Loaded configuration from {}", config_file_env);
@@ -1490,7 +1460,7 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
     }
 
     // Priority 3: GCP Secret Manager (only on GCP builds)
-    #[cfg(not(feature = "alibabacloud"))]
+    #[cfg(not(feature = "oci"))]
     {
         info!("Attempting to fetch configuration from GCP Secret Manager...");
         let gcp_config = fetch_config_from_gcp().await;
@@ -1502,16 +1472,34 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
         }
     }
 
-    #[cfg(feature = "alibabacloud")]
+    // Priority 3: OCI instance user_data (JSON config delivered by deploy-oci.sh)
+    #[cfg(feature = "oci")]
     {
-        info!("Alibaba Cloud build: config provided via environment variables or CONFIG_FILE");
+        info!("Attempting to fetch configuration from OCI instance user_data...");
+        match crate::oci_snp::oci_user_data().await {
+            Some(raw) => {
+                match serde_json::from_str::<Config>(raw.trim()) {
+                    Ok(c) => {
+                        info!("Loaded configuration from OCI instance user_data");
+                        return apply_config_fallbacks(c);
+                    }
+                    Err(e) => warn!("OCI user_data is not valid config JSON: {}", e),
+                }
+            }
+            None => info!("OCI user_data not available"),
+        }
+    }
+
+    #[cfg(feature = "oci")]
+    {
+        info!("OCI build: config provided via environment variables, CONFIG_FILE, or instance user_data");
     }
 
     Err("Configuration not available. Set PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, PAYPAL_VERIFIED_CLIENT_ID, PAYPAL_VERIFIED_CLIENT_SECRET, DOMAIN environment variables, or provide CONFIG_FILE path.".into())
 }
 
 /// Fetch configuration from GCP Secret Manager
-#[cfg(not(feature = "alibabacloud"))]
+#[cfg(not(feature = "oci"))]
 async fn fetch_config_from_gcp() -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
     let mode_secret = "projects/project-ae136ba1-3cc9-42cf-a48/secrets/PAYPAL_AUTH_MODE/versions/latest";
     let client = hardened_client();
@@ -1612,7 +1600,7 @@ fn apply_config_fallbacks(mut config: Config) -> Result<Config, Box<dyn std::err
 }
 
 // ============================================================================
-// ACME CERTIFICATE MANAGER (Google Public CA on GCP, Let's Encrypt on Alibaba)
+// ACME CERTIFICATE MANAGER (Google Public CA on GCP, Let's Encrypt on OCI)
 // ============================================================================
 
 struct GooglePublicCaManager {
@@ -1637,12 +1625,12 @@ impl GooglePublicCaManager {
 
     /// Select the appropriate ACME directory based on platform and EAB availability
     fn acme_directory(&self) -> &str {
-        #[cfg(feature = "alibabacloud")]
+        #[cfg(feature = "oci")]
         {
-            // Alibaba Cloud: Use Let's Encrypt (no EAB required)
+            // OCI: Use Let's Encrypt (no EAB required)
             LETSENCRYPT_CA_DIRECTORY
         }
-        #[cfg(not(feature = "alibabacloud"))]
+        #[cfg(not(feature = "oci"))]
         {
             // GCP: Use Google Public CA (requires EAB)
             GOOGLE_PUBLIC_CA_DIRECTORY
@@ -1651,9 +1639,9 @@ impl GooglePublicCaManager {
 
     /// Whether this CA requires External Account Binding (EAB) credentials
     fn requires_eab(&self) -> bool {
-        #[cfg(feature = "alibabacloud")]
+        #[cfg(feature = "oci")]
         { false }
-        #[cfg(not(feature = "alibabacloud"))]
+        #[cfg(not(feature = "oci"))]
         { true }
     }
 
@@ -1705,7 +1693,7 @@ impl GooglePublicCaManager {
             }
             account
         } else {
-            // No EAB required (Let's Encrypt / Alibaba Cloud)
+            // No EAB required (Let's Encrypt / OCI)
             info!("Creating new ACME account (no EAB)...");
             let dir = DirectoryBuilder::new(acme_url.to_string()).build().await?;
             let mut builder = AccountBuilder::new(dir);
@@ -1767,12 +1755,12 @@ impl GooglePublicCaManager {
 
     async fn fetch_cached_tls() -> Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
         // TLS caching relies on cloud KMS — only available on GCP builds
-        #[cfg(feature = "alibabacloud")]
+        #[cfg(feature = "oci")]
         {
-            info!("TLS cache via GCP Secret Manager not available on Alibaba Cloud builds");
+            info!("TLS cache via GCP Secret Manager not available on OCI builds");
             return None;
         }
-        #[cfg(not(feature = "alibabacloud"))]
+        #[cfg(not(feature = "oci"))]
         {
         let secret_name = std::env::var("TLS_CACHE_SECRET").ok()?;
         info!("Attempting to restore TLS from cache: {}", secret_name);
@@ -1816,18 +1804,18 @@ impl GooglePublicCaManager {
         
         info!("Successfully restored and unsealed TLS private key from cache (cert and ACME account unsealed)");
         Some((cert, key, acme_key))
-        } // end cfg(not(alibabacloud))
+        } // end cfg(not(oci))
     }
 
     async fn store_cached_tls(cert: &[u8], key: &[u8], acme_key: Option<&[u8]>) {
         // TLS cache store only works on GCP builds (uses GCP Secret Manager)
-        #[cfg(feature = "alibabacloud")]
+        #[cfg(feature = "oci")]
         {
             let _ = (cert, key, acme_key);
-            info!("TLS cache storage skipped on Alibaba Cloud build");
+            info!("TLS cache storage skipped on OCI build");
             return;
         }
-        #[cfg(not(feature = "alibabacloud"))]
+        #[cfg(not(feature = "oci"))]
         {
         if let Ok(secret_name) = std::env::var("TLS_CACHE_SECRET") {
             use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -1871,7 +1859,7 @@ impl GooglePublicCaManager {
                 }
             }
         }
-        } // end cfg(not(alibabacloud))
+        } // end cfg(not(oci))
     }
 }
 
@@ -2114,10 +2102,10 @@ async fn get_userinfo(token: &str, api_base: &str) -> Result<PayPalUserInfo, Box
 // HTTP HANDLERS
 // ============================================================================
 
-#[cfg(not(feature = "alibabacloud"))]
+#[cfg(not(feature = "oci"))]
 const PLATFORM_LABEL: &str = "AMD SEV-SNP / Google Cloud";
-#[cfg(feature = "alibabacloud")]
-const PLATFORM_LABEL: &str = "Intel TDX / Alibaba Cloud";
+#[cfg(feature = "oci")]
+const PLATFORM_LABEL: &str = "AMD SEV-SNP / Oracle Cloud";
 
 async fn index(
     State(state): State<Arc<AppState>>,
@@ -2440,9 +2428,9 @@ async fn load_tls_config(
     Ok(Arc::new(builder.build()))
 }
 
-/// Generate a self-signed TLS certificate using rcgen (fallback for Alibaba Cloud
+/// Generate a self-signed TLS certificate using rcgen (fallback for OCI
 /// when ACME is unreachable due to DNS/network constraints)
-#[cfg(feature = "alibabacloud")]
+#[cfg(feature = "oci")]
 fn generate_self_signed_cert(domain: &str) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
     use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 
@@ -2501,23 +2489,21 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // Platform-specific hardware interface check
-    #[cfg(not(feature = "alibabacloud"))]
-    {
-        if std::path::Path::new("/dev/sev-guest").exists() {
-            enclave_init::kmsg("Hardware interface /dev/sev-guest is PRESENT (likely built-in)");
-        } else {
-            enclave_init::kmsg("Hardware interface /dev/sev-guest is MISSING");
-        }
+    if std::path::Path::new("/dev/sev-guest").exists() {
+        enclave_init::kmsg("Hardware interface /dev/sev-guest is PRESENT");
+    } else {
+        enclave_init::kmsg("Hardware interface /dev/sev-guest is MISSING");
     }
-    #[cfg(feature = "alibabacloud")]
+    #[cfg(feature = "oci")]
     {
         if std::path::Path::new("/dev/tpmrm0").exists() {
-            enclave_init::kmsg("TPM device /dev/tpmrm0 is PRESENT (Intel TDX standard TPM)");
+            enclave_init::kmsg("TPM device /dev/tpmrm0 present (unexpected on OCI confidential VM)");
         } else {
-            enclave_init::kmsg("WARNING: /dev/tpmrm0 is MISSING — TPM attestation unavailable");
+            enclave_init::kmsg("No TPM device — expected on OCI; AMD SEV-SNP report is the hardware root");
         }
-        if std::path::Path::new("/sys/bus/platform/drivers/tdx").exists() {
-            enclave_init::kmsg("Intel TDX driver is loaded");
+        match std::fs::read_to_string("/sys/module/kvm_amd/parameters/sev_snp") {
+            Ok(v) => enclave_init::kmsg(&format!("kvm_amd sev_snp = {}", v.trim())),
+            Err(_) => enclave_init::kmsg("kvm_amd sev_snp parameter not exposed"),
         }
     }
 
@@ -2570,22 +2556,24 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
     // Note: PCR 15 was anchored with the disk manifest in PID 1 phase.
     // BIN_HASH is included in the report JSON and verified via SLSA.
     
-    // Log current PCR 15 state for diagnostics
-    if let Ok(pcr_out) = tpm::run_cmd("tpm2", &["pcrread", "sha256:15"]).await {
-        info!("Current PCR 15 State:\n{}", String::from_utf8_lossy(&pcr_out).trim());
-    }
-
     // DIAGNOSTIC: Check TPM device presence
     let tpm_exists = std::path::Path::new("/dev/tpmrm0").exists() || std::path::Path::new("/dev/tpm0").exists();
     info!("TPM Device present: {}", tpm_exists);
 
-    // DIAGNOSTIC: Dump all NV indices to find the SEV-SNP report
-    match tpm::run_cmd("/usr/bin/tpm2_getcap", &["handles-nv-index"]).await {
-        Ok(nv_out) => info!("Available TPM NV Indices:\n{}", String::from_utf8_lossy(&nv_out).trim()),
-        Err(e) => warn!("Failed to get TPM NV indices (full path): {}", e),
+    // Log current PCR 15 state for diagnostics (TPM builds only)
+    if tpm_exists {
+        if let Ok(pcr_out) = tpm::run_cmd("tpm2", &["pcrread", "sha256:15"]).await {
+            info!("Current PCR 15 State:\n{}", String::from_utf8_lossy(&pcr_out).trim());
+        }
+
+        // DIAGNOSTIC: Dump all NV indices to find the SEV-SNP report
+        match tpm::run_cmd("/usr/bin/tpm2_getcap", &["handles-nv-index"]).await {
+            Ok(nv_out) => info!("Available TPM NV Indices:\n{}", String::from_utf8_lossy(&nv_out).trim()),
+            Err(e) => warn!("Failed to get TPM NV indices (full path): {}", e),
+        }
     }
 
-    #[cfg(not(feature = "alibabacloud"))]
+    #[cfg(not(feature = "oci"))]
     {
         let _client = hardened_client();
         // Try the instance-level identity token (GCP Attestation Token)
@@ -2602,27 +2590,21 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         }
     }
 
-    #[cfg(feature = "alibabacloud")]
+    #[cfg(feature = "oci")]
     {
-        // Alibaba Cloud: Fetch instance identity document from metadata service
-        let meta_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build().unwrap_or_else(|_| reqwest::Client::new());
-        match meta_client.get("http://100.100.100.200/latest/dynamic/instance-identity/document")
-            .send().await {
-            Ok(resp) => {
-                match resp.text().await {
-                    Ok(identity_doc) => info!("Alibaba Cloud Instance Identity: {}", &identity_doc[..identity_doc.len().min(200)]),
-                    Err(e) => warn!("Failed to read Alibaba instance identity: {}", e),
-                }
-            },
-            Err(e) => warn!("Alibaba Cloud metadata service unavailable: {}", e),
+        // OCI: Fetch instance identity from the Instance Metadata Service (opc/v2)
+        match crate::oci_snp::oci_metadata("instance/").await {
+            Some(identity_doc) => {
+                let preview: String = identity_doc.chars().take(200).collect();
+                info!("OCI Instance Identity: {}", preview);
+            }
+            None => warn!("OCI metadata service unavailable"),
         }
-        // Check Intel TDX availability
-        if crate::intel_tdx::is_intel_tdx_available() {
-            info!("Intel TDX hardware attestation available on this Alibaba Cloud instance");
+        // Check AMD SEV-SNP availability
+        if crate::oci_snp::is_sev_snp_available() {
+            info!("AMD SEV-SNP hardware attestation available on this OCI instance");
         } else {
-            warn!("Intel TDX not detected — falling back to standard TPM attestation");
+            warn!("AMD SEV-SNP interface not detected — SNP report acquisition may fail");
         }
     }
 
@@ -2798,7 +2780,7 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
             r
         }
         Err(e) => {
-            #[cfg(feature = "alibabacloud")]
+            #[cfg(feature = "oci")]
             {
                 error!("ACME certificate failed: {}. Generating self-signed certificate as fallback...", e);
                 match generate_self_signed_cert(&config.domain) {
@@ -2814,7 +2796,7 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
                     }
                 }
             }
-            #[cfg(not(feature = "alibabacloud"))]
+            #[cfg(not(feature = "oci"))]
             {
                 error!(
                     "Failed to get certificate: {}. Keeping process alive for debugging...",

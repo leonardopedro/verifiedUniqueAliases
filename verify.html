@@ -498,31 +498,39 @@
             updateStatus('enclaveCheck', sigOk, sigOk ? "Report mathematically verified." : "Signature invalid!");
 
             // 3. TPM Hardware Audit (Strict Binary Parsing)
+            // GCP reports always carry TPM evidence and are checked strictly.
+            // OCI AMD SEV-SNP reports have no vTPM at all — absence is expected there
+            // and the session is bound through the SNP report_data instead.
             let tpmSigOk = false;
             let tpmNonceOk = false;
             let pcrDigestOk = false;
+            const hasTpmEvidence = !!(hw.ak_pub_pem && hw.tpm_quote_msg && hw.tpm_quote_sig);
 
-            const akKey = await crypto.subtle.importKey('spki', pemToBuffer(hw.ak_pub_pem), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
-            const tpmMsg = pemToBuffer(hw.tpm_quote_msg);
-            const tpmSig = pemToBuffer(hw.tpm_quote_sig);
-            const rsaSig = tpmSig.length > 256 ? tpmSig.slice(tpmSig.length - 256) : tpmSig;
-            
-            tpmSigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, akKey, rsaSig, tpmMsg);
-            
-            const parsedAttest = parseTpmsAttest(tpmMsg);
-            tpmNonceOk = (parsedAttest.extraDataHex === expectedNonce);
-            const expectedComposite = await calculatePcrCompositeDigest(hw.pcr_values);
-            pcrDigestOk = (parsedAttest.pcrDigestHex === expectedComposite);
+            if (hasTpmEvidence) {
+                const akKey = await crypto.subtle.importKey('spki', pemToBuffer(hw.ak_pub_pem), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+                const tpmMsg = pemToBuffer(hw.tpm_quote_msg);
+                const tpmSig = pemToBuffer(hw.tpm_quote_sig);
+                const rsaSig = tpmSig.length > 256 ? tpmSig.slice(tpmSig.length - 256) : tpmSig;
 
-            const tpmFinal = tpmSigOk && tpmNonceOk && pcrDigestOk;
-            if (!tpmNonceOk) {
-                throw new Error("CRITICAL: TPM Quote Nonce does not match the expected Session Nonce! (Did the user profile hash change?)");
+                tpmSigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, akKey, rsaSig, tpmMsg);
+
+                const parsedAttest = parseTpmsAttest(tpmMsg);
+                tpmNonceOk = (parsedAttest.extraDataHex === expectedNonce);
+                const expectedComposite = await calculatePcrCompositeDigest(hw.pcr_values);
+                pcrDigestOk = (parsedAttest.pcrDigestHex === expectedComposite);
+
+                const tpmFinal = tpmSigOk && tpmNonceOk && pcrDigestOk;
+                if (!tpmNonceOk) {
+                    throw new Error("CRITICAL: TPM Quote Nonce does not match the expected Session Nonce! (Did the user profile hash change?)");
+                }
+                let tpmMsgText = tpmFinal ? "TPM Quote, Nonce, and PCR Digest strictly verified." : "TPM validation failed (Forgery detected): ";
+                if (!tpmSigOk) tpmMsgText += "Signature Invalid. ";
+                if (!tpmNonceOk) tpmMsgText += "Nonce Mismatch. ";
+                if (!pcrDigestOk) tpmMsgText += "PCR Composite Hash Mismatch. ";
+                updateStatus('tpmCheck', tpmFinal, tpmMsgText);
+            } else {
+                updateStatus('tpmCheck', true, "No TPM evidence in report — expected on AMD SEV-SNP platforms without a vTPM (Oracle Cloud). Session bound by the SNP report_data instead.");
             }
-            let tpmMsgText = tpmFinal ? "TPM Quote, Nonce, and PCR Digest strictly verified." : "TPM validation failed (Forgery detected): ";
-            if (!tpmSigOk) tpmMsgText += "Signature Invalid. ";
-            if (!tpmNonceOk) tpmMsgText += "Nonce Mismatch. ";
-            if (!pcrDigestOk) tpmMsgText += "PCR Composite Hash Mismatch. ";
-            updateStatus('tpmCheck', tpmFinal, tpmMsgText);
 
             // 4. Software Provenance (Hardware-Anchored PCR 15)
             const [bin, ker, init, cfg] = await Promise.all([
@@ -533,8 +541,11 @@
             ]);
             
             const expectedPcr15 = await calculatePcr15(boot.disk_manifest);
-            const actualPcr15 = (hw.pcr_values["pcr_15"] || "").replace(/^0x/i, '').toLowerCase();
-            const pcr15Ok = (actualPcr15 === expectedPcr15);
+            const hasPcr15 = !!(hw.pcr_values && hw.pcr_values["pcr_15"]);
+            const actualPcr15 = ((hw.pcr_values && hw.pcr_values["pcr_15"]) || "").replace(/^0x/i, '').toLowerCase();
+            // PCR 15 exists only when a TPM extended it (GCP). TPM-less reports (OCI
+            // SNP) skip this binding; GitHub provenance checks above still apply.
+            const pcr15Ok = hasPcr15 ? (actualPcr15 === expectedPcr15) : !hasTpmEvidence;
 
             let commonRuns = null;
             for (const c of [bin, ker, init, cfg]) {
@@ -546,7 +557,9 @@
             const provResults =[
                 bin.success ? `✅ Binary (#${bin.runIds.join(',')})` : `❌ Binary`,
                 atomic ? `✅ Image Atomicity (Run #${[...commonRuns][0]})` : `❌ Image Atomicity`,
-                pcr15Ok ? `✅ PCR 15 hardware binding mathematically verified` : `❌ PCR 15 Software Mismatch`
+                hasPcr15
+                    ? (pcr15Ok ? `✅ PCR 15 hardware binding mathematically verified` : `❌ PCR 15 Software Mismatch`)
+                    : `ℹ️ PCR 15 not applicable (no TPM in this report) — session bound via SNP report_data`
             ];
             updateStatus('githubCheck', bin.success && atomic && pcr15Ok, provResults.join('<br>'));
 
@@ -604,13 +617,66 @@
                 }
             }
 
-            // 5b. Verify Direct AMD Silicon Root (Fallback/Optional)
+            // 5b. Direct AMD SEV-SNP Root (OCI ships no Google AK cert; SNP is the sole root)
             if (hw.snp_report_b64 && hw.vcek_der_b64) {
-                // ... (Existing SNP verification logic remains if data is present)
-                siliconMsg += `<br>✅ <b>Native AMD SEV-SNP Evidence Verified</b>`;
+                try {
+                    if (!snp || snp.length < 672 + 144) throw new Error("SNP report truncated (expected ≥ 816 bytes)");
+                    // report_data[0..32] MUST equal the session nonce
+                    // (SHA-256(paypal_hash ∥ SHA-256(pubkey DER))); [32..64] zero.
+                    const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2, '0')).join('');
+                    const snpBindingOk = (reportDataHex === expectedNonce.padEnd(128, '0'));
+
+                    // ECDSA P-384/SHA-384 over signed region snp[0..672]; r/s are
+                    // 72-byte little-endian — take low 48 bytes, reverse to big-endian.
+                    const rBE = new Uint8Array(48), sBE = new Uint8Array(48);
+                    for (let i = 0; i < 48; i++) { rBE[i] = snp[672 + 47 - i]; sBE[i] = snp[744 + 47 - i]; }
+                    const ecdsaSig = new Uint8Array(96); ecdsaSig.set(rBE, 0); ecdsaSig.set(sBE, 48);
+                    const vcekCert = parseAnyCertToForge(hw.vcek_der_b64, "AMD VCEK");
+                    const vcekKey = await crypto.subtle.importKey('spki', pemToBytes(forge.pki.publicKeyToPem(vcekCert.publicKey)), { name: 'ECDSA', namedCurve: 'P-384' }, false, ['verify']);
+                    const snpSigOk = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-384' }, vcekKey, ecdsaSig, snp.slice(0, 672));
+
+                    // VCEK → ASK → ARK chain, root pinned by SHA-256 of the raw ARK DER.
+                    let chainOk = false;
+                    let arkPinHex = "n/a";
+                    if (hw.amd_chain_b64) {
+                        const chainPem = atob(hw.amd_chain_b64);
+                        const pems = chainPem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
+                        if (pems && pems.length >= 2) {
+                            const askCert = forge.pki.certificateFromPem(pems[0]);
+                            const arkCert = forge.pki.certificateFromPem(pems[1]);
+                            const arkBody = (pems[1].match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/) || [])[1].replace(/\s+/g, '');
+                            const arkDer = Uint8Array.from(atob(arkBody), c => c.charCodeAt(0));
+                            arkPinHex = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', arkDer))).map(b => b.toString(16).padStart(2, '0')).join('');
+                            const TRUSTED_AMD_ARKS = [
+                                '4c6598d19c18719c5dfd4a7d335f674e5bfe1d8f800cea2cf270c10d103db2f1', // Genoa (OCI E5/E6)
+                                '1f084161a44bb6d93778a904877d4819cafa5d05ef4193b2ded9dd9c73dd3f6a', // Turin
+                                '69d063b45344d26a2e94e1f4210de49ef555308287d4c174445c95639a540bcd', // Milan (KDS)
+                                '00e7040d7c71ba48530ec1aa7bcbc9f491c360fb1e58284e36ce3b49cb422998'  // Milan legacy reference pin
+                            ];
+                            chainOk = askCert.verify(vcekCert) && arkCert.verify(askCert) && TRUSTED_AMD_ARKS.includes(arkPinHex);
+                        }
+                    }
+
+                    snpVerified = snpBindingOk && snpSigOk && chainOk;
+                    const measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2, '0')).join('');
+                    if (snpVerified) {
+                        siliconMsg += `<br>✅ <b>Native AMD SEV-SNP Evidence Verified</b><br>` +
+                                      `🔐 Session nonce bound in report_data<br>` +
+                                      `🔏 ECDSA P-384 signature valid<br>` +
+                                      `⛓️ VCEK→ASK→ARK chain pinned (ARK ${arkPinHex.substring(0, 16)}…)<br>` +
+                                      `📏 Measurement: ${measurement.substring(0, 16)}…`;
+                    } else if (!googleVerified) {
+                        siliconMsg += `<br>❌ <b>SEV-SNP verification failed</b> (binding=${snpBindingOk}, sig=${snpSigOk}, chain=${chainOk}, ark=${arkPinHex})`;
+                    }
+                } catch (err) {
+                    snpVerified = false;
+                    if (!googleVerified) {
+                        siliconMsg += `<br>❌ <b>SEV-SNP verification error:</b> ${err.message}`;
+                    }
+                }
             }
 
-            if (googleVerified) {
+            if (googleVerified || snpVerified) {
                 siliconOk = true;
             }
 
