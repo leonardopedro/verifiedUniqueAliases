@@ -57,5 +57,5 @@ panic = "abort"
 [features]
 # Default: Google Cloud Confidential VM (AMD SEV-SNP attestation root of trust)
 default = []
-# Enable Intel TDX attestation support for Alibaba Cloud ECS.r9i.xlarge instances
-alibabacloud = []
+# Enable AMD SEV-SNP attestation support for Oracle Cloud (OCI) E5/E6 confidential instances
+oci = []

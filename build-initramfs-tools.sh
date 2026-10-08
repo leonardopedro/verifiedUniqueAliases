@@ -92,10 +92,10 @@ chmod 644 /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
 # Default: GCP AMD SEV-SNP
 PLATFORM_MODULES="sev_guest sev-guest amd_tsm tsm gve virtio_net virtio_scsi virtio_blk nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct configfs coco virt_anchor"
 
-if [[ "${BUILD_FEATURE:-}" == "alibabacloud" ]]; then
-    # Intel TDX / Alibaba Cloud: drop GCP-specific modules, add TDX support
-    PLATFORM_MODULES="tdx virtio_net virtio_scsi virtio_blk nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct configfs"
-    echo "🏗️ Building initramfs for Alibaba Cloud Intel TDX"
+if [[ "${BUILD_FEATURE:-}" == "oci" ]]; then
+    # Oracle Cloud (AMD SEV-SNP): SNP guest driver + virtio network/block stack
+    PLATFORM_MODULES="sev_guest sev-guest amd_sev amd_tsm tsm virtio virtio_ring virtio_scsi virtio_blk virtio_pci virtio_net nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct configfs"
+    echo "🏗️ Building initramfs for Oracle Cloud AMD SEV-SNP"
 else
     echo "🏗️ Building initramfs for GCP AMD SEV-SNP"
 fi

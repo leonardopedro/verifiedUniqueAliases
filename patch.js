@@ -989,14 +989,8 @@ const newScript = `<script>
                 // Native AMD SEV-SNP verification
                 const snp = pemToBuffer(hw.snp_report_b64);
                 
-                const akPemBytes = new TextEncoder().encode(hw.ak_pub_pem);
-                const rawExpectedNonce = new Uint8Array(expectedNonce.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-                const boundBuffer = new Uint8Array(akPemBytes.length + rawExpectedNonce.length);
-                boundBuffer.set(akPemBytes); boundBuffer.set(rawExpectedNonce, akPemBytes.length);
-                const expectedBoundNonce = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', boundBuffer))).map(b => b.toString(16).padStart(2, '0')).join('');
-                
                 const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2,'0')).join('');
-                const snpBindingOk = (reportDataHex === expectedBoundNonce.padEnd(128, '0'));
+                const snpBindingOk = (reportDataHex === expectedNonce.padEnd(128, '0'));
 
                 const rBE = new Uint8Array(48), sBE = new Uint8Array(48);
                 for (let i = 0; i < 48; i++) { rBE[i] = snp[672 + 47 - i]; sBE[i] = snp[744 + 47 - i]; }

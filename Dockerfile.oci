@@ -28,7 +28,7 @@ RUN bash -c ". /usr/local/cargo/env && \
     set -euo pipefail && \
     mkdir -p src && \
     echo 'fn main() {}' > src/main.rs && \
-    cargo build --release --features alibabacloud --target x86_64-unknown-linux-gnu && \
+    cargo build --release --features oci --target x86_64-unknown-linux-gnu && \
     rm -f target/x86_64-unknown-linux-gnu/release/deps/paypal_auth_vm* \
           target/x86_64-unknown-linux-gnu/release/paypal_auth_vm* \
           target/x86_64-unknown-linux-gnu/release/deps/paypal-auth-vm*"
@@ -37,7 +37,7 @@ RUN bash -c ". /usr/local/cargo/env && \
 COPY src ./src
 RUN bash -c ". /usr/local/cargo/env && \
     set -euo pipefail && \
-    cargo build --release --features alibabacloud --target x86_64-unknown-linux-gnu && \
+    cargo build --release --features oci --target x86_64-unknown-linux-gnu && \
     cp target/x86_64-unknown-linux-gnu/release/paypal-auth-vm /paypal-auth-vm-bin"
 
 # Strip binary for determinism
@@ -66,19 +66,22 @@ WORKDIR /build
 COPY --from=rust-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin
 COPY --from=rust-builder /usr/bin/add-det /usr/bin/add-det
 
-COPY build-initramfs-tools.sh ./
+COPY build-initramfs-tools.sh build-oci-image.sh ./
 COPY src ./src
 
-RUN chmod +x build-initramfs-tools.sh && \
+RUN chmod +x build-initramfs-tools.sh build-oci-image.sh && \
     dpkg-query -W -f='${Package} ${Version} ${Architecture}\n' | sort > /build/packages.txt && \
     echo "=== Installed Package Manifest ===" && cat /build/packages.txt && \
-    BUILD_FEATURE=alibabacloud ./build-initramfs-tools.sh && \
+    BUILD_FEATURE=oci ./build-initramfs-tools.sh && \
+    ./build-oci-image.sh && \
     rm -rf /usr/local/cargo/registry /usr/local/cargo/git
 
 # Copy artifacts to root for easy extraction
-RUN cp /build/output/initramfs-paypal-auth.img /initramfs-paypal-auth.img && \
+RUN cp /build/paypal-auth-vm-oci.qcow2 /paypal-auth-vm-oci.qcow2 && \
+    cp /build/output/initramfs-paypal-auth.img /initramfs-paypal-auth.img && \
+    cp /build/output/grub.cfg /grub.cfg && \
     cp /build/packages.txt /packages.txt && \
-    cp /build/paypal-auth-vm-bin /paypal-auth-vm-bin && \
-    sha256sum /initramfs-paypal-auth.img
+    echo "Build Hashes:" && \
+    sha256sum /paypal-auth-vm-oci.qcow2 /initramfs-paypal-auth.img /grub.cfg
 
 CMD ["/bin/bash"]
