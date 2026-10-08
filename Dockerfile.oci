@@ -45,6 +45,16 @@ RUN /usr/bin/add-det /paypal-auth-vm-bin && \
     rm -rf /usr/local/cargo/registry /usr/local/cargo/git
 
 
+# -----------------------------------------------------------------------------
+# Stage: extract Oracle Linux 10 (UEK8) boot binaries — the OS OCI lists as
+# supported for confidential VM.Standard.E5.Flex (AMD SEV-SNP). Packages come
+# pinned from Oracle's yum repos, identical content to the OCI platform image.
+# -----------------------------------------------------------------------------
+FROM oraclelinux:10@sha256:f685a1ff75f33c1b449bbc067b41a1f49878f467873874be2eabc383644e8a14 AS ol10-builder
+COPY extract-ol10-binaries.sh /usr/local/bin/extract-ol10-binaries.sh
+RUN chmod +x /usr/local/bin/extract-ol10-binaries.sh \
+    && /usr/local/bin/extract-ol10-binaries.sh /ol10
+
 FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a AS image-builder
 ENV DEBIAN_FRONTEND=noninteractive
 ENV SOURCE_DATE_EPOCH=1712260800
@@ -65,8 +75,10 @@ RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --n
 WORKDIR /build
 COPY --from=rust-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin
 COPY --from=rust-builder /usr/bin/add-det /usr/bin/add-det
+# Oracle Linux 10 (UEK8) kernel/shim/grub binaries from the ol10-builder stage
+COPY --from=ol10-builder /ol10 /build/ol10
 
-COPY build-initramfs-tools.sh build-oci-image.sh ./
+COPY build-initramfs-tools.sh build-oci-image.sh extract-ol10-binaries.sh ./
 COPY src ./src
 
 RUN chmod +x build-initramfs-tools.sh build-oci-image.sh && \

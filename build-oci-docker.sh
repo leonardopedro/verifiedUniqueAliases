@@ -9,24 +9,31 @@
 # ==============================================================================
 set -eo pipefail
 
+# Prefer docker, fall back to rootless podman
+ENGINE="$(command -v docker || command -v podman || true)"
+if [ -z "$ENGINE" ]; then
+    echo "ERROR: neither docker nor podman found in PATH" >&2
+    exit 1
+fi
+
 echo "============================================================"
-echo "🐳 Building Oracle Cloud VM (AMD SEV-SNP) using Docker"
+echo "🐳 Building Oracle Cloud VM (AMD SEV-SNP) using $ENGINE"
 echo "============================================================"
 
-# Build the Docker image (binary + initramfs + qcow2)
-docker build -f Dockerfile.oci -t paypal-auth-vm:oci .
+# Build the container image (binary + initramfs + qcow2)
+"$ENGINE" build -f Dockerfile.oci -t paypal-auth-vm:oci .
 
 # Extract artifacts from the container
 echo ""
 echo "📦 Extracting artifacts..."
-docker rm -f tmp_oci 2>/dev/null || true
-docker create --name tmp_oci paypal-auth-vm:oci
-docker cp tmp_oci:/paypal-auth-vm-oci.qcow2 ./paypal-auth-vm-oci.qcow2
-docker cp tmp_oci:/initramfs-paypal-auth.img ./initramfs-oci.img
-docker cp tmp_oci:/grub.cfg ./grub-oci.cfg
-docker cp tmp_oci:/packages.txt ./packages-oci.txt
-docker cp tmp_oci:/paypal-auth-vm-bin ./paypal-auth-vm || true
-docker rm tmp_oci
+"$ENGINE" rm -f tmp_oci 2>/dev/null || true
+"$ENGINE" create --name tmp_oci paypal-auth-vm:oci
+"$ENGINE" cp tmp_oci:/paypal-auth-vm-oci.qcow2 ./paypal-auth-vm-oci.qcow2
+"$ENGINE" cp tmp_oci:/initramfs-paypal-auth.img ./initramfs-oci.img
+"$ENGINE" cp tmp_oci:/grub.cfg ./grub-oci.cfg
+"$ENGINE" cp tmp_oci:/packages.txt ./packages-oci.txt
+"$ENGINE" cp tmp_oci:/paypal-auth-vm-bin ./paypal-auth-vm || true
+"$ENGINE" rm tmp_oci
 
 # Compute hashes
 echo ""

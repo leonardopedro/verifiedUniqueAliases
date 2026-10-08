@@ -58,7 +58,7 @@ cat <<EOF > grub.cfg
 set default=0
 set timeout=0
 menuentry "Oracle Cloud Confidential PayPal Auth (AMD SEV-SNP)" {
-    linux /EFI/BOOT/vmlinuz root=tmpfs rootok=1 console=tty0 console=ttyS0,115200n8 selinux=0 panic=1 net.ifnames=0 biosdevname=0 mem_encryption=on sev=on
+    linux /EFI/BOOT/vmlinuz root=tmpfs rootok=1 console=tty0 console=ttyS0,115200n8 selinux=0 panic=1 net.ifnames=0 biosdevname=0 mem_encryption=on
     initrd /EFI/BOOT/initrd.img
 }
 EOF

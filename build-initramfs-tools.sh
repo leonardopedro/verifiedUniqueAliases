@@ -78,51 +78,83 @@ mkdir -p "$OUTPUT_DIR"
 rm -rf "$STAGING_DIR"
 mkdir -p "$STAGING_DIR"
 
-# In Debian, the kernel is in /boot/vmlinuz-*-amd64 or /boot/vmlinuz-*-cloud-amd64
-KERNEL_FILE=$(ls /boot/vmlinuz-*amd64 | sort -V | tail -n 1)
-# The modules are in /lib/modules/
-KERNEL_VERSION=$(basename "$KERNEL_FILE" | sed 's/vmlinuz-//')
-echo "🔍 Using kernel version: $KERNEL_VERSION"
-
-# Workarounds for Ubuntu mkinitramfs hook warnings
-touch /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
-chmod 644 /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
+# Kernel source selection:
+#  - OL10/UEK path: ./ol10/ binaries extracted by extract-ol10-binaries.sh
+#    inside the oraclelinux:10 container stage (OCI confidential VM OS source).
+#  - Debian path (GCP): /boot/vmlinuz-*amd64 from linux-image-cloud-amd64.
+MODULES_OVERRIDE=""
+BASE_IMG=""
+if [ -f "$SRC_ROOT/ol10/vmlinuz" ]; then
+    KERNEL_FILE="$SRC_ROOT/ol10/vmlinuz"
+    KERNEL_VERSION="$(basename "$(ls -1d "$SRC_ROOT"/ol10/modules/*)")"
+    MODULES_OVERRIDE="$SRC_ROOT/ol10/modules/${KERNEL_VERSION}"
+    KERNEL_SOURCE="oraclelinux-10-uek8"
+    echo "🔍 Using Oracle Linux 10 UEK kernel: $KERNEL_VERSION"
+else
+    # In Debian, the kernel is in /boot/vmlinuz-*-amd64 or /boot/vmlinuz-*-cloud-amd64
+    KERNEL_FILE=$(ls /boot/vmlinuz-*amd64 | sort -V | tail -n 1)
+    # The modules are in /lib/modules/
+    KERNEL_VERSION=$(basename "$KERNEL_FILE" | sed 's/vmlinuz-//')
+    KERNEL_SOURCE="debian-trixie-linux-image-cloud-amd64"
+    echo "🔍 Using kernel version: $KERNEL_VERSION"
+fi
 
 # Platform-specific hardware modules detection
 # Default: GCP AMD SEV-SNP
 PLATFORM_MODULES="sev_guest sev-guest amd_tsm tsm gve virtio_net virtio_scsi virtio_blk nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct configfs coco virt_anchor"
 
 if [[ "${BUILD_FEATURE:-}" == "oci" ]]; then
-    # Oracle Cloud (AMD SEV-SNP): SNP guest driver + virtio network/block stack
-    PLATFORM_MODULES="sev_guest sev-guest amd_sev amd_tsm tsm virtio virtio_ring virtio_scsi virtio_blk virtio_pci virtio_net nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct configfs"
+    # Oracle Cloud (AMD SEV-SNP): SNP guest driver + virtio network/block stack.
+    # Derived from the UEK8 (OL10) kernel config: =y builtins (virtio core,
+    # nf_tables, nft_chain_filter, nls_*, configfs, libcrc32c) load silently;
+    # everything else must exist as .ko inside the initramfs for modprobe.
+    # Extra entries (nf_nat, nf_defrag_*, nft_reject, ...) close the modprobe
+    # dependency graph of nft_ct / nft_reject_ipv4 / vfat / nvme.
+    # virtio_pci_modern_dev/legacy_dev: hard deps of virtio_pci (kernel rejects
+    # virtio_pci without them); net_failover/failover: hard deps of virtio_net
+    # (qemu + OCI standby/failover path); cdrom: dep of sr_mod.
+    PLATFORM_MODULES="sev_guest sev-guest amd_sev amd_tsm tsm virtio virtio_ring virtio_scsi virtio_blk virtio_pci virtio_pci_modern_dev virtio_pci_legacy_dev virtio_net net_failover failover sd_mod sr_mod cdrom fat vfat nls_base nls_cp437 nls_ascii nvme nvme_core nvme_auth nvme_keyring nf_tables nft_chain_filter nft_reject nft_reject_ipv4 nf_reject_ipv4 nft_limit nf_conntrack nft_ct nf_nat nf_conncount nf_defrag_ipv4 nf_defrag_ipv6 configfs"
     echo "🏗️ Building initramfs for Oracle Cloud AMD SEV-SNP"
 else
     echo "🏗️ Building initramfs for GCP AMD SEV-SNP"
 fi
 
-# Force inclusion of hardware modules
-for mod in $PLATFORM_MODULES; do
-    echo "$mod" | tee -a /etc/initramfs-tools/modules >/dev/null
-done
-
-echo "🔨 Generating base mkinitramfs..."
-BASE_IMG="/tmp/base-initrd.img"
-mkinitramfs -o "$BASE_IMG" "$KERNEL_VERSION"
-
-# 4. Extract base initramfs
-echo "📦 Extracting base image..."
-cd "$STAGING_DIR"
-# Detect compression format
-FILE_TYPE=$(file -b "$BASE_IMG")
-if echo "$FILE_TYPE" | grep -qi "gzip"; then
-    zcat "$BASE_IMG" | cpio -idm --quiet 2>/dev/null || true
-elif echo "$FILE_TYPE" | grep -qi "xz"; then
-    xzcat "$BASE_IMG" | cpio -idm --quiet 2>/dev/null || true
-elif echo "$FILE_TYPE" | grep -qi "zstd"; then
-    zstdcat "$BASE_IMG" | cpio -idm --quiet 2>/dev/null || true
+if [ -n "$MODULES_OVERRIDE" ]; then
+    # Oracle Linux 10 (UEK8) path: self-assembled initramfs. No Debian base,
+    # no mkinitramfs — the enclave runs as PID 1 and loads modules explicitly
+    # (modprobe/insmod); there is no udev/hotplug dependency by design.
+    echo "⏭️  Skipping Debian mkinitramfs (self-assembled UEK initramfs)"
+    cd "$STAGING_DIR"
+    mkdir -p proc sys run tmp dev etc lib usr sbin bin
 else
-    # Uncompressed cpio archive
-    cpio -idm --quiet < "$BASE_IMG" 2>/dev/null || true
+    # Workarounds for Ubuntu mkinitramfs hook warnings
+    touch /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
+    chmod 644 /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
+
+    # Force inclusion of hardware modules
+    for mod in $PLATFORM_MODULES; do
+        echo "$mod" | tee -a /etc/initramfs-tools/modules >/dev/null
+    done
+
+    echo "🔨 Generating base mkinitramfs..."
+    BASE_IMG="/tmp/base-initrd.img"
+    mkinitramfs -o "$BASE_IMG" "$KERNEL_VERSION"
+
+    # 4. Extract base initramfs
+    echo "📦 Extracting base image..."
+    cd "$STAGING_DIR"
+    # Detect compression format
+    FILE_TYPE=$(file -b "$BASE_IMG")
+    if echo "$FILE_TYPE" | grep -qi "gzip"; then
+        zcat "$BASE_IMG" | cpio -idm --quiet 2>/dev/null || true
+    elif echo "$FILE_TYPE" | grep -qi "xz"; then
+        xzcat "$BASE_IMG" | cpio -idm --quiet 2>/dev/null || true
+    elif echo "$FILE_TYPE" | grep -qi "zstd"; then
+        zstdcat "$BASE_IMG" | cpio -idm --quiet 2>/dev/null || true
+    else
+        # Uncompressed cpio archive
+        cpio -idm --quiet < "$BASE_IMG" 2>/dev/null || true
+    fi
 fi
 
 # 🚀 Installing Enclave Init...
@@ -141,25 +173,43 @@ chmod 755 ./init
 
 # 5b. Forcefully inject hardware modules (platform-dependent)
 # mkinitramfs may skip these if not running on the target hardware.
-echo "🛡️  Injecting hardware and network modules..."
-MODULES_BASE="/lib/modules/$KERNEL_VERSION"
-for modname in $PLATFORM_MODULES; do
-    # Find the module file (could be .ko, .ko.gz, .ko.xz, or .ko.zst)
-    # Search deeper to find all variants (handle hyphen/underscore mismatch)
-    altname="${modname//_/-}"
-    mod_files=$(find "$MODULES_BASE" \( -name "${modname}.ko*" -o -name "${altname}.ko*" \) 2>/dev/null || true)
-    if [ -n "$mod_files" ]; then
-        for mod_file in $mod_files; do
-            echo "  Found $modname at $mod_file, copying..."
-            # Recreate the directory structure in staging
-            dest_rel_path=$(python3 -c "import os; print(os.path.relpath('$mod_file', '/'))")
-            mkdir -p "./$(dirname "$dest_rel_path")"
-            cp "$mod_file" "./$dest_rel_path"
-        done
+    echo "🛡️  Injecting hardware and network modules..."
+    if [ -n "$MODULES_OVERRIDE" ]; then
+        MODULES_BASE="$MODULES_OVERRIDE"
     else
-        echo "  ⚠️ Warning: $modname.ko not found in $MODULES_BASE"
+        MODULES_BASE="/lib/modules/$KERNEL_VERSION"
     fi
-done
+    for modname in $PLATFORM_MODULES; do
+        # Find the module file (could be .ko, .ko.gz, .ko.xz, or .ko.zst)
+        # Search deeper to find all variants (handle hyphen/underscore mismatch)
+        altname="${modname//_/-}"
+        mod_files=$(find "$MODULES_BASE" \( -name "${modname}.ko*" -o -name "${altname}.ko*" \) 2>/dev/null || true)
+        if [ -n "$mod_files" ]; then
+            for mod_file in $mod_files; do
+                echo "  Found $modname at $mod_file, copying..."
+                # Recreate the module tree in staging at lib/modules/<ver>/...
+                # (relative to MODULES_BASE so the OL10 override path works too)
+                sub_rel=$(python3 -c "import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))" "$mod_file" "$MODULES_BASE")
+                dest_rel_path="lib/modules/$KERNEL_VERSION/$sub_rel"
+                mkdir -p "./$(dirname "$dest_rel_path")"
+                cp "$mod_file" "./$dest_rel_path"
+            done
+        else
+            echo "  ⚠️ Warning: $modname.ko not found in $MODULES_BASE"
+        fi
+    done
+
+    # Module metadata: depmod needs modules.builtin(+.modinfo)/modules.order to
+    # resolve builtin (built-in) module names and produce a complete dependency
+    # graph — without them depmod warns and modprobe reports builtins as
+    # "not found" (configfs, nf_tables, nls_*, ...).
+    echo "  Copying module metadata (modules.builtin*, modules.order)..."
+    mkdir -p "./lib/modules/$KERNEL_VERSION"
+    for meta in modules.builtin modules.builtin.modinfo modules.builtin.ranges modules.order; do
+        if [ -f "$MODULES_BASE/$meta" ]; then
+            cp "$MODULES_BASE/$meta" "./lib/modules/$KERNEL_VERSION/$meta"
+        fi
+    done
 
 # 6. Inject required binaries and their dependencies
 echo "🔍 Resolving and copying dependencies..."
@@ -353,7 +403,9 @@ rm -f /tmp/initramfs-raw.cpio /tmp/initramfs-norm.cpio /tmp/normalize_cpio.py
 # Clean up
 cd /
 rm -rf "$STAGING_DIR"
-rm -f "$BASE_IMG"
+if [ -n "$BASE_IMG" ]; then
+    rm -f "$BASE_IMG"
+fi
 chown "$(whoami):$(whoami)" "$OUTPUT_FILE"
 
 # 11. Generate manifest and SHA256
@@ -367,6 +419,7 @@ cat > build-manifest.json << EOF
   "timestamp": "$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%dT%H:%M:%SZ)",
   "source_date_epoch": "$SOURCE_DATE_EPOCH",
   "kernel_version": "$KERNEL_VERSION",
+  "kernel_source": "$KERNEL_SOURCE",
   "rust_version": "$RUST_VER",
   "target": "$BUILD_TARGET",
   "initramfs_sha256": "$HASH"
@@ -375,23 +428,32 @@ EOF
 
 echo "✅ Build complete! SHA256: $HASH"
 echo "🚀 Output ready at: $OUTPUT_FILE"
+
 # Extract kernel, shim, and grub for GPT image builder
 cp "$KERNEL_FILE" "$OUTPUT_DIR/vmlinuz"
 
-# Find shim and grub more robustly in Debian 13
-SHIM_SRC=$(find /usr/lib/shim -name "shimx64.efi.signed" -print -quit 2>/dev/null || find /usr/lib/shim -name "shimx64.efi" -print -quit 2>/dev/null || true)
-GRUB_SRC=$(find /usr/lib/grub -name "grubx64.efi.signed" -print -quit 2>/dev/null || find /usr/lib/grub -name "grubx64.efi" -print -quit 2>/dev/null || true)
-
-if [ -n "$SHIM_SRC" ]; then
-    echo "  Found shim at $SHIM_SRC"
-    cp "$SHIM_SRC" "$OUTPUT_DIR/shimx64.efi"
+if [ -n "$MODULES_OVERRIDE" ]; then
+    # Oracle Linux 10 (UEK8) binaries staged by extract-ol10-binaries.sh
+    echo "  Using OL10 UEK8 shim/grub from $SRC_ROOT/ol10"
+    cp "$SRC_ROOT/ol10/BOOTX64.EFI" "$OUTPUT_DIR/shimx64.efi"
+    cp "$SRC_ROOT/ol10/grubx64.efi" "$OUTPUT_DIR/grubx64.efi"
+    cp "$SRC_ROOT/ol10/VERSIONS.txt" "$OUTPUT_DIR/ol10-versions.txt"
 else
-    echo "  ⚠️ Warning: shimx64.efi.signed not found!"
-fi
+    # Find shim and grub more robustly in Debian 13
+    SHIM_SRC=$(find /usr/lib/shim -name "shimx64.efi.signed" -print -quit 2>/dev/null || find /usr/lib/shim -name "shimx64.efi" -print -quit 2>/dev/null || true)
+    GRUB_SRC=$(find /usr/lib/grub -name "grubx64.efi.signed" -print -quit 2>/dev/null || find /usr/lib/grub -name "grubx64.efi" -print -quit 2>/dev/null || true)
 
-if [ -n "$GRUB_SRC" ]; then
-    echo "  Found grub at $GRUB_SRC"
-    cp "$GRUB_SRC" "$OUTPUT_DIR/grubx64.efi"
-else
-    echo "  ⚠️ Warning: grubx64.efi.signed not found!"
+    if [ -n "$SHIM_SRC" ]; then
+        echo "  Found shim at $SHIM_SRC"
+        cp "$SHIM_SRC" "$OUTPUT_DIR/shimx64.efi"
+    else
+        echo "  ⚠️ Warning: shimx64.efi.signed not found!"
+    fi
+
+    if [ -n "$GRUB_SRC" ]; then
+        echo "  Found grub at $GRUB_SRC"
+        cp "$GRUB_SRC" "$OUTPUT_DIR/grubx64.efi"
+    else
+        echo "  ⚠️ Warning: grubx64.efi.signed not found!"
+    fi
 fi

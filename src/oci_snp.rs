@@ -77,7 +77,10 @@ pub struct AmdPlatform {
 fn cpu_family_model() -> (u8, u8) {
     #[cfg(target_arch = "x86_64")]
     {
-        let r = core::arch::x86_64::__cpuid(1);
+        // __cpuid is unsafe on older toolchains (<=1.91) and safe on newer
+        // ones — wrap so both compile.
+        #[allow(unused_unsafe)]
+        let r = unsafe { core::arch::x86_64::__cpuid(1) };
         let eax = r.eax;
         let base_family = ((eax >> 8) & 0xf) as u8;
         let ext_family = ((eax >> 20) & 0xff) as u8;

@@ -250,19 +250,35 @@ mod enclave_init {
     fn modprobe(module: &str) {
         let paths = ["/sbin/modprobe", "/usr/sbin/modprobe", "/bin/modprobe", "modprobe"];
         let mut success = false;
+        let mut last_err = String::from("no path ran");
         for path in &paths {
-            match std::process::Command::new(path).arg("-q").arg(module).status() {
-                Ok(s) if s.success() => {
+            match std::process::Command::new(path).arg(module).output() {
+                Ok(out) if out.status.success() => {
                     kmsg(&format!("modprobe {} (via {}): OK", module, path));
                     success = true;
                     break;
                 },
-                Ok(_) => {}, // Try next path if this one failed (maybe not found)
-                Err(_) => {},
+                Ok(out) => {
+                    if last_err == "no path ran" {
+                        let err = String::from_utf8_lossy(&out.stderr);
+                        let sout = String::from_utf8_lossy(&out.stdout);
+                        last_err = format!(
+                            "rc={} out='{}' err='{}'",
+                            out.status.code().unwrap_or(-1),
+                            sout.trim(),
+                            err.trim()
+                        );
+                    }
+                },
+                Err(e) => {
+                    if last_err == "no path ran" {
+                        last_err = format!("spawn {}: {}", path, e);
+                    }
+                },
             }
         }
         if !success {
-            kmsg(&format!("modprobe {}: ALL PATHS FAILED", module));
+            kmsg(&format!("modprobe {}: ALL PATHS FAILED ({})", module, last_err));
         }
     }
 
