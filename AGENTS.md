@@ -154,9 +154,20 @@ cargo build --release --target x86_64-unknown-linux-gnu
 # Oracle Cloud
 cargo build --release --features oci --target x86_64-unknown-linux-gnu
 
-# Full reproducible OCI image (binary + initramfs + QCOW2)
+# Full reproducible OCI image (binary + initramfs + QCOW2), uses docker or rootless podman
 bash build-oci-docker.sh
 ```
+
+### OCI Image Build Details (OL10 / UEK8)
+
+The deliverable is a **bootable QCOW2 VM image** — the container is only a build sandbox. Rootless podman works (no root/docker daemon needed; needs `/etc/subuid`+`/etc/subgid` entries, setuid `newuidmap`/`newgidmap`, `~/.config/containers/policy.json` with `insecureAcceptAnything`, and `registries.conf` with `unqualified-search-registries=["docker.io"]` for the short-name `debian@sha256:…` ref).
+
+1. **`ol10-builder` stage** (`FROM oraclelinux:10@sha256:…` digest-pinned): `extract-ol10-binaries.sh` dnf-installs pinned NEVRAs (`kernel-uek-* 6.12.0-207.111.5.1.el10uek` from a written UEKR8 repo, `shim-x64`, `grub2-efi-x64`, `--setopt=tsflags=noscripts`), stages `ol10/{vmlinuz,modules/<ver>,BOOTX64.EFI,grubx64.efi,VERSIONS.txt}` with a sha256 manifest
+2. **rust-builder stage**: Debian + pinned `RUST_VERSION`, builds `--features oci` for `x86_64-unknown-linux-gnu`
+3. **initramfs** (`build-initramfs-tools.sh` OL10 branch): self-assembled staging (skips Debian `mkinitramfs`), curated `MODULES_OVERRIDE` injection with **dependency closure** — boot-proven required sets: `virtio_pci`→`virtio_pci_modern_dev`+`virtio_pci_legacy_dev`, `virtio_net`→`net_failover`→`failover`, `sr_mod`→`cdrom`, `sev_guest`→`tsm`, `nvme`→`nvme-core`→`nvme-auth`+`nvme-keyring`, `nft_ct`→`nf_conntrack`; `modules.builtin*`/`modules.order` must be copied into staging or depmod warns and builtin lookups fail
+4. **`build-oci-image.sh`**: deterministic GPT+ESP → QCOW2. Kernel cmdline uses `mem_encryption=on` only — `sev=on` is invalid for this kernel
+
+Reproducibility (proven repeatedly): `podman build` vs `podman build --no-cache` → bitwise-identical qcow2/initramfs/grub.cfg. QE smoke test: `qemu-system-x86_64 -machine q35 -enable-kvm -m 2048` + OVMF pflash pair (`OVMF.fd` → `FV/{OVMF_CODE.fd,OVMF_VARS.fd}`, copy VARS to a writable file and `chmod 644` — nix store files are read-only) + virtio-blk qcow2 + user-mode net. Expected in qemu: all modules load, DHCP handshake completes, then the config fetch fails (no OCI IMDS in qemu) → `panic=1` reboot loop.
 
 ---
 
@@ -227,3 +238,5 @@ The system presents a signed **Remote Attestation Report** on the OAuth callback
 - **SNP report layout (fixed offsets)**: report_data @ 0x50 (64B), measurement @ 0x90, reported_tcb @ 0x180, chip_id @ 0x1A0 (64B), signature @ 0x2A0 (r @ 0x2A0, s @ 0x2E8, each 72B little-endian), signed region = first **672 bytes**, total report = **1184 bytes**.
 - **AMD KDS product naming**: family 19h → `Milan` (base model 0x) / `Genoa` (base model 0x1/0xA); family 1Ah → `Turin` (or `Venice` for models 0x50-0x5F). TCB byte layout: Layout A (bl=b0, tee=b1, snp=b6, ucode=b7) for Milan/Genoa/standard Turin; Layout B (bl=b1, tee=b2, snp=b3, ucode=b7) for Turin-Dense (1Ah model ≥ 0x60). Override with env `AMD_VCEK_FAMILY` during bring-up.
 - **OCI user_data path**: `http://169.254.169.254/opc/v2/instance/metadata/user_data` (header `Authorization: Bearer Oracle`), v1 fallback at `/opc/v1/...`. The config arrives base64-encoded (OCI CLI encodes `--user-data-file` automatically).
+- **`modprobe sev-guest` fails with ENODEV on non-SNP machines (expected)**: v6.12 `sev_guest_probe()` returns `-ENODEV` when `!cc_platform_has(CC_ATTR_GUEST_SEV_SNP)` and `module_platform_driver_probe()` propagates it through finit → kmod logs `could not insert 'sev_guest': No such device`. This is **normal in qemu/dev builds** — not an initramfs defect. On real OCI E5 with SNP it must load and create `/dev/sev-guest` (still runtime-unverified).
+- **PID-1 `modprobe()` captures kmod output** (`src/main.rs`): failures log exit code + captured stdout/stderr to kmsg (the old `-q` invocation swallowed even finit errors). Use the boot log's `ALL PATHS FAILED (rc=… err=…)` lines as the authoritative module-load diagnosis; kmod `-q` hides errors that `.status()` alone would never show.
