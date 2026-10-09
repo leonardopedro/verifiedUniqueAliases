@@ -113,7 +113,11 @@ if [[ "${BUILD_FEATURE:-}" == "oci" ]]; then
     # virtio_pci_modern_dev/legacy_dev: hard deps of virtio_pci (kernel rejects
     # virtio_pci without them); net_failover/failover: hard deps of virtio_net
     # (qemu + OCI standby/failover path); cdrom: dep of sr_mod.
-    PLATFORM_MODULES="sev_guest sev-guest amd_sev amd_tsm tsm virtio virtio_ring virtio_scsi virtio_blk virtio_pci virtio_pci_modern_dev virtio_pci_legacy_dev virtio_net net_failover failover sd_mod sr_mod cdrom fat vfat nls_base nls_cp437 nls_ascii nvme nvme_core nvme_auth nvme_keyring nf_tables nft_chain_filter nft_reject nft_reject_ipv4 nf_reject_ipv4 nft_limit nf_conntrack nft_ct nf_nat nf_conncount nf_defrag_ipv4 nf_defrag_ipv6 configfs"
+    # gcm/ghash_generic/gf128mul: sev_guest probe runs
+    # crypto_alloc_aead("gcm(aes)") — without them probe fails with -EIO
+    # ("probe with driver sev-guest failed with error -5") and /dev/sev-guest
+    # never appears. aes/ctr/cryptd are built-in (UEK modules.builtin).
+    PLATFORM_MODULES="sev_guest sev-guest amd_sev amd_tsm tsm gcm ghash_generic gf128mul virtio virtio_ring virtio_scsi virtio_blk virtio_pci virtio_pci_modern_dev virtio_pci_legacy_dev virtio_net net_failover failover sd_mod sr_mod cdrom fat vfat nls_base nls_cp437 nls_ascii nvme nvme_core nvme_auth nvme_keyring nf_tables nft_chain_filter nft_reject nft_reject_ipv4 nf_reject_ipv4 nft_limit nf_conntrack nft_ct nf_nat nf_conncount nf_defrag_ipv4 nf_defrag_ipv6 configfs"
     echo "🏗️ Building initramfs for Oracle Cloud AMD SEV-SNP"
 else
     echo "🏗️ Building initramfs for GCP AMD SEV-SNP"

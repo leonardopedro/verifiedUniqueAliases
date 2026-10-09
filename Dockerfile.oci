@@ -52,8 +52,19 @@ RUN /usr/bin/add-det /paypal-auth-vm-bin && \
 # -----------------------------------------------------------------------------
 FROM oraclelinux:10@sha256:f685a1ff75f33c1b449bbc067b41a1f49878f467873874be2eabc383644e8a14 AS ol10-builder
 COPY extract-ol10-binaries.sh /usr/local/bin/extract-ol10-binaries.sh
+# /host-ol10 = binaries staged by extract-ol10-platform.sh directly from the
+# OCI "Oracle Linux 10" platform image. When the build context only carries
+# the placeholder (CI checkouts), fall back to the pinned-yum extraction.
+COPY ol10 /host-ol10
 RUN chmod +x /usr/local/bin/extract-ol10-binaries.sh \
-    && /usr/local/bin/extract-ol10-binaries.sh /ol10
+    && if [ -f /host-ol10/vmlinuz ]; then \
+           echo "Using OL10 platform-image binaries from build context" \
+           && mkdir -p /ol10 && cp -a /host-ol10/. /ol10/ \
+           && chmod -R a+rX /ol10 ; \
+       else \
+           echo "No staged ol10/ binaries — extracting pinned NEVRAs from Oracle yum" \
+           && /usr/local/bin/extract-ol10-binaries.sh /ol10 ; \
+       fi
 
 FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a AS image-builder
 ENV DEBIAN_FRONTEND=noninteractive

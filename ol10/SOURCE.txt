@@ -1,0 +1,20 @@
+This directory holds the Oracle Linux 10 boot binaries that Dockerfile.oci's
+ol10-builder stage copies into the image build.
+
+Populate it by running (needs the oci CLI + OCI_COMPARTMENT_ID/OCI_SUBNET_ID):
+
+    bash extract-ol10-platform.sh
+
+which launches a short-lived spot instance from the OCI "Oracle Linux 10"
+platform image, copies /boot + ESP + kernel modules off it, and terminates it.
+Expected contents after extraction:
+
+    ol10/vmlinuz
+    ol10/BOOTX64.EFI
+    ol10/grubx64.efi
+    ol10/VERSIONS.txt
+    ol10/modules/<kernel-version>/...
+
+If only this placeholder is present (e.g. a CI checkout), the build falls back
+to extract-ol10-binaries.sh, which installs pinned NEVRAs from Oracle's yum
+repositories inside the digest-pinned oraclelinux:10 container.
