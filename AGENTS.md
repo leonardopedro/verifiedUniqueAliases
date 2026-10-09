@@ -146,13 +146,21 @@ To ensure 100% bitwise reproducibility regardless of host environment, the proje
 | *(none / default)* | GCP Confidential VM | Google EK Cert + Session AK | virtio_net / gve |
 | `oci` | Oracle Cloud VM.Standard.E5.Flex | VCEK (AMD KDS) + SNP report | virtio_net / virtio_blk |
 
-Build commands:
+Build commands (local builds need `pkg-config` + OpenSSL headers, which the
+`nix-shell -p pkg-config openssl` wrapper supplies — a bare `cargo build`
+stops at `openssl-sys`; the Docker/podman path installs its own):
 ```bash
 # GCP (default)
-cargo build --release --target x86_64-unknown-linux-gnu
+nix-shell -p pkg-config openssl --run 'cargo build --release --target x86_64-unknown-linux-gnu'
 
 # Oracle Cloud
-cargo build --release --features oci --target x86_64-unknown-linux-gnu
+nix-shell -p pkg-config openssl --run 'cargo build --release --features oci --target x86_64-unknown-linux-gnu'
+
+# Local verification: the tree has no #[test], so the gate is "both feature sets compile"
+nix-shell -p pkg-config openssl --run 'cargo test --locked && cargo check --locked --all-targets --features oci'
+
+# Relative markdown links (CI: linkcheck.yml)
+nix-shell -p python3 --run "python3 scripts/check-links"
 
 # Full reproducible OCI image (binary + initramfs + QCOW2), uses docker or rootless podman
 bash build-oci-docker.sh

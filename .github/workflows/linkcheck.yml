@@ -1,0 +1,14 @@
+name: linkcheck
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  links:
+    name: relative markdown links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check-links
+        run: python3 scripts/check-links
