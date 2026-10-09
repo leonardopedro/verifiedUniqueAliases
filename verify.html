@@ -329,6 +329,313 @@
         }
     }
 
+    // ── EC-capable X.509 helpers ─────────────────────────────────────────────
+    // node-forge's pki.certificateFromPem/Asn1 only parses RSA
+    // SubjectPublicKeyInfo and throws "OID is not RSA" on the AMD ECDSA P-384
+    // VCEK/ASK/ARK certificates, which silently failed the entire silicon block
+    // for OCI reports ("CRITICAL: No valid Silicon Root of Trust"). These
+    // helpers parse raw ASN.1 (algorithm-agnostic) and verify signatures with
+    // WebCrypto — the same primitive already used for the SNP report signature.
+    function derBytesToBinary(u8) {
+        let s = '';
+        for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));
+        return s;
+    }
+    function binaryToBytes(bin) {
+        // forge may hand back a Uint8Array (e.g. INTEGER values) or a binary
+        // STRING whose char codes can exceed 0xFF — naive charCodeAt(0) would
+        // corrupt those bytes (that bug produced 512-byte garbage signatures).
+        if (bin instanceof Uint8Array) return bin;
+        return Uint8Array.from(bin, c => c.charCodeAt(0) & 0xff);
+    }
+    // forge exposes OID node .value as raw DER bytes (NOT a dotted string).
+    // Decode base-128 OID bytes → dotted-decimal for sigAlg / SPKI / curve lookups.
+    function oidBytesToDotted(bin) {
+        const bytes = binaryToBytes(bin);
+        let out = [], val = 0, first = true;
+        for (const b of bytes) {
+            val = (val * 128) + (b & 0x7f);
+            if (!(b & 0x80)) {
+                if (first) { out.push(Math.floor(val / 40), val % 40); first = false; }
+                else out.push(val);
+                val = 0;
+            }
+        }
+        return out.join('.');
+    }
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+    function x509NodesFromDerBin(bin) {
+        const cert = forge.asn1.fromDer(bin);
+        if (cert.type !== forge.asn1.Type.SEQUENCE || cert.value.length !== 3) {
+            throw new Error("Not an X.509 certificate");
+        }
+        return {
+            tbs: cert.value[0],
+            sigAlg: cert.value[1],
+            sigAlgOid: oidBytesToDotted(cert.value[1].value[0].value),
+            sigBits: cert.value[2]
+        };
+    }
+    // TBSCertificate: locate subjectPublicKeyInfo = SEQUENCE { SEQUENCE { OID, ... }, BIT STRING }
+    function x509FindSpki(tbsNode) {
+        for (const child of tbsNode.value) {
+            if (child.type === forge.asn1.Type.SEQUENCE && Array.isArray(child.value) && child.value.length === 2
+                && child.value[0] && child.value[0].type === forge.asn1.Type.SEQUENCE
+                && child.value[0].value && child.value[0].value[0] && child.value[0].value[0].type === forge.asn1.Type.OID
+                && child.value[1] && child.value[1].type === forge.asn1.Type.BITSTRING) {
+                return child;
+            }
+        }
+        throw new Error("subjectPublicKeyInfo not found");
+    }
+    // Accepts PEM, base64-DER, or binary DER; returns raw nodes + SPKI DER bytes.
+    function x509ParseAny(certInput, name) {
+        try {
+            let decoded;
+            if (certInput.includes('-----BEGIN')) {
+                const m = certInput.match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);
+                if (!m) throw new Error("Malformed PEM");
+                decoded = atob(m[1].replace(/\s+/g, ''));
+            } else {
+                const b64 = certInput.replace(/-/g, '+').replace(/_/g, '/');
+                decoded = atob(b64 + '='.repeat((4 - b64.length % 4) % 4));
+            }
+            const nodes = x509NodesFromDerBin(decoded);
+            return {
+                nodes: nodes,
+                spkiDer: binaryToBytes(forge.asn1.toDer(x509FindSpki(nodes.tbs)).getBytes())
+            };
+        } catch (e) {
+            throw new Error(`Failed to parse ${name} Certificate: ` + e.message);
+        }
+    }
+    // ECDSA AlgorithmIdentifier → WebCrypto curve params (AMD uses P-384).
+    function ecCurveParams(spkiDer) {
+        const spki = forge.asn1.fromDer(derBytesToBinary(spkiDer));
+        const algSeq = spki.value[0].value;
+        if (oidBytesToDotted(algSeq[0].value) !== '1.2.840.10045.2.1') throw new Error('Not an EC public key');
+        const curves = {
+            '1.3.132.0.34': 'P-384', '1.3.132.0.35': 'P-521',
+            '1.3.132.0.33': 'P-256', '1.2.840.10045.3.1.7': 'P-256'
+        };
+        const curveOid = oidBytesToDotted(algSeq[1].value);
+        const named = curves[curveOid];
+        if (!named) throw new Error('Unsupported EC curve ' + curveOid);
+        return { name: 'ECDSA', namedCurve: named };
+    }
+    function x509HashForOid(oid) {
+        const map = {
+            '1.2.840.10045.4.3.2': 'SHA-256',  // ecdsa-with-SHA256
+            '1.2.840.10045.4.3.3': 'SHA-384',  // ecdsa-with-SHA384 (AMD KDS VCEK)
+            '1.2.840.10045.4.3.4': 'SHA-512',  // ecdsa-with-SHA512
+            '1.2.840.113549.1.1.11': 'SHA-256', // sha256WithRSAEncryption
+            '1.2.840.113549.1.1.12': 'SHA-384', // sha384WithRSAEncryption
+            '1.2.840.113549.1.1.13': 'SHA-512', // sha512WithRSAEncryption
+            '1.2.840.113549.1.1.10': 'PSS'      // RSASSA-PSS (AMD ASK/ARK) — hash parsed from params
+        };
+        if (!map[oid]) throw new Error('Unsupported signature algorithm ' + oid);
+        return map[oid];
+    }
+    // Extract RSA public key (modulus n, exponent e) as BigInts from an SPKI DER.
+    // Convert a forge node's .value to a Uint8Array regardless of whether forge
+    // returned a flat binary string, a Uint8Array, or a nested parsed node.
+    function forgeValueToBytes(v) {
+        if (v instanceof Uint8Array) return v;
+        if (typeof v === 'string') return binaryToBytes(v);
+        // forge sometimes wraps the real node in a 1-element Array — unwrap it.
+        let node = v;
+        while (Array.isArray(node)) node = node[0];
+        // Re-encode the parsed ASN.1 node back to DER bytes.
+        return binaryToBytes(forge.asn1.toDer(node).getBytes());
+    }
+    function rsaPubKeyFromSpki(spkiDer) {
+        const spki = forge.asn1.fromDer(derBytesToBinary(spkiDer));
+        // SPKI = SEQUENCE { AlgId, BIT STRING }. forge may return the BIT STRING
+        // .value as a flat binary string OR as a nested parsed node (Array).
+        // For the nested form the raw key bytes live at SEQUENCE→INTEGER→string.
+        const keyBits = spki.value[1];
+        let rawKeyBytes;
+        if (Array.isArray(keyBits.value)) {
+            const seq = keyBits.value[0];                       // inner SEQUENCE
+            const modulusStr = seq.value[0].value;              // INTEGER n (binary string)
+            const exponentStr = seq.value[1].value;             // INTEGER e (binary string)
+            rawKeyBytes = binaryToBytes(modulusStr);
+            var exponentBytes = binaryToBytes(exponentStr);
+        } else {
+            const raw = forgeValueToBytes(keyBits.value);
+            rawKeyBytes = (raw.length > 0 && raw[0] === 0) ? raw.slice(1) : raw;
+            const pubAsn = forge.asn1.fromDer(derBytesToBinary(rawKeyBytes));
+            var exponentBytes = binaryToBytes(pubAsn.value[1].value);
+            rawKeyBytes = binaryToBytes(pubAsn.value[0].value);
+        }
+        // DER INTEGERs carry a leading 0x00 when the high bit is set — strip it
+        // so the modulus is a clean 512-byte (4096-bit) value.
+        while (rawKeyBytes.length > 1 && rawKeyBytes[0] === 0) rawKeyBytes = rawKeyBytes.slice(1);
+        const bytesToBig = (b) => { let x = 0n; for (const byte of b) x = (x << 8n) | BigInt(byte); return x; };
+        return {
+            n: bytesToBig(rawKeyBytes),
+            e: bytesToBig(exponentBytes),
+            k: rawKeyBytes.length
+        };
+    }
+    // RSA public operation m = s^e mod n (square-and-multiply).
+    function rsaPublicOp(s, e, n) {
+        let m = 1n, base = s % n, exp = e;
+        while (exp > 0n) { if (exp & 1n) m = (m * base) % n; base = (base * base) % n; exp >>= 1n; }
+        return m;
+    }
+    // forge's RSA key.verify uses OAEP unpadding → breaks on raw PKCS#1 sigs. Implement
+    // EMSA-PKCS1-v1_5 encoding check (RFC 8017 §9.2) ourselves, as the WebCrypto spec does.
+    async function rsaVerifyPkcs1(parentSpkiDer, hashName, tbsDer, sigBytes) {
+        const hLen = { 'SHA-256': 32, 'SHA-384': 48, 'SHA-512': 64 }[hashName];
+        if (!hLen) throw new Error('PKCS1 hash unsupported: ' + hashName);
+        const { n, e, k } = rsaPubKeyFromSpki(parentSpkiDer);
+        // Build expected EM = 0x00 || 0x01 || PS(0xFF) || 0x00 || DigestInfo
+        const hBytes = new Uint8Array(await crypto.subtle.digest(hashName, tbsDer));
+        const prefixes = {
+            'SHA-256': '3031300d060960864801650304020105000420',
+            'SHA-384': '3041300d060960864801650304020205000430',
+            'SHA-512': '3051300d060960864801650304020305000440'
+        };
+        const diPrefix = forge.util.hexToBytes(prefixes[hashName]);
+        const digestInfo = diPrefix + derBytesToBinary(hBytes);
+        const tLen = 3 + digestInfo.length; // 0x00 0x01 <PS> 0x00 <DI>
+        if (k < tLen) return false;
+        const psLen = k - tLen;
+        let em = '\x00\x01';
+        for (let i = 0; i < psLen; i++) em += '\xff';
+        em += '\x00' + digestInfo;
+        const s = bytesToBigLocal(sigBytes);
+        const m = rsaPublicOp(s, e, n);
+        // m → fixed-width k bytes, constant-time compare with expected EM.
+        let mBytes = m.toString(16); if (mBytes.length % 2) mBytes = '0' + mBytes;
+        let mBin = forge.util.hexToBytes(mBytes);
+        while (mBin.length < k) mBin = '\x00' + mBin;
+        if (mBin.length !== k) return false;
+        let diff = 0;
+        for (let i = 0; i < k; i++) diff |= mBin.charCodeAt(i) ^ em.charCodeAt(i);
+        return diff === 0;
+    }
+    function bytesToBigLocal(b) { let x = 0n; for (const byte of b) x = (x << 8n) | BigInt(byte); return x; }
+    // RSASSA-PSS verification (RFC 8017 §9.1). AMD signs the VCEK→ASK→ARK chain
+    // with PSS: hash/MGF1 and salt length are read from the AlgorithmIdentifier
+    // params (AMD's current KDS chain uses SHA-384 + MGF1-SHA-384 + saltLen 48;
+    // older chains used SHA-256/salt 32). emBits = modBits - 1, so the unused
+    // high bits of maskedDB/DB must be masked — omitting that step fails
+    // verifications ~50% of the time (whenever signer-side bit 0 is set).
+    async function rsaVerifyPss(parentSpkiDer, hashName, tbsDer, sigBytes, saltLen) {
+        const hLen = { 'SHA-256': 32, 'SHA-384': 48, 'SHA-512': 64 }[hashName];
+        if (!hLen) throw new Error('PSS hash unsupported: ' + hashName);
+        if (saltLen == null) saltLen = hLen;
+        const { n, e } = rsaPubKeyFromSpki(parentSpkiDer);
+        const modBits = n.toString(2).length;
+        const emBits = modBits - 1;
+        const emLen = Math.ceil(emBits / 8);
+        const unusedBits = 8 * emLen - emBits;
+        if (emLen < hLen + saltLen + 2) return false;
+        const s = bytesToBigLocal(sigBytes);
+        const m = rsaPublicOp(s, e, n);
+        // EM = maskedDB || H || 0xbc
+        let emBytes = m.toString(16); if (emBytes.length % 2) emBytes = '0' + emBytes;
+        let emBin = forge.util.hexToBytes(emBytes);
+        while (emBin.length < emLen) emBin = '\x00' + emBin;
+        if (emBin.length !== emLen) return false;
+        const em = binaryToBytes(emBin);
+        if (em[emLen - 1] !== 0xbc) return false;
+        const dbLen = emLen - hLen - 1;
+        const maskedDB = em.slice(0, dbLen);
+        const h = em.slice(dbLen, dbLen + hLen);
+        // Step 9: the leftmost 8*emLen - emBits bits of maskedDB MUST be zero.
+        if (unusedBits > 0 && (maskedDB[0] & (0xff << (8 - unusedBits) & 0xff)) !== 0) return false;
+        // MGF1 unmask of maskedDB
+        const db = new Uint8Array(dbLen);
+        let counter = 0, offset = 0;
+        while (offset < dbLen) {
+            const ctr = new Uint8Array([(counter >>> 24) & 0xff, (counter >>> 16) & 0xff, (counter >>> 8) & 0xff, counter & 0xff]);
+            const seed = new Uint8Array(h.length + 4); seed.set(h, 0); seed.set(ctr, h.length);
+            const digest = new Uint8Array(await crypto.subtle.digest(hashName, seed));
+            for (let i = 0; i < digest.length && offset < dbLen; i++, offset++) db[offset] = maskedDB[offset] ^ digest[i];
+            counter++;
+        }
+        // Step 12: clear the unused high bits of DB after unmasking.
+        if (unusedBits > 0) db[0] &= 0xff >> unusedBits;
+        // db = PS || 0x01 || salt
+        const salt = db.slice(dbLen - saltLen);
+        const padLen = dbLen - saltLen - 1;
+        for (let i = 0; i < padLen; i++) if (db[i] !== 0) return false;
+        if (db[padLen] !== 0x01) return false;
+        // mPrime = 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 || mHash || salt
+        const mHash = new Uint8Array(await crypto.subtle.digest(hashName, tbsDer));
+        const mPrime = new Uint8Array(8 + hLen + saltLen);
+        mPrime.set(mHash, 8); mPrime.set(salt, 8 + hLen);
+        const hPrime = new Uint8Array(await crypto.subtle.digest(hashName, mPrime));
+        let diff = 0;
+        for (let i = 0; i < hLen; i++) diff |= h[i] ^ hPrime[i];
+        return diff === 0;
+    }
+    // Cryptographic chain link: was `child` signed by `parent`'s public key?
+    async function x509SignedBy(child, parent) {
+        try {
+            const hash = x509HashForOid(child.nodes.sigAlgOid);
+            const sigBin = child.nodes.sigBits.value;
+            const tbsDer = binaryToBytes(forge.asn1.toDer(child.nodes.tbs).getBytes());
+            const sigAlgOid = child.nodes.sigAlgOid;
+
+            // BIT STRING: [unused-bits byte] || raw RSA signature
+            const rsaSigContent = (sigBin.length > 0 && sigBin.charCodeAt(0) === 0) ? sigBin.slice(1) : sigBin;
+            const rsaSigBytes = binaryToBytes(rsaSigContent);
+
+            // RSASSA-PSS (AMD ASK/ARK chain): hash/MGF1/salt parsed from the
+            // AlgorithmIdentifier params. Defaults: SHA-256, saltLen = hLen.
+            if (sigAlgOid === '1.2.840.113549.1.1.10') {
+                let pssHash = 'SHA-256', saltLen = null;
+                try {
+                    const algSeq = child.nodes.sigAlg;
+                    const params = algSeq && algSeq.value && algSeq.value[1];
+                    if (params && params.type === 16 && Array.isArray(params.value)) {
+                        // ctx[0] = hash algorithm; ctx[0].value[0] = AlgorithmIdentifier
+                        const hashAlgSeq = params.value.find(p => p.type === 0);
+                        if (hashAlgSeq && Array.isArray(hashAlgSeq.value) && hashAlgSeq.value[0]) {
+                            const hOid = oidBytesToDotted(hashAlgSeq.value[0].value[0].value);
+                            const hMap = { '2.16.840.1.101.3.4.2.1': 'SHA-256', '2.16.840.1.101.3.4.2.2': 'SHA-384', '2.16.840.1.101.3.4.2.3': 'SHA-512' };
+                            if (hMap[hOid]) pssHash = hMap[hOid];
+                        }
+                        // ctx[2] = salt length (INTEGER)
+                        const saltAlg = params.value.find(p => p.type === 2 && Array.isArray(p.value) && p.value[0] && p.value[0].type === 2);
+                        if (saltAlg) { const sv = binaryToBytes(saltAlg.value[0].value); let sl = 0; for (const b of sv) sl = (sl << 8) | b; saltLen = sl; }
+                    }
+                } catch (e) { /* fall back to SHA-256 defaults */ }
+                return await rsaVerifyPss(parent.spkiDer, pssHash, tbsDer, rsaSigBytes, saltLen);
+            }
+
+            // RSA PKCS#1 v1.5 (AMD ASK/ARK chain): RSASSA-PKCS1-v1_5 with sha*WithRSAEncryption.
+            if (sigAlgOid === '1.2.840.113549.1.1.11' || sigAlgOid === '1.2.840.113549.1.1.12' || sigAlgOid === '1.2.840.113549.1.1.13') {
+                return await rsaVerifyPkcs1(parent.spkiDer, hash, tbsDer, rsaSigBytes);
+            }
+
+            // ECDSA path (VCEK leaf, P-384): BIT STRING = DER SEQUENCE { r, s }
+            const sigBytes2 = binaryToBytes(sigBin);
+            const content = (sigBin.length > 0 && sigBin.charCodeAt(0) === 0) ? sigBin.slice(1) : sigBin;
+            const seq = forge.asn1.fromDer(content);
+            const toInt = (n) => {
+                let b = binaryToBytes(n.value);
+                let i = 0;
+                while (i < b.length - 1 && b[i] === 0) i++;
+                return b.slice(i);
+            };
+            const r = toInt(seq.value[0]), s = toInt(seq.value[1]);
+            const half = Math.max(r.length, s.length);
+            const raw = new Uint8Array(half * 2);
+            raw.set(r, half - r.length);
+            raw.set(s, half * 2 - s.length);
+            const key = await crypto.subtle.importKey('spki', parent.spkiDer, ecCurveParams(parent.spkiDer), false, ['verify']);
+            return await crypto.subtle.verify({ name: 'ECDSA', hash: hash }, key, raw, tbsDer);
+        } catch (e) {
+            console.error('x509SignedBy failed:', e);
+            return false;
+        }
+    }
+
     function getLeafCert(pem) {
         if (!pem) return "";
         const match = pem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/);
@@ -631,8 +938,10 @@
                     const rBE = new Uint8Array(48), sBE = new Uint8Array(48);
                     for (let i = 0; i < 48; i++) { rBE[i] = snp[672 + 47 - i]; sBE[i] = snp[744 + 47 - i]; }
                     const ecdsaSig = new Uint8Array(96); ecdsaSig.set(rBE, 0); ecdsaSig.set(sBE, 48);
-                    const vcekCert = parseAnyCertToForge(hw.vcek_der_b64, "AMD VCEK");
-                    const vcekKey = await crypto.subtle.importKey('spki', pemToBytes(forge.pki.publicKeyToPem(vcekCert.publicKey)), { name: 'ECDSA', namedCurve: 'P-384' }, false, ['verify']);
+                    // EC-capable parse (forge's certificateFrom* is RSA-only and
+                    // throws "OID is not RSA" on the AMD ECDSA P-384 VCEK).
+                    const vcekCert = x509ParseAny(hw.vcek_der_b64, "AMD VCEK");
+                    const vcekKey = await crypto.subtle.importKey('spki', vcekCert.spkiDer, ecCurveParams(vcekCert.spkiDer), false, ['verify']);
                     const snpSigOk = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-384' }, vcekKey, ecdsaSig, snp.slice(0, 672));
 
                     // VCEK → ASK → ARK chain, root pinned by SHA-256 of the raw ARK DER.
@@ -642,8 +951,8 @@
                         const chainPem = atob(hw.amd_chain_b64);
                         const pems = chainPem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
                         if (pems && pems.length >= 2) {
-                            const askCert = forge.pki.certificateFromPem(pems[0]);
-                            const arkCert = forge.pki.certificateFromPem(pems[1]);
+                            const askCert = x509ParseAny(pems[0], "AMD ASK");
+                            const arkCert = x509ParseAny(pems[1], "AMD ARK");
                             const arkBody = (pems[1].match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/) || [])[1].replace(/\s+/g, '');
                             const arkDer = Uint8Array.from(atob(arkBody), c => c.charCodeAt(0));
                             arkPinHex = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', arkDer))).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -653,7 +962,11 @@
                                 '69d063b45344d26a2e94e1f4210de49ef555308287d4c174445c95639a540bcd', // Milan (KDS)
                                 '00e7040d7c71ba48530ec1aa7bcbc9f491c360fb1e58284e36ce3b49cb422998'  // Milan legacy reference pin
                             ];
-                            chainOk = askCert.verify(vcekCert) && arkCert.verify(askCert) && TRUSTED_AMD_ARKS.includes(arkPinHex);
+                            // forge's cert.verify() is RSA-only — verify the ECDSA
+                            // P-384 chain links with WebCrypto instead.
+                            const linkVcekAsk = await x509SignedBy(vcekCert, askCert);
+                            const linkAskArk = await x509SignedBy(askCert, arkCert);
+                            chainOk = linkVcekAsk && linkAskArk && TRUSTED_AMD_ARKS.includes(arkPinHex);
                         }
                     }
 
@@ -680,11 +993,15 @@
                 siliconOk = true;
             }
 
+            // Surface the detailed verdict BEFORE any throw so a failure always
+            // shows WHICH sub-check failed (binding / sig / chain / ark pin).
+            updateStatus('firmwareCheck', siliconOk, siliconMsg || (siliconOk
+                ? "✅ Silicon root verified"
+                : "❌ No AMD SNP or Google AK evidence present in report"));
+
             if (!siliconOk) {
                 throw new Error("CRITICAL: No valid Silicon Root of Trust (AMD or Google) found in report.");
             }
-
-            updateStatus('firmwareCheck', siliconOk, siliconMsg);
 
             // 6. TLS Binding
             const certInput = document.getElementById('certInput').value;
