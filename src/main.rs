@@ -51,6 +51,13 @@ mod enclave_init {
         modprobe("tsm");
         modprobe("amd_tsm");
         modprobe("amd-tsm");
+        // v148: crypto prerequisites for the sev_guest probe — probe calls
+        // crypto_alloc_aead("gcm(aes)"); if gcm/ghash are absent the probe
+        // fails with -EIO and /dev/sev-guest never appears (both SNP paths
+        // depend on it: PATH 0 ioctl and PATH 3 ConfigFS TSM provider).
+        // gf128mul is pulled in as ghash_generic's modules.dep dependency.
+        modprobe("gcm");
+        modprobe("ghash_generic");
         modprobe("sev-guest");
         modprobe("sev_guest");
         modprobe("coco_guest");
@@ -1616,7 +1623,8 @@ fn apply_config_fallbacks(mut config: Config) -> Result<Config, Box<dyn std::err
 }
 
 // ============================================================================
-// ACME CERTIFICATE MANAGER (Google Public CA on GCP, Let's Encrypt on OCI)
+// ACME CERTIFICATE MANAGER (Google Public CA on GCP; Google Public CA on OCI
+// when EAB credentials are provisioned, Let's Encrypt fallback without them)
 // ============================================================================
 
 struct GooglePublicCaManager {
@@ -1639,12 +1647,22 @@ impl GooglePublicCaManager {
         }
     }
 
+    /// Whether External Account Binding credentials are present and usable
+    #[cfg(feature = "oci")]
+    fn has_eab(&self) -> bool {
+        self.eab_key_id.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
+            && self.eab_hmac_key.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
+    }
+
     /// Select the appropriate ACME directory based on platform and EAB availability
     fn acme_directory(&self) -> &str {
         #[cfg(feature = "oci")]
         {
-            // OCI: Use Let's Encrypt (no EAB required)
-            LETSENCRYPT_CA_DIRECTORY
+            // OCI: Google Public CA when EAB credentials are provisioned in the
+            // instance config (same CA as GCP — avoids Let's Encrypt's per-week
+            // rate limits, which the boot-time re-issuance cycle burns through);
+            // fall back to Let's Encrypt (no EAB required) when they are absent.
+            if self.has_eab() { GOOGLE_PUBLIC_CA_DIRECTORY } else { LETSENCRYPT_CA_DIRECTORY }
         }
         #[cfg(not(feature = "oci"))]
         {
@@ -1656,7 +1674,7 @@ impl GooglePublicCaManager {
     /// Whether this CA requires External Account Binding (EAB) credentials
     fn requires_eab(&self) -> bool {
         #[cfg(feature = "oci")]
-        { false }
+        { self.has_eab() }
         #[cfg(not(feature = "oci"))]
         { true }
     }
@@ -1684,6 +1702,33 @@ impl GooglePublicCaManager {
             let mut builder = AccountBuilder::new(dir);
             builder.private_key(priv_pem);
             builder.build().await?
+        } else if let Some(account_pem) = self
+            .acme_account_json
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            // Cross-boot account persistence: the config carries the ACME
+            // account private key, so the SAME account is reused on every boot.
+            // No new account — and therefore no still-valid EAB — is needed
+            // after the first issuance (Google Public CA EAB keys expire 7
+            // days after creation, which would otherwise break every boot).
+            // For Google Public CA the key MUST already have an account
+            // registered at acme_url (pre-created once with a fresh EAB);
+            // CAs that allow account creation without EAB (Let's Encrypt)
+            // accept a fresh key here directly.
+            info!("Restoring ACME account from config-provided account key...");
+            let dir = DirectoryBuilder::new(acme_url.to_string()).build().await?;
+            let priv_pem = openssl::pkey::PKey::private_key_from_pem(account_pem.as_bytes())?;
+            let mut builder = AccountBuilder::new(dir);
+            builder.contact(vec![format!("mailto:admin@{}", self.domain)]);
+            builder.terms_of_service_agreed(true);
+            builder.private_key(priv_pem);
+            let account = builder.build().await?;
+            if let Ok(priv_key_pem) = account.private_key().private_key_to_pem_pkcs8() {
+                let _ = tokio::fs::write(account_path, priv_key_pem).await;
+            }
+            account
         } else if self.requires_eab() {
             let kid = self.eab_key_id.as_ref().ok_or("Missing EAB key ID")?;
             info!("Creating new ACME account with EAB Key ID: {}...", &kid[..8.min(kid.len())]);
@@ -2217,7 +2262,101 @@ async fn debug_attestation() -> impl IntoResponse {
     results.insert("tsm_loaded".to_string(), serde_json::Value::Bool(std::path::Path::new("/sys/kernel/config/tsm").exists()));
     results.insert("amd_tsm_loaded".to_string(), serde_json::Value::Bool(std::path::Path::new("/sys/bus/platform/drivers/amd_tsm").exists() || std::path::Path::new("/sys/bus/platform/drivers/amd-tsm").exists()));
     results.insert("sev_guest_device".to_string(), serde_json::Value::Bool(std::path::Path::new("/dev/sev-guest").exists()));
-    
+
+    // v147: TPM-less (OCI) runtime diagnostics — the only observability channel
+    // on the enclave (no shell, no dmesg binary in the initramfs).
+    results.insert(
+        "cmdline".to_string(),
+        serde_json::Value::String(
+            std::fs::read_to_string("/proc/cmdline").unwrap_or_default().trim().to_string(),
+        ),
+    );
+
+    // CPU flags relevant to AMD confidential compute (sev / sev_es / sev_snp)
+    let mut cpu_sev_flags: Vec<String> = std::fs::read_to_string("/proc/cpuinfo")
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with("flags"))
+        .flat_map(|l| l.split_whitespace().skip(1).map(|s| s.to_string()).collect::<Vec<_>>())
+        .filter(|f| f.contains("sev") || f == "snp")
+        .collect();
+    cpu_sev_flags.sort();
+    cpu_sev_flags.dedup();
+    results.insert("cpu_sev_flags".to_string(), serde_json::to_value(&cpu_sev_flags).unwrap());
+
+    // Loaded kernel modules (names only)
+    let modules: Vec<String> = std::fs::read_to_string("/proc/modules")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_whitespace().next().map(|s| s.to_string()))
+        .collect();
+    results.insert("loaded_modules".to_string(), serde_json::to_value(&modules).unwrap());
+
+    results.insert(
+        "sev_guest_driver_dir".to_string(),
+        serde_json::Value::Bool(std::path::Path::new("/sys/bus/platform/drivers/sev-guest").exists()),
+    );
+    results.insert(
+        "tsm_report_dir".to_string(),
+        serde_json::Value::Bool(std::path::Path::new("/sys/kernel/config/tsm/report").exists()),
+    );
+
+    // Fresh modprobe attempt with captured kmod diagnostics — kmod prints the
+    // probe result (e.g. "ERROR: could not insert 'sev_guest': No such device")
+    match std::process::Command::new("/sbin/modprobe").args(["sev-guest"]).output() {
+        Ok(o) => {
+            results.insert(
+                "modprobe_sev_guest_rc".to_string(),
+                serde_json::Value::from(o.status.code().unwrap_or(-1)),
+            );
+            results.insert(
+                "modprobe_sev_guest_out".to_string(),
+                serde_json::Value::String(
+                    format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))
+                        .trim()
+                        .to_string(),
+                ),
+            );
+        }
+        Err(e) => {
+            results.insert(
+                "modprobe_sev_guest_out".to_string(),
+                serde_json::Value::String(format!("spawn error: {}", e)),
+            );
+        }
+    }
+
+    // Bounded non-blocking /dev/kmsg scan (O_NONBLOCK → stop at buffer end)
+    let mut klog: Vec<String> = Vec::new();
+    #[allow(unused_imports)]
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0o4000) // O_NONBLOCK
+        .open("/dev/kmsg")
+    {
+        use std::io::Read;
+        let mut buf = [0u8; 8192];
+        for _ in 0..600 {
+            match f.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let line = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let lower = line.to_lowercase();
+                    if lower.contains("sev") || lower.contains("tsm") || lower.contains("snp")
+                        || lower.contains("coco") || lower.contains("encrypt")
+                    {
+                        klog.push(line.trim().to_string());
+                    }
+                }
+                Err(_) => break, // EAGAIN — no more buffered records
+            }
+        }
+    }
+    let klog_len = klog.len();
+    klog.drain(..klog_len.saturating_sub(40));
+    results.insert("kmsg_sev".to_string(), serde_json::to_value(&klog).unwrap());
+
     if let Ok(output) = std::process::Command::new("dmesg").output() {
         let s = String::from_utf8_lossy(&output.stdout);
         let sev_logs: Vec<String> = s.lines()
@@ -2437,7 +2576,11 @@ async fn load_tls_config(
     tokio::fs::write("/tmp/tls-key.pem", key_pem).await?;
 
     let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())?;
-    builder.set_certificate_file("/tmp/tls-cert.pem", SslFiletype::PEM)?;
+    // Load the FULL chain (leaf + intermediates): set_certificate_file() maps to
+    // SSL_CTX_use_certificate_file, which reads only the FIRST certificate —
+    // with a Let's Encrypt leaf that drops the YR2 intermediate and every
+    // non-browser client fails verification with "unable to get local issuer".
+    builder.set_certificate_chain_file("/tmp/tls-cert.pem")?;
     builder.set_private_key_file("/tmp/tls-key.pem", SslFiletype::PEM)?;
     builder.check_private_key()?;
 

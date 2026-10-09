@@ -17,7 +17,7 @@
 //!
 //! | Offset | Size | Field |
 //! |--------|------|-------|
-//! | 0x000  | 4    | version (LE u32, 1..=4) |
+//! | 0x000  | 4    | version (LE u32, 1..=8 — observed v5 on OCI) |
 //! | 0x008  | 8    | policy (LE u64) |
 //! | 0x050  | 64   | report_data (session nonce bound here) |
 //! | 0x180  | 8    | reported_tcb (TCB_VERSION, LE u64) |
@@ -39,6 +39,12 @@ const SNP_GET_REPORT: libc::c_ulong = 0xC0205300;
 
 /// Total SNP report length (version 2): 0x4A0
 pub const SNP_REPORT_LEN: usize = 0x4A0;
+
+/// Highest accepted SNP report format version at offset 0x000.
+/// Historical formats are 1..2; the current spec requires ≥3 (CoRIM profile)
+/// and version 5 has been observed on OCI E5 / UEK8 — keep headroom while
+/// still rejecting garbage when scanning blobs for embedded reports.
+pub const SNP_REPORT_MAX_VERSION: u32 = 8;
 
 /// Offset of report_data (64 bytes)
 const OFF_REPORT_DATA: usize = 0x050;
@@ -213,13 +219,42 @@ pub fn snp_get_report(report_data: &[u8; 64]) -> Option<Vec<u8>> {
         return None;
     }
 
-    // Validate: version in 1..=4, extract declared length region
-    let version = u32::from_le_bytes([resp.data[0], resp.data[1], resp.data[2], resp.data[3]]);
-    if !(1..=4).contains(&version) {
-        tracing::error!("SNP: invalid report version {}", version);
-        return None;
+    // Validate: report version, then locate the raw report inside the response.
+    // The decrypted REPORT_REQ payload begins with a 32-byte message header
+    // (struct snp_msg_report_resp_hdr { u32 status; u32 report_size; u8 rsvd[24]; })
+    // ahead of the raw report — the kernel's configfs path strips it
+    // (sev_report_new) but the plain SNP_GET_REPORT ioctl passes the firmware
+    // payload through verbatim, so the report starts at offset 32 there.
+    // Tolerate a bare report at offset 0 for kernels that strip the header.
+    let hdr_status = u32::from_le_bytes([resp.data[0], resp.data[1], resp.data[2], resp.data[3]]);
+    let hdr_report_size = u32::from_le_bytes([resp.data[4], resp.data[5], resp.data[6], resp.data[7]]);
+    let mut report: Option<(usize, Vec<u8>)> = None;
+    for off in [32usize, 0usize] {
+        if resp.data.len() < off + SNP_REPORT_LEN {
+            continue;
+        }
+        let version = u32::from_le_bytes(resp.data[off..off + 4].try_into().unwrap());
+        if (1..=SNP_REPORT_MAX_VERSION).contains(&version) {
+            tracing::info!(
+                "SNP: report at offset {} (version {}), msg-hdr status={} report_size={}",
+                off, version, hdr_status, hdr_report_size
+            );
+            report = Some((version as usize, resp.data[off..off + SNP_REPORT_LEN].to_vec()));
+            break;
+        }
     }
-    let report = resp.data[..SNP_REPORT_LEN].to_vec();
+    let (version, report) = match report {
+        Some(r) => r,
+        None => {
+            tracing::error!(
+                "SNP: no valid report found (msg-hdr status={} report_size={}, u32@0={} u32@32={})",
+                hdr_status, hdr_report_size,
+                u32::from_le_bytes(resp.data[0..4].try_into().unwrap()),
+                u32::from_le_bytes(resp.data[32..36].try_into().unwrap())
+            );
+            return None;
+        }
+    };
 
     // Session binding sanity: report_data must equal what we requested
     if report[OFF_REPORT_DATA..OFF_REPORT_DATA + 64] != *report_data {
@@ -279,7 +314,9 @@ pub fn parse_report(data: &[u8]) -> Option<SnpReportInfo> {
         return None;
     }
     let version = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    if !(1..=4).contains(&version) {
+    // Report format versions: 1..2 historical, 3+ current spec (CoRIM profile
+    // requires ≥3); observed version 5 on OCI E5/UEK8 — keep headroom.
+    if !(1..=SNP_REPORT_MAX_VERSION).contains(&version) {
         return None;
     }
 

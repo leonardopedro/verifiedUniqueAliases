@@ -33,6 +33,8 @@ add-det
 # GCP Synthesis Intermediate Files
 .mtoolsrc
 grub.cfg
+grub-*.cfg
+packages-*.txt
 esp.img
 esp_norm.img
 esp_mount/
@@ -52,4 +54,6 @@ run-initramfs-build.sh
 
 repomix-output.xml
 
-paypal-auth-vm-alibaba
+# OL10 platform-image binaries (staged by extract-ol10-platform.sh)
+ol10/*
+!ol10/SOURCE.txt

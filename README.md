@@ -1,8 +1,14 @@
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/leonardopedro/verifiedUniqueAliases)
 
-# GCP Confidential Auth VM — Reproducible & Attested
+# Confidential Auth VM — Reproducible & Attested (GCP + Oracle Cloud)
 
-Hardware-attested PayPal OAuth service on **GCP Confidential VM** (AMD SEV-SNP).
+Hardware-attested PayPal OAuth service on **confidential compute** — a single codebase targeting two AMD SEV-SNP platforms:
+
+| Target | Shape | Root of Trust | Build flag |
+|---|---|---|---|
+| GCP Confidential VM | n2d (vTPM) | Google EK Cert + Session AK (TPM quote) | *(default)* |
+| Oracle Cloud | `VM.Standard.E5.Flex` (spot) | AMD VCEK + SNP report (`/dev/sev-guest`) | `--features oci` |
+
 Built for 100% bit-by-bit reproducibility and a mathematically unbroken chain of trust from AMD silicon to GitHub provenance.
 
 **Live endpoint**: `https://login.airma.de`
@@ -65,13 +71,59 @@ The entire stack is built in a deterministic multi-stage Docker pipeline produci
 docker build -f Dockerfile.repro -t paypal-auth-vm-repro .
 ```
 
-### 2. Full Deployment
+### 2. GCP Deployment
 ```bash
-bash deploy-gcp.sh
+bash upload-secrets.sh   # update PayPal credentials (GCP: Secret Manager + reset)
 ```
-This script: rotates EAB keys → builds the image locally → uploads to GCS → registers GCP custom image → tears down old VM → provisions new SEV-SNP Confidential VM.
+Build the image with `bash build-vm-image.sh` / `Dockerfile.repro`, register it as a GCP custom image, then provision the SEV-SNP Confidential VM.
 
-### 3. High-Fidelity Audit: `verify.html`
+### 3. Oracle Cloud Deployment (cheapest confidential spot VM)
+
+```bash
+# 0. Stage OL10 boot binaries from the OCI "Oracle Linux 10" platform image
+#    (short-lived 1-OCPU spot instance, copied then terminated). Optional —
+#    without it the build falls back to pinned NEVRAs from Oracle's yum repos.
+export OCI_COMPARTMENT_ID=ocid1.compartment...
+export OCI_SUBNET_ID=ocid1.subnet...
+bash extract-ol10-platform.sh     # → ./ol10
+
+# 1. Build bootable QCOW2 (docker or rootless podman)
+bash build-oci-docker.sh          # → paypal-auth-vm-oci.qcow2
+
+# 2. Import as OCI custom image (QCOW2 only; raw is rejected by the API).
+#    Also attaches the image capability schema (UEFI firmware + AMD SEV/SNP) —
+#    imported images have none by default and cannot launch without it.
+export OCI_COMPARTMENT_ID=ocid1.compartment...
+export OCI_BUCKET_NAME=paypal-auth-vm
+bash import-oci-image.sh          # → prints ocid1.image... (polls until AVAILABLE)
+
+# 3. Launch the cheapest confidential instance (defaults are already minimal)
+export OCI_SUBNET_ID=ocid1.subnet...
+export OCI_IMAGE_ID=ocid1.image...
+export PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... DOMAIN=your.domain.example.com
+bash deploy-oci.sh
+
+# Later credential rotation — user_data is immutable on OCI, so this
+# relaunches the instance from the same image with the new config
+# (verified before the old instance is terminated; public IP changes):
+bash upload-secrets.sh
+```
+
+Defaults target the **cheapest possible** confidential VM:
+
+| Knob | Default | Notes |
+|---|---|---|
+| Shape | `VM.Standard.E5.Flex` | `platformConfig: {type: AMD_VM, isMemoryEncryptionEnabled: true}` → SEV-SNP |
+| OCPUs | `1` (`OCI_OCPUS`) | minimum |
+| Memory | `1 GB` (`OCI_MEM_GB`) | minimum |
+| Boot volume | `50 GB` | OCI's **hard** minimum — `--boot-volume-size-in-gbs` rejects anything below 50; thin-provisioned (our image uses < 1 GB of it) |
+| Capacity | On-demand (default); `OCI_PREEMPTIBLE=true` attempts spot with automatic on-demand fallback | OCI forbids preemptible + confidential (docs: "Confidential computing" is not available with preemptible instances). Observed in FRA: `platformConfig AMD_VM` instances are rejected as preemptible on E4/E5 ("not supported for VM preemptible"), so the script retries on-demand — the cheapest *available* confidential config |
+
+Config reaches the enclave through instance `user_data` (the OCI CLI base64-encodes `--user-data-file`); the enclave reads `/opc/v2/instance/metadata/user_data` with `Authorization: Bearer Oracle` — **no cloud-init**.
+
+In-VM verification: `bash verify_enclave.sh` — it auto-detects the platform: strict TPM checks on GCP, and on OCI a TPM-less branch that skips EK/NVRAM/PCR 15 and instead verifies `/dev/sev-guest` + IMDS + (optionally, `EXPECTED_HOST=your.domain`) a live SNP report from `/debug/attestation`.
+
+### 4. High-Fidelity Audit: `verify.html`
 
 The browser-based auditor performs a 6-stage cryptographic validation entirely in-browser using WebCrypto — no server trust required.
 
@@ -97,7 +149,12 @@ echo | openssl s_client -connect login.airma.de:443 -showcerts \
 | `src/google_ca.pem` | Embedded Google Root CA (compiled into binary via `include_bytes!`) |
 | `src/paypal.pem` | Embedded PayPal Root CA (compiled into binary via `include_bytes!`) |
 | `verify.html` | Browser auditor: binary TPM parser, DER cert decoder, WebCrypto, GitHub API |
-| `deploy-gcp.sh` | End-to-end deployment (EAB rotation → build → GCS → GCP VM) |
+| `upload-secrets.sh` | Update PayPal credentials: OCI → relaunch from same image with new `user_data` (old instance kept until `/login` redirect verifies); GCP → Secret Manager + reset |
+| `build-oci-docker.sh` | OCI image build (binary `--features oci` + initramfs + QCOW2) via docker/podman |
+| `extract-ol10-platform.sh` | Stage OL10 boot binaries from the OCI Oracle Linux 10 platform image |
+| `import-oci-image.sh` | Upload QCOW2 to Object Storage + `oci compute image import` |
+| `deploy-oci.sh` | OCI launch: cheapest spot SEV-SNP VM, config via `user_data` |
+| `Dockerfile.oci` | OL10/UEK8 + Debian Trixie pinned OCI build pipeline |
 | `Dockerfile.repro` | Multi-stage reproducible build (Debian Trixie pinned snapshots) |
 | `build-initramfs-tools.sh` | Initramfs construction with kernel module selection |
 | `build-gcp-gpt-image.sh` | GPT disk image assembly (ESP + GRUB + measured boot) |
