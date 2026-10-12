@@ -35,9 +35,9 @@ Built for 100% bit-by-bit reproducibility and a mathematically unbroken chain of
 All cryptographic audit checks pass end-to-end in `verify.html`:
 
 1. **✅ Enclave Identity Signature** — RSA-4096 signature over canonicalized JSON report
-2. **✅ PayPal Identity Binding** — Session nonce = `SHA-256(user_hash ∥ pubkey_hash)`
+2. **✅ PayPal Identity Binding** — Session nonce = `SHA-256(user_hash ∥ pubkey_hash ∥ SHA-256(custom_info))`
 3. **✅ TPM Hardware Proof** — Binary `TPMS_ATTEST` parsed; session AK signature, nonce, and PCR composite hash all verified
-4. **✅ Silicon Root of Trust** — Google EK Certificate retrieved from NVRAM `0x01c00002`; issuer verified as `EK/AK CA Intermediate` under Google's CA hierarchy; instance identity decoded from subject fields
+4. **✅ Silicon Root of Trust** — Google EK Certificate retrieved from NVRAM `0x01c00002`; issuer verified as `EK/AK CA Intermediate` under Google's CA hierarchy **and** a fully-verified TPM quote must accompany it (a pasted public certificate alone is rejected); instance identity decoded from subject fields
 5. **✅ GitHub Build Provenance** — Sigstore attestation confirms binary + image atomicity + PCR 15 binding
 6. **✅ TLS Certificate Binding** — Optional: confirms browser connection matches signed report
 

@@ -45,7 +45,6 @@ socket2 = "=0.5.8"
 rand = "=0.8.5"
 aes-gcm = "0.10"
 hex = "0.4"
-rcgen = "0.14"
 
 [profile.release]
 opt-level = 3

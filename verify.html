@@ -787,10 +787,17 @@
             const pubKeyBuffer = pemToBuffer(pubKeyPem);
             const pubKeyHash = await crypto.subtle.digest('SHA-256', pubKeyBuffer);
             const paypalHash = new Uint8Array(report.paypal_user_info_raw_hash.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-            
-            const combined = new Uint8Array(64);
+
+            // v152: The nonce also binds the user's custom_info into the
+            // hardware quote. Nonce = SHA-256(paypal_hash ∥ pubkey_hash ∥ SHA-256(custom_info)).
+            // "NONE" is the enclave's canonical value for an absent custom_info.
+            const customInfoStr = report.custom_info || "NONE";
+            const customInfoHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(customInfoStr));
+
+            const combined = new Uint8Array(96);
             combined.set(paypalHash);
             combined.set(new Uint8Array(pubKeyHash), 32);
+            combined.set(new Uint8Array(customInfoHash), 64);
             const combinedHash = await crypto.subtle.digest('SHA-256', combined);
             const expectedNonce = Array.from(new Uint8Array(combinedHash)).map(b => b.toString(16).padStart(2, '0')).join('');
             
@@ -876,6 +883,21 @@
             let googleVerified = false;
             let siliconMsg = "";
 
+            // Pinned AMD SEV-SNP LAUNCH_DIGEST values (MEASUREMENT field,
+            // bytes 144..192 of the report). The digest is computed by the
+            // OCI hypervisor over the initial guest image at launch; because
+            // our OCI image stack (OVMF + grub + kernel + initrd + cmdline)
+            // is bitwise-reproducible, the expected digest is a constant.
+            // Without this pin, ANY attacker-launched AMD SEV-SNP instance
+            // produces a valid VCEK-signed report ("ghost enclave") — the
+            // signature proves silicon, not that OUR code is running.
+            // Update this list only after reviewing a capture from a
+            // freshly-deployed, independently-audited instance.
+            const EXPECTED_SNP_MEASUREMENTS = [
+                // OL10/UEK8 reproducible OCI image stack (captured 2026-10-09 from a live OCI E5 confidential instance)
+                '8f58e1cc3b7297c307c5f5f37ef093dab31f8682884db0c2e35f5248938515b87bf929a8c424eb5040f5d60554885617'
+            ];
+
             // v132: Dual-Root Enforcement (AMD SEV-SNP + Google AK)
             let snp = null;
             if (hw.snp_report_b64) {
@@ -900,6 +922,18 @@
                     
                     if (!isValidIssuer) {
                         throw new Error(`CRITICAL: Certificate not issued by a known Google Confidential CA: "${issuer}"`);
+                    }
+
+                    // SECURITY (v152): The Google EK/AK certificate is PUBLIC
+                    // data — a checked-in copy exists in this very repository.
+                    // Pasting it into google_ak_cert_pem must never anchor the
+                    // silicon root on its own. It only counts when the report
+                    // ALSO carries a TPM quote that fully verifies (signature,
+                    // session nonce, PCR digest — checked in step 3), i.e. on
+                    // a real GCP Confidential VM. TPM-less (OCI) reports must
+                    // pass through the AMD SEV-SNP path below instead.
+                    if (!hasTpmEvidence || !(tpmSigOk && tpmNonceOk && pcrDigestOk)) {
+                        throw new Error("Google AK certificate present but no fully-verified TPM quote evidence accompanies it. The certificate is public data and cannot anchor the silicon root by itself (spoofing attempt blocked).");
                     }
 
                     // 2. ARCHITECTURE NOTE (GCP vTPM model):
@@ -929,7 +963,7 @@
                 try {
                     if (!snp || snp.length < 672 + 144) throw new Error("SNP report truncated (expected ≥ 816 bytes)");
                     // report_data[0..32] MUST equal the session nonce
-                    // (SHA-256(paypal_hash ∥ SHA-256(pubkey DER))); [32..64] zero.
+                    // (SHA-256(paypal_hash ∥ SHA-256(pubkey DER) ∥ SHA-256(custom_info))); [32..64] zero.
                     const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2, '0')).join('');
                     const snpBindingOk = (reportDataHex === expectedNonce.padEnd(128, '0'));
 
@@ -970,22 +1004,32 @@
                         }
                     }
 
-                    snpVerified = snpBindingOk && snpSigOk && chainOk;
+                    // v152: the MEASUREMENT (LAUNCH_DIGEST) must match a
+                    // pinned expected digest of the reproducible image stack.
+                    // A valid VCEK signature alone proves only that SOME
+                    // AMD SEV-SNP VM produced the report — without the pin,
+                    // an attacker's own enclave would pass every check.
                     const measurement = Array.from(snp.slice(144, 192)).map(b => b.toString(16).padStart(2, '0')).join('');
+                    const measurementOk = EXPECTED_SNP_MEASUREMENTS.includes(measurement);
+                    snpVerified = snpBindingOk && snpSigOk && chainOk && measurementOk;
                     if (snpVerified) {
                         siliconMsg += `<br>✅ <b>Native AMD SEV-SNP Evidence Verified</b><br>` +
                                       `🔐 Session nonce bound in report_data<br>` +
                                       `🔏 ECDSA P-384 signature valid<br>` +
                                       `⛓️ VCEK→ASK→ARK chain pinned (ARK ${arkPinHex.substring(0, 16)}…)<br>` +
-                                      `📏 Measurement: ${measurement.substring(0, 16)}…`;
-                    } else if (!googleVerified) {
-                        siliconMsg += `<br>❌ <b>SEV-SNP verification failed</b> (binding=${snpBindingOk}, sig=${snpSigOk}, chain=${chainOk}, ark=${arkPinHex})`;
+                                      `📏 Launch digest pinned: ${measurement.substring(0, 16)}…`;
+                    } else {
+                        if (!measurementOk) {
+                            siliconMsg += `<br>❌ <b>Launch digest (MEASUREMENT) not pinned:</b> ${measurement}<br>` +
+                                          `⚠️ This report comes from an AMD SEV-SNP launch whose initial image does not match the expected reproducible OCI image stack — possible "ghost enclave". Do NOT trust this report.`;
+                        }
+                        if (!snpBindingOk || !snpSigOk || !chainOk) {
+                            siliconMsg += `<br>❌ <b>SEV-SNP verification failed</b> (binding=${snpBindingOk}, sig=${snpSigOk}, chain=${chainOk}, ark=${arkPinHex})`;
+                        }
                     }
                 } catch (err) {
                     snpVerified = false;
-                    if (!googleVerified) {
-                        siliconMsg += `<br>❌ <b>SEV-SNP verification error:</b> ${err.message}`;
-                    }
+                    siliconMsg += `<br>❌ <b>SEV-SNP verification error:</b> ${err.message}`;
                 }
             }
 

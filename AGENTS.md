@@ -102,7 +102,7 @@ GitHub Provenance
     └─► PCR 15 (disk_manifest SHA-256 measured into TPM at boot)
             └─► PCR Composite Hash (SHA-256 of all quoted PCRs 0,4,8,9,15)
                     └─► TPMS_ATTEST binary (signed by Session AK over PCR composite + session nonce)
-                            └─► Session Nonce (SHA-256[PayPal User Hash ∥ Enclave PubKey Hash])
+                            └─► Session Nonce (SHA-256[PayPal User Hash ∥ Enclave PubKey Hash ∥ SHA-256(custom_info)])
                                      │                │
                                      │                └── Enclave Asymmetric RSA signing key DER
                                      └── PayPal OAuth userinfo JSON (compact sorted)
@@ -119,7 +119,7 @@ Note: The EK Certificate and the TPM Quote signing key (Session AK) are separate
 
 ```
 GitHub Provenance ──► disk_manifest SHA-256 (measured at boot; no PCR 15 — bound via report instead)
-Session Nonce (SHA-256[paypal hash ∥ SHA-256(enclave pubkey DER)])
+Session Nonce (SHA-256[paypal hash ∥ SHA-256(enclave pubkey DER) ∥ SHA-256(custom_info)])
     └─► SNP report_data[0..32] = raw 32-byte nonce (rest zero)   ← binds report to THIS session
 AMD VCEK (from kdsintf.amd.com, TCB-versioned by bl/tee/snp/ucode SPLs)
     └─► ECDSA P-384/SHA-384 signature over SNP report bytes [0..672)
@@ -211,8 +211,8 @@ Loaded during `enclave_init` to enforce strict output traffic rules: only ports 
 #### DNS egress hardening
 Production hardened client locks specific domains (`api-m.paypal.com`, `api-m.sandbox.paypal.com`) to known IPs via `reqwest::Client::builder().resolve(...)`, eliminating reliance on whatever nameserver config the cloud provider hands out.
 
-#### Symmetrical Fallbacks
-Both PayPal credential configurations include hardcoded defaults if Secret Manager is unreachable, preventing dead-starts while maintaining auth enforcement at token exchange step.
+#### Credential Loading (fail-closed)
+Credentials (both PayPal flows) are loaded from environment variables, `CONFIG_FILE`, or instance `user_data` and **validated at startup** — empty or `MISSING_*` placeholder values abort boot. Hardcoded fallback secrets were removed in v152: the OCI image is reproducible from a public repo, so any compiled-in credential is world-readable.
 
 ---
 
@@ -224,11 +224,12 @@ The system presents a signed **Remote Attestation Report** on the OAuth callback
 2. **GitHub Sigstore provenance**: Automatically fetches and verifies atomic run metadata across all components (binary, kernel, initramfs, bootloader)
 3. **Silicon Audit**: Reads `google_ak_cert_pem` from report body and confirms:
    - Issuer chain contains `EK/AK CA Intermediate` or `Google Cloud Confidential Computing OS Root CA`
+   - **A fully-verified TPM quote accompanies the cert** (signature + nonce + PCR digest) — a pasted public certificate alone is rejected (v152)
    - Encoded subject identity displays correctly (instance, zone, project)
    - Does **not** compare EK cert public key to session AK public key
 4. **Disk Manifest Audit**: Live SHA-256 of every file mounted under `boot/efi` compared against signed CI baseline. Verifies expected PCR 15 extension value against hardware state — **PCR 15 check only runs when the report contains TPM evidence** (GCP); TPM-less OCI reports skip it (GitHub provenance checks still apply)
 5. **TPM Quote Validity Proof**: Binary-parses `TPMS_ATTEST` structure from `tpe_quote_msg` field (magic `0xFF544347`, type `0x8018`) to extract `extraData` (the combined nonce) and `pcrDigest`. Verifies session AK RSA-2048 signature over raw quote message through WebCrypto API. Skipped entirely when `ak_pub_pem`/`tpm_quote_msg` are empty (OCI reports)
-6. **AMD SEV-SNP Silicon Proof** (OCI reports): Decodes `snp_report_b64` — checks `report_data[0..32] === expectedNonce` (rest zero), verifies the ECDSA P-384/SHA-384 signature over report bytes `[0..672)` (r/s are 72-byte little-endian fields at 0x2A0/0x2E8), then verifies VCEK → ASK → ARK with the ARK pinned by SHA-256 of its raw DER (Genoa/Turin/Milan pins embedded in `verify.html`)
+6. **AMD SEV-SNP Silicon Proof** (OCI reports): Decodes `snp_report_b64` — checks `report_data[0..32] === expectedNonce` (rest zero), verifies the ECDSA P-384/SHA-384 signature over report bytes `[0..672)` (r/s are 72-byte little-endian fields at 0x2A0/0x2E8), then verifies VCEK → ASK → ARK with the ARK pinned by SHA-256 of its raw DER (Genoa/Turin/Milan pins embedded in `verify.html`), **and requires the MEASUREMENT (bytes 144..192) to match `EXPECTED_SNP_MEASUREMENTS`** — the pinned launch digest of the reproducible OCI image stack
 
 ---
 
@@ -237,14 +238,25 @@ The system presents a signed **Remote Attestation Report** on the OAuth callback
 - **EK Certificate ≠ Session AK** (by design): Never compare them during any verification pass. This mismatch is expected.
 - **No persistent AK handles on GCP**: `tpm2 getcap handles-persistent` always returns empty on GCP Confidential VMs — the enclave creates a session signing AK via `tpm2_createprimary` each boot.
 - **NVRAM buffer must be unbounded**: `tpm2 nvread -s <size>` truncates large certs. Always use `tpm2 nvread` without a size argument to retrieve the complete 1560-byte EC certificate blob.
-- **Nonce binding formula**: `SHA-256(SHA-256(PayPal user JSON compacted) ∥ SHA-256(enclave asymmetric signing key DER bytes))`. The TPM quote's `extraData` MUST contain exactly this 32-byte digest or the entire attestation fails validation.
+- **Nonce binding formula**: `SHA-256(SHA-256(PayPal user JSON compacted) ∥ SHA-256(enclave asymmetric signing key DER bytes) ∥ SHA-256(custom_info))`. The TPM quote's `extraData` / SNP `report_data[0..32]` MUST contain exactly this 32-byte digest or the entire attestation fails validation.
 - **`tpm2` standalone binary vs wrapper**: In the minimal initramfs filesystem, the unified `tpm2` binary should always be invoked directly — wrapper aliases like `tpm2_getcap` often don't exist, causing silent failures. Use pattern `tpm2 getcap` instead of `tpm2-getcap`.
 - **DHCP timeout**: NATIVE implementation waits up to 30 seconds for DHCPAC before rejecting. If the cloud metadata service is slow responding, increase the socket timeout in PID-1 init (currently set to 30 seconds in the socket setup path).
 - **PCIe slot exhaustion**: Each module loaded via `insmod` occupies PCI space on bare-metal virtualized infrastructures; batch loads where possible in `insmod_all()` function.
 - **No TPM on OCI**: Never hard-fail on missing TPM artifacts in the `oci` build — `quote()` probes `/dev/tpmrm0`/`/dev/tpm0` first. Empty `ak_pub_pem`/`tpm_quote_msg`/`pcr_values` in a report means "TPM-less platform", not "forgery"; GCP reports always carry TPM evidence and stay strict.
-- **SNP report_data binding**: `report_data[0..32]` = raw 32-byte session nonce (`SHA-256(paypal_hash ∥ SHA-256(pubkey DER))`), `[32..64]` zero. The legacy formula `SHA-256(ak_pem ∥ nonce)` was removed — auditors must compare against `expectedNonce` directly.
+- **SNP report_data binding**: `report_data[0..32]` = raw 32-byte session nonce (`SHA-256(paypal_hash ∥ SHA-256(pubkey DER) ∥ SHA-256(custom_info))`), `[32..64]` zero. The legacy formula `SHA-256(ak_pem ∥ nonce)` was removed — auditors must compare against `expectedNonce` directly. `custom_info` is bound into the hardware quote (not just the software signature) so it cannot be substituted even with a leaked enclave signing key.
+- **SNP MEASUREMENT pinning (ghost-enclave guard)**: `verify.html` requires the report's launch digest (bytes 144..192, SHA-384 of the initial guest image) to match `EXPECTED_SNP_MEASUREMENTS` — the pinned digest of the reproducible OCI image stack. A valid VCEK signature only proves *some* AMD SEV-SNP VM produced the report; the pin proves it is *our* image. **Re-pin after any image change**: capture `snp.slice(144,192)` hex from a freshly deployed, independently audited instance and add it to the list in `verify.html`.
+- **Google AK certificate is not a silicon root by itself**: the cert is public data (checked-in copies existed in git history until v152). `verify.html` only accepts it when accompanied by a fully-verified TPM quote (signature + session nonce + PCR digest) — i.e. on real GCP hardware. TPM-less (OCI) reports must pass the AMD SEV-SNP path instead.
+- **OAuth CSRF state**: `/login` issues a random 32-byte `state` (single-use, 10-min TTL, server-side map) mirrored into an `HttpOnly; Secure; SameSite=Lax` cookie; `/callback` rejects unless the query token matches the cookie and is found unexpired in the map. The old static `state` (flow label) allowed Login CSRF.
+- **Fail-closed firewall**: any `nft` spawn error **or non-zero exit** during `setup_firewall()` poweroffs the enclave — running without egress filtering violates the threat model.
+- **No self-signed TLS fallback**: ACME failures retry with capped backoff (2 min → 1 h) instead of serving a self-signed certificate (removed in v152 with its `rcgen` dependency) — a fallback cert breaks production and trains users to accept warnings (MITM prompt-fatigue).
+- **No private key logging**: the ephemeral attestation RSA key PEM is never written to `info!()` — on OCI, GRUB's `console=ttyS0` lands every log line in Instance Console History (readable with console permissions).
 - **SNP report layout (fixed offsets)**: report_data @ 0x50 (64B), measurement @ 0x90, reported_tcb @ 0x180, chip_id @ 0x1A0 (64B), signature @ 0x2A0 (r @ 0x2A0, s @ 0x2E8, each 72B little-endian), signed region = first **672 bytes**, total report = **1184 bytes**.
 - **AMD KDS product naming**: family 19h → `Milan` (base model 0x) / `Genoa` (base model 0x1/0xA); family 1Ah → `Turin` (or `Venice` for models 0x50-0x5F). TCB byte layout: Layout A (bl=b0, tee=b1, snp=b6, ucode=b7) for Milan/Genoa/standard Turin; Layout B (bl=b1, tee=b2, snp=b3, ucode=b7) for Turin-Dense (1Ah model ≥ 0x60). Override with env `AMD_VCEK_FAMILY` during bring-up.
 - **OCI user_data path**: `http://169.254.169.254/opc/v2/instance/metadata/user_data` (header `Authorization: Bearer Oracle`), v1 fallback at `/opc/v1/...`. The config arrives base64-encoded (OCI CLI encodes `--user-data-file` automatically).
 - **`modprobe sev-guest` fails with ENODEV on non-SNP machines (expected)**: v6.12 `sev_guest_probe()` returns `-ENODEV` when `!cc_platform_has(CC_ATTR_GUEST_SEV_SNP)` and `module_platform_driver_probe()` propagates it through finit → kmod logs `could not insert 'sev_guest': No such device`. This is **normal in qemu/dev builds** — not an initramfs defect. On real OCI E5 with SNP it must load and create `/dev/sev-guest` (still runtime-unverified).
 - **PID-1 `modprobe()` captures kmod output** (`src/main.rs`): failures log exit code + captured stdout/stderr to kmsg (the old `-q` invocation swallowed even finit errors). Use the boot log's `ALL PATHS FAILED (rc=… err=…)` lines as the authoritative module-load diagnosis; kmod `-q` hides errors that `.status()` alone would never show.
+
+## Security Regression Tests
+
+- `cargo test` — v152 suite: credential validation (no hardcoded fallbacks, placeholders rejected), session-nonce formula + cross-implementation parity vector (must match `expectedNonce` in `verify.html`; update both together), source scan for reintroduced secrets.
+- `npm install --no-save node-forge && node scripts/test-verify-security.mjs` — drives the REAL `runAudit()` from `verify.html` (DOM stubbed) against: the Google-cert-paste spoof (must fail), a tampered SEV-SNP launch digest (must fail), nonce parity, and a legitimate GCP report (must still pass). Set `GENUINE_REPORT=/path/to/capture.json` to also exercise the pinned-digest checks against a live capture.

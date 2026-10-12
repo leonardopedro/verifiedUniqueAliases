@@ -119,14 +119,26 @@ mod enclave_init {
             "add rule inet filter output tcp dport 443 accept",
         ];
 
+        // v152 SECURITY: FAIL-CLOSED firewall. The old code only logged
+        // spawn errors AND ignored non-zero exit statuses — a missing or
+        // broken `nft` (e.g. glibc mismatch in the OL10 initramfs) left the
+        // enclave running with NO egress filtering at all. Any failure now
+        // aborts the boot: operating without the firewall violates the
+        // threat model, so halting beats serving an unfiltered enclave.
         for cmd in commands {
-            let status = std::process::Command::new("/usr/sbin/nft")
-                .arg(cmd)
-                .status();
-            if let Err(e) = status {
-                kmsg(&format!("Failed to execute nft command '{}': {}", cmd, e));
+            match std::process::Command::new("/usr/sbin/nft").arg(cmd).status() {
+                Ok(st) if st.success() => {}
+                Ok(st) => {
+                    kmsg(&format!("FATAL: nft command '{}' exited with {} — fail-closed", cmd, st));
+                    poweroff();
+                }
+                Err(e) => {
+                    kmsg(&format!("FATAL: failed to execute nft command '{}': {} — fail-closed", cmd, e));
+                    poweroff();
+                }
             }
         }
+        kmsg("Egress firewall active: default DROP, only DNS/80/443/metadata/loopback permitted");
     }
 
     pub fn mount_filesystems() {
@@ -945,7 +957,8 @@ mod tpm {
         let ak_der_sha256 = hex::encode(sha2::Sha256::digest(&ak_der_bytes));
 
         // Session nonce binding for the SNP report_data field (64 bytes):
-        // bytes 0..32 = combined session nonce SHA-256[paypalHash ∥ pubkeyHash],
+        // bytes 0..32 = combined session nonce
+        //   SHA-256[paypalHash ∥ pubkeyHash ∥ SHA256(customInfo)] (v152),
         // bytes 32..64 = zero. The auditor recomputes `expectedNonce` identically
         // and requires report_data[0..32] === expectedNonce.
         let mut nonce_bytes = [0u8; 64];
@@ -1285,6 +1298,11 @@ struct AppState {
     connection_semaphore: Arc<Semaphore>,
     boot_manifest: BTreeMap<String, String>,
     pending_attestations: Arc<RwLock<std::collections::HashMap<String, (String, PayPalUserInfo, Instant)>>>,
+    // v152 SECURITY: OAuth CSRF state. Maps the random `state` token sent to
+    // PayPal (also mirrored in the browser's HttpOnly cookie) to the flow
+    // label. Verified strictly on /callback: token must exist server-side,
+    // match the cookie, and is single-use.
+    pending_oauth_states: Arc<RwLock<std::collections::HashMap<String, (String, Instant)>>>,
 }
 
 struct PayPalFlowConfig {
@@ -1461,7 +1479,7 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
         std::env::var("DOMAIN"),
     ) {
         info!("Using configuration from Environment Variables");
-        return Ok(Config {
+        return require_credentials(Config {
             paypal_client_id: p_id,
             paypal_client_secret: p_sec,
             paypal_verified_client_id: Some(pv_id),
@@ -1479,7 +1497,7 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
     let config_file_env = std::env::var("CONFIG_FILE").unwrap_or_else(|_| "/etc/paypal-auth/config.json".to_string());
     if let Ok(config) = load_config_from_file(&config_file_env).await {
         info!("Loaded configuration from {}", config_file_env);
-        return apply_config_fallbacks(config);
+        return require_credentials(config);
     }
 
     // Priority 3: GCP Secret Manager (only on GCP builds)
@@ -1488,7 +1506,7 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
         info!("Attempting to fetch configuration from GCP Secret Manager...");
         let gcp_config = fetch_config_from_gcp().await;
         match gcp_config {
-            Ok(c) => return apply_config_fallbacks(c),
+            Ok(c) => return require_credentials(c),
             Err(e) => {
                 warn!("GCP Secret Manager unavailable: {}. Falling back to file config.", e);
             }
@@ -1504,7 +1522,7 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
                 match serde_json::from_str::<Config>(raw.trim()) {
                     Ok(c) => {
                         info!("Loaded configuration from OCI instance user_data");
-                        return apply_config_fallbacks(c);
+                        return require_credentials(c);
                     }
                     Err(e) => warn!("OCI user_data is not valid config JSON: {}", e),
                 }
@@ -1605,20 +1623,41 @@ async fn fetch_config_from_gcp() -> Result<Config, Box<dyn std::error::Error + S
     Ok(config)
 }
 
-/// Apply hardcoded fallback credentials when values are empty/missing
-fn apply_config_fallbacks(mut config: Config) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
-    config.paypal_client_id = if config.paypal_client_id.is_empty() || config.paypal_client_id == "MISSING_CLIENT_ID" {
-        "***REMOVED***".to_string()
-    } else { config.paypal_client_id };
-    config.paypal_client_secret = if config.paypal_client_secret.is_empty() || config.paypal_client_secret == "MISSING_CLIENT_SECRET" {
-        "EFdUSE2qjgZy5Ok5f4Cy0SBuodWTj30TzO-7b8W8VAQOoNDwu-Feecb7va89C0jS5BZuclqiJSt4I20s".to_string()
-    } else { config.paypal_client_secret };
-    config.paypal_verified_client_id = Some(config.paypal_verified_client_id.unwrap_or_else(|| {
-        "***REMOVED***".to_string()
-    }));
-    config.paypal_verified_client_secret = Some(config.paypal_verified_client_secret.unwrap_or_else(|| {
-        "***REMOVED***".to_string()
-    }));
+/// v152 SECURITY: validate credentials instead of substituting hardcoded
+/// fallbacks. Live PayPal client secrets must never be compiled into the
+/// binary — the OCI image is public-repo-derived and reproducible, so every
+/// embedded secret is world-readable. Startup now ABORTS when credentials
+/// are missing so a misconfigured deployment fails loudly instead of
+/// silently operating on leaked credentials.
+fn require_credentials(config: Config) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
+    fn missing(v: Option<&str>) -> bool {
+        match v {
+            None => true,
+            Some(s) => {
+                let s = s.trim();
+                s.is_empty() || s == "MISSING_CLIENT_ID" || s == "MISSING_CLIENT_SECRET"
+            }
+        }
+    }
+    let mut problems = Vec::new();
+    if config.paypal_client_id.trim().is_empty() || config.paypal_client_id.trim() == "MISSING_CLIENT_ID" {
+        problems.push("paypal_client_id");
+    }
+    if config.paypal_client_secret.trim().is_empty() || config.paypal_client_secret.trim() == "MISSING_CLIENT_SECRET" {
+        problems.push("paypal_client_secret");
+    }
+    if missing(config.paypal_verified_client_id.as_deref()) {
+        problems.push("paypal_verified_client_id");
+    }
+    if missing(config.paypal_verified_client_secret.as_deref()) {
+        problems.push("paypal_verified_client_secret");
+    }
+    if !problems.is_empty() {
+        return Err(format!(
+            "Missing/placeholder PayPal credentials: {}. Provide them via environment variables, CONFIG_FILE, or instance user_data — hardcoded fallbacks were removed in v152.",
+            problems.join(", ")
+        ).into());
+    }
     Ok(config)
 }
 
@@ -1950,6 +1989,24 @@ fn extract_pub_key(private_key_pem: &str) -> String {
         .unwrap_or_else(|| "N/A".to_string())
 }
 
+/// v152: session nonce = SHA-256(paypal_hash ∥ pubkey_hash ∥ SHA-256(custom_info)).
+/// Binding custom_info into the hardware-attested nonce means the AMD SNP
+/// report_data / TPM quote extraData attests the user's custom context
+/// (e.g. wallet address), not just the PayPal identity + signing key.
+/// MUST stay in lockstep with `expectedNonce` in verify.html.
+fn compute_session_nonce(paypal_hash_hex: &str, pub_key_hash: &[u8], custom_info: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut custom_hasher = Sha256::new();
+    custom_hasher.update(custom_info.as_bytes());
+    let custom_info_hash = custom_hasher.finalize();
+
+    let mut combined_hasher = Sha256::new();
+    combined_hasher.update(hex::decode(paypal_hash_hex).expect("Internal Error: Invalid PayPal Hex"));
+    combined_hasher.update(pub_key_hash);
+    combined_hasher.update(custom_info_hash);
+    hex::encode(combined_hasher.finalize())
+}
+
 async fn generate_attestation(
     state: &AppState,
     clicked_button_label: String,
@@ -2006,11 +2063,12 @@ async fn generate_attestation(
     let pub_key_hash_bytes = pub_key_hasher.finalize();
     let pub_key_hash_hex = hex::encode(pub_key_hash_bytes);
 
-    // Combine paypal_hash and pub_key_hash into a final nonce
-    let mut combined_hasher = Sha256::new();
-    combined_hasher.update(hex::decode(&paypal_hash).expect("Internal Error: Invalid PayPal Hex"));
-    combined_hasher.update(&pub_key_hash_bytes);
-    let final_combined_nonce = hex::encode(combined_hasher.finalize());
+    // v152: Bind custom_info into the hardware-attested nonce (see
+    // compute_session_nonce). Previously custom_info was only covered by the
+    // enclave's software signature, so a leaked signing key allowed
+    // substitution without invalidating the hardware quote.
+    let custom_info_str = custom_info.clone().unwrap_or_else(|| "NONE".to_string());
+    let final_combined_nonce = compute_session_nonce(&paypal_hash, &pub_key_hash_bytes, &custom_info_str);
 
     info!("Generating hardware attestation with bound public key hash: {}", pub_key_hash_hex);
     let mut tpm_report = match tpm::quote(&final_combined_nonce).await {
@@ -2048,7 +2106,7 @@ async fn generate_attestation(
             "clicked_button_label": clicked_button_label,
             "tls_certificate_pem": &cert_pem,
         },
-        "custom_info": custom_info.unwrap_or_else(|| "NONE".to_string()),
+        "custom_info": custom_info_str,
         "hardware_level_attestation": tpm_val,
     });
 
@@ -2231,15 +2289,39 @@ async fn login(
     
     let auth_base = if state.staging { PAYPAL_SANDBOX_AUTH } else { PAYPAL_PRODUCTION_AUTH };
 
+    // v152 SECURITY: RFC 6749 §10.12 — `state` MUST be an unguessable,
+    // per-session value, not a static label. A static state allows Login
+    // CSRF: an attacker captures their own authorization code and tricks a
+    // victim into completing the callback with it. The random token is
+    // (a) stored server-side (single-use, 10 min TTL) carrying the flow
+    // label, and (b) mirrored into an HttpOnly cookie so the callback can
+    // prove the response comes from the browser that started the flow.
+    use rand::Rng;
+    let mut state_bytes = [0u8; 32];
+    rand::thread_rng().fill(&mut state_bytes);
+    let oauth_state = hex::encode(state_bytes);
+    state
+        .pending_oauth_states
+        .write()
+        .insert(oauth_state.clone(), (config.label.clone(), Instant::now()));
+
     let url = format!(
         "{}?client_id={}&response_type=code&scope={}&redirect_uri={}&state={}",
         auth_base,
         config.client_id,
         urlencoding::encode(&config.scope),
         urlencoding::encode(&state.redirect_uri),
-        config.label
+        oauth_state
     );
-    Redirect::temporary(&url).into_response()
+    let mut resp = Redirect::temporary(&url).into_response();
+    let cookie = format!(
+        "paypal_oauth_state={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600",
+        oauth_state
+    );
+    if let Ok(hv) = axum::http::HeaderValue::from_str(&cookie) {
+        resp.headers_mut().insert(axum::http::header::SET_COOKIE, hv);
+    }
+    resp
 }
 
 async fn debug_attestation() -> impl IntoResponse {
@@ -2371,6 +2453,7 @@ async fn debug_attestation() -> impl IntoResponse {
 
 async fn callback(
     Query(query): Query<CallbackQuery>,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
 ) -> Response {
@@ -2378,8 +2461,39 @@ async fn callback(
         return (StatusCode::BAD_REQUEST, "Error from PayPal").into_response();
     }
     let code = query.code.clone().unwrap_or_default();
-    let flow = query.state.as_deref().unwrap_or("full");
-    let config = state.get_flow_config(flow);
+
+    // v152 SECURITY: strict OAuth state verification (Login CSRF defense).
+    // 1. The `state` must be a token WE issued (server-side map, single-use).
+    // 2. It must match the HttpOnly cookie set on /login — proving the
+    //    callback hits the same browser that initiated the flow, so an
+    //    attacker's captured code+state pair cannot be replayed on a victim.
+    let oauth_state = match query.state.as_deref() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return (StatusCode::BAD_REQUEST, "Missing OAuth state").into_response(),
+    };
+    let cookie_state = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|c| {
+            c.split(';')
+                .map(str::trim)
+                .find_map(|kv| kv.strip_prefix("paypal_oauth_state="))
+        });
+    if cookie_state != Some(oauth_state.as_str()) {
+        warn!("OAuth state cookie mismatch — possible Login CSRF attempt");
+        return (StatusCode::FORBIDDEN, "Invalid OAuth state (session mismatch). Please restart the login from the homepage.").into_response();
+    }
+    let flow = {
+        let mut states = state.pending_oauth_states.write();
+        match states.remove(&oauth_state) {
+            Some((flow, issued)) if issued.elapsed() < Duration::from_secs(600) => flow,
+            _ => {
+                warn!("OAuth state unknown or expired — possible replay attempt");
+                return (StatusCode::FORBIDDEN, "Invalid or expired OAuth state. Please restart the login from the homepage.").into_response();
+            }
+        }
+    };
+    let config = state.get_flow_config(&flow);
     
     let redirect_uri = state.redirect_uri.clone();
 
@@ -2587,33 +2701,10 @@ async fn load_tls_config(
     Ok(Arc::new(builder.build()))
 }
 
-/// Generate a self-signed TLS certificate using rcgen (fallback for OCI
-/// when ACME is unreachable due to DNS/network constraints)
-#[cfg(feature = "oci")]
-fn generate_self_signed_cert(domain: &str) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
-    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
-
-    info!("Generating self-signed TLS certificate for domain: {}", domain);
-    let mut params = CertificateParams::default();
-    let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, domain);
-    dn.push(DnType::OrganizationName, "PayPal Auth Confidential VM");
-    params.distinguished_name = dn;
-    params.subject_alt_names = vec![
-        SanType::DnsName(domain.to_string().try_into()?),
-    ];
-    // 90-day validity
-    params.not_before = rcgen::date_time_ymd(2026, 1, 1);
-    params.not_after = rcgen::date_time_ymd(2027, 1, 1);
-
-    let key_pair = KeyPair::generate()?;
-    let cert = params.self_signed(&key_pair)?;
-    let cert_pem = cert.pem().into_bytes();
-    let key_pem = key_pair.serialize_pem().into_bytes();
-
-    info!("Self-signed certificate generated ({} bytes cert, {} bytes key)", cert_pem.len(), key_pem.len());
-    Ok((cert_pem, key_pem))
-}
+// v152 SECURITY: the self-signed TLS fallback (rcgen) was REMOVED. Serving
+// an untrusted certificate when ACME is rate-limited breaks production and
+// conditions users to click through warnings (MITM prompt-fatigue). ACME is
+// now retried with capped backoff instead — see async_main.
 
 // ============================================================================
 // MAIN
@@ -2795,9 +2886,12 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         info!("Attestation signing key missing in Vault, generating ephemeral RAM-ONLY RSA 4096 key...");
         acme2_eab::gen_rsa_private_key(4096).ok().map(|k| {
             let pem = String::from_utf8(k.private_key_to_pem_pkcs8().expect("Failed to convert key to PEM")).unwrap();
-            info!("--- EPHEMERAL RSA KEY GENERATED (RAM ONLY) ---");
-            info!("{}", pem);
-            info!("----------------------------------------------");
+            // v152 SECURITY: never log private key material. On OCI the GRUB
+            // cmdline carries `console=ttyS0`, so every info!() line lands in
+            // the Instance Console History, which is readable by anyone with
+            // console access — a logged key would let an attacker sign
+            // attestation reports offline. Log only the key's existence.
+            info!("--- EPHEMERAL RSA KEY GENERATED (RAM ONLY, {} bytes, material never logged) ---", pem.len());
             pem
         })
     };
@@ -2822,6 +2916,7 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         connection_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         boot_manifest,
         pending_attestations: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        pending_oauth_states: Arc::new(RwLock::new(std::collections::HashMap::new())),
     });
 
     // v117: Background task for cleaning up expired pending attestations (DoS mitigation)
@@ -2840,6 +2935,11 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
             if before != after {
                 info!("Cleaned up {} expired pending attestations ({} remaining)", before - after, after);
             }
+            drop(pending);
+
+            // v152: same TTL sweep for OAuth CSRF state tokens
+            let mut oauth = state_for_cleanup.pending_oauth_states.write();
+            oauth.retain(|_, (_, timestamp)| now.duration_since(*timestamp) < Duration::from_secs(600));
         }
     });
 
@@ -2939,32 +3039,31 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
             r
         }
         Err(e) => {
-            #[cfg(feature = "oci")]
-            {
-                error!("ACME certificate failed: {}. Generating self-signed certificate as fallback...", e);
-                match generate_self_signed_cert(&config.domain) {
+            // v152 SECURITY: never fall back to a self-signed certificate.
+            // When Google Public CA / Let's Encrypt rate-limits us, a
+            // self-signed cert would break production AND train users to
+            // click through browser warnings (MITM prompt-fatigue). Instead
+            // retry ACME with capped backoff — rate-limit windows expire;
+            // serving an untrusted cert does not become safer over time.
+            error!("ACME certificate failed: {}. Retrying with backoff (no self-signed fallback).", e);
+            let mut backoff = Duration::from_secs(120);
+            let max_backoff = Duration::from_secs(3600);
+            let (cert_pem, key_pem) = loop {
+                tokio::time::sleep(backoff).await;
+                match ca.ensure_certificate().await {
                     Ok(r) => {
-                        warn!("Using SELF-SIGNED certificate — not suitable for production without a reverse proxy");
-                        https_ready.store(true, Ordering::Relaxed);
-                        *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&r.0).to_string());
-                        r
+                        info!("Certificate obtained via ACME after retry");
+                        break r;
                     }
                     Err(e2) => {
-                        error!("Self-signed cert also failed: {}. Keeping process alive for debugging...", e2);
-                        loop { tokio::time::sleep(Duration::from_secs(3600)).await; }
+                        warn!("ACME retry failed: {} — backing off {:?}", e2, backoff);
+                        backoff = (backoff * 2).min(max_backoff);
                     }
                 }
-            }
-            #[cfg(not(feature = "oci"))]
-            {
-                error!(
-                    "Failed to get certificate: {}. Keeping process alive for debugging...",
-                    e
-                );
-                loop {
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                }
-            }
+            };
+            https_ready.store(true, Ordering::Relaxed);
+            *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&cert_pem).to_string());
+            (cert_pem, key_pem)
         }
     };
     eprintln!("[DEBUG] cert obtained, loading TLS");
@@ -3070,3 +3169,102 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
 }
 
 // PROD: Debug handlers removed
+
+// ============================================================================
+// v152 SECURITY REGRESSION TESTS
+// ============================================================================
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    fn base_config() -> Config {
+        Config {
+            paypal_client_id: "id".to_string(),
+            paypal_client_secret: "secret".to_string(),
+            paypal_verified_client_id: Some("vid".to_string()),
+            paypal_verified_client_secret: Some("vsecret".to_string()),
+            domain: "example.com".to_string(),
+            eab_key_id: None,
+            eab_hmac_key: None,
+            staging: false,
+            acme_account_json: None,
+            attestation_signing_key: None,
+        }
+    }
+
+    #[test]
+    fn require_credentials_accepts_real_credentials() {
+        assert!(require_credentials(base_config()).is_ok());
+    }
+
+    #[test]
+    fn require_credentials_rejects_missing_secret() {
+        let mut c = base_config();
+        c.paypal_client_secret = String::new();
+        assert!(require_credentials(c).is_err());
+    }
+
+    #[test]
+    fn require_credentials_rejects_legacy_placeholder() {
+        let mut c = base_config();
+        c.paypal_client_secret = "MISSING_CLIENT_SECRET".to_string();
+        assert!(require_credentials(c).is_err());
+        let mut c2 = base_config();
+        c2.paypal_verified_client_id = Some("MISSING_CLIENT_ID".to_string());
+        assert!(require_credentials(c2).is_err());
+    }
+
+    #[test]
+    fn no_hardcoded_fallback_secrets_in_source() {
+        // The old hardcoded PayPal credentials must never come back.
+        // Fragments are assembled from parts so this test's own source
+        // cannot match itself under include_str!("main.rs").
+        let src = include_str!("main.rs");
+        let leaked = [
+            format!("{}{}", "EFdUSE2qjgZy5Ok5f4Cy0", "SBuodWTj30TzO"),
+            format!("{}{}", "EHSSIjy5sUHPYrBA1tN-U", "qDLfuTe-FSSdx"),
+            format!("{}{}", "ARDDrFepkPcuh-bWdtKPLe", "MNptSHp2Bvha"),
+            format!("{}{}", "AZXkzMWMioIQ-lYG1lrKrg", "iDAwtx2rWtig"),
+        ];
+        for frag in &leaked {
+            assert!(!src.contains(frag.as_str()), "hardcoded credential fragment found in source: {}", &frag[..12]);
+        }
+    }
+
+    #[test]
+    fn session_nonce_binds_custom_info() {
+        use sha2::{Digest, Sha256};
+        let paypal_hash = hex::encode(Sha256::digest(b"{\"sub\":\"user\"}"));
+        let pubkey = Sha256::digest(b"fake-der-bytes");
+
+        let n1 = compute_session_nonce(&paypal_hash, &pubkey, "walletA");
+        let n2 = compute_session_nonce(&paypal_hash, &pubkey, "walletB");
+        assert_ne!(n1, n2, "custom_info must be bound into the nonce");
+
+        // Absent custom_info is canonicalized to "NONE" by the caller; the
+        // auditor hashes report.custom_info (or "NONE") identically.
+        let n_none = compute_session_nonce(&paypal_hash, &pubkey, "NONE");
+        assert_ne!(n1, n_none);
+
+        // Deterministic for the same inputs
+        assert_eq!(n1, compute_session_nonce(&paypal_hash, &pubkey, "walletA"));
+
+        // Cross-check against an independent SHA-256(p ∥ k ∥ SHA256(c)) impl —
+        // this exact vector is mirrored in the node test for verify.html.
+        let mut h = Sha256::new();
+        h.update(hex::decode(&paypal_hash).unwrap());
+        h.update(&pubkey);
+        h.update(Sha256::digest(b"walletA"));
+        assert_eq!(n1, hex::encode(h.finalize()));
+
+        // Cross-implementation parity pin: this vector was computed
+        // independently in node (crypto.createHash) and by verify.html's
+        // WebCrypto expectedNonce code. If enclave and auditor ever drift
+        // apart again, this assertion fails at CI time.
+        assert_eq!(
+            n1,
+            "be61c8edada1a19eb7a08176084fd25c5d2c13621f020ea6c5a5713ee668f2da",
+            "nonce formula drifted from the auditor's expectedNonce — update verify.html and this vector together"
+        );
+    }
+}

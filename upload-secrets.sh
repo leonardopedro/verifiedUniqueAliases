@@ -79,21 +79,36 @@ discover_oci_instance() {
     if [[ -n "${OCI_INSTANCE_ID:-}" ]]; then
         return 0
     fi
-    local comp by_name all
+    local comp by_name all only_name
     comp=$(oci_compartment)
     if [[ -z "$comp" ]]; then
         error "No OCI compartment found (set OCI_COMPARTMENT_ID or configure ~/.oci/config)"
         exit 1
     fi
+    # JMESPath requires hyphenated keys to be quoted. The unquoted
+    # `display-name` below made the CLI's lexer fail ("Unknown token '-'")
+    # and `2>/dev/null || true` swallowed the error, so discovery silently
+    # fell through to the single-instance fallback — which never fires while
+    # a second instance (the free-tier helper `ol-arm-free`) is running, so
+    # the script aborted with "No running paypal-auth-vm instance found".
     by_name=$(oci compute instance list --compartment-id "$comp" --lifecycle-state RUNNING \
-        --query "data[?contains(display-name, 'paypal-auth-vm')].id | [0]" --raw-output 2>/dev/null || true)
+        --query "data[?contains(\"display-name\", 'paypal-auth-vm')].id | [0]" --raw-output 2>/dev/null || true)
     case "$by_name" in ""|None|null) by_name="" ;; esac
     if [[ -z "$by_name" ]]; then
+        # Fallback for a renamed auth VM: trust a lone running instance only
+        # when its display name still looks like the auth VM. The compartment
+        # also hosts the free-tier build helper, and mistaking that for the
+        # auth VM would relaunch it from its own image with the PayPal config.
         all=$(oci compute instance list --compartment-id "$comp" --lifecycle-state RUNNING \
             --query 'length(data)' --raw-output 2>/dev/null || echo 0)
         if [[ "$all" == "1" ]]; then
-            by_name=$(oci compute instance list --compartment-id "$comp" --lifecycle-state RUNNING \
-                --query 'data[0].id' --raw-output 2>/dev/null || true)
+            only_name=$(oci compute instance list --compartment-id "$comp" --lifecycle-state RUNNING \
+                --query 'data[0]."display-name"' --raw-output 2>/dev/null || true)
+            case "$only_name" in
+                *paypal-auth*)
+                    by_name=$(oci compute instance list --compartment-id "$comp" --lifecycle-state RUNNING \
+                        --query 'data[0].id' --raw-output 2>/dev/null || true) ;;
+            esac
         fi
     fi
     if [[ -z "$by_name" ]]; then
@@ -221,7 +236,13 @@ apply_oci_config() {
     # the NEW credentials (rollback safety: on any failure the old one stays).
     local verified=false
     if [[ -z "$new_ip" ]]; then
-        warn "Replacement has no public IP — skipping redirect verification."
+        # No IP means no proof the new credentials are live. The contract is
+        # "verify, only then terminate" — and with the reserved-IP path the
+        # deploy step may already have MOVED the address off the old instance,
+        # so terminating here could destroy the last known-good copy unverified.
+        error "Replacement has no public IP — cannot verify the new credentials"
+        error "OLD instance ($old_id) was NOT terminated — check both before proceeding."
+        exit 1
     elif [[ -z "$location" ]]; then
         error "Replacement did not serve https://$new_ip/login within 480s"
         error "OLD instance ($old_id) was NOT terminated — check both before proceeding."

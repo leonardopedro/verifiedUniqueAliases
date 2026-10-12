@@ -70,3 +70,4 @@ paypal-auth-vm-oci.qcow2
 /google_ak*
 /debug_full.json
 /report*.json
+node_modules/
