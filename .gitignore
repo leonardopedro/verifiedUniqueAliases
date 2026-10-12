@@ -57,3 +57,16 @@ repomix-output.xml
 # OL10 platform-image binaries (staged by extract-ol10-platform.sh)
 ol10/*
 !ol10/SOURCE.txt
+
+google_ak.der
+paypal-auth-vm
+paypal-auth-vm-oci.qcow2
+
+# Instance-specific hardware captures — never commit.
+# The live enclave returns its own EK cert / report dynamically
+# (report field `google_ak_cert_pem`), so a checked-in copy has zero
+# verifier utility and only hands adversaries legitimate certificates
+# to replay in verifier bypasses.
+/google_ak*
+/debug_full.json
+/report*.json
