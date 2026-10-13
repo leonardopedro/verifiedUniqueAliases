@@ -3434,10 +3434,30 @@ async fn acme_challenge(
     if state.https_ready.load(Ordering::Relaxed) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    // SECURITY: an unvalidated path segment joined onto a directory is a
+    // traversal primitive — `..%2F..%2Fproc%2F1%2Fenviron` arrives as one
+    // Path segment and is percent-decoded AFTER routing, escaping
+    // /tmp/acme-challenge while this route is live on port 80 during the
+    // pre-TLS boot window (PID 1 = root). RFC 8555 §8.3 http-01 tokens are
+    // unpadded base64url — reject everything outside that alphabet.
+    if !acme_token_valid(&token) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     match tokio::fs::read_to_string(format!("/tmp/acme-challenge/{}", token)).await {
         Ok(c) => c.into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// RFC 8555 http-01 token alphabet check: unpadded base64url
+/// (`[A-Za-z0-9_-]+`), bounded length. Rejects `..`, `/` (raw or
+/// percent-decoded), NUL, and everything else outside the alphabet.
+fn acme_token_valid(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 128
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 #[allow(dead_code)]
@@ -3455,6 +3475,12 @@ async fn load_tls_config(
 ) -> Result<Arc<SslAcceptor>, Box<dyn std::error::Error + Send + Sync>> {
     tokio::fs::write("/tmp/tls-cert.pem", cert_pem).await?;
     tokio::fs::write("/tmp/tls-key.pem", key_pem).await?;
+    // SECURITY: /tmp is world-writable tmpfs — the private key must not be
+    // world-readable (tokio::fs::write creates 0644 under umask 022).
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions("/tmp/tls-key.pem", std::fs::Permissions::from_mode(0o600))?;
+    }
 
     let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())?;
     // Load the FULL chain (leaf + intermediates): set_certificate_file() maps to
@@ -4010,6 +4036,40 @@ mod security_tests {
         let mut c = base_config();
         c.paypal_client_secret = String::new();
         assert!(require_credentials(c).is_err());
+    }
+
+    /// SECURITY: /\.well-known/acme-challenge/{token} must never traverse out
+    /// of /tmp/acme-challenge. The token is a single axum Path segment but
+    /// percent-decoding happens AFTER routing, so `..%2F..%2Fetc%2Fpasswd`
+    /// arrives as one segment and would escape the directory if joined
+    /// unvalidated.
+    #[test]
+    fn acme_token_rejects_traversal() {
+        // traversal primitives — all must be rejected
+        for tok in [
+            "..",
+            "../etc/passwd",
+            "..%2F..%2Fetc%2Fpasswd", // not decoded here; '%' is outside the alphabet
+            "../../proc/1/environ",
+            ".",
+            "",
+            "a/b",
+            "token\0.txt",
+            "token.with.dots",
+            "tok en",
+        ] {
+            assert!(!acme_token_valid(tok), "accepted traversal token {tok:?}");
+        }
+        // RFC 8555 §8.3: unpadded base64url — realistic http-01 tokens pass
+        for tok in [
+            "evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA",
+            "LT-7Mn7l0Dh7l0Dh7l0Dh7l0Dh7l0Dh7l0Dh7l0Dh7",
+            "_abc-XYZ_0123456789",
+        ] {
+            assert!(acme_token_valid(tok), "rejected valid token {tok:?}");
+        }
+        // bounded length (DoS: unbounded join/read)
+        assert!(!acme_token_valid(&"a".repeat(129)));
     }
 
     #[test]
