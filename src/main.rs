@@ -3130,6 +3130,79 @@ async fn debug_attestation() -> impl IntoResponse {
     Json(results)
 }
 
+// v156 (audit): full signed attestation envelope with a SYNTHETIC identity.
+// /debug/attestation only exposes the raw hardware quote (diagnostic nonce),
+// so before this route an operator could not run verify.html against the LIVE
+// enclave without completing a real PayPal login. This handler feeds
+// generate_attestation a fabricated profile (sub=DEBUG-ONLY): the enclave
+// signature, the SEC-02 nonce binding and the SNP evidence are the real
+// enclave's, the identity is explicitly fake. Useful to prove the deployed
+// enclave end-to-end; NEVER usable as identity proof — the report says so in
+// every identity field.
+async fn debug_envelope(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let synthetic: PayPalUserInfo = serde_json::from_str(
+        r#"{"user_id":"DEBUG-ONLY-NOT-A-REAL-PAYPAL-USER","sub":"DEBUG-ONLY","payer_id":"DEBUG","verified_account":"true","verified":"true"}"#,
+    )
+    .expect("static synthetic debug identity");
+    let envelope = generate_attestation(
+        &state,
+        "debug-envelope (synthetic identity — NOT a real PayPal login)".to_string(),
+        synthetic,
+        Some("DEBUG ENVELOPE — synthetic identity, no real user attached".to_string()),
+    )
+    .await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        envelope,
+    )
+}
+
+// v156 (audit): security headers on every HTTPS response. The enclave renders
+// an OAuth callback carrying user identity + a signed attestation report:
+//   - frame-ancestors 'none' / X-Frame-Options DENY  → clickjacking
+//   - X-Content-Type-Options: nosniff                → MIME sniffing
+//   - Referrer-Policy: no-referrer                   → the callback URL (with
+//     PayPal `code`) must never leak via Referer to external links
+//   - HSTS                                            → pin HTTPS
+//   - Cache-Control: no-store                        → identity/report pages
+//     must not be written to browser or proxy caches
+// Deliberately NOT a full resource CSP: the pages use inline styles/scripts
+// and a strict policy would break them without nonces; frame-ancestors gets
+// the clickjacking defense without that cost.
+async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert(
+        axum::http::header::STRICT_TRANSPORT_SECURITY,
+        axum::http::HeaderValue::from_static("max-age=63072000; includeSubDomains"),
+    );
+    h.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    h.insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    h.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    h.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    h.insert(
+        axum::http::HeaderName::from_static("permissions-policy"),
+        axum::http::HeaderValue::from_static("camera=(), microphone=(), geolocation=(), usb=()"),
+    );
+    resp
+}
+
 async fn callback(
     Query(query): Query<CallbackQuery>,
     headers: axum::http::HeaderMap,
@@ -3181,8 +3254,12 @@ async fn callback(
     let token = match exchange_code_for_token(&code, &config.client_id, &config.client_secret, &redirect_uri, api_base).await {
         Ok(t) => t,
         Err(e) => {
+            // v156 (audit): the detailed error (reqwest chain, PayPal response
+            // body) goes to the enclave log ONLY — echoing it to the browser
+            // discloses internal endpoints / upstream replies on a public
+            // OAuth surface.
             error!("Token exchange failed: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Token exchange failed: {}", e)).into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Token exchange failed — the enclave logged the details.").into_response();
         }
     };
 
@@ -3190,7 +3267,7 @@ async fn callback(
         Ok(u) => u,
         Err(e) => {
             error!("Userinfo failed: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Userinfo failed: {}", e)).into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Userinfo fetch failed — the enclave logged the details.").into_response();
         }
     };
 
@@ -3651,10 +3728,12 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         .route("/callback", get(callback))
         .route("/generate", axum::routing::post(generate_cert))
         .route("/debug/attestation", get(debug_attestation))
+        .route("/debug/envelope", get(debug_envelope))
         .route("/privacy", get(privacy))
         .route("/terms", get(terms))
         .route("/report", get(|| async { Redirect::to("/") }))
         .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
+        .layer(axum::middleware::from_fn(security_headers))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
     eprintln!("[DEBUG] router built");
