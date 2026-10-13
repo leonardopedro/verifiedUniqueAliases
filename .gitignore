@@ -74,3 +74,6 @@ node_modules/
 
 # Agent-tooling session marker (internal UUID — audit SEC-07: never track)
 .freebuff/
+
+# v155 (SEC-02): local build artifact identity — deploy-oci.sh gates on it
+.build-provenance

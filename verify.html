@@ -797,15 +797,36 @@
             const paypalHash = new Uint8Array(report.paypal_user_info_raw_hash.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
 
             // v152: The nonce also binds the user's custom_info into the
-            // hardware quote. Nonce = SHA-256(paypal_hash ∥ pubkey_hash ∥ SHA-256(custom_info)).
+            // hardware quote.
+            // v155 (SEC-02): it additionally commits to the EXACT code
+            // identity — the measured binary_sha256 + the canonical
+            // disk-manifest composite. On OCI the SEV-SNP launch digest is
+            // fleet-constant (it covers only Oracle's OVMF firmware), so
+            // this fusion is what makes the silicon quote attest the code
+            // actually running: nonce = SHA-256(paypal ∥ pubkey ∥ custom_info
+            // ∥ binary_sha256 ∥ SHA256(canonical manifest)). The Sigstore
+            // provenance check below then proves those same hashes are
+            // CI-built (defense-in-depth Layers 2+3).
             // "NONE" is the enclave's canonical value for an absent custom_info.
             const customInfoStr = report.custom_info || "NONE";
             const customInfoHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(customInfoStr));
 
-            const combined = new Uint8Array(96);
+            // Canonical manifest: sorted [path, sha256] pairs, compact JSON —
+            // byte-identical to the enclave's canonical_manifest_json.
+            const diskManifest = boot.disk_manifest || {};
+            const sortedManifest = Object.keys(diskManifest).sort().map(k => [k, diskManifest[k]]);
+            const manifestHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(sortedManifest)));
+            if (!/^[0-9a-f]{64}$/i.test(boot.binary_sha256 || "")) {
+                throw new Error("Report is missing a valid enclave binary_sha256 — cannot reconstruct the hardware-bound nonce (SEC-02 code binding). The report is malformed or from a pre-SEC-02 enclave.");
+            }
+            const binaryHashBytes = new Uint8Array((boot.binary_sha256.match(/.{1,2}/g) || []).map(byte => parseInt(byte, 16)));
+
+            const combined = new Uint8Array(160);
             combined.set(paypalHash);
             combined.set(new Uint8Array(pubKeyHash), 32);
             combined.set(new Uint8Array(customInfoHash), 64);
+            combined.set(binaryHashBytes, 96);
+            combined.set(new Uint8Array(manifestHash), 128);
             const combinedHash = await crypto.subtle.digest('SHA-256', combined);
             const expectedNonce = Array.from(new Uint8Array(combinedHash)).map(b => b.toString(16).padStart(2, '0')).join('');
             
@@ -1082,6 +1103,13 @@
             //   * AMD SEV-SNP evidence present (OCI) → SNP path required;
             //   * Google cert / TPM evidence (GCP)   → Google+TPM path;
             //   * mixed evidence                     → BOTH must verify.
+            // NOTE (SEC-02 plan review): `platform_type === "AMD SEV-SNP"` is
+            // deliberately NOT part of claimsOci — BOTH build targets report
+            // platform_type "AMD SEV-SNP" (the TDX-era label was retired with
+            // the OCI migration), so including it would force the SNP path on
+            // genuine GCP vTPM reports and brick them. The evidence fields
+            // themselves (snp_report / vcek / google cert / TPM evidence) are
+            // the authoritative platform signal.
             const claimsOci = !!(hw.snp_report_b64 || hw.vcek_der_b64);
             const claimsGcp = !!(hw.google_ak_cert_pem || hasTpmEvidence);
             if (claimsOci && claimsGcp) {

@@ -1535,12 +1535,27 @@ mod tpm {
             }
             if !got_ext {
                 // Legacy path: plain SNP_GET_REPORT (older kernels without the
-                // extended request) — certs from AMD KDS as before.
+                // extended request) — certs from AMD KDS as before, but with
+                // the SAME verify-before-publish rule as the ext path (SEC-02/
+                // v154): on hosts whose PSP signs with a key KDS does not
+                // hold, the KDS cert chains to the ARK yet does NOT sign this
+                // report — publishing it would give auditors a cert that
+                // fails the signature check. Fail closed instead.
                 tracing::info!("v136: PATH 0 — /dev/sev-guest SNP_GET_REPORT");
                 if let Some(report) = crate::oci_snp::snp_get_report(&nonce_bytes) {
                     if let Some(info) = crate::oci_snp::parse_report(&report) {
                         tracing::info!("v136: PATH 0 report {} bytes, AMD chip {}", info.report.len(), &info.chip_id_hex[..16]);
-                        vcek_der_b64 = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await;
+                        if let Some(b64) = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await {
+                            match STANDARD.decode(&b64) {
+                                Ok(der) if crate::oci_snp::verify_report_signature(&info.report, &der) => {
+                                    tracing::info!("v155: plain-report KDS VCEK verifies the live report — publishing (source=kds)");
+                                    vcek_der_b64 = Some(b64);
+                                    vcek_source = Some("kds".to_string());
+                                }
+                                Ok(_) => tracing::error!("v155: plain-report KDS VCEK does NOT verify the live report signature (OCI PSP/KDS key mismatch) — NOT publishing; report ships without an endorsement leaf"),
+                                Err(e) => tracing::error!("v155: plain-report KDS VCEK undecodable: {}", e),
+                            }
+                        }
                         amd_chain_b64 = fetch_amd_chain().await;
                         snp_report_b64 = Some(STANDARD.encode(&info.report));
                     } else {
@@ -2592,20 +2607,55 @@ fn extract_pub_key(private_key_pem: &str) -> String {
 }
 
 /// v152: session nonce = SHA-256(paypal_hash ∥ pubkey_hash ∥ SHA-256(custom_info)).
-/// Binding custom_info into the hardware-attested nonce means the AMD SNP
-/// report_data / TPM quote extraData attests the user's custom context
-/// (e.g. wallet address), not just the PayPal identity + signing key.
-/// MUST stay in lockstep with `expectedNonce` in verify.html.
-fn compute_session_nonce(paypal_hash_hex: &str, pub_key_hash: &[u8], custom_info: &str) -> String {
+/// Canonical JSON for the disk manifest: `[[path, sha256], …]`, sorted by
+/// path, compact (no whitespace). Hashed into the hardware-bound session
+/// nonce (SEC-02) and mirrored byte-for-byte by the auditor's
+/// `JSON.stringify(sorted.map(k => [k, m[k]]))` in verify.html — the two
+/// MUST produce identical bytes or every attestation fails its binding check.
+/// (BTreeMap iteration is already key-sorted; the explicit sort documents
+/// the contract and keeps us safe if the type ever changes.)
+fn canonical_manifest_json(manifest: &std::collections::BTreeMap<String, String>) -> String {
+    let mut pairs: Vec<(&String, &String)> = manifest.iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    serde_json::to_string(&pairs).unwrap_or_default()
+}
+
+/// SEC-02 (code-to-silicon binding): the session nonce bound into the AMD
+/// SNP report_data / TPM quote extraData commits to the EXACT code identity
+/// of the running enclave, not only the user's PayPal profile:
+///
+///   nonce = SHA-256( paypal_hash ∥ pubkey_hash ∥ SHA-256(custom_info)
+///                    ∥ binary_sha256 ∥ SHA-256(canonical_manifest_json) )
+///
+/// On OCI the SEV-SNP launch digest covers only the fleet-constant OVMF
+/// firmware, so without this fusion a tampered disk would still produce a
+/// "valid" hardware quote. With it, the silicon quote itself commits to the
+/// measured binary + disk manifest, and the auditor's independent Sigstore
+/// lookup of those same hashes closes the loop (Layer 2 + Layer 3 of the
+/// defense-in-depth model). MUST stay in lockstep with `expectedNonce` in
+/// verify.html.
+fn compute_session_nonce(
+    paypal_hash_hex: &str,
+    pub_key_hash: &[u8],
+    custom_info: &str,
+    binary_sha256_hex: &str,
+    manifest_canonical_json: &str,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut custom_hasher = Sha256::new();
     custom_hasher.update(custom_info.as_bytes());
     let custom_info_hash = custom_hasher.finalize();
 
+    let mut manifest_hasher = Sha256::new();
+    manifest_hasher.update(manifest_canonical_json.as_bytes());
+    let manifest_hash = manifest_hasher.finalize();
+
     let mut combined_hasher = Sha256::new();
     combined_hasher.update(hex::decode(paypal_hash_hex).expect("Internal Error: Invalid PayPal Hex"));
     combined_hasher.update(pub_key_hash);
     combined_hasher.update(custom_info_hash);
+    combined_hasher.update(hex::decode(binary_sha256_hex).expect("Internal Error: Invalid binary hash hex"));
+    combined_hasher.update(manifest_hash);
     hex::encode(combined_hasher.finalize())
 }
 
@@ -2669,8 +2719,19 @@ async fn generate_attestation(
     // compute_session_nonce). Previously custom_info was only covered by the
     // enclave's software signature, so a leaked signing key allowed
     // substitution without invalidating the hardware quote.
+    // v155 (SEC-02): the nonce additionally commits to the measured binary
+    // hash + canonical disk-manifest composite, so the silicon quote binds
+    // the exact code identity (the OCI launch digest alone is fleet-constant
+    // and cannot distinguish disks).
     let custom_info_str = custom_info.clone().unwrap_or_else(|| "NONE".to_string());
-    let final_combined_nonce = compute_session_nonce(&paypal_hash, &pub_key_hash_bytes, &custom_info_str);
+    let manifest_canonical = canonical_manifest_json(&state.boot_manifest);
+    let final_combined_nonce = compute_session_nonce(
+        &paypal_hash,
+        &pub_key_hash_bytes,
+        &custom_info_str,
+        &binary_self_hash,
+        &manifest_canonical,
+    );
 
     info!("Generating hardware attestation with bound public key hash: {}", pub_key_hash_hex);
     let mut tpm_report = match tpm::quote(&final_combined_nonce).await {
@@ -3354,9 +3415,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 4. Anchor manifest in PCR 15 for the auditor
     {
         use sha2::{Digest, Sha256};
-        let mut sorted_manifest: Vec<_> = boot_manifest.iter().collect();
-        sorted_manifest.sort_by_key(|(k, _)| *k);
-        let manifest_json = serde_json::to_string(&sorted_manifest).unwrap_or_default();
+        let manifest_json = canonical_manifest_json(&boot_manifest);
         let manifest_hash = Sha256::digest(manifest_json.as_bytes());
         let hash_hex = hex::encode(manifest_hash);
         
@@ -3906,25 +3965,50 @@ mod security_tests {
         use sha2::{Digest, Sha256};
         let paypal_hash = hex::encode(Sha256::digest(b"{\"sub\":\"user\"}"));
         let pubkey = Sha256::digest(b"fake-der-bytes");
+        // SEC-02: the nonce also binds the binary hash + canonical manifest.
+        let binary = "ab".repeat(32);
+        let mut manifest = std::collections::BTreeMap::new();
+        // Inserted deliberately "unsorted"; canonical_manifest_json must sort.
+        manifest.insert("EFI/BOOT/vmlinuz".to_string(), "cc".repeat(32));
+        manifest.insert("EFI/BOOT/initrd.img".to_string(), "dd".repeat(32));
+        let canonical = canonical_manifest_json(&manifest);
+        // Canonical form is the sorted [path, sha] pair array, compact JSON —
+        // byte-identical to verify.html's JSON.stringify of the sorted pairs.
+        assert_eq!(
+            canonical,
+            format!("[[\"EFI/BOOT/initrd.img\",\"{}\"],[\"EFI/BOOT/vmlinuz\",\"{}\"]]", "dd".repeat(32), "cc".repeat(32))
+        );
 
-        let n1 = compute_session_nonce(&paypal_hash, &pubkey, "walletA");
-        let n2 = compute_session_nonce(&paypal_hash, &pubkey, "walletB");
+        let n1 = compute_session_nonce(&paypal_hash, &pubkey, "walletA", &binary, &canonical);
+        let n2 = compute_session_nonce(&paypal_hash, &pubkey, "walletB", &binary, &canonical);
         assert_ne!(n1, n2, "custom_info must be bound into the nonce");
+
+        // The code identity is bound too: different binary or manifest →
+        // different nonce (a tampered disk cannot reuse a valid quote).
+        let other_binary = format!("{}ac", "ab".repeat(31)); // 32 bytes, last byte flipped
+        let n_bin = compute_session_nonce(&paypal_hash, &pubkey, "walletA", &other_binary, &canonical);
+        assert_ne!(n1, n_bin, "binary_sha256 must be bound into the nonce");
+        let mut manifest2 = manifest.clone();
+        manifest2.insert("EFI/BOOT/evil.efi".to_string(), "ee".repeat(32));
+        let n_man = compute_session_nonce(&paypal_hash, &pubkey, "walletA", &binary, &canonical_manifest_json(&manifest2));
+        assert_ne!(n1, n_man, "disk manifest must be bound into the nonce");
 
         // Absent custom_info is canonicalized to "NONE" by the caller; the
         // auditor hashes report.custom_info (or "NONE") identically.
-        let n_none = compute_session_nonce(&paypal_hash, &pubkey, "NONE");
+        let n_none = compute_session_nonce(&paypal_hash, &pubkey, "NONE", &binary, &canonical);
         assert_ne!(n1, n_none);
 
         // Deterministic for the same inputs
-        assert_eq!(n1, compute_session_nonce(&paypal_hash, &pubkey, "walletA"));
+        assert_eq!(n1, compute_session_nonce(&paypal_hash, &pubkey, "walletA", &binary, &canonical));
 
-        // Cross-check against an independent SHA-256(p ∥ k ∥ SHA256(c)) impl —
+        // Cross-check against an independent SHA-256(5-element pre-image) impl —
         // this exact vector is mirrored in the node test for verify.html.
         let mut h = Sha256::new();
         h.update(hex::decode(&paypal_hash).unwrap());
         h.update(&pubkey);
         h.update(Sha256::digest(b"walletA"));
+        h.update(hex::decode(&binary).unwrap());
+        h.update(Sha256::digest(canonical.as_bytes()));
         assert_eq!(n1, hex::encode(h.finalize()));
 
         // Cross-implementation parity pin: this vector was computed
@@ -3933,7 +4017,7 @@ mod security_tests {
         // apart again, this assertion fails at CI time.
         assert_eq!(
             n1,
-            "be61c8edada1a19eb7a08176084fd25c5d2c13621f020ea6c5a5713ee668f2da",
+            "398c2c1b18583ac9c3935ffdea04f0b2a3dfdd927140072bd50511e9f77db8f7",
             "nonce formula drifted from the auditor's expectedNonce — update verify.html and this vector together"
         );
     }

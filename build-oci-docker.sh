@@ -87,6 +87,25 @@ echo "   paypal-auth-vm-oci.qcow2: $QCOW_SHA (import this)"
 echo "   initramfs-oci.img:        $INITRD_SHA"
 echo "============================================================"
 echo ""
+
+# ---------------------------------------------------------------------------
+# v155 (SEC-02 Phase 4): persist the build's artifact identity so
+# deploy-oci.sh can HARD-GATE the launch on GitHub attestation of exactly
+# these hashes. The file is gitignored (it describes a local build, not
+# source); its `commit` field must match a pushed commit for CI to have
+# attested these hashes.
+# ---------------------------------------------------------------------------
+BIN_SHA=""
+[[ -f paypal-auth-vm ]] && BIN_SHA=$(sha256sum paypal-auth-vm | cut -d' ' -f1)
+BUILD_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+jq -n \
+    --arg commit "$BUILD_COMMIT" \
+    --arg dirty "$(git status --porcelain 2>/dev/null | head -1 | wc -l)" \
+    --arg bin "$BIN_SHA" --arg initrd "$INITRD_SHA" --arg qcow "$QCOW_SHA" \
+    '{commit: $commit, dirty_files: ($dirty != "0"), binary_sha256: $bin, initramfs_sha256: $initrd, qcow2_sha256: $qcow}' \
+    > .build-provenance
+echo "📝 Wrote .build-provenance (commit=${BUILD_COMMIT:0:7}, deploy-oci.sh will gate on it)"
+
 echo "Next steps:"
 echo "  1. Import the QCOW2 as an Oracle Cloud custom image:"
 echo "     bash import-oci-image.sh"

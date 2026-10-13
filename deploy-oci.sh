@@ -240,6 +240,53 @@ fi
 # and parses it as config JSON — no cloud-init involved.
 
 # ------------------------------------------------------------------
+# [1c] v155 (SEC-02 Phase 4): provenance gate — refuse to launch an image
+# whose artifacts GitHub Actions has NOT attested. build-oci-docker.sh
+# writes .build-provenance (commit + binary/initramfs/qcow2 SHA-256); the
+# launch is only allowed when every recorded hash answers HTTP 200 on the
+# public attestation API. Escape hatch: PROVENANCE_GATE=off (for qemu/dev
+# redeploys of an already-qualified image).
+# ------------------------------------------------------------------
+if [[ "${PROVENANCE_GATE:-on}" != "off" ]]; then
+    PROV="${PROVENANCE_FILE:-.build-provenance}"
+    if [[ ! -f "$PROV" ]]; then
+        echo "❌ Provenance gate: $PROV not found."
+        echo "   Run: bash build-oci-docker.sh (from a CLEAN, PUSHED commit so CI"
+        echo "   attests the build), import the image, then deploy."
+        echo "   (PROVENANCE_GATE=off to skip — never do this for production.)"
+        exit 1
+    fi
+    PROV_REPO="leonardopedro/verifiedUniqueAliases"
+    GATE_FAIL=0
+    check_gate() {
+        local label="$1" hash="$2" status
+        if [[ -z "$hash" || "$hash" == "null" ]]; then
+            echo "   ⚠️  $label: no hash recorded in $PROV — skipping"
+            return
+        fi
+        status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${PROV_REPO}/attestations/sha256:${hash}" 2>/dev/null || echo 000)
+        if [[ "$status" == "200" ]]; then
+            echo "   ✅ $label attested (${hash:0:12}…)"
+        else
+            echo "   ❌ $label NOT attested (HTTP $status, ${hash:0:12}…)"
+            GATE_FAIL=1
+        fi
+    }
+    echo "🔐 [1c] Provenance gate: verifying GitHub attestations for this build..."
+    check_gate "Enclave Binary" "$(jq -r '.binary_sha256' "$PROV")"
+    check_gate "Initramfs"      "$(jq -r '.initramfs_sha256' "$PROV")"
+    check_gate "QCOW2 Disk"     "$(jq -r '.qcow2_sha256' "$PROV")"
+    if [[ "$GATE_FAIL" != "0" ]]; then
+        echo "❌ Provenance gate: refusing to deploy an unattested image to confidential compute."
+        echo "   Commit + push so CI attests, rebuild (build-oci-docker.sh), re-import, redeploy."
+        exit 1
+    fi
+    echo "   Provenance gate passed."
+fi
+
+# ------------------------------------------------------------------
 # [2/4] Launch confidential preemptible instance
 # ------------------------------------------------------------------
 if [[ "$OCI_PREEMPTIBLE" == "true" ]]; then

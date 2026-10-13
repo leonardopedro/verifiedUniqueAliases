@@ -67,6 +67,22 @@ function check(name, cond, detail) {
   else { fail++; console.log(`  ❌ ${name}${detail ? ' — ' + detail : ''}`); }
 }
 
+// SEC-02: the hardware nonce commits to code identity too. Mirror of the
+// enclave's compute_session_nonce over the 160-byte (5-element) pre-image:
+// paypal ∥ pubkey ∥ SHA256(custom_info) ∥ binary_sha256 ∥ SHA256(canonical manifest).
+async function nonce160Hex(paypalHash, pubkeyHash, customInfoStr, binaryShaHex, diskManifest) {
+  const ciHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(customInfoStr)));
+  const sorted = Object.keys(diskManifest || {}).sort().map(k => [k, diskManifest[k]]);
+  const manHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(sorted))));
+  const combined = new Uint8Array(160);
+  combined.set(paypalHash, 0);
+  combined.set(pubkeyHash, 32);
+  combined.set(ciHash, 64);
+  combined.set(new Uint8Array((binaryShaHex.match(/.{1,2}/g) || []).map(b => parseInt(b, 16))), 96);
+  combined.set(manHash, 128);
+  return Buffer.from(await crypto.subtle.digest('SHA-256', combined)).toString('hex');
+}
+
 // ---- Optional: a genuine captured OCI report (not committed — instance
 // hardware captures are gitignored). Supply via GENUINE_REPORT to enable
 // Tests 1 and 3; the self-contained Tests 2/4/5 always run.
@@ -176,29 +192,28 @@ if (genuine) {
 
 // Test 4: nonce parity — verify.html expectedNonce must equal the enclave's
 // compute_session_nonce for the same inputs (cross-implementation vector)
-console.log('\nTest 4: nonce formula parity (custom_info binding)');
+console.log('\nTest 4: nonce formula parity (SEC-02 code binding)');
 {
-  // Independent reference implementation of SHA-256(p ∥ k ∥ SHA256(c))
+  // Independent reference implementation of the 160-byte pre-image
   const { createHash } = await import('crypto');
   const sha256 = (buf) => createHash('sha256').update(buf).digest();
   const paypalHash = sha256(Buffer.from('{"sub":"user"}'));
   const pubkeyHash = sha256(Buffer.from('fake-der-bytes'));
   const customInfoHash = sha256(Buffer.from('walletA'));
-  const reference = sha256(Buffer.concat([paypalHash, pubkeyHash, customInfoHash])).toString('hex');
+  const binary = Buffer.from('ab'.repeat(32), 'hex');
+  const manifest = { 'EFI/BOOT/vmlinuz': 'cc'.repeat(32), 'EFI/BOOT/initrd.img': 'dd'.repeat(32) };
+  const canonical = JSON.stringify(Object.keys(manifest).sort().map(k => [k, manifest[k]]));
+  const manHash = sha256(Buffer.from(canonical));
+  const reference = sha256(Buffer.concat([paypalHash, pubkeyHash, customInfoHash, binary, manHash])).toString('hex');
 
   // The same computation as written in verify.html's runAudit()
-  const customInfoStr = 'walletA';
-  const ciHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(customInfoStr)));
-  const combined = new Uint8Array(96);
-  combined.set(paypalHash);
-  combined.set(pubkeyHash, 32);
-  combined.set(ciHash, 64);
-  const jsNonce = Buffer.from(await crypto.subtle.digest('SHA-256', combined)).toString('hex');
+  const jsNonce = await nonce160Hex(paypalHash, pubkeyHash, 'walletA', 'ab'.repeat(32), manifest);
   check('JS expectedNonce matches independent reference', jsNonce === reference,
     `js=${jsNonce} ref=${reference}`);
+  check('pre-image is the 160-byte 5-element form', Buffer.concat([paypalHash, pubkeyHash, customInfoHash, binary, manHash]).length === 160);
 
   // The Rust side pins this exact vector in security_tests::session_nonce_binds_custom_info
-  const RUST_PIN = 'be61c8edada1a19eb7a08176084fd25c5d2c13621f020ea6c5a5713ee668f2da';
+  const RUST_PIN = '398c2c1b18583ac9c3935ffdea04f0b2a3dfdd927140072bd50511e9f77db8f7';
   check('JS expectedNonce matches the Rust-pinned parity vector', jsNonce === RUST_PIN,
     `js=${jsNonce} rustPin=${RUST_PIN}`);
 }
@@ -233,16 +248,18 @@ console.log('\nTest 5: legitimate GCP report still passes (no regression)');
     hardware_level_attestation: null, // filled below (needs nonce)
   };
 
-  // Expected nonce — same formula as runAudit step 1
+  // Expected nonce — same formula as runAudit step 1 (SEC-02: 160-byte
+  // pre-image including binary_sha256 + canonical manifest composite)
   // NOTE: pubkey hash is over the raw DER (SPKI), not the PEM text — matches
   // the enclave's PKey::public_key_to_der() and the page's pemToBuffer().
   const pemToDer = (pem) => Buffer.from(pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
-  const ciHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(customInfo)));
-  const combined = new Uint8Array(96);
-  combined.set(Buffer.from(reportBody.paypal_user_info_raw_hash, 'hex'));
-  combined.set(new Uint8Array(sha256(pemToDer(encPem))), 32);
-  combined.set(ciHash, 64);
-  const expectedNonceHex = Buffer.from(await crypto.subtle.digest('SHA-256', combined)).toString('hex');
+  const expectedNonceHex = await nonce160Hex(
+    Buffer.from(reportBody.paypal_user_info_raw_hash, 'hex'),
+    new Uint8Array(sha256(pemToDer(encPem))),
+    customInfo,
+    reportBody.enclave_config.boot_measurements.binary_sha256,
+    reportBody.enclave_config.boot_measurements.disk_manifest,
+  );
 
   // PCR values: all five quoted PCRs; pcr_15 must equal calculatePcr15(manifest)
   const pcr15 = await calculatePcr15(reportBody.enclave_config.boot_measurements.disk_manifest);
@@ -341,12 +358,13 @@ console.log('\nTest 6: OCI report + forged local TPM quote + Google cert (SEC-04
     hardware_level_attestation: null, // nonce-dependent
   };
   const pemToDer = (pem) => Buffer.from(pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
-  const ciHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(customInfo)));
-  const combined = new Uint8Array(96);
-  combined.set(Buffer.from(reportBody.paypal_user_info_raw_hash, 'hex'));
-  combined.set(new Uint8Array(sha256(pemToDer(encPem))), 32);
-  combined.set(ciHash, 64);
-  const expectedNonceHex = Buffer.from(await crypto.subtle.digest('SHA-256', combined)).toString('hex');
+  const expectedNonceHex = await nonce160Hex(
+    Buffer.from(reportBody.paypal_user_info_raw_hash, 'hex'),
+    new Uint8Array(sha256(pemToDer(encPem))),
+    customInfo,
+    reportBody.enclave_config.boot_measurements.binary_sha256,
+    reportBody.enclave_config.boot_measurements.disk_manifest,
+  );
 
   // Forged but fully self-consistent TPM quote (the attacker's own machine).
   const pcr15 = await calculatePcr15(reportBody.enclave_config.boot_measurements.disk_manifest);
@@ -444,10 +462,13 @@ console.log('\nTest 7: OCI report with SNP evidence but no endorsement leaf');
     hardware_level_attestation: null,
   };
   const pemToDer = (pem) => Buffer.from(pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
-  const combined = new Uint8Array(96);
-  combined.set(Buffer.from(reportBody.paypal_user_info_raw_hash, 'hex'));
-  combined.set(new Uint8Array(sha256(pemToDer(encPem))), 32);
-  combined.set(new Uint8Array(sha256(Buffer.from('NONE'))), 64);
+  const expectedNonceHex = await nonce160Hex(
+    Buffer.from(reportBody.paypal_user_info_raw_hash, 'hex'),
+    new Uint8Array(sha256(pemToDer(encPem))),
+    'NONE',
+    reportBody.enclave_config.boot_measurements.binary_sha256,
+    reportBody.enclave_config.boot_measurements.disk_manifest,
+  );
   reportBody.hardware_level_attestation = {
     snp_report_b64: Buffer.alloc(1184, 0x5a).toString('base64'), // no vcek_der_b64!
     vcek_source: 'kds-undecodable',

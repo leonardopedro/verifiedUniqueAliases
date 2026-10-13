@@ -54,11 +54,20 @@ mcopy -v -m -i $ESP_IMAGE "$KERNEL" ::/EFI/BOOT/vmlinuz
 mcopy -v -m -i $ESP_IMAGE "$INITRD" ::/EFI/BOOT/initrd.img
 
 # Create GRUB config for Oracle Cloud (UEFI + SNP memory encryption)
+# v155 (SEC-02 Phase 2): lockdown=confidentiality puts the kernel in
+# lockdown mode the moment it starts — unsigned kernel modules cannot be
+# loaded, /dev/mem and kexec are blocked, and the already-measured
+# initramfs cannot be augmented at runtime. This is safe on OCI because
+# every module in the initramfs comes from Oracle's UEK RPM (signed by
+# Oracle's module-signing key, present in the running kernel's builtin
+# keyring); the GCP/Debian image deliberately does NOT get this flag
+# (Debian modules are unsigned and would fail to load — validated in the
+# qemu smoke test where module loading happens before any network step).
 cat <<EOF > grub.cfg
 set default=0
 set timeout=0
 menuentry "Oracle Cloud Confidential PayPal Auth (AMD SEV-SNP)" {
-    linux /EFI/BOOT/vmlinuz root=tmpfs rootok=1 console=tty0 console=ttyS0,115200n8 selinux=0 panic=1 net.ifnames=0 biosdevname=0 mem_encryption=on
+    linux /EFI/BOOT/vmlinuz root=tmpfs rootok=1 console=tty0 console=ttyS0,115200n8 selinux=0 panic=1 net.ifnames=0 biosdevname=0 mem_encryption=on lockdown=confidentiality
     initrd /EFI/BOOT/initrd.img
 }
 EOF

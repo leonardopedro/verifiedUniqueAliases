@@ -24,6 +24,13 @@ E="${1:-}"
 [[ -z "$E" ]] && { echo "usage: $0 <instance-ocid>"; exit 2; }
 command -v oci >/dev/null || { echo "oci CLI required"; exit 2; }
 
+# Region from the OCID itself (ocid1.instance.<realm>.<region>.…) so the
+# check works in every region, not just the one this script was born in.
+REGION="$(printf '%s' "$E" | cut -d'.' -f4)"
+[[ -z "$REGION" || "$REGION" == "$E" ]] && REGION="$(oci iam region list --query 'data[?"is-home-region"==`true`].name | [0]' --raw-output 2>/dev/null)"
+CONSOLE_ENDPOINT="instance-console.${REGION}.oci.oraclecloud.com"
+echo "region: $REGION (console: $CONSOLE_ENDPOINT)"
+
 KEY=/tmp/console-rsa
 if [[ ! -f "$KEY" ]]; then
     ssh-keygen -t rsa -b 2048 -N "" -f "$KEY" -q
@@ -48,7 +55,7 @@ done
 ( for _ in $(seq 1 40); do
     ssh -tt -i "$KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
         -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 \
-        -o ProxyCommand="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -W %h:%p -p 443 $CONN@instance-console.eu-frankfurt-1.oci.oraclecloud.com" \
+        -o ProxyCommand="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -W %h:%p -p 443 $CONN@$CONSOLE_ENDPOINT" \
         "$E" >> "$LOG" 2>&1
     sleep 2
 done ) &
