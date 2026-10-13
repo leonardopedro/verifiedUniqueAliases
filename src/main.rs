@@ -79,6 +79,15 @@ mod enclave_init {
         modprobe("virtio_pci");
         modprobe("nvme");
         modprobe("nvme_core");
+        // v153b (real-OCI E5 bring-up, 2026-10-13): the boot volume on OCI
+        // confidential E5 is a paravirtualized SCSI device ("ORACLE
+        // BlockVolume" behind virtio_scsi) — without sd_mod no /dev/sda*
+        // node ever appears, the ESP can never be mounted, and every report
+        // ships `disk_manifest: {}` (❌ Image Atomicity). sd_mod/sr_mod are
+        // staged in the OL10 initramfs but were never modprobe'd (qemu
+        // attaches the disk as virtio-blk/vda, which masked the bug).
+        modprobe("sd_mod");
+        modprobe("sr_mod");
         
         // v91: Recursive module hunter for attestation drivers
         kmsg("Scanning for attestation modules...");
@@ -214,7 +223,7 @@ mod enclave_init {
         modprobe("nls_cp437");
         modprobe("nls_ascii");
 
-        fn mount_device(source: &str, target: &str, data: Option<&str>) -> bool {
+        fn mount_device_logged(source: &str, target: &str, data: Option<&str>, log_fail: bool) -> bool {
             let src = std::ffi::CString::new(source).unwrap();
             let tgt = std::ffi::CString::new(target).unwrap();
             let fst = std::ffi::CString::new("vfat").unwrap();
@@ -228,7 +237,9 @@ mod enclave_init {
                 kmsg(&format!("Successfully mounted {}{} -> {}", source, data.map(|d| format!(" ({d})")).unwrap_or_default(), target));
                 true
             } else {
-                kmsg(&format!("vfat mount of {} failed: {}", source, std::io::Error::last_os_error()));
+                if log_fail {
+                    kmsg(&format!("vfat mount of {} failed: {}", source, std::io::Error::last_os_error()));
+                }
                 false
             }
         }
@@ -249,23 +260,38 @@ mod enclave_init {
         //    `vda`/`sda`, which is how an unpartitioned ESP would appear),
         //    each across the iocharset fallbacks. loop/ram/zram devices are
         //    skipped: never the ESP, and a stray loop mount could shadow it.
+        //
+        //    v153b: RETRY with patience. On real OCI E5 the PV disk attaches
+        //    as a virtio-scsi LUN whose async SCSI scan + sd probe completes
+        //    a few hundred ms AFTER the drivers load (measured on hardware:
+        //    scan at ~2.18s, single-shot measurement at ~2.31s saw ZERO
+        //    block devices → empty manifest). Scan for up to ~10s.
         let mut success = false;
-        if let Ok(entries) = std::fs::read_dir("/sys/class/block") {
-            let mut candidates: Vec<String> = entries.filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| !n.starts_with("loop") && !n.starts_with("ram") && !n.starts_with("zram"))
-                .collect();
-            candidates.sort();
-
-            'devices: for dev_name in candidates {
+        'rounds: for round in 0..20u32 {
+            let mut candidates: Vec<String> = std::fs::read_dir("/sys/class/block")
+                .map(|entries| {
+                    let mut v: Vec<String> = entries.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|n| !n.starts_with("loop") && !n.starts_with("ram") && !n.starts_with("zram"))
+                        .collect();
+                    v.sort();
+                    v
+                })
+                .unwrap_or_default();
+            if round == 0 || round == 4 || round == 12 {
+                kmsg(&format!("block devices (round {}): {:?}", round, candidates));
+            }
+            let log_fail = round < 3;
+            for dev_name in &candidates {
                 let dev_path = format!("/dev/{}", dev_name);
                 for opts in [None, Some("iocharset=ascii"), Some("iocharset=cp437")] {
-                    if mount_device(&dev_path, mount_point, opts) {
+                    if mount_device_logged(&dev_path, mount_point, opts, log_fail) {
                         success = true;
-                        break 'devices;
+                        break 'rounds;
                     }
                 }
             }
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
 
         if !success {
