@@ -380,7 +380,7 @@ if [ "$PLATFORM" = "tpm" ]; then
     echo "  • GCP Identity: $([ -n "$IDENTITY" ] && [ "$IDENTITY" != "{}" ] && echo "✅" || echo "❌")"
     echo ""
     echo "If all checks pass → Attestation is working correctly!"
-    echo "If any critical check fails → See GCP_ATTESTATION_FIX.md"
+    echo "If any critical check fails → see AGENTS.md (GCP vTPM two-key model)"
 else
     echo "  • SEV guest device: $([ -c /dev/sev-guest ] && echo "✅" || echo "⚠️  (ConfigFS fallback)")"
     echo "  • SEV module: $([ $MODULE_FOUND -eq 1 ] && echo "✅" || echo "❌")"

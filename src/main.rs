@@ -5,6 +5,8 @@
 //! Runtime: GCP Confidential VM (AMD SEV-SNP) or Oracle Cloud OCI SEV-SNP depending on build target
 
 mod oci_snp;  // AMD SEV-SNP attestation adapter for OCI E5/E6 confidential instances
+#[cfg(feature = "oci")]
+mod oci_principal;  // Instance-principal auth + Secret Management fetch (Option A / Vuln 2)
 
 const GOOGLE_CA_PEM: &[u8] = include_bytes!("google_ca.pem");
 const PAYPAL_CA_PEM: &[u8] = include_bytes!("paypal.pem");
@@ -167,11 +169,28 @@ mod enclave_init {
         mount_fs("configfs", "/sys/kernel/config", "configfs");
         std::fs::create_dir_all("/dev/pts").ok();
 
-        // 9. Mount EFI partition to measure the boot chain
+        // 9. Mount EFI partition to measure the boot chain.
+        //    vfat's default iocharset (utf8) needs the nls_utf8 module, which
+        //    is NOT staged in the OL10 initramfs — a plain vfat mount then
+        //    fails on OCI. Retry with the NLS charsets that are kernel
+        //    builtins (nls_ascii / nls_cp437). GCP standard is sda1, VirtIO
+        //    is vda1; OCI E5 is vda1 (virtio-blk) or nvme0n1p1 (PV-NVMe).
         std::fs::create_dir_all("/boot/efi").ok();
-        // GCP standard is sda1, VirtIO is vda1.
-        mount_fs("/dev/sda1", "/boot/efi", "vfat");
-        mount_fs("/dev/vda1", "/boot/efi", "vfat");
+        for efi_dev in ["/dev/sda1", "/dev/vda1", "/dev/nvme0n1p1"] {
+            let mounted = [None, Some("iocharset=ascii"), Some("iocharset=cp437")].into_iter().any(|opts| {
+                let src = std::ffi::CString::new(efi_dev).unwrap();
+                let tgt = std::ffi::CString::new("/boot/efi").unwrap();
+                let fst = std::ffi::CString::new("vfat").unwrap();
+                let data_c = opts.map(std::ffi::CString::new).transpose().ok().flatten();
+                let data_ptr = data_c.as_ref().map(|c| c.as_ptr().cast::<std::ffi::c_void>()).unwrap_or(std::ptr::null());
+                let ret = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), libc::MS_RDONLY, data_ptr) };
+                if ret == 0 {
+                    kmsg(&format!("Mounted EFI partition {} at /boot/efi{}", efi_dev, opts.map(|o| format!(" ({o})")).unwrap_or_default()));
+                }
+                ret == 0
+            });
+            if mounted { break; }
+        }
 
         kmsg("Filesystems mounted");
     }
@@ -182,38 +201,73 @@ mod enclave_init {
         
         let mount_point = "/tmp/esp";
         let _ = std::fs::create_dir_all(mount_point);
-        
-        fn mount_device(source: &str, target: &str) -> bool {
+
+        // v153 (audit follow-up: empty `disk_manifest` on OCI): this manifest
+        // is what verify.html's GitHub-provenance half audits on TPM-less
+        // reports — an empty manifest renders as "❌ Image Atomicity". On the
+        // live OCI E5 instance it was empty because UEK8's vfat defaults to
+        // iocharset=utf8 and nls_utf8 is NOT staged in the OL10 initramfs,
+        // so every plain vfat mount failed with EIO. Fix: explicit iocharset
+        // fallbacks using NLS charsets that are kernel builtins on both UEK8
+        // and Debian (nls_ascii / nls_cp437), plus broader discovery.
+        modprobe("vfat");
+        modprobe("nls_cp437");
+        modprobe("nls_ascii");
+
+        fn mount_device(source: &str, target: &str, data: Option<&str>) -> bool {
             let src = std::ffi::CString::new(source).unwrap();
             let tgt = std::ffi::CString::new(target).unwrap();
             let fst = std::ffi::CString::new("vfat").unwrap();
-            let ret = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), libc::MS_RDONLY, std::ptr::null()) };
+            let data_c = match data { Some(d) => std::ffi::CString::new(d).ok(), None => None };
+            let data_ptr = match &data_c {
+                Some(c) => c.as_ptr().cast::<std::ffi::c_void>(),
+                None => std::ptr::null(),
+            };
+            let ret = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), libc::MS_RDONLY, data_ptr) };
             if ret == 0 {
-                kmsg(&format!("Successfully mounted {} to {}", source, target));
+                kmsg(&format!("Successfully mounted {}{} -> {}", source, data.map(|d| format!(" ({d})")).unwrap_or_default(), target));
                 true
             } else {
+                kmsg(&format!("vfat mount of {} failed: {}", source, std::io::Error::last_os_error()));
                 false
             }
         }
 
-        // DYNAMIC DISCOVERY: Scan /sys/class/block for anything that looks like a partition
+        // 1. Prefer the ESP that mount_filesystems() already mounted at
+        //    /boot/efi — same volume, and it proves the mount path worked.
+        if std::fs::read_dir("/boot/efi").map(|mut e| e.next().is_some()).unwrap_or(false) {
+            kmsg("Measuring boot components from already-mounted /boot/efi");
+            hash_recursive("/boot/efi", "/boot/efi", &mut manifest);
+            if !manifest.is_empty() {
+                kmsg(&format!("Disk manifest: {} files measured (pre-mounted ESP)", manifest.len()));
+                return manifest;
+            }
+        }
+
+        // 2. DYNAMIC DISCOVERY: try EVERY block device (partitions AND
+        //    whole-disk images — the old digit-only filter skipped bare
+        //    `vda`/`sda`, which is how an unpartitioned ESP would appear),
+        //    each across the iocharset fallbacks. loop/ram/zram devices are
+        //    skipped: never the ESP, and a stray loop mount could shadow it.
         let mut success = false;
         if let Ok(entries) = std::fs::read_dir("/sys/class/block") {
             let mut candidates: Vec<String> = entries.filter_map(|e| e.ok())
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.chars().any(|c| c.is_digit(10))) // Likely a partition
+                .filter(|n| !n.starts_with("loop") && !n.starts_with("ram") && !n.starts_with("zram"))
                 .collect();
-            candidates.sort(); // Try sda1 before sda2 etc.
-            
-            for dev_name in candidates {
+            candidates.sort();
+
+            'devices: for dev_name in candidates {
                 let dev_path = format!("/dev/{}", dev_name);
-                if mount_device(&dev_path, mount_point) {
-                    success = true;
-                    break;
+                for opts in [None, Some("iocharset=ascii"), Some("iocharset=cp437")] {
+                    if mount_device(&dev_path, mount_point, opts) {
+                        success = true;
+                        break 'devices;
+                    }
                 }
             }
         }
-        
+
         if !success {
             kmsg("CRITICAL: Failed to mount EFI System Partition after scanning all devices!");
         }
@@ -242,10 +296,12 @@ mod enclave_init {
                 }
             }
         }
-        hash_recursive(mount_point, mount_point, &mut manifest);
-        
-        let tgt = std::ffi::CString::new(mount_point).unwrap();
-        unsafe { libc::umount(tgt.as_ptr()); }
+        if success {
+            hash_recursive(mount_point, mount_point, &mut manifest);
+            let tgt = std::ffi::CString::new(mount_point).unwrap();
+            unsafe { libc::umount(tgt.as_ptr()); }
+        }
+        kmsg(&format!("Disk manifest: {} files measured", manifest.len()));
         manifest
     }
 
@@ -509,7 +565,7 @@ use acme2_eab::{
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering, AtomicU64};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
 use tokio::sync::Semaphore;
 use tokio::net::TcpListener;
@@ -554,6 +610,11 @@ mod tpm {
         pub amd_chain_b64: Option<String>,
         pub google_ak_cert_pem: Option<String>,
         pub ak_der_sha256: String,
+        // v153: VLEK (Versioned Loaded Endorsement Key) when the PSP cert
+        // table offers one — some multi-tenant confidential hosts sign
+        // reports with a vendor-loaded key instead of the chip VCEK.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub vlek_der_b64: Option<String>,
         // Legacy TDX schema fields — always None after the OCI migration,
         // kept so older reports remain deserializable.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -702,38 +763,202 @@ mod tpm {
         Ok(dek)
     }
 
+    // =========================================================================
+    // v152: AMD KDS material cache — VCEK + ASK/ARK cert chain
+    // ---------------------------------------------------------------------------
+    // The enclave may boot from a read-only root or a volatile initramfs, so KDS
+    // material is fetched ONCE and persisted. Directory resolution order:
+    //   1. $AMD_VCEK_CACHE_DIR           explicit override (bring-up / tests)
+    //   2. /persistent/.enclave/amd-kds  writable persistent mount (survives reboot)
+    //   3. /tmp/amd-kds-cache            tmpfs fallback when /persistent is absent
+    // A cache miss (or an expired / partial entry) is the ONLY reason to hit
+    // kdsintf.amd.com again. The VCEK cache name embeds chip_id + reported TCB
+    // SPLs, so a TCB update changes the key and triggers exactly one fresh
+    // download — every other boot reuses the persisted cert.
+    // =========================================================================
+
+    /// Writable cache directory, chosen once per process.
+    fn kds_cache_dir() -> Option<std::path::PathBuf> {
+        static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+            if let Ok(d) = std::env::var("AMD_VCEK_CACHE_DIR") {
+                if !d.is_empty() { candidates.push(std::path::PathBuf::from(d)); }
+            }
+            candidates.push(std::path::PathBuf::from("/persistent/.enclave/amd-kds"));
+            candidates.push(std::path::PathBuf::from("/tmp/amd-kds-cache"));
+            for dir in &candidates {
+                if std::fs::create_dir_all(dir).is_ok() {
+                    let probe = dir.join(".probe");
+                    if std::fs::write(&probe, b"1").is_ok() {
+                        let _ = std::fs::remove_file(&probe);
+                        tracing::info!("v152: AMD KDS cache directory: {}", dir.display());
+                        return Some(dir.clone());
+                    }
+                }
+            }
+            tracing::warn!("v152: no writable AMD KDS cache directory — every attestation will hit kdsintf.amd.com");
+            None
+        }).clone()
+    }
+
+    /// Cache name for a VCEK: family + chip + reported TCB SPLs. Any TCB
+    /// component changing produces a new key → forced re-download for that TCB.
+    fn kds_vcek_cache_name(family: &str, chip_id: &str, bl: u8, tee: u8, snp: u8, ucode: u8) -> String {
+        format!("vcek-{}-{}-{:02}{:02}{:02}{:02}.der", family, chip_id, bl, tee, snp, ucode)
+    }
+
+    /// Re-download certs that expire within this window (an expired VCEK would
+    /// fail the auditor's chain check anyway — expiry outranks TCB stability).
+    const KDS_CERT_MARGIN_SECS: i64 = 7 * 24 * 3600;
+
+    fn kds_cert_not_expired(cert: &openssl::x509::X509) -> bool {
+        let margin = match openssl::asn1::Asn1Time::from_unix(chrono::Utc::now().timestamp() + KDS_CERT_MARGIN_SECS) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        match margin.diff(cert.not_after()) {
+            // not_after − margin > 0 → cert still valid past the margin.
+            Ok(d) => d.days > 0 || (d.days == 0 && d.secs > 0),
+            Err(_) => false,
+        }
+    }
+
+    /// A cached VCEK is usable iff it parses (PEM or raw DER — KDS serves DER)
+    /// and its validity window comfortably outlives the next attestation.
+    fn kds_vcek_is_fresh(bytes: &[u8]) -> bool {
+        match openssl::x509::X509::from_pem(bytes).or_else(|_| openssl::x509::X509::from_der(bytes)) {
+            Ok(c) => kds_cert_not_expired(&c),
+            Err(_) => false,
+        }
+    }
+
+    /// Number of `-----BEGIN CERTIFICATE-----` markers in a PEM blob.
+    fn kds_chain_cert_count(pem: &[u8]) -> usize {
+        pem.windows(27).filter(|w| *w == b"-----BEGIN CERTIFICATE-----").count()
+    }
+
+    /// Split a PEM bundle into parsed X.509 certificates (order preserved).
+    fn kds_pem_certs(pem: &[u8]) -> Vec<openssl::x509::X509> {
+        let text = String::from_utf8_lossy(pem);
+        let mut out = Vec::new();
+        for chunk in text.split("-----END CERTIFICATE-----") {
+            let begin = match chunk.find("-----BEGIN CERTIFICATE-----") { Some(i) => i, None => continue };
+            let block = format!("{}-----END CERTIFICATE-----", &chunk[begin..]);
+            if let Ok(c) = openssl::x509::X509::from_pem(block.as_bytes()) { out.push(c); }
+        }
+        out
+    }
+
+    /// The published chain must be the FULL issuer path — ASK (signs the VCEK)
+    /// → ARK (root). verify.html anchors silicon trust ONLY on the ARK (SHA-256
+    /// of its raw DER) and walks VCEK→ASK→ARK itself, so a blob shorter than
+    /// ASK+ARK can never validate: it is neither cached nor published.
+    fn kds_chain_is_fresh(pem: &[u8]) -> bool {
+        if kds_chain_cert_count(pem) < 2 { return false; }
+        let certs = kds_pem_certs(pem);
+        certs.len() >= 2 && certs.iter().all(kds_cert_not_expired)
+    }
+
     async fn fetch_vcek(chip_id: &str, bl: u8, tee: u8, snp: u8, ucode: u8) -> Option<String> {
-        let client = reqwest::Client::new(); // Standard client for public KDS to avoid pinning errors
         // Family-aware KDS endpoint (Milan / Genoa / Turin) derived from CPUID
         let family = crate::oci_snp::amd_kds_family();
+        let cache_name = kds_vcek_cache_name(&family, chip_id, bl, tee, snp, ucode);
+
+        // 1. Cache first — reused across boots until the TCB (key) changes.
+        if let Some(dir) = kds_cache_dir() {
+            let path = dir.join(&cache_name);
+            match tokio::fs::read(&path).await {
+                Ok(bytes) if !bytes.is_empty() && kds_vcek_is_fresh(&bytes) => {
+                    tracing::info!("v152: VCEK cache hit {} ({} bytes)", path.display(), bytes.len());
+                    return Some(STANDARD.encode(&bytes));
+                }
+                Ok(_) => tracing::warn!("v152: cached VCEK expired/unparsable — re-downloading {}", path.display()),
+                Err(_) => {} // miss (incl. TCB change → new cache name)
+            }
+        }
+
+        // 2. Fetch from the public AMD KDS (standard client: no pinning).
+        let client = reqwest::Client::new();
         let url = format!("https://kdsintf.amd.com/vcek/v1/{}/{}?blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}", family, chip_id, bl, tee, snp, ucode);
         tracing::info!("v136: Fetching VCEK from {}", url);
-        match client.get(&url).send().await {
+        let bytes = match client.get(&url).send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    if let Ok(bytes) = resp.bytes().await { 
-                        tracing::info!("v136: VCEK fetch succeeded ({} bytes)", bytes.len());
-                        return Some(STANDARD.encode(&bytes)); 
+                    match resp.bytes().await {
+                        Ok(b) => { tracing::info!("v136: VCEK fetch succeeded ({} bytes)", b.len()); Some(b) },
+                        Err(e) => { tracing::warn!("v136: VCEK body read failed: {}", e); None },
                     }
                 } else {
                     tracing::warn!("v136: VCEK fetch failed with status {}. Response: {:?}", status, resp.text().await.unwrap_or_default());
+                    None
                 }
             },
-            Err(e) => tracing::warn!("v136: VCEK fetch HTTP error: {}", e),
+            Err(e) => { tracing::warn!("v136: VCEK fetch HTTP error: {}", e); None }
+        }?;
+
+        // 3. Persist (best effort) and prune superseded TCBs for this chip so
+        //    the cache directory holds exactly one VCEK per chip.
+        if let Some(dir) = kds_cache_dir() {
+            let path = dir.join(&cache_name);
+            match tokio::fs::write(&path, &bytes).await {
+                Ok(()) => {
+                    tracing::info!("v152: VCEK persisted to {}", path.display());
+                    let prefix = format!("vcek-{}-{}-", family, chip_id);
+                    if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+                        while let Ok(Some(entry)) = rd.next_entry().await {
+                            let name = entry.file_name();
+                            let name = name.to_string_lossy();
+                            if name.starts_with(&prefix) && name != cache_name.as_str() {
+                                let _ = tokio::fs::remove_file(entry.path()).await;
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("v152: VCEK cache write to {} failed: {}", path.display(), e),
+            }
         }
-        None
+
+        Some(STANDARD.encode(&bytes))
     }
 
     async fn fetch_amd_chain() -> Option<String> {
-        let client = reqwest::Client::new();
         let family = crate::oci_snp::amd_kds_family();
+        let cache_name = format!("chain-{}.pem", family);
+
+        // 1. Cache first — family-scoped and TCB-independent.
+        if let Some(dir) = kds_cache_dir() {
+            let path = dir.join(&cache_name);
+            if let Ok(text) = tokio::fs::read(&path).await {
+                if kds_chain_is_fresh(&text) {
+                    tracing::info!("v152: AMD cert chain cache hit {} ({} certs)", path.display(), kds_chain_cert_count(&text));
+                    return Some(STANDARD.encode(&text));
+                }
+                tracing::warn!("v152: cached AMD chain incomplete/stale — re-downloading {}", path.display());
+            }
+        }
+
+        let client = reqwest::Client::new();
         match client.get(format!("https://kdsintf.amd.com/vcek/v1/{}/cert_chain", family)).send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    if let Ok(text) = resp.text().await { 
-                        tracing::info!("v136: AMD chain fetch succeeded");
-                        return Some(STANDARD.encode(text.as_bytes())); 
+                    if let Ok(text) = resp.text().await {
+                        if !kds_chain_is_fresh(text.as_bytes()) {
+                            // Fail closed: a partial chain can never satisfy the
+                            // auditor's ARK pin, so refuse to cache/publish it.
+                            tracing::error!("v152: AMD chain fetch returned an incomplete chain ({} certs, need ASK+ARK) — refusing to publish", kds_chain_cert_count(text.as_bytes()));
+                            return None;
+                        }
+                        tracing::info!("v136: AMD chain fetch succeeded ({} certs)", kds_chain_cert_count(text.as_bytes()));
+                        // 2. Persist (best effort).
+                        if let Some(dir) = kds_cache_dir() {
+                            let path = dir.join(&cache_name);
+                            if let Err(e) = tokio::fs::write(&path, &text).await {
+                                tracing::warn!("v152: AMD chain cache write to {} failed: {}", path.display(), e);
+                            }
+                        }
+                        return Some(STANDARD.encode(text.as_bytes()));
                     }
                 } else {
                     tracing::warn!("v136: AMD chain fetch failed with status {}", resp.status());
@@ -742,6 +967,90 @@ mod tpm {
             Err(e) => tracing::warn!("v136: AMD chain fetch HTTP error: {}", e),
         }
         None
+    }
+
+    // v152: Warm the KDS cache up front — fetch the VCEK + cert chain once and
+    // persist them BEFORE the first attestation request. Uses a zero-nonce SNP
+    // report only to read chip_id + TCB SPLs for the cache key; that report is
+    // never presented as evidence. No-op when valid cache entries exist.
+    #[cfg(feature = "oci")]
+    pub async fn warm_kds_cache() {
+        if !std::path::Path::new("/dev/sev-guest").exists() {
+            tracing::info!("v152: KDS warm-up skipped (/dev/sev-guest absent)");
+            return;
+        }
+        let report = match crate::oci_snp::snp_get_report(&[0u8; 64]) {
+            Some(r) => r,
+            None => { tracing::warn!("v152: KDS warm-up skipped (zero-nonce SNP report unavailable)"); return; }
+        };
+        let info = match crate::oci_snp::parse_report(&report) {
+            Some(i) => i,
+            None => { tracing::warn!("v152: KDS warm-up skipped (SNP report unparsable)"); return; }
+        };
+        tracing::info!("v152: warming AMD KDS cache — chip {} TCB {:02}{:02}{:02}{:02}", &info.chip_id_hex[..16], info.bl, info.tee, info.snp, info.ucode);
+        let vcek = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await;
+        let chain = fetch_amd_chain().await;
+        tracing::info!("v152: KDS warm-up complete (vcek={}, chain={})", vcek.is_some(), chain.is_some());
+    }
+
+    #[cfg(test)]
+    mod kds_cache_tests {
+        fn self_signed(days: u32) -> openssl::x509::X509 {
+            use openssl::asn1::Asn1Time;
+            use openssl::hash::MessageDigest;
+            use openssl::pkey::PKey;
+            use openssl::rsa::Rsa;
+            use openssl::x509::X509Builder;
+            let pkey = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+            let mut b = X509Builder::new().unwrap();
+            b.set_version(2).unwrap();
+            let mut name = openssl::x509::X509NameBuilder::new().unwrap();
+            name.append_entry_by_text("CN", "kds-cache-test").unwrap();
+            let name = name.build();
+            b.set_subject_name(&name).unwrap();
+            b.set_issuer_name(&name).unwrap();
+            b.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+            b.set_not_after(&Asn1Time::days_from_now(days).unwrap()).unwrap();
+            b.set_pubkey(&pkey).unwrap();
+            b.sign(&pkey, MessageDigest::sha256()).unwrap();
+            b.build()
+        }
+
+        #[test]
+        fn vcek_cache_key_is_tcb_scoped() {
+            let base = super::kds_vcek_cache_name("Genoa", "cafe", 1, 0, 8, 113);
+            assert_eq!(base, "vcek-Genoa-cafe-010008113.der");
+            // TCB change (any SPL) → new key → exactly one forced re-download.
+            assert_ne!(base, super::kds_vcek_cache_name("Genoa", "cafe", 1, 0, 9, 113));
+            assert_ne!(base, super::kds_vcek_cache_name("Genoa", "cafe", 2, 0, 8, 113));
+            // Different chip or family never collides.
+            assert_ne!(base, super::kds_vcek_cache_name("Genoa", "dead", 1, 0, 8, 113));
+            assert_ne!(base, super::kds_vcek_cache_name("Milan", "cafe", 1, 0, 8, 113));
+        }
+
+        #[test]
+        fn vcek_freshness_tracks_expiry() {
+            let fresh = self_signed(365).to_pem().unwrap();
+            let stale = self_signed(3).to_pem().unwrap(); // inside the 7-day margin
+            assert!(super::kds_vcek_is_fresh(&fresh));
+            assert!(!super::kds_vcek_is_fresh(&stale));
+            assert!(!super::kds_vcek_is_fresh(b"not a certificate"));
+            // Raw DER form (what KDS actually serves) is accepted too.
+            let der = self_signed(365).to_der().unwrap();
+            assert!(super::kds_vcek_is_fresh(&der));
+        }
+
+        #[test]
+        fn chain_requires_full_ask_to_ark_path() {
+            let pem = self_signed(365).to_pem().unwrap();
+            let full = [pem.as_slice(), pem.as_slice()].concat();
+            assert_eq!(super::kds_chain_cert_count(&full), 2);
+            assert!(super::kds_pem_certs(&full).len() == 2);
+            assert!(super::kds_chain_is_fresh(&full));
+            // ASK without ARK (or a single cert) is never accepted/published.
+            assert!(!super::kds_chain_is_fresh(&pem));
+            assert_eq!(super::kds_chain_cert_count(&pem), 1);
+        }
     }
 
 
@@ -996,6 +1305,7 @@ mod tpm {
         // Independently verifiable against AMD's KDS without trusting Google.
         let mut auxblob_b64 = None;
         let mut vcek_der_b64 = None;
+        let mut vlek_der_b64 = None;
         let mut amd_chain_b64 = None;
         let mut snp_report_b64 = None;
 
@@ -1015,19 +1325,98 @@ mod tpm {
             None
         };
 
-        // PATH 0: OCI /dev/sev-guest — SNP_GET_REPORT, session-nonce-bound report.
-        // Primary hardware root for OCI confidential instances (no vTPM there).
+        // PATH 0: OCI /dev/sev-guest — SNP_GET_EXT_REPORT (extended guest request,
+        // GHCB v2): the PSP returns the session-bound attestation report AND its
+        // own VCEK/VLEK + ASK + ARK certificate table in one call. The
+        // silicon-provisioned certs are authoritative — on some OCI E5 hosts the
+        // PSP's signing key does NOT match the kdsintf.amd.com entry for the
+        // same chip_id/TCB, so KDS-fetched certs fail to verify the live
+        // report's signature. KDS remains the fallback (legacy kernels, or an
+        // incomplete PSP table).
         #[cfg(feature = "oci")]
         if snp_report_b64.is_none() {
-            tracing::info!("v136: PATH 0 — /dev/sev-guest SNP_GET_REPORT");
-            if let Some(report) = crate::oci_snp::snp_get_report(&nonce_bytes) {
-                if let Some(info) = crate::oci_snp::parse_report(&report) {
-                    tracing::info!("v136: PATH 0 report {} bytes, AMD chip {}", info.report.len(), &info.chip_id_hex[..16]);
-                    vcek_der_b64 = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await;
-                    amd_chain_b64 = fetch_amd_chain().await;
+            tracing::info!("v153: PATH 0 — /dev/sev-guest SNP_GET_EXT_REPORT (report + PSP cert table)");
+            let mut got_ext = false;
+            if let Some(ext) = crate::oci_snp::snp_get_ext_report(&nonce_bytes) {
+                if let Some(info) = crate::oci_snp::parse_report(&ext.report) {
+                    tracing::info!("v153: PATH 0 ext report {} bytes, AMD chip {}", info.report.len(), &info.chip_id_hex[..16]);
+                    let table = crate::oci_snp::parse_snp_cert_table(&ext.certs);
+                    tracing::info!("v153: PSP cert table — vcek={} vlek={} ask={} ark={}",
+                        table.vcek.as_ref().map(|c| crate::oci_snp::hash_cert(c)).unwrap_or_default(),
+                        table.vlek.as_ref().map(|c| crate::oci_snp::hash_cert(c)).unwrap_or_default(),
+                        table.ask.is_some(), table.ark.is_some());
+                    // vlek_der_b64: publish the vendor-loaded key when present so
+                    // auditors can see which key the PSP actually offers.
+                    if let Some(vlek) = table.vlek.as_ref() {
+                        vlek_der_b64 = Some(STANDARD.encode(vlek));
+                    }
+                    // Try EVERY endorsement leaf the PSP offers (VCEK first,
+                    // then VLEK): publish the first one whose chain validates
+                    // AND whose key actually verifies this report's signature.
+                    // On some multi-tenant confidential hosts the report is
+                    // signed by a key that is neither the KDS VCEK nor the
+                    // obvious leaf — this probing finds the real signer.
+                    match (table.ask.clone(), table.ark.clone()) {
+                        (Some(ask), Some(ark)) => {
+                            let mut published = false;
+                            for (label, leaf) in [("VCEK", table.vcek.clone()), ("VLEK", table.vlek.clone())] {
+                                let leaf = match leaf { Some(l) => l, None => continue };
+                                let chain_ok = crate::oci_snp::validate_amd_chain(&leaf, &ask, &ark);
+                                let sig_ok = crate::oci_snp::verify_report_signature(&info.report, &leaf);
+                                tracing::info!("v153: {} leaf: chain_ok={} sig_ok={} sha256={}", label, chain_ok, sig_ok, &crate::oci_snp::hash_cert(&leaf)[..16]);
+                                if chain_ok && sig_ok {
+                                    tracing::info!("v153: PSP cert table VERIFIED with {} (report signed by this key)", label);
+                                    vcek_der_b64 = Some(STANDARD.encode(&leaf));
+                                    let chain_pem = format!("{}{}",
+                                        crate::oci_snp::der_to_pem("CERTIFICATE", &ask),
+                                        crate::oci_snp::der_to_pem("CERTIFICATE", &ark));
+                                    amd_chain_b64 = Some(STANDARD.encode(chain_pem.as_bytes()));
+                                    published = true;
+                                    break;
+                                }
+                            }
+                            if !published {
+                                tracing::error!("v153: no PSP cert (VCEK/VLEK) verifies this report — falling back to KDS");
+                            }
+                        }
+                        _ => tracing::warn!("v153: PSP cert table incomplete (vcek={} vlek={} ask={} ark={}) — falling back to KDS",
+                            table.vcek.is_some(), table.vlek.is_some(), table.ask.is_some(), table.ark.is_some()),
+                    }
                     snp_report_b64 = Some(STANDARD.encode(&info.report));
+                    got_ext = true;
+                    // KDS fallback for anything the PSP table didn't supply —
+                    // with a loud diagnostic when the KDS key disagrees with
+                    // the live report (the OCI E5 mismatch being fixed here).
+                    if vcek_der_b64.is_none() {
+                        vcek_der_b64 = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await;
+                        if let Some(b64) = vcek_der_b64.as_ref() {
+                            if let Ok(der) = STANDARD.decode(b64) {
+                                if !crate::oci_snp::verify_report_signature(&info.report, &der) {
+                                    tracing::error!("v153: KDS VCEK does NOT verify the live report signature (OCI PSP/KDS key mismatch) — auditors cannot validate this report");
+                                }
+                            }
+                        }
+                    }
+                    if amd_chain_b64.is_none() {
+                        amd_chain_b64 = fetch_amd_chain().await;
+                    }
                 } else {
-                    tracing::error!("v136: PATH 0 produced an unparseable SNP report");
+                    tracing::error!("v153: PATH 0 ext report unparseable");
+                }
+            }
+            if !got_ext {
+                // Legacy path: plain SNP_GET_REPORT (older kernels without the
+                // extended request) — certs from AMD KDS as before.
+                tracing::info!("v136: PATH 0 — /dev/sev-guest SNP_GET_REPORT");
+                if let Some(report) = crate::oci_snp::snp_get_report(&nonce_bytes) {
+                    if let Some(info) = crate::oci_snp::parse_report(&report) {
+                        tracing::info!("v136: PATH 0 report {} bytes, AMD chip {}", info.report.len(), &info.chip_id_hex[..16]);
+                        vcek_der_b64 = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await;
+                        amd_chain_b64 = fetch_amd_chain().await;
+                        snp_report_b64 = Some(STANDARD.encode(&info.report));
+                    } else {
+                        tracing::error!("v136: PATH 0 produced an unparseable SNP report");
+                    }
                 }
             }
         }
@@ -1155,6 +1544,7 @@ mod tpm {
             auxblob_b64,
             signature_binding_pubkey_hash: "".to_string(), // Filled by caller
             vcek_der_b64,
+            vlek_der_b64,
             amd_chain_b64,
             google_ak_cert_pem,
             ak_der_sha256,
@@ -1199,7 +1589,13 @@ mod crypto {
 
 const MAX_TRACKED_IPS: usize = 1000;
 const MAX_CONCURRENT_CONNECTIONS: usize = 50;
-const GLOBAL_EGRESS_BYTES_PER_HOUR: u64 = 512 * 1024 * 1024; // 512 MB
+// v153 SECURITY (audit SEC-05): the GLOBAL_EGRESS_BYTES_PER_HOUR cap (512
+// MB/hour shared across all clients) was removed. The homepage is ~3 KB, so
+// ~170k cheap requests — or one fat /callback download loop — exhausted the
+// shared counter and record_egress_data() returned 429 to EVERY client until
+// the hour rolled over: a self-inflicted service-wide DoS with no attacker
+// cost. Abuse containment stays per-IP; bulk-volume protection belongs at the
+// infrastructure firewall (nftables), not in the request path.
 const IP_EGRESS_BYTES_PER_HOUR: u64 = 25 * 1024 * 1024;     // 25 MB
 const GOOGLE_PUBLIC_CA_DIRECTORY: &str = "https://dv.acme-v02.api.pki.goog/directory";
 const LETSENCRYPT_CA_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
@@ -1270,6 +1666,14 @@ struct Config {
     // v69: Asymmetric key for signing the attestation payload
     #[serde(default)]
     attestation_signing_key: Option<String>,
+    // v153 Option A (audit Vuln 2): OCID of the OCI Secret Management bundle
+    // holding the real configuration. When set on the (non-secret) user_data
+    // template, the enclave resolves credentials via instance principals
+    // instead of trusting plaintext metadata. Empty credential strings in the
+    // template are placeholders — they fail `require_credentials` if the
+    // secret cannot be fetched (fail-closed).
+    #[serde(default)]
+    secret_ocid: Option<String>,
 }
 
 // ============================================================================
@@ -1290,11 +1694,9 @@ struct AppState {
     staging: bool,
     // v69: For inclusion in remote attestation
     tls_cert_pem: Arc<RwLock<Option<String>>>,
-    attestation_signing_key: Option<String>,
-    // v70: DDoS Protection for IP tracking
-    ip_stats: Arc<RwLock<std::collections::BTreeMap<IpAddr, u64>>>,
-    global_egress_bytes: Arc<AtomicU64>,
-    last_limit_reset: Arc<RwLock<Instant>>,
+    attestation_signing_key: Option<String>,        // v70: DDoS Protection for IP tracking
+        ip_stats: Arc<RwLock<std::collections::BTreeMap<IpAddr, u64>>>,
+        last_limit_reset: Arc<RwLock<Instant>>,
     connection_semaphore: Arc<Semaphore>,
     boot_manifest: BTreeMap<String, String>,
     pending_attestations: Arc<RwLock<std::collections::HashMap<String, (String, PayPalUserInfo, Instant)>>>,
@@ -1341,19 +1743,12 @@ impl AppState {
         if now.duration_since(*reset) > Duration::from_secs(3600) {
             info!("Egress data counters reset (1 hour interval reached)");
             *reset = now;
-            self.global_egress_bytes.store(0, Ordering::Relaxed);
             stats.clear();
         }
         drop(reset); 
 
-        // 1. Global Data Limit Check
-        let current_global = self.global_egress_bytes.fetch_add(bytes, Ordering::Relaxed);
-        if current_global + bytes >= GLOBAL_EGRESS_BYTES_PER_HOUR {
-            error!("Global data limit reached ({}/{} bytes)", current_global, GLOBAL_EGRESS_BYTES_PER_HOUR);
-            return Err(StatusCode::TOO_MANY_REQUESTS);
-        }
-
-        // 2. Per-IP Data Limit Check
+        // Per-IP Data Limit Check (see IP_EGRESS_BYTES_PER_HOUR for why the
+        // old global cap was removed — audit SEC-05).
         let ip_bytes = if let Some(count) = stats.get_mut(&ip) {
             *count += bytes;
             *count
@@ -1448,7 +1843,10 @@ async fn fetch_secret_direct(secret_id: &str) -> Option<String> {
         .send().await.ok()?.json().await.ok()?;
     let access_token = token_resp["access_token"].as_str()?;
 
-    let project_id = "REDACTED_GCP_PROJECT";
+    // Audit SEC-07: the operator's GCP project id is no longer hard-coded in
+    // this public repo — bake it in at compile time for GCP builds:
+    //   GCP_PROJECT_ID=... cargo build --release
+    let project_id = gcp_project_id()?;
     let url = format!("https://secretmanager.googleapis.com/v1/projects/{}/secrets/{}/versions/latest:access", project_id, secret_id);
     let secret_resp: serde_json::Value = client
         .get(&url).bearer_auth(access_token).send().await.ok()?.json().await.ok()?;
@@ -1485,6 +1883,7 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
             paypal_verified_client_id: Some(pv_id),
             paypal_verified_client_secret: Some(pv_sec),
             domain: dom,
+            secret_ocid: None,
             eab_key_id: std::env::var("EAB_KEY_ID").ok(),
             eab_hmac_key: std::env::var("EAB_HMAC_KEY").ok(),
             staging: std::env::var("STAGING").map(|s| s == "true").unwrap_or(false),
@@ -1521,6 +1920,34 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
             Some(raw) => {
                 match serde_json::from_str::<Config>(raw.trim()) {
                     Ok(c) => {
+                        // Option A: resolve the real config from Secret
+                        // Management when the template names a secret OCID.
+                        // On fetch/parse failure keep the template — its empty
+                        // credential fields then fail `require_credentials`
+                        // (fail-closed; no silent plaintext fallback exists
+                        // because the migrated template carries no secrets).
+                        let c = match c.secret_ocid.clone() {
+                            Some(ocid) => {
+                                info!("secret_ocid present — resolving configuration via instance principal...");
+                                match crate::oci_principal::get_secret_bundle(&ocid).await {
+                                    Ok(inner) => match resolve_secret_config(inner.trim()) {
+                                        Ok(resolved) => {
+                                            info!("Loaded configuration from OCI Secret Management bundle");
+                                            resolved
+                                        }
+                                        Err(e) => {
+                                            warn!("Secret bundle is not valid config JSON: {}", e);
+                                            c
+                                        }
+                                    },
+                                    Err(e) => {
+                                        warn!("Secret bundle fetch failed: {}", e);
+                                        c
+                                    }
+                                }
+                            }
+                            None => c,
+                        };
                         info!("Loaded configuration from OCI instance user_data");
                         return require_credentials(c);
                     }
@@ -1539,10 +1966,30 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
     Err("Configuration not available. Set PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, PAYPAL_VERIFIED_CLIENT_ID, PAYPAL_VERIFIED_CLIENT_SECRET, DOMAIN environment variables, or provide CONFIG_FILE path.".into())
 }
 
+/// Parse a secret-bundle payload as the real configuration (Option A).
+/// The bundle's own `secret_ocid` field (if any) is cleared so the resolved
+/// config can never re-trigger a fetch.
+#[cfg(feature = "oci")]
+fn resolve_secret_config(secret_json: &str) -> Result<Config, String> {
+    let mut cfg: Config = serde_json::from_str(secret_json).map_err(|e| e.to_string())?;
+    cfg.secret_ocid = None;
+    Ok(cfg)
+}
+
+/// GCP project id for the Secret Manager path (GCP build only).
+/// Audit SEC-07: not hard-coded anymore — provide it at compile time:
+///   GCP_PROJECT_ID=... cargo build --release
+#[cfg(not(feature = "oci"))]
+fn gcp_project_id() -> Option<&'static str> {
+    option_env!("GCP_PROJECT_ID").filter(|s| !s.is_empty())
+}
+
 /// Fetch configuration from GCP Secret Manager
 #[cfg(not(feature = "oci"))]
 async fn fetch_config_from_gcp() -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
-    let mode_secret = "projects/REDACTED_GCP_PROJECT/secrets/PAYPAL_AUTH_MODE/versions/latest";
+    let project_id = gcp_project_id()
+        .ok_or("GCP_PROJECT_ID not baked into this build — GCP Secret Manager path disabled (set the env at compile time)")?;
+    let mode_secret = format!("projects/{}/secrets/PAYPAL_AUTH_MODE/versions/latest", project_id);
     let client = hardened_client();
 
     let token_resp: serde_json::Value = client
@@ -1581,7 +2028,7 @@ async fn fetch_config_from_gcp() -> Result<Config, Box<dyn std::error::Error + S
     let base_secret_name = if mode == "staging" { "PAYPAL_AUTH_STAGING" } else { "PAYPAL_AUTH_PRODUCTION" };
 
     let secret_name = std::env::var("SECRET_NAME").unwrap_or_else(|_| {
-        format!("projects/REDACTED_GCP_PROJECT/secrets/{}/versions/latest", base_secret_name)
+        format!("projects/{}/secrets/{}/versions/latest", project_id, base_secret_name)
     });
 
     info!("Fetching main config from: {}", secret_name);
@@ -2149,9 +2596,25 @@ fn hardened_client() -> reqwest::Client {
         .timeout(std::time::Duration::from_secs(30))
         .use_rustls_tls()
         // v151: DNS Egress Hardening (Prevent DNS Hijacking)
-        // Hardcode PayPal API production IP to bypass OS resolver.
-        .resolve("api-m.paypal.com", std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(104, 16, 124, 74)), 443))
-        .resolve("api-m.sandbox.paypal.com", std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(146, 75, 123, 1)), 443));
+        // v153 (audit SEC-06): pin MULTIPLE Cloudflare/Fastly edge addresses
+        // per PayPal host instead of a single Anycast IP. A single pinned IP
+        // is a single point of failure — PayPal/Cloudflare reroute edges
+        // routinely (the v151 pin 104.16.124.74 stopped appearing in live
+        // DNS answers by 2026-10), and when that edge goes dark every token
+        // exchange dies until a new disk image is built. reqwest tries the
+        // pinned addrs in order, so this degrades gracefully. IP takeover
+        // cannot forge identity here: TLS still validates the hostname
+        // against the embedded PayPal/Google roots — the pins only defeat
+        // resolver hijack and keep availability. Refresh this list if
+        // PayPal's edges rotate again (dig api-m.paypal.com).
+        .resolve_to_addrs("api-m.paypal.com", &[
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(104, 16, 125, 58)), 443),
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(104, 16, 126, 58)), 443),
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(104, 16, 124, 74)), 443),
+        ])
+        .resolve_to_addrs("api-m.sandbox.paypal.com", &[
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(146, 75, 123, 1)), 443),
+        ]);
     
     // Pin PayPal Root CA (Embedded)
     if let Ok(cert) = Certificate::from_pem(PAYPAL_CA_PEM) {
@@ -2798,6 +3261,15 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
 
     eprintln!("[DEBUG] tracing initialized");
     info!("Starting PayPal Auth on {} (v151 Hardened)", PLATFORM_LABEL);
+
+    #[cfg(feature = "oci")]
+    {
+        // v152: fetch the AMD VCEK + ASK/ARK cert chain once, up front, and
+        // persist them (read-only root → /persistent when available, /tmp
+        // tmpfs otherwise). Later quote() calls reuse the cache and only
+        // re-download when the TCB changes.
+        tokio::spawn(async { tpm::warm_kds_cache().await });
+    }
     info!("SECRET_NAME={:?}", std::env::var("SECRET_NAME"));
 
     eprintln!("[DEBUG] about to fetch config");
@@ -2911,7 +3383,6 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         tls_cert_pem: Arc::new(RwLock::new(None)),
         attestation_signing_key,
         ip_stats: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
-        global_egress_bytes: Arc::new(AtomicU64::new(0)),
         last_limit_reset: Arc::new(RwLock::new(Instant::now())),
         connection_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         boot_manifest,
@@ -3189,7 +3660,36 @@ mod security_tests {
             staging: false,
             acme_account_json: None,
             attestation_signing_key: None,
+            secret_ocid: None,
         }
+    }
+
+    #[cfg(feature = "oci")]
+    #[test]
+    fn option_a_secret_resolution_and_fail_closed() {
+        // 1. The migrated (non-secret) user_data template parses: empty
+        //    credential fields + secret_ocid.
+        let template: Config = serde_json::from_str(
+            r#"{"paypal_client_id":"","paypal_client_secret":"","domain":"x.example.com","secret_ocid":"ocid1.secret.oc1..abc"}"#,
+        )
+        .expect("template must parse");
+        assert_eq!(template.secret_ocid.as_deref(), Some("ocid1.secret.oc1..abc"));
+
+        // 2. An unfetched template FAILS credential validation (fail-closed:
+        //    no silent acceptance of an empty secret).
+        assert!(require_credentials(template).is_err());
+
+        // 3. The secret bundle payload resolves to full credentials and its
+        //    own secret_ocid is cleared (no re-fetch loops).
+        let resolved = resolve_secret_config(
+            r#"{"paypal_client_id":"id","paypal_client_secret":"sec","domain":"x.example.com","secret_ocid":"ocid1.secret.oc1..abc"}"#,
+        )
+        .expect("bundle must resolve");
+        assert_eq!(resolved.paypal_client_secret, "sec");
+        assert!(resolved.secret_ocid.is_none());
+
+        // 4. A malformed bundle is rejected loudly.
+        assert!(resolve_secret_config("not json").is_err());
     }
 
     #[test]

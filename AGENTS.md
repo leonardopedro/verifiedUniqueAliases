@@ -37,10 +37,10 @@ The project uses a **single codebase** with conditional compilation to support b
 - **PCR 15 Software Binding**: Strict verification of `disk_manifest` hash against hardware PCR 15, ensuring running code matches GitHub provenance.
 - **PCR Composite Digest**: Auditor manually reconstructs expected SHA-256 hash of all quoted PCRs (0, 4, 8, 9, 15) and verifies against signed `TPMS_ATTEST`.
 - **Native DHCP Implementation**: Complete rewrite of network acquisition from shell scripts into pure Rust. Uses `socket2` with `SO_BINDTODEVICE` for reliable broadcast UDP on interfaces lacking IP bindings, including full BOOTP packet construction, lease parsing, and route application (with GCP-specific `/32` MTU handling).
-- **Four-Path AMD Hardware Root Acquisition**: Automatic fallback strategy when acquiring SNP reports — PATH 0: native `/dev/sev-guest` ioctl (`SNP_GET_REPORT`, report_data = session nonce, OCI primary), PATH 1: NVRAM scan (systematic NV index discovery), PATH 2: TPM quote auxblob inspection, PATH 3: ConfigFS TSM interface. Includes automatic VCEK fetch from AMD Key Distribution Service (KDS) based on extracted chip ID with CPUID family-aware product naming (Milan/Genoa/Turin) and TCB layout selection (AMD KDS spec Tables 3/4).
+- **Four-Path AMD Hardware Root Acquisition**: Automatic fallback strategy when acquiring SNP reports — PATH 0: native `/dev/sev-guest` ioctl (`SNP_GET_EXT_REPORT` first, which returns the PSP's own VCEK/VLEK+ASK+ARK cert table in one call, then plain `SNP_GET_REPORT`), PATH 1: NVRAM scan (systematic NV index discovery), PATH 2: TPM quote auxblob inspection, PATH 3: ConfigFS TSM interface. The PSP cert table is authoritative — the enclave verifies chain + report signature against each offered leaf (VCEK, then VLEK) and publishes the one that verifies; AMD KDS remains the fallback for legacy kernels. Includes automatic VCEK fetch from AMD Key Distribution Service (KDS) based on extracted chip ID with CPUID family-aware product naming (Milan/Genoa/Turin) and TCB layout selection (AMD KDS spec Tables 3/4).
 - **OCI SEV-SNP Adapter** (`oci_snp.rs`): Replaces the retired Intel TDX module — sev-guest ioctl structs, CPUID family detection (`__cpuid(1)`), report parsing (report_data/chip_id/reported_tcb/signature at documented offsets), TCB byte-layout selection (Layout A vs B), AMD KDS VCEK/chain fetch, and OCI instance metadata access (`/opc/v2` with v1 fallback, `Authorization: Bearer Oracle`) including `user_data` config delivery.
 - **PID 1 Hardened Init Pipeline**: All filesystem lifecycle logic lives in `enclave_init` module within PID 1 before Tokio runtime starts. Handles mount ordering (`/dev` first so kmsg works), aggressive driver discovery via recursive `insmod` scanning of `/lib/modules`, and EFI partition measurement (dynamic device scanning).
-- **Egress Hardening & Firewalling**: nftables ruleset enforcing strict TCP/UDP port filtering. TLS pinning enforced at transport layer via embedded `google_ca.pem` and `paypal.pem` compiled into binary via `include_bytes!`. DNS resolution hardcoded via `reqwest::resolver::resolve` to prevent hijacking. Bandwidth throttled per-IP and globally.
+- **Egress Hardening & Firewalling**: nftables ruleset enforcing strict TCP/UDP port filtering. TLS pinning enforced at transport layer via embedded `google_ca.pem` and `paypal.pem` compiled into binary via `include_bytes!`. DNS resolution hardcoded via `reqwest::resolver::resolve` to prevent hijacking. Bandwidth throttled per-IP (the old global 512 MB/h cap was removed in v153 — audit SEC-05: it was a self-inflicted service-wide DoS).
 - **Secure Time Synchronization**: RTC pre-seeded to epoch 2026 prevents TLS cert validation failure on cold-boot machines. HTTPS-based time fetch serves as clock source after initial boot; timezone stripped from Date header.
 - **Stable Build OS**: Build system, kernel image, initramfs pinned to Debian 13 (Trixie) using snapshot.debian.org. Reproducible via multi-stage Docker synthesis engine.
 
@@ -118,7 +118,7 @@ Note: The EK Certificate and the TPM Quote signing key (Session AK) are separate
 ### OCI (TPM-less) Chain of Trust
 
 ```
-GitHub Provenance ──► disk_manifest SHA-256 (measured at boot; no PCR 15 — bound via report instead)
+GitHub Provenance ──► disk_manifest SHA-256 (measured at boot; no PCR 15 — carried in the enclave-signed report only, see the scope warning below)
 Session Nonce (SHA-256[paypal hash ∥ SHA-256(enclave pubkey DER) ∥ SHA-256(custom_info)])
     └─► SNP report_data[0..32] = raw 32-byte nonce (rest zero)   ← binds report to THIS session
 AMD VCEK (from kdsintf.amd.com, TCB-versioned by bl/tee/snp/ucode SPLs)
@@ -126,6 +126,38 @@ AMD VCEK (from kdsintf.amd.com, TCB-versioned by bl/tee/snp/ucode SPLs)
             └─► VCEK → ASK → ARK chain (ARK pinned by SHA-256 of raw DER in verify.html)
                     └─► ARK pin set: Genoa / Turin / Milan (KDS) — family selected by CPUID
 ```
+
+> **⚠️ OCI measurement-scope truth (audit SEC-02, 2026-10-13)**: on OCI the
+> AMD SEV-SNP `LAUNCH_DIGEST` (report bytes 144..192) measures only Oracle's
+> OVMF launch firmware — the virtual disk (shim/grub/kernel/initramfs/enclave)
+> is attached via virtio and read AFTER the launch measurement, so it is
+> **not** hardware-measured. The pinned digest pins *Oracle's standard
+> confidential OVMF*, not our code. What hardware proves on OCI: genuine AMD
+> silicon, memory encryption, and a session-bound nonce. Code integrity rests
+> on the GitHub provenance of the self-reported `disk_manifest` /
+> `binary_sha256` against the bitwise-reproducible build — NOT on the SNP
+> digest. `verify.html` states this inline on every OCI report. If OCI ever
+> ships a vTPM for E5/E6, migrate measured boot back to PCRs.
+>
+> **Deploy only attested builds (audit follow-up)**: `verify.html` queries
+> `api.github.com/repos/…/attestations/sha256:<hash>` for exactly the hashes a
+> report carries, and CI attests artifacts built **from pushed commits**
+> (`.github/workflows/build-attest.yml`). A binary/disk built from a dirty or
+> uncommitted tree has a hash no attestation will ever cover — every report
+> from such a deployment shows `❌ Binary / ❌ Image Atomicity`. Workflow:
+> commit → push → CI attests → build from the clean checkout
+> (bitwise-reproducible) → deploy. `build-oci-docker.sh` now warns when a
+> freshly built hash has no GitHub attestation.
+>
+> **Local ≠ CI kernel trap (fixed 2026-10-13)**: `Dockerfile.oci` used to
+> prefer a gitignored host-side `ol10/` staging dir over the in-container
+> pinned-NEVRA extraction. That dir (kernel `6.12.0-206.104.4.4`) silently
+> overrode the committed pin (`6.12.0-207.111.5.1.el10uek`) in EVERY local
+> build, so local images and CI artifacts never shared a kernel hash — and
+> provenance could never pass no matter what was deployed. The pinned
+> extraction is now the default (identical to CI); the host shortcut is
+> opt-in via `--build-arg USE_HOST_OL10=1` (bring-up only — it forfeits
+> attestation parity).
 
 ---
 
@@ -251,12 +283,19 @@ The system presents a signed **Remote Attestation Report** on the OAuth callback
 - **No self-signed TLS fallback**: ACME failures retry with capped backoff (2 min → 1 h) instead of serving a self-signed certificate (removed in v152 with its `rcgen` dependency) — a fallback cert breaks production and trains users to accept warnings (MITM prompt-fatigue).
 - **No private key logging**: the ephemeral attestation RSA key PEM is never written to `info!()` — on OCI, GRUB's `console=ttyS0` lands every log line in Instance Console History (readable with console permissions).
 - **SNP report layout (fixed offsets)**: report_data @ 0x50 (64B), measurement @ 0x90, reported_tcb @ 0x180, chip_id @ 0x1A0 (64B), signature @ 0x2A0 (r @ 0x2A0, s @ 0x2E8, each 72B little-endian), signed region = first **672 bytes**, total report = **1184 bytes**.
+- **OCI PSP/KDS key mismatch (v153)**: some OCI E5 hosts' PSP signs reports with a key that matches NEITHER the KDS entry for its chip_id/TCB NOR the PSP's own cert table (verified with Google go-sev-guest: report format valid, well-formed P-384 scalars, every cert/encoding fails; sibling instance on a different host/chip verifies fine). The enclave therefore uses `SNP_GET_EXT_REPORT` (0xC0205302) to pull the PSP's own GHCB cert table (`{GUID[16], offset u32, length u32}` entries, zero-terminated, GUIDs VCEK `63da758d-…`, VLEK `a8074bc2-…`, ASK `4ab7b379-…`, ARK `c0b406a4-…`), validates chain+signature per leaf, and publishes whichever verifies; a report whose signature verifies against NO available cert is a defective host — relaunch on different hardware (AD-2 landed on a good chip where all 19 verify.html checks pass).
 - **AMD KDS product naming**: family 19h → `Milan` (base model 0x) / `Genoa` (base model 0x1/0xA); family 1Ah → `Turin` (or `Venice` for models 0x50-0x5F). TCB byte layout: Layout A (bl=b0, tee=b1, snp=b6, ucode=b7) for Milan/Genoa/standard Turin; Layout B (bl=b1, tee=b2, snp=b3, ucode=b7) for Turin-Dense (1Ah model ≥ 0x60). Override with env `AMD_VCEK_FAMILY` during bring-up.
 - **OCI user_data path**: `http://169.254.169.254/opc/v2/instance/metadata/user_data` (header `Authorization: Bearer Oracle`), v1 fallback at `/opc/v1/...`. The config arrives base64-encoded (OCI CLI encodes `--user-data-file` automatically).
 - **`modprobe sev-guest` fails with ENODEV on non-SNP machines (expected)**: v6.12 `sev_guest_probe()` returns `-ENODEV` when `!cc_platform_has(CC_ATTR_GUEST_SEV_SNP)` and `module_platform_driver_probe()` propagates it through finit → kmod logs `could not insert 'sev_guest': No such device`. This is **normal in qemu/dev builds** — not an initramfs defect. On real OCI E5 with SNP it must load and create `/dev/sev-guest` (still runtime-unverified).
 - **PID-1 `modprobe()` captures kmod output** (`src/main.rs`): failures log exit code + captured stdout/stderr to kmsg (the old `-q` invocation swallowed even finit errors). Use the boot log's `ALL PATHS FAILED (rc=… err=…)` lines as the authoritative module-load diagnosis; kmod `-q` hides errors that `.status()` alone would never show.
+- **AMD KDS cache (v152)**: the VCEK and the ASK+ARK cert chain are fetched once and persisted — directory order `$AMD_VCEK_CACHE_DIR` → `/persistent/.enclave/amd-kds` (survives reboot) → `/tmp/amd-kds-cache` (tmpfs fallback for read-only/volatile roots). The VCEK cache name embeds `chip_id` + reported TCB SPLs, so a TCB update is the only thing that forces a re-download (plus a 7-day expiry margin). Chains shorter than ASK+ARK are never cached or published — `verify.html` anchors silicon trust solely on the pinned ARK, so a partial chain can never validate. `tpm::warm_kds_cache()` (cfg `oci`) pre-fetches both at boot from a zero-nonce SNP report (chip/TCB only, never presented as evidence).
+
+- **vfat iocharset trap (empty `disk_manifest`, fixed v153)**: UEK8's vfat defaults to `iocharset=utf8` and `nls_utf8` is a *module* that was never staged in the OL10 initramfs — every plain vfat mount failed with EIO, so `measure_boot_components()` shipped `disk_manifest: {}` and `verify.html` showed `❌ Image Atomicity` on every OCI report. Three-layer mitigation: `nls_utf8`+`nls_iso8859-1` are now staged (`build-initramfs-tools.sh`); `measure_boot_components()` retries mounts with `iocharset=ascii`/`cp437` (kernel builtins on both UEK8 and Debian) and reuses an already-mounted `/boot/efi`; the boot log's `vfat mount of … failed:` / `Disk manifest: N files measured` kmsg lines are the diagnosis. A live report with `enclave_debug.manifest_size: 0` means the enclave predates the fix.
+- **Platform-enforced silicon root (audit SEC-04)**: `verify.html` derives the required silicon root from the report's own evidence class — SNP evidence present → the AMD SEV-SNP path MUST verify; Google cert/TPM evidence → the Google+TPM path; mixed evidence → BOTH. The old `googleVerified || snpVerified` OR let a TPM-less OCI-claiming report be "validated" with a locally forged (self-consistent) TPM quote + the public Google cert. Residual documented risk: a self-consistent TPM quote can still anchor a report that CLAIMS GCP — inherent to the two-key model where EK and session AK are intentionally unlinked; closing it needs GCP-side AK certification against the EK.
+- **PayPal edge IP pins need refreshing (audit SEC-06)**: `hardened_client()` pins multiple Cloudflare/Fastly addresses per PayPal host via `resolve_to_addrs` (the v151 single pin `104.16.124.74` stopped appearing in live DNS answers by 2026-10). TLS hostname validation against the embedded roots still gates identity — a stale pin is an *availability* risk, not a trust risk. Refresh with `dig api-m.paypal.com` when token exchanges start failing.
+- **No operator identity in the public repo (audit SEC-07)**: the GCP project id is no longer hard-coded anywhere — scripts read `GCP_PROJECT_ID`, the enclave bakes it in via `option_env!("GCP_PROJECT_ID")` at compile time for GCP builds. The legacy GCP troubleshooting docs (`DEBUG_CHECKLIST.md`, `README_GCP_ATTESTATION_FIX.md`, `FINAL_SUMMARY.md`, `gcp-config-check.sh`, `google-archive/`) and scratch files were removed; git HISTORY still contains them — a `git filter-repo`/BFG scrub is an owner decision.
 
 ## Security Regression Tests
 
 - `cargo test` — v152 suite: credential validation (no hardcoded fallbacks, placeholders rejected), session-nonce formula + cross-implementation parity vector (must match `expectedNonce` in `verify.html`; update both together), source scan for reintroduced secrets.
-- `npm install --no-save node-forge && node scripts/test-verify-security.mjs` — drives the REAL `runAudit()` from `verify.html` (DOM stubbed) against: the Google-cert-paste spoof (must fail), a tampered SEV-SNP launch digest (must fail), nonce parity, and a legitimate GCP report (must still pass). Set `GENUINE_REPORT=/path/to/capture.json` to also exercise the pinned-digest checks against a live capture.
+- `npm install --no-save node-forge && node scripts/test-verify-security.mjs` — drives the REAL `runAudit()` from `verify.html` (DOM stubbed) against: the Google-cert-paste spoof (must fail), a tampered SEV-SNP launch digest (must fail), nonce parity, a legitimate GCP report (must still pass), an OCI-claiming report with a forged local TPM quote + pasted Google cert (SEC-04 bypass, must fail), and the provenance-failure diagnostics (empty manifest + unattested hash must render explanations, not bare ❌s). Set `GENUINE_REPORT=/path/to/capture.json` to also exercise the pinned-digest checks against a live capture.

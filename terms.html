@@ -69,10 +69,11 @@
             <p>By using this experimental service, you accept the following terms and conditions.</p>
             
             <h2 id="as-is">1. "AS IS" Provision</h2>
-            <p>This service is a free, experimental demonstration of a bitwise-reproducible, self-attesting enclave built on Google Cloud Confidential VM. It is provided <strong>"AS IS", WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND</strong>, consistent with the Apache 2.0 License.</p>
+            <p>This service is a free, experimental demonstration of a bitwise-reproducible, self-attesting enclave built on confidential compute — Google Cloud Confidential VM (AMD SEV-SNP behind a vTPM) or Oracle Cloud confidential compute (AMD SEV-SNP, TPM-less). It is provided <strong>"AS IS", WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND</strong>, consistent with the Apache 2.0 License.</p>
             
             <h2 id="verification">2. User Responsibility & Verification</h2>
             <p>The core philosophy of this project is verifiable trust. Users are responsible for verifying the hardware attestation provided by the AMD SEV-SNP enclave. You acknowledge that you use this service at your own risk.</p>
+            <p><strong>Attestation scope (Oracle Cloud reports):</strong> hardware attestation there proves genuine AMD SEV-SNP silicon, encrypted memory, and that the report is cryptographically bound to <em>your</em> session nonce. The AMD launch digest measures Oracle's UEFI launch firmware, <strong>not</strong> the virtual disk — boot-disk and application-code integrity are established by the GitHub build provenance of the bitwise-reproducible image (auditable offline with <code>verify.html</code>), not by the hardware measurement itself. On Google Cloud reports, PCR 15 additionally binds the disk manifest into the TPM quote.</p>
             
             <h2 id="no-liability">3. Limitation of Liability</h2>
             <p>Under no circumstances shall the author be liable for any direct, indirect, incidental, special, exemplary, or consequential damages (including, but not limited to, procurement of substitute goods or services; loss of use, data, or profits; or business interruption).</p>

@@ -49,7 +49,10 @@ if ! command -v jq &>/dev/null; then
     exit 1
 fi
 
-PROJECT_ID="REDACTED_GCP_PROJECT"   # GCP platform only
+# Operator identity is NOT hard-coded in this public repo (audit SEC-07):
+# the GCP platform path needs the project id at runtime — export it instead:
+#   GCP_PROJECT_ID=... bash upload-secrets.sh
+PROJECT_ID="${GCP_PROJECT_ID:-}"   # GCP platform only
 
 # ---------------------------------------------------------------------------
 # Platform selection: oci (default when the oci CLI is configured) or gcp.
@@ -65,6 +68,12 @@ case "$TARGET_PLATFORM" in
     oci|gcp) ;;
     *) error "TARGET_PLATFORM must be 'oci' or 'gcp' (got: $TARGET_PLATFORM)"; exit 1 ;;
 esac
+
+if [[ "$TARGET_PLATFORM" == "gcp" && -z "$PROJECT_ID" ]]; then
+    error "GCP platform selected but GCP_PROJECT_ID is not set (audit SEC-07: no project id is hard-coded anymore)."
+    error "Run:  GCP_PROJECT_ID=<your-project> bash upload-secrets.sh"
+    exit 1
+fi
 
 oci_compartment() {
     if [[ -n "${OCI_COMPARTMENT_ID:-}" ]]; then
@@ -171,7 +180,21 @@ get_current_config() {
 apply_oci_config() {
     local json="$1"
     local old_id="$OCI_INSTANCE_ID" old_ip new_id new_ip old_name image_id subnet_id
-    local deploy_out exp_redirect exp_client location i code
+    local deploy_out exp_redirect exp_client location i code secret_ocid
+
+    # SECURITY (audit SEC-03): preserve Option A across credential rotations.
+    # OCI user_data is immutable, so a rotation relaunches via deploy-oci.sh —
+    # if that call does not forward OCI_SECRET_OCID, deploy sees an empty value
+    # and silently reverts to writing PLAINTEXT credentials into
+    # metadata.user_data. Derive the OCID from the live instance instead of
+    # trusting the operator's environment.
+    secret_ocid=$(extract_json_val "$(get_current_config)" "secret_ocid")
+    case "$secret_ocid" in ""|None|null) secret_ocid="" ;; esac
+    if [[ -n "$secret_ocid" ]]; then
+        info "🔒 Option A preserved: secret_ocid=$secret_ocid (credentials stay in the vault)"
+    else
+        warn "No secret_ocid in the current user_data — the replacement will carry PLAINTEXT credentials (Option B)"
+    fi
 
     info "🔎 Reading launch parameters from the current instance..."
     old_name=$(oci compute instance get --instance-id "$old_id" \
@@ -198,6 +221,7 @@ apply_oci_config() {
         -u PAYPAL_VERIFIED_CLIENT_ID -u PAYPAL_VERIFIED_CLIENT_SECRET \
         -u DOMAIN -u STAGING -u EAB_KEY_ID -u EAB_HMAC_KEY \
         OCI_CONFIG_CONTENT="$json" \
+        OCI_SECRET_OCID="$secret_ocid" \
         OCI_INSTANCE_NAME="$old_name" \
         OCI_IMAGE_ID="$image_id" \
         OCI_SUBNET_ID="$subnet_id" \

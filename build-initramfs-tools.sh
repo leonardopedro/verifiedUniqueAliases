@@ -101,7 +101,7 @@ fi
 
 # Platform-specific hardware modules detection
 # Default: GCP AMD SEV-SNP
-PLATFORM_MODULES="sev_guest sev-guest amd_tsm tsm gve virtio_net virtio_scsi virtio_blk nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct configfs coco virt_anchor"
+PLATFORM_MODULES="sev_guest sev-guest amd_tsm tsm gve virtio_net virtio_scsi virtio_blk nvme nvme_core vfat nls_utf8 nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct configfs coco virt_anchor"
 
 if [[ "${BUILD_FEATURE:-}" == "oci" ]]; then
     # Oracle Cloud (AMD SEV-SNP): SNP guest driver + virtio network/block stack.
@@ -117,7 +117,7 @@ if [[ "${BUILD_FEATURE:-}" == "oci" ]]; then
     # crypto_alloc_aead("gcm(aes)") — without them probe fails with -EIO
     # ("probe with driver sev-guest failed with error -5") and /dev/sev-guest
     # never appears. aes/ctr/cryptd are built-in (UEK modules.builtin).
-    PLATFORM_MODULES="sev_guest sev-guest amd_sev amd_tsm tsm gcm ghash_generic gf128mul virtio virtio_ring virtio_scsi virtio_blk virtio_pci virtio_pci_modern_dev virtio_pci_legacy_dev virtio_net net_failover failover sd_mod sr_mod cdrom fat vfat nls_base nls_cp437 nls_ascii nvme nvme_core nvme_auth nvme_keyring nf_tables nft_chain_filter nft_reject nft_reject_ipv4 nf_reject_ipv4 nft_limit nf_conntrack nft_ct nf_nat nf_conncount nf_defrag_ipv4 nf_defrag_ipv6 configfs"
+    PLATFORM_MODULES="sev_guest sev-guest amd_sev amd_tsm tsm gcm ghash_generic gf128mul virtio virtio_ring virtio_scsi virtio_blk virtio_pci virtio_pci_modern_dev virtio_pci_legacy_dev virtio_net net_failover failover sd_mod sr_mod cdrom fat vfat nls_base nls_utf8 nls_iso8859-1 nls_cp437 nls_ascii nvme nvme_core nvme_auth nvme_keyring nf_tables nft_chain_filter nft_reject nft_reject_ipv4 nf_reject_ipv4 nft_limit nf_conntrack nft_ct nf_nat nf_conncount nf_defrag_ipv4 nf_defrag_ipv6 configfs"
     echo "🏗️ Building initramfs for Oracle Cloud AMD SEV-SNP"
 else
     echo "🏗️ Building initramfs for GCP AMD SEV-SNP"

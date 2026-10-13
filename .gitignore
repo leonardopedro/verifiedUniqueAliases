@@ -71,3 +71,6 @@ paypal-auth-vm-oci.qcow2
 /debug_full.json
 /report*.json
 node_modules/
+
+# Agent-tooling session marker (internal UUID — audit SEC-07: never track)
+.freebuff/

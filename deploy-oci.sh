@@ -195,6 +195,47 @@ else
     echo "   Set PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, and DOMAIN to enable configuration"
 fi
 
+# ------------------------------------------------------------------
+# [1b] Option A (audit Vuln 2): config → OCI Secret Management
+# ------------------------------------------------------------------
+# With OCI_SECRET_OCID set, the FULL config (PayPal credentials, EAB,
+# ACME account key) is uploaded as a secret version and the user_data
+# template carries only secret_ocid + non-secret fields. The enclave
+# resolves the secret at boot with an instance principal (its identity
+# key is served exclusively over link-local IMDS), so plaintext
+# credentials are never readable from the control plane/console.
+#
+# Required IAM:
+#   operator:  manage vaults / keys / secret-bundles in the compartment
+#   instance:  dynamic-group rule `instance.id = <this instance>` with
+#              `read secret-bundles, update secret-bundles` in the compartment
+if [[ -n "${OCI_SECRET_OCID:-}" && -s "$CONFIG_TMPFILE" ]]; then
+    echo "🔐 [1b] Uploading configuration to OCI Secret Management..."
+    if ! jq empty "$CONFIG_TMPFILE" 2>/dev/null; then
+        echo "❌ config JSON is invalid — refusing secret upload"
+        exit 1
+    fi
+    SECRET_B64=$(base64 -w0 < "$CONFIG_TMPFILE" 2>/dev/null || base64 < "$CONFIG_TMPFILE" | tr -d '\n')
+    if ! oci vault secret update-base64 --secret-id "$OCI_SECRET_OCID" \
+            --secret-content-content "$SECRET_B64" --force --output none; then
+        echo "❌ Secret upload failed — refusing to launch with plaintext credentials."
+        echo "   (First-time setup: oci vault secret create-base64 --vault-id ... --key-id ... --secret-name ... --secret-content-content ...)"
+        exit 1
+    fi
+    echo "   ✅ Secret version updated ($(wc -c < "$CONFIG_TMPFILE") bytes)"
+    # Non-secret template for user_data: credentials emptied, OCID recorded.
+    jq --arg ocid "$OCI_SECRET_OCID" '
+        .paypal_client_id = "" | .paypal_client_secret = ""
+        | .paypal_verified_client_id = "" | .paypal_verified_client_secret = ""
+        | .eab_key_id = "" | .eab_hmac_key = "" | .acme_account_json = ""
+        | del(.attestation_signing_key)
+        | .secret_ocid = $ocid' "$CONFIG_TMPFILE" > "${CONFIG_TMPFILE}.tpl"
+    mv "${CONFIG_TMPFILE}.tpl" "$CONFIG_TMPFILE"
+    echo "   user_data template now carries secret_ocid only (no credentials)"
+else
+    echo "   ℹ️ Plain-text user_data delivery (set OCI_SECRET_OCID for Option A)"
+fi
+
 # The enclave reads instance metadata "user_data" directly (base64 handled by the CLI)
 # and parses it as config JSON — no cloud-init involved.
 

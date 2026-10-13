@@ -56,13 +56,22 @@ COPY extract-ol10-binaries.sh /usr/local/bin/extract-ol10-binaries.sh
 # OCI "Oracle Linux 10" platform image. When the build context only carries
 # the placeholder (CI checkouts), fall back to the pinned-yum extraction.
 COPY ol10 /host-ol10
+# Default: extract the PINNED NEVRAs inside the container — this is what CI
+# does (its checkout never carries ol10/, which is gitignored) and therefore
+# the only path whose artifact hashes can match the GitHub attestations.
+# The old unconditional "use host ol10/ if present" shortcut made every
+# LOCAL build ship whatever stale platform-image extraction happened to sit
+# in the build context (kernel 206 vs the committed 207 pin) — a silent
+# local≠CI divergence that made verify.html provenance permanently fail
+# (audit follow-up, 2026-10-13). Opt back in with --build-arg USE_HOST_OL10=1.
+ARG USE_HOST_OL10=""
 RUN chmod +x /usr/local/bin/extract-ol10-binaries.sh \
-    && if [ -f /host-ol10/vmlinuz ]; then \
-           echo "Using OL10 platform-image binaries from build context" \
+    && if [ -n "$USE_HOST_OL10" ] && [ -f /host-ol10/vmlinuz ]; then \
+           echo "Using OL10 platform-image binaries from build context (USE_HOST_OL10=1 — NOT CI parity!)" \
            && mkdir -p /ol10 && cp -a /host-ol10/. /ol10/ \
            && chmod -R a+rX /ol10 ; \
        else \
-           echo "No staged ol10/ binaries — extracting pinned NEVRAs from Oracle yum" \
+           echo "Extracting pinned NEVRAs from Oracle yum (CI-parity path)" \
            && /usr/local/bin/extract-ol10-binaries.sh /ol10 ; \
        fi
 

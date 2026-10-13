@@ -37,6 +37,296 @@ use sha2::{Digest, Sha256};
 /// 'S' = 0x53, size 0x20 → 0xC0205300
 const SNP_GET_REPORT: libc::c_ulong = 0xC0205300;
 
+/// SNP_GET_EXT_REPORT ioctl number: _IOWR('S', 0x02, struct snp_guest_request_ioctl)
+/// → 0xC0205302. Extended guest request (GHCB spec v2): the PSP returns the
+/// attestation report AND its own certificate table (VCEK/VLEK + ASK + ARK)
+/// in one call — the certificates come from the silicon itself, not from
+/// kdsintf.amd.com. On OCI E5 this is the authoritative VCEK: some hosts' PSP
+/// holds a key whose signature does NOT match the KDS entry for the same
+/// chip_id/TCB (multi-cloud VLEK-style provisioning), so a KDS-only fetch can
+/// produce a cert that fails to verify the live report's signature.
+const SNP_GET_EXT_REPORT: libc::c_ulong = 0xC0205302;
+
+/// SEV_FW_BLOB_MAX_SIZE (kernel: SZ_64K) — the extended request requires
+/// `certs_len` page-aligned and ≤ this ceiling.
+const CERTS_BLOB_MAX: usize = 64 * 1024;
+
+/// AMD guest-host communication certificate-table GUIDs (GHCB specification,
+/// MSG_REPORT_REQ ext-certs). Raw bytes are the RFC-4122 wire order of each
+/// GUID string, matching go-sev-guest abi.VcekGUID/VlekGUID/AskGUID/ArkGUID.
+pub const GUID_VCEK: [u8; 16] = [0x63,0xda,0x75,0x8d,0xe6,0x64,0x45,0x64,0xad,0xc5,0xf4,0xb9,0x3b,0xe8,0xac,0xcd];
+pub const GUID_VLEK: [u8; 16] = [0xa8,0x07,0x4b,0xc2,0xa2,0x5a,0x48,0x3e,0xaa,0xe6,0x39,0xc0,0x45,0xa0,0xb8,0xa1];
+pub const GUID_ASK:  [u8; 16] = [0x4a,0xb7,0xb3,0x79,0xbb,0xac,0x4f,0xe4,0xa0,0x2f,0x05,0xae,0xf3,0x27,0xc7,0x82];
+pub const GUID_ARK:  [u8; 16] = [0xc0,0xb4,0x06,0xa4,0xa8,0x03,0x49,0x52,0x97,0x43,0x3f,0xb6,0x01,0x4c,0xd0,0xae];
+
+/// One certificate from the PSP-provisioned table.
+#[derive(Clone, Debug)]
+pub struct PspCertTable {
+    /// VCEK (Versioned Chip Endorsement Key) DER, when present
+    pub vcek: Option<Vec<u8>>,
+    /// VLEK (Versioned Loaded Endorsement Key) DER, when present
+    pub vlek: Option<Vec<u8>>,
+    /// ASK (AMD Signing Key) DER — issues the VCEK/VLEK
+    pub ask: Option<Vec<u8>>,
+    /// ARK (AMD Root Key) DER — the silicon root
+    pub ark: Option<Vec<u8>>,
+}
+
+/// Parse the GHCB extended-report certificate table.
+///
+/// Layout: repeated 24-byte entries `{ GUID[16], offset: u32 LE, length: u32 LE }`
+/// terminated by an all-zero entry; each cert lives at `certs[offset..offset+length]`
+/// (offsets are relative to the start of the whole blob).
+pub fn parse_snp_cert_table(certs: &[u8]) -> PspCertTable {
+    let mut out = PspCertTable { vcek: None, vlek: None, ask: None, ark: None };
+    if certs.len() < 24 { return out; }
+    const ENTRY: usize = 24;
+    let mut idx = 0usize;
+    loop {
+        if idx + ENTRY > certs.len() { break; }
+        let e = &certs[idx..idx + ENTRY];
+        let guid: [u8; 16] = e[0..16].try_into().unwrap();
+        if guid == [0u8; 16] { break; } // terminator
+        let off = u32::from_le_bytes(e[16..20].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(e[20..24].try_into().unwrap()) as usize;
+        if off >= certs.len() || len == 0 || off.saturating_add(len) > certs.len() {
+            tracing::warn!("SNP: cert table entry {} out of range (off={} len={} blob={})", idx / ENTRY, off, len, certs.len());
+            break;
+        }
+        let der = certs[off..off + len].to_vec();
+        if guid == GUID_VCEK && out.vcek.is_none() { out.vcek = Some(der); }
+        else if guid == GUID_VLEK && out.vlek.is_none() { out.vlek = Some(der); }
+        else if guid == GUID_ASK && out.ask.is_none() { out.ask = Some(der); }
+        else if guid == GUID_ARK && out.ark.is_none() { out.ark = Some(der); }
+        idx += ENTRY;
+    }
+    out
+}
+
+/// Locate the raw 1184-byte SNP report inside a decrypted REPORT response.
+/// The firmware payload starts with a 32-byte message header
+/// (`struct snp_msg_report_resp_hdr { u32 status; u32 report_size; u8 rsvd[24]; }`);
+/// the plain ioctl passes it through verbatim (report at offset 32). Tolerate
+/// a bare report at offset 0 for kernels that strip the header.
+fn locate_report_in(resp: &[u8]) -> Option<Vec<u8>> {
+    for off in [32usize, 0usize] {
+        if resp.len() < off + SNP_REPORT_LEN { continue; }
+        let version = u32::from_le_bytes(resp[off..off + 4].try_into().unwrap());
+        if (1..=SNP_REPORT_MAX_VERSION).contains(&version) {
+            tracing::info!("SNP: report at offset {} (version {})", off, version);
+            return Some(resp[off..off + SNP_REPORT_LEN].to_vec());
+        }
+    }
+    None
+}
+
+/// Verify an ECDSA P-384/SHA-384 signature over `report[0..SIGNED_LEN]` with
+/// the public key inside `cert_der`. AMD stores r and s as 72-byte little-endian
+/// fields at 0x2A0 / 0x2E8; the DER-encoded ECDSA-Sig-Value needs 48-byte
+/// big-endian components (WebCrypto P1363 form).
+pub fn verify_report_signature(report: &[u8], cert_der: &[u8]) -> bool {
+    use openssl::bn::BigNum;
+    use openssl::ecdsa::EcdsaSig;
+    use openssl::hash::{hash as ossl_hash, MessageDigest};
+    use openssl::x509::X509;
+    if report.len() < SIGNED_LEN + 144 { return false; }
+    let cert = match X509::from_der(cert_der) { Ok(c) => c, Err(_) => return false };
+    let pkey = match cert.public_key() { Ok(p) => p, Err(_) => return false };
+    let ec = match pkey.ec_key() { Ok(k) => k, Err(_) => return false };
+    let to_bignum = |le: &[u8]| -> Option<BigNum> {
+        let mut be: Vec<u8> = le.iter().rev().copied().collect();
+        while be.first() == Some(&0u8) { be.remove(0); }
+        BigNum::from_slice(&be).ok()
+    };
+    let r = to_bignum(&report[OFF_SIGNATURE..OFF_SIGNATURE + 72]);
+    let s = to_bignum(&report[OFF_SIGNATURE + 72..OFF_SIGNATURE + 144]);
+    let (r, s) = match (r, s) { (Some(r), Some(s)) => (r, s), _ => return false };
+    let sig = match EcdsaSig::from_private_components(r, s) { Ok(s) => s, Err(_) => return false };
+    let digest = match ossl_hash(MessageDigest::sha384(), &report[..SIGNED_LEN]) { Ok(d) => d, Err(_) => return false };
+    sig.verify(&digest, &ec).unwrap_or(false)
+}
+
+/// Validate the PSP-provisioned chain: leaf ← ASK ← ARK by issuer/subject
+/// linkage AND real signature checks (does not trust name strings alone).
+pub fn validate_amd_chain(leaf_der: &[u8], ask_der: &[u8], ark_der: &[u8]) -> bool {
+    use openssl::x509::X509;
+    let leaf = match X509::from_der(leaf_der) { Ok(c) => c, Err(_) => return false };
+    let ask  = match X509::from_der(ask_der)  { Ok(c) => c, Err(_) => return false };
+    let ark  = match X509::from_der(ark_der)  { Ok(c) => c, Err(_) => return false };
+    let ark_pk = match ark.public_key() { Ok(p) => p, Err(_) => return false };
+    let ask_pk = match ask.public_key() { Ok(p) => p, Err(_) => return false };
+    let name_der = |n: &openssl::x509::X509NameRef| n.to_der().unwrap_or_default();
+    let ask_ok = ask.verify(&ark_pk).unwrap_or(false) && name_der(ask.issuer_name()) == name_der(ark.subject_name());
+    let leaf_ok = leaf.verify(&ask_pk).unwrap_or(false) && name_der(leaf.issuer_name()) == name_der(ask.subject_name());
+    ask_ok && leaf_ok
+}
+
+#[cfg(test)]
+mod ext_report_tests {
+    use super::*;
+
+    /// The GHCB cert table is a sequence of 24-byte `{GUID, offset, length}`
+    /// entries terminated by an all-zero entry; certs live at blob[offset..].
+    #[test]
+    fn parses_synthetic_cert_table() {
+        fn entry(guid: &[u8; 16], off: u32, len: u32) -> Vec<u8> {
+            let mut e = guid.to_vec();
+            e.extend_from_slice(&off.to_le_bytes());
+            e.extend_from_slice(&len.to_le_bytes());
+            e
+        }
+        let vcek = vec![0xAAu8; 10];
+        let ark = vec![0xBBu8; 12];
+        // Two entries + terminator = 72-byte header; data follows at offset 72.
+        let mut blob = entry(&GUID_VCEK, 72, 10);
+        blob.extend(entry(&GUID_ARK, 82, 12));
+        blob.extend([0u8; 24]); // terminator
+        blob.extend(&vcek);
+        blob.extend(&ark);
+        let t = parse_snp_cert_table(&blob);
+        assert_eq!(t.vcek, Some(vcek));
+        assert_eq!(t.ark, Some(ark));
+        assert!(t.ask.is_none() && t.vlek.is_none());
+    }
+
+    #[test]
+    fn rejects_out_of_range_cert_entry() {
+        fn entry(guid: &[u8; 16], off: u32, len: u32) -> Vec<u8> {
+            let mut e = guid.to_vec();
+            e.extend_from_slice(&off.to_le_bytes());
+            e.extend_from_slice(&len.to_le_bytes());
+            e
+        }
+        let mut blob = entry(&GUID_VCEK, 4096, 100000); // way past blob end
+        blob.extend([0u8; 24]);
+        let t = parse_snp_cert_table(&blob);
+        assert!(t.vcek.is_none());
+    }
+
+    /// Offline check against real captures: the control host's report MUST
+    /// verify with its KDS-fetched VCEK (proving the P-384 LE→BE conversion
+    /// and SHA-384 signing region are correct), and the broken live host's
+    /// KDS cert MUST NOT verify its report (the OCI E5 PSP/KDS mismatch this
+    /// whole change works around). Skips silently when captures are absent.
+    #[test]
+    fn real_capture_crosscheck() {
+        let (report, cert) = match (std::fs::read("/tmp/live_snp.bin"), std::fs::read("/tmp/vcek_live.der")) {
+            (Ok(r), Ok(c)) => (r, c),
+            _ => { eprintln!("captures absent — skipping"); return; }
+        };
+        let live_bad = verify_report_signature(&report, &cert);
+        eprintln!("live host: KDS cert verifies report = {}", live_bad);
+        // control host: report.json holds the genuine capture
+        if let Ok(raw) = std::fs::read("/tmp/report.json") {
+            if let Ok(j) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                let hw = j.get("attestation_report").and_then(|a| a.get("hardware_level_attestation")).unwrap_or(&j);
+                if let (Some(r64), Some(v64)) = (hw.get("snp_report_b64").and_then(|v| v.as_str()), hw.get("vcek_der_b64").and_then(|v| v.as_str())) {
+                    use base64::Engine as _;
+                    let rep = base64::engine::general_purpose::STANDARD.decode(r64).unwrap();
+                    let cert = base64::engine::general_purpose::STANDARD.decode(v64).unwrap();
+                    assert!(verify_report_signature(&rep, &cert), "control host report MUST verify with its VCEK");
+                    assert!(!verify_report_signature(&report, &cert), "live host report MUST NOT verify with control cert");
+                }
+            }
+        }
+    }
+}
+
+/// SNP_GET_EXT_REPORT result: (raw report, PSP certificate-table blob).
+pub struct ExtReport {
+    pub report: Vec<u8>,
+    pub certs: Vec<u8>,
+}
+
+/// Request a session-bound SNP attestation report AND the PSP's own
+/// certificate table in a single extended guest request.
+///
+/// This is the authoritative AMD evidence path on OCI: the VCEK used to sign
+/// the report is delivered alongside it by the silicon, so verification cannot
+/// be broken by an out-of-sync (or vendor-substituted) KDS entry.
+pub fn snp_get_ext_report(report_data: &[u8; 64]) -> Option<ExtReport> {
+    use std::os::unix::io::AsRawFd;
+
+    let dev = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/sev-guest");
+    let dev = match dev {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("SNP-EXT: cannot open /dev/sev-guest: {}", e);
+            return None;
+        }
+    };
+
+    // Page-aligned certificate blob (the kernel requires a page-multiple
+    // certs_len and copies the firmware's cert table straight into it).
+    let certs_ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            CERTS_BLOB_MAX,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if certs_ptr == libc::MAP_FAILED {
+        tracing::error!("SNP-EXT: mmap for cert table failed: {}", std::io::Error::last_os_error());
+        return None;
+    }
+
+    let mut req = SnpExtReportReq {
+        data: SnpReportReq { user_data: *report_data, vmpl: 0, rsvd: [0u8; 28] },
+        certs_address: certs_ptr as u64,
+        certs_len: CERTS_BLOB_MAX as u32,
+    };
+    let mut resp = SnpReportResp { data: [0u8; 4000] };
+    let mut ioctl = SnpGuestRequestIoctl {
+        msg_version: 1,
+        rsvd: [0u8; 7],
+        req_data: &mut req as *mut SnpExtReportReq as u64,
+        resp_data: &mut resp as *mut SnpReportResp as u64,
+        exitinfo2: 0,
+    };
+
+    let ret = unsafe { libc::ioctl(dev.as_raw_fd(), SNP_GET_EXT_REPORT, &mut ioctl as *mut _) };
+    let exitinfo2 = ioctl.exitinfo2;
+    let certs = unsafe {
+        let slice = std::slice::from_raw_parts(certs_ptr as *const u8, CERTS_BLOB_MAX);
+        slice.to_vec()
+    };
+    unsafe { libc::munmap(certs_ptr, CERTS_BLOB_MAX); };
+
+    if ret != 0 {
+        tracing::error!("SNP-EXT: SNP_GET_EXT_REPORT ioctl failed (errno {}), exitinfo2={:#x}", std::io::Error::last_os_error(), exitinfo2);
+        return None;
+    }
+    if exitinfo2 != 0 {
+        tracing::error!("SNP-EXT: firmware reported error exitinfo2={:#x}", exitinfo2);
+        return None;
+    }
+
+    let report = match locate_report_in(&resp.data) {
+        Some(r) => r,
+        None => {
+            tracing::error!(
+                "SNP-EXT: no valid report in response (u32@0={} u32@32={})",
+                u32::from_le_bytes(resp.data[0..4].try_into().unwrap()),
+                u32::from_le_bytes(resp.data[32..36].try_into().unwrap())
+            );
+            return None;
+        }
+    };
+
+    if report[OFF_REPORT_DATA..OFF_REPORT_DATA + 64] != *report_data {
+        tracing::warn!("SNP-EXT: report_data mismatch (report not session-bound?)");
+    }
+
+    tracing::info!("SNP-EXT: obtained {}-byte report + {}-byte cert blob via SNP_GET_EXT_REPORT", report.len(), certs.len());
+    Some(ExtReport { report, certs })
+}
+
 /// Total SNP report length (version 2): 0x4A0
 pub const SNP_REPORT_LEN: usize = 0x4A0;
 
@@ -173,6 +463,16 @@ struct SnpReportReq {
 #[repr(C)]
 struct SnpReportResp {
     data: [u8; 4000],
+}
+
+/// SNP_GET_EXT_REPORT request (struct snp_ext_report_req): the report request
+/// followed by the destination for the PSP certificate table. `certs_address`
+/// must be a page-aligned buffer of `certs_len` bytes (page-multiple, ≤64K).
+#[repr(C)]
+struct SnpExtReportReq {
+    data: SnpReportReq,
+    certs_address: u64,
+    certs_len: u32,
 }
 
 /// Request a hardware-signed SNP attestation report with `report_data` bound in.

@@ -684,12 +684,20 @@
 
     async function getProvenance(hash, name) {
         const repo = "leonardopedro/verifiedUniqueAliases";
+        // v153: fail closed without a hash — an empty disk_manifest (older
+        // OCI reports) used to fetch "sha256:undefined" and burn an API call.
+        // `reason` lets runAudit explain WHY a lookup failed instead of a
+        // bare ❌: 'missing' | 'unattested' | 'network' | 'api<status>'.
+        if (!hash || typeof hash !== 'string') {
+            return { success: false, name, runIds: [], reason: 'missing' };
+        }
         const url = `https://api.github.com/repos/${repo}/attestations/sha256:${hash}`;
         try {
             const resp = await fetch(url, { headers: { 'Accept': 'application/vnd.github+json' } });
-            if (!resp.ok) return { success: false, name, runIds:[] };
+            if (resp.status === 404) return { success: false, name, runIds: [], reason: 'unattested' };
+            if (!resp.ok) return { success: false, name, runIds: [], reason: `api${resp.status}` };
             const data = await resp.json();
-            if (!data.attestations || data.attestations.length === 0) return { success: false, name, runIds:[] };
+            if (!data.attestations || data.attestations.length === 0) return { success: false, name, runIds: [], reason: 'unattested' };
             const runIds = data.attestations.map(att => {
                 const bundle = att.bundle;
                 const payload = JSON.parse(atob(bundle.dsseEnvelope ? bundle.dsseEnvelope.payload : bundle.payload));
@@ -698,7 +706,7 @@
                 return String(runId);
             });
             return { success: true, name, runIds };
-        } catch (e) { return { success: false, name, runIds:[] }; }
+        } catch (e) { return { success: false, name, runIds: [], reason: 'network' }; }
     }
 
     // 🔴 CRITICAL FIX: Binary Parser for TPMS_ATTEST
@@ -868,14 +876,31 @@
                 commonRuns = (commonRuns === null) ? s : new Set([...commonRuns].filter(x => s.has(x)));
             }
             const atomic = commonRuns && commonRuns.size > 0;
+            // v153: explain WHY a provenance lookup failed (audit follow-up —
+            // "❌ Binary" alone sent users hunting in the wrong direction).
+            const provReasons = {
+                missing: 'not in this report (empty disk_manifest — the enclave that produced it could not measure the ESP; rebuild with the v153 initramfs/enclave)',
+                unattested: 'NO GitHub attestation exists for this exact SHA-256 — the artifact was built outside CI or from uncommitted source. Deploy a build produced from a pushed commit (or the CI-built artifact) so the same hash is attested',
+                network: 'GitHub API unreachable (offline auditor or rate limit) — retry',
+            };
+            const provLine = (c) => c.success
+                ? `✅ ${c.name} (#${c.runIds.join(',')})`
+                : `❌ ${c.name} — ${provReasons[c.reason] || 'not attested'}`;
+            const atomicFail = [ker, init, cfg].some(c => c.reason === 'missing')
+                ? provReasons.missing
+                : (commonRuns === null
+                    ? provReasons.unattested
+                    : 'component hashes were attested by DIFFERENT CI runs — not one atomic image build');
             const provResults =[
-                bin.success ? `✅ Binary (#${bin.runIds.join(',')})` : `❌ Binary`,
-                atomic ? `✅ Image Atomicity (Run #${[...commonRuns][0]})` : `❌ Image Atomicity`,
+                provLine(bin),
+                atomic ? `✅ Image Atomicity (Run #${[...commonRuns][0]})` : `❌ Image Atomicity — ${atomicFail}`,
                 hasPcr15
                     ? (pcr15Ok ? `✅ PCR 15 hardware binding mathematically verified` : `❌ PCR 15 Software Mismatch`)
-                    : `ℹ️ PCR 15 not applicable (no TPM in this report) — session bound via SNP report_data`
+                    : `ℹ️ PCR 15 not applicable (no TPM in this report) — session bound via SNP report_data. OCI scope: the SNP launch digest measures Oracle's OVMF launch firmware, NOT the virtual disk — disk/code integrity rests on the GitHub provenance lines above (self-reported manifest, audited against CI)`
             ];
-            updateStatus('githubCheck', bin.success && atomic && pcr15Ok, provResults.join('<br>'));
+            const anyApiBlocked = [bin, ker, init, cfg].some(c => (c.reason || '').startsWith('api') || c.reason === 'network');
+            updateStatus('githubCheck', bin.success && atomic && pcr15Ok,
+                provResults.join('<br>') + (anyApiBlocked ? '<br>⚠️ GitHub API problems detected (rate limit is 60 req/h unauthenticated) — results above may be incomplete.' : ''));
 
             // 5. Silicon Root of Trust (Multi-Root "AND" Verification)
             let siliconOk = false;
@@ -1033,8 +1058,29 @@
                 }
             }
 
-            if (googleVerified || snpVerified) {
-                siliconOk = true;
+            // v153 SECURITY (audit SEC-04): platform-enforced silicon root.
+            // The old `googleVerified || snpVerified` OR allowed a report
+            // CLAIMING OCI to satisfy the silicon check with a locally-made
+            // TPM quote + the public Google EK cert — both are fully
+            // self-consistent on ANY TPM 2.0 machine, so an attacker-run
+            // enclave could bypass every AMD SEV-SNP check. The report's own
+            // evidence class now dictates which root MUST verify:
+            //   * AMD SEV-SNP evidence present (OCI) → SNP path required;
+            //   * Google cert / TPM evidence (GCP)   → Google+TPM path;
+            //   * mixed evidence                     → BOTH must verify.
+            const claimsOci = !!(hw.snp_report_b64 || hw.vcek_der_b64);
+            const claimsGcp = !!(hw.google_ak_cert_pem || hasTpmEvidence);
+            if (claimsOci && claimsGcp) {
+                siliconOk = snpVerified && googleVerified;
+            } else if (claimsOci) {
+                siliconOk = snpVerified;
+                if (!snpVerified && siliconMsg.indexOf('❌') === -1) {
+                    siliconMsg += `<br>❌ <b>AMD SEV-SNP report did not verify</b> — OCI/AMD reports are ONLY trusted through the SNP path (v153: the Google/TPM root can no longer substitute for it).`;
+                }
+            } else if (claimsGcp) {
+                siliconOk = googleVerified;
+            } else {
+                siliconOk = false;
             }
 
             // Surface the detailed verdict BEFORE any throw so a failure always

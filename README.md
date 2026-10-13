@@ -60,6 +60,8 @@ Google EK Certificate (NVRAM 0x01c00002, Google-signed, permanent)
 
 > **Key insight**: The Google EK Certificate and the TPM Quote signing key (session AK) are **two separate keys**. The EK cert proves *hardware identity*; the session AK proves *measurement integrity* for this specific session. This is the correct TPM 2.0 attestation model.
 
+> **⚠️ Oracle Cloud attestation scope (honest limits)**: on OCI confidential instances there is **no vTPM** — the AMD SEV-SNP launch digest measures Oracle's UEFI launch firmware, **not** the virtual disk. Hardware proves genuine AMD silicon + session-bound nonce; boot-disk/code integrity is established by the GitHub Sigstore provenance of the reproducible image (verifiable offline with `verify.html`), not by the SNP measurement itself. See `AGENTS.md` for the full chain diagram and the deploy-only-attested-builds rule.
+
 ---
 
 ## 🏗️ Build & Verifiability Workflow
@@ -146,6 +148,8 @@ echo | openssl s_client -connect login.airma.de:443 -showcerts \
 | File | Purpose |
 |---|---|
 | `src/main.rs` | Rust PID 1: DHCP, TPM attestation, ACME TLS, PayPal OAuth, report signing |
+| `src/oci_snp.rs` | AMD SEV-SNP adapter (sev-guest ioctl, VCEK/ASK/ARK, OCI IMDS) |
+| `src/oci_principal.rs` | Option A: instance-principal auth + OCI Secret Management retrieval |
 | `src/google_ca.pem` | Embedded Google Root CA (compiled into binary via `include_bytes!`) |
 | `src/paypal.pem` | Embedded PayPal Root CA (compiled into binary via `include_bytes!`) |
 | `verify.html` | Browser auditor: binary TPM parser, DER cert decoder, WebCrypto, GitHub API |

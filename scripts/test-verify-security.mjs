@@ -314,5 +314,115 @@ console.log('\nTest 5: legitimate GCP report still passes (no regression)');
     `className=${tpmEl && tpmEl.className}`);
 }
 
+// Test 6 (audit SEC-04): an OCI-claiming report (SNP evidence present) must
+// NOT be satisfiable by a locally-forged TPM quote + pasted Google cert.
+// Historically `googleVerified || snpVerified` let this pass: the TPM quote
+// is fully self-consistent on ANY TPM 2.0 machine (right nonce, right PCR
+// digest) and the Google EK cert is public data.
+console.log('\nTest 6: OCI report + forged local TPM quote + Google cert (SEC-04 bypass)');
+{
+  const { generateKeyPairSync, sign: rsaSign, createHash } = await import('crypto');
+  const sha256 = (b) => createHash('sha256').update(b).digest();
+
+  const enc = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const encPem = enc.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const ak = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const akPem = ak.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const customInfo = 'oci_spoof_wallet';
+  const reportBody = {
+    custom_info: customInfo,
+    enclave_config: {
+      boot_measurements: { binary_sha256: 'cc'.repeat(32), disk_manifest: {} },
+      domain: 'x',
+    },
+    paypal_user_info_raw_hash: '22'.repeat(32),
+    session_context: {},
+    timestamp_ms: Date.now(),
+    hardware_level_attestation: null, // nonce-dependent
+  };
+  const pemToDer = (pem) => Buffer.from(pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
+  const ciHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(customInfo)));
+  const combined = new Uint8Array(96);
+  combined.set(Buffer.from(reportBody.paypal_user_info_raw_hash, 'hex'));
+  combined.set(new Uint8Array(sha256(pemToDer(encPem))), 32);
+  combined.set(ciHash, 64);
+  const expectedNonceHex = Buffer.from(await crypto.subtle.digest('SHA-256', combined)).toString('hex');
+
+  // Forged but fully self-consistent TPM quote (the attacker's own machine).
+  const pcr15 = await calculatePcr15(reportBody.enclave_config.boot_measurements.disk_manifest);
+  const pcrValues = {};
+  for (const p of [0, 4, 8, 9]) pcrValues['pcr_' + p] = sha256(Buffer.from(`pcr${p}`)).toString('hex');
+  pcrValues['pcr_15'] = pcr15;
+  const composite = sha256(Buffer.concat([0, 4, 8, 9, 15].map(p => Buffer.from(pcrValues['pcr_' + p], 'hex'))));
+  const qSigner = Buffer.alloc(32, 0x41);
+  const extra = Buffer.from(expectedNonceHex, 'hex');
+  const parts = [];
+  const hdr = Buffer.alloc(8);
+  hdr.writeUInt32BE(0xFF544347, 0);
+  hdr.writeUInt16BE(0x8018, 4);
+  hdr.writeUInt16BE(qSigner.length, 6);
+  parts.push(hdr, qSigner);
+  const edSz = Buffer.alloc(2); edSz.writeUInt16BE(extra.length, 0);
+  parts.push(edSz, extra, Buffer.alloc(17 + 8, 0));
+  const selCount = Buffer.alloc(4); selCount.writeUInt32BE(1, 0);
+  parts.push(selCount, Buffer.from([0x00, 0x0b, 0x03, 0x00, 0x04, 0x0f]));
+  const dgSz = Buffer.alloc(2); dgSz.writeUInt16BE(composite.length, 0);
+  parts.push(dgSz, composite);
+  const quoteMsg = Buffer.concat(parts);
+  const quoteSig = rsaSign('sha256', quoteMsg, ak.privateKey);
+
+  const gkeys = forge.pki.rsa.generateKeyPair(2048);
+  const gcert = forge.pki.createCertificate();
+  gcert.publicKey = gkeys.publicKey;
+  gcert.serialNumber = '03';
+  gcert.validity.notBefore = new Date(Date.now() - 86400000);
+  gcert.validity.notAfter = new Date(Date.now() + 86400000);
+  const gdn = [{ name: 'commonName', value: 'spoof' }, { name: 'organizationName', value: 'EK/AK CA Intermediate' }];
+  gcert.setSubject(gdn); gcert.setIssuer(gdn);
+  gcert.sign(gkeys.privateKey, forge.md.sha256.create());
+
+  // Garbage SNP evidence: the report CLAIMS OCI (vcek+report present) but the
+  // bytes are attacker-controlled, so the SNP path can never verify.
+  const fakeSnp = Buffer.alloc(1184, 0x5a).toString('base64');
+  const fakeVcek = Buffer.from('not-a-cert').toString('base64');
+  reportBody.hardware_level_attestation = {
+    ak_pub_pem: akPem,
+    tpm_quote_msg: quoteMsg.toString('base64'),
+    tpm_quote_sig: quoteSig.toString('base64'),
+    pcr_values: pcrValues,
+    google_ak_cert_pem: forge.pki.certificateToPem(gcert),
+    snp_report_b64: fakeSnp,
+    vcek_der_b64: fakeVcek,
+    platform_type: 'OCI SEV-SNP',
+  };
+
+  const payload = JSON.stringify(reorder(reportBody));
+  const sig = rsaSign('sha256', Buffer.from(payload), enc.privateKey);
+  const spoof = {
+    attestation_report: reportBody,
+    enclave_signature_b64: sig.toString('base64'),
+    enclave_signing_public_key: encPem,
+  };
+
+  // Stub provenance: every lookup 404s (nothing here is CI-built)
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ attestations: [] }) });
+  const alertMsg = await runAuditWith(spoof);
+  globalThis.fetch = realFetch;
+
+  const fw = fwStatus();
+  check('silicon root FAILS (platform enforcement kills the OR-bypass)',
+    !fw || fw.className !== 'verified', `className=${fw && fw.className}`);
+  check('audit fails with an alert', !!alertMsg && alertMsg.startsWith('Audit Failed'), `alert=${alertMsg}`);
+  check('failure is the silicon root, not something earlier',
+    !!alertMsg && /Silicon Root of Trust/i.test(alertMsg), `alert=${alertMsg}`);
+  const gh = document.getElementById('githubCheck');
+  const ghDesc = (gh && (gh.innerHTML || (gh.querySelector() && gh.querySelector().innerHTML))) || '';
+  check('provenance diagnostics explain the unattested binary (no bare ❌)',
+    /no GitHub attestation exists for this exact SHA-256/i.test(ghDesc), `ghDesc=${ghDesc.slice(0, 200)}`);
+  check('provenance diagnostics flag the empty disk_manifest',
+    /empty disk_manifest/i.test(ghDesc), `ghDesc=${ghDesc.slice(0, 200)}`);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

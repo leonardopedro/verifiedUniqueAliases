@@ -26,7 +26,7 @@ set -eo pipefail
 COMPARTMENT_ID="${OCI_COMPARTMENT_ID:-}"
 SUBNET_ID="${OCI_SUBNET_ID:-}"
 IMAGE_ID="${OL10_IMAGE_ID:-ocid1.image.oc1.eu-frankfurt-1.aaaaaaaada4cogim4qsd5txra7fr7fwpcwpq6upp6kvfeah2r2aibe24afaq}"  # Oracle-Linux-10.2-2026.09.18-0
-SSH_PUB="${OL10_SSH_KEY:-$HOME/.ssh/id_ed25519.pub}"
+SSH_PUB="${OL10_SSH_KEY:-$HOME/.ssh/id_ed25519.pub}"   # audit SEC-07: no operator-specific default
 OUT="${1:-ol10}"
 SHAPE="${OCI_SHAPE:-VM.Standard.E5.Flex}"
 
