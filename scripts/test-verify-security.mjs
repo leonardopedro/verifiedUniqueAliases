@@ -424,5 +424,48 @@ console.log('\nTest 6: OCI report + forged local TPM quote + Google cert (SEC-04
     /empty disk_manifest/i.test(ghDesc), `ghDesc=${ghDesc.slice(0, 200)}`);
 }
 
+// ---- Test 7: SNP evidence WITHOUT a verifiable endorsement leaf (v154) ----
+// The enclave only publishes a VCEK/VLEK that actually verifies the live
+// report. A report that carries an SNP report but no vcek_der_b64 means the
+// enclave could NOT obtain any key that signs it — the audit must fail closed
+// with a precise explanation, not silently skip the silicon root.
+console.log('\nTest 7: OCI report with SNP evidence but no endorsement leaf');
+{
+  const nodeCrypto = require('crypto');
+  const sha256 = (buf) => nodeCrypto.createHash('sha256').update(buf).digest();
+  const enc = forge.pki.rsa.generateKeyPair(2048);
+  const encPem = forge.pki.publicKeyToPem(enc.publicKey);
+  const reportBody = {
+    custom_info: 'NONE',
+    enclave_config: { boot_measurements: { binary_sha256: 'dd'.repeat(32), disk_manifest: {} }, domain: 'x' },
+    paypal_user_info_raw_hash: '33'.repeat(32),
+    session_context: {},
+    timestamp_ms: Date.now(),
+    hardware_level_attestation: null,
+  };
+  const pemToDer = (pem) => Buffer.from(pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
+  const combined = new Uint8Array(96);
+  combined.set(Buffer.from(reportBody.paypal_user_info_raw_hash, 'hex'));
+  combined.set(new Uint8Array(sha256(pemToDer(encPem))), 32);
+  combined.set(new Uint8Array(sha256(Buffer.from('NONE'))), 64);
+  reportBody.hardware_level_attestation = {
+    snp_report_b64: Buffer.alloc(1184, 0x5a).toString('base64'), // no vcek_der_b64!
+    vcek_source: 'kds-undecodable',
+    platform_type: 'AMD SEV-SNP',
+  };
+  const payload = JSON.stringify(reorder(reportBody));
+  const sig = nodeCrypto.createSign('sha256').update(payload).sign(forge.pki.privateKeyToPem(enc.privateKey));
+  const report = { attestation_report: reportBody, enclave_signature_b64: sig.toString('base64'), enclave_signing_public_key: encPem };
+
+  const alertMsg = await runAuditWith(report);
+  check('audit fails with an alert', !!alertMsg && alertMsg.startsWith('Audit Failed'), `alert=${alertMsg}`);
+  check('failure is the silicon root', !!alertMsg && /Silicon Root of Trust/i.test(alertMsg), `alert=${alertMsg}`);
+  const fw = fwStatus();
+  const fwHtml = (fw && (fw.innerHTML || (fw.querySelector() && fw.querySelector().innerHTML))) || '';
+  check('precise fail-closed explanation is shown',
+    /NO verifiable endorsement key/i.test(fwHtml), `fw=${fwHtml.slice(0, 200)}`);
+  check('vcek_source is surfaced to the auditor', /kds-undecodable/.test(fwHtml), `fw=${fwHtml.slice(0, 200)}`);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

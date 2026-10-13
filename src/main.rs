@@ -641,6 +641,13 @@ mod tpm {
         // reports with a vendor-loaded key instead of the chip VCEK.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub vlek_der_b64: Option<String>,
+        // v154: Where the published endorsement leaf came from, so auditors
+        // can see the provenance of the key that (should) verify the report:
+        // "psp-table:VCEK" / "psp-table:VLEK" (silicon-provisioned, authoritative),
+        // "psp-table+kds-chain:…" (leaf from PSP, chain completed from KDS),
+        // "kds" (AMD KDS — only published when it actually verifies).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub vcek_source: Option<String>,
         // Legacy TDX schema fields — always None after the OCI migration,
         // kept so older reports remain deserializable.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1019,6 +1026,56 @@ mod tpm {
         tracing::info!("v152: KDS warm-up complete (vcek={}, chain={})", vcek.is_some(), chain.is_some());
     }
 
+    // v154: Boot-time diagnostics for the AMD endorsement path. On OCI E5
+    // hosts with VLEK-style provisioning the PSP's signing key is NOT in
+    // kdsintf.amd.com, so the ONLY authoritative endorsement leaf comes from
+    // the PSP's own certificate table (SNP_GET_EXT_REPORT). This probe runs
+    // with a zero-nonce report (never presented as evidence) and logs, to the
+    // serial console, exactly which certs this host offers and which of them
+    // verifies a live report — so a host-level key mismatch is visible from
+    // the boot log without needing a full attestation run.
+    #[cfg(feature = "oci")]
+    pub async fn diagnostic_psp_probe() {
+        use base64::Engine as _;
+        if !std::path::Path::new("/dev/sev-guest").exists() {
+            tracing::info!("v154: PSP diag skipped (/dev/sev-guest absent)");
+            return;
+        }
+        let Some(ext) = crate::oci_snp::snp_get_ext_report(&[0u8; 64]) else {
+            tracing::warn!("v154: PSP diag: SNP_GET_EXT_REPORT failed — this host only supports the plain report (KDS is the only cert source)");
+            return;
+        };
+        let Some(info) = crate::oci_snp::parse_report(&ext.report) else {
+            tracing::warn!("v154: PSP diag: zero-nonce report unparsable");
+            return;
+        };
+        let table = crate::oci_snp::parse_snp_cert_table(&ext.certs);
+        tracing::info!("v154: PSP diag: certs blob {} bytes — vcek={} vlek={} ask={} ark={}",
+            ext.certs.len(),
+            table.vcek.as_ref().map(|c| crate::oci_snp::hash_cert(c)).unwrap_or_default(),
+            table.vlek.as_ref().map(|c| crate::oci_snp::hash_cert(c)).unwrap_or_default(),
+            table.ask.is_some(), table.ark.is_some());
+        for (label, leaf) in [("VCEK", &table.vcek), ("VLEK", &table.vlek)] {
+            if let Some(l) = leaf {
+                let sig_ok = crate::oci_snp::verify_report_signature(&ext.report, l);
+                let chain_ok = match (&table.ask, &table.ark) {
+                    (Some(a), Some(k)) => crate::oci_snp::validate_amd_chain(l, a, k),
+                    _ => false,
+                };
+                tracing::info!("v154: PSP diag: {} leaf sig_ok={} chain_ok(table)={}", label, sig_ok, chain_ok);
+            }
+        }
+        if let Some(b64) = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await {
+            if let Ok(der) = STANDARD.decode(&b64) {
+                tracing::info!("v154: PSP diag: KDS VCEK sig_ok={} (chip {} TCB {:02}{:02}{:02}{:02})",
+                    crate::oci_snp::verify_report_signature(&ext.report, &der),
+                    &info.chip_id_hex[..16], info.bl, info.tee, info.snp, info.ucode);
+            }
+        } else {
+            tracing::warn!("v154: PSP diag: no KDS VCEK for this chip/TCB (404?)");
+        }
+    }
+
     #[cfg(test)]
     mod kds_cache_tests {
         fn self_signed(days: u32) -> openssl::x509::X509 {
@@ -1334,6 +1391,8 @@ mod tpm {
         let mut vlek_der_b64 = None;
         let mut amd_chain_b64 = None;
         let mut snp_report_b64 = None;
+        // v154: provenance of the published endorsement leaf (auditor-visible).
+        let mut vcek_source: Option<String> = None;
 
         // Helper closure to try parsing SNP report from a byte slice.
         // Delegates to oci_snp::parse_report — correct offsets:
@@ -1377,49 +1436,81 @@ mod tpm {
                         vlek_der_b64 = Some(STANDARD.encode(vlek));
                     }
                     // Try EVERY endorsement leaf the PSP offers (VCEK first,
-                    // then VLEK): publish the first one whose chain validates
-                    // AND whose key actually verifies this report's signature.
-                    // On some multi-tenant confidential hosts the report is
-                    // signed by a key that is neither the KDS VCEK nor the
-                    // obvious leaf — this probing finds the real signer.
-                    match (table.ask.clone(), table.ark.clone()) {
-                        (Some(ask), Some(ark)) => {
-                            let mut published = false;
-                            for (label, leaf) in [("VCEK", table.vcek.clone()), ("VLEK", table.vlek.clone())] {
-                                let leaf = match leaf { Some(l) => l, None => continue };
-                                let chain_ok = crate::oci_snp::validate_amd_chain(&leaf, &ask, &ark);
-                                let sig_ok = crate::oci_snp::verify_report_signature(&info.report, &leaf);
-                                tracing::info!("v153: {} leaf: chain_ok={} sig_ok={} sha256={}", label, chain_ok, sig_ok, &crate::oci_snp::hash_cert(&leaf)[..16]);
-                                if chain_ok && sig_ok {
-                                    tracing::info!("v153: PSP cert table VERIFIED with {} (report signed by this key)", label);
-                                    vcek_der_b64 = Some(STANDARD.encode(&leaf));
-                                    let chain_pem = format!("{}{}",
-                                        crate::oci_snp::der_to_pem("CERTIFICATE", &ask),
-                                        crate::oci_snp::der_to_pem("CERTIFICATE", &ark));
-                                    amd_chain_b64 = Some(STANDARD.encode(chain_pem.as_bytes()));
-                                    published = true;
-                                    break;
+                    // then VLEK). Ground truth is the SIGNATURE: on some
+                    // multi-tenant confidential hosts the report is signed by
+                    // a vendor-loaded key (VLEK-style provisioning) whose
+                    // entry is NOT in AMD KDS — only the PSP knows the real
+                    // signer. The chain is completed from the table when
+                    // present, else from the KDS ASK/ARK (issuer keys are
+                    // not chip-specific). A leaf is published iff it verifies
+                    // this report's signature; a valid chain alone proves
+                    // nothing about who signed THIS report.
+                    let table_chain = match (table.ask.clone(), table.ark.clone()) {
+                        (Some(ask), Some(ark)) => Some((ask, ark, "psp-table".to_string())),
+                        _ => {
+                            if table.vcek.is_some() || table.vlek.is_some() {
+                                tracing::warn!("v154: PSP table has a leaf but no ASK/ARK — completing chain from KDS");
+                                match fetch_amd_chain().await {
+                                    Some(pem) => {
+                                        let ders = crate::oci_snp::pem_certs_to_der(&pem);
+                                        match (ders.first(), ders.get(1)) {
+                                            (Some(ask), Some(ark)) => Some((ask.clone(), ark.clone(), "psp-table+kds-chain".to_string())),
+                                            _ => { tracing::warn!("v154: KDS chain unusable ({} certs) — probing leaves without chain", ders.len()); None }
+                                        }
+                                    }
+                                    None => None,
                                 }
-                            }
-                            if !published {
-                                tracing::error!("v153: no PSP cert (VCEK/VLEK) verifies this report — falling back to KDS");
+                            } else {
+                                None
                             }
                         }
-                        _ => tracing::warn!("v153: PSP cert table incomplete (vcek={} vlek={} ask={} ark={}) — falling back to KDS",
-                            table.vcek.is_some(), table.vlek.is_some(), table.ask.is_some(), table.ark.is_some()),
+                    };
+                    let mut published = false;
+                    for (label, leaf) in [("VCEK", table.vcek.clone()), ("VLEK", table.vlek.clone())] {
+                        let leaf = match leaf { Some(l) => l, None => continue };
+                        let sig_ok = crate::oci_snp::verify_report_signature(&info.report, &leaf);
+                        let chain_ok = table_chain.as_ref().map(|(ask, ark, _)| crate::oci_snp::validate_amd_chain(&leaf, ask, ark)).unwrap_or(false);
+                        tracing::info!("v154: {} leaf: sig_ok={} chain_ok={} sha256={}", label, sig_ok, chain_ok, &crate::oci_snp::hash_cert(&leaf)[..16]);
+                        if sig_ok {
+                            let source = match (table_chain.as_ref(), chain_ok) {
+                                (Some((_, _, how)), true) => format!("{}:{}", how, label),
+                                (Some((_, _, how)), false) => format!("{}:{}(chain-unverified)", how, label),
+                                (None, _) => format!("psp-table:{}(chain-unverified)", label),
+                            };
+                            tracing::info!("v154: PSP cert table VERIFIED with {} (report signed by this key, source={})", label, source);
+                            vcek_der_b64 = Some(STANDARD.encode(&leaf));
+                            vcek_source = Some(source);
+                            if let Some((ask, ark, _)) = table_chain.as_ref() {
+                                let chain_pem = format!("{}{}",
+                                    crate::oci_snp::der_to_pem("CERTIFICATE", ask),
+                                    crate::oci_snp::der_to_pem("CERTIFICATE", ark));
+                                amd_chain_b64 = Some(STANDARD.encode(chain_pem.as_bytes()));
+                            }
+                            published = true;
+                            break;
+                        }
+                    }
+                    if !published {
+                        tracing::error!("v154: NO PSP leaf (VCEK/VLEK) verifies this report — trying KDS");
                     }
                     snp_report_b64 = Some(STANDARD.encode(&info.report));
                     got_ext = true;
-                    // KDS fallback for anything the PSP table didn't supply —
-                    // with a loud diagnostic when the KDS key disagrees with
-                    // the live report (the OCI E5 mismatch being fixed here).
+                    // KDS fallback — verify BEFORE publishing. On OCI E5 hosts
+                    // whose PSP key is not in KDS (VLEK-style provisioning) the
+                    // KDS VCEK chains fine to the ARK but does NOT sign this
+                    // report; publishing it would give auditors a cert that
+                    // fails the signature check (sig=false). Fail closed:
+                    // publish nothing rather than a wrong key.
                     if vcek_der_b64.is_none() {
-                        vcek_der_b64 = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await;
-                        if let Some(b64) = vcek_der_b64.as_ref() {
-                            if let Ok(der) = STANDARD.decode(b64) {
-                                if !crate::oci_snp::verify_report_signature(&info.report, &der) {
-                                    tracing::error!("v153: KDS VCEK does NOT verify the live report signature (OCI PSP/KDS key mismatch) — auditors cannot validate this report");
+                        if let Some(b64) = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await {
+                            match STANDARD.decode(&b64) {
+                                Ok(der) if crate::oci_snp::verify_report_signature(&info.report, &der) => {
+                                    tracing::info!("v154: KDS VCEK verifies the live report — publishing (source=kds)");
+                                    vcek_der_b64 = Some(b64);
+                                    vcek_source = Some("kds".to_string());
                                 }
+                                Ok(_) => tracing::error!("v154: KDS VCEK does NOT verify the live report signature (OCI PSP/KDS key mismatch) — NOT publishing it; report ships without an endorsement leaf and auditors must fail closed"),
+                                Err(e) => tracing::error!("v154: KDS VCEK undecodable: {}", e),
                             }
                         }
                     }
@@ -1558,6 +1649,10 @@ mod tpm {
         let (pck_cert_pem, tdx_policy, platform_type, td_info_json) =
             (None, None, "AMD SEV-SNP".to_string(), None);
 
+        // v154: any leaf that arrived via the KDS-fetching legacy paths
+        // (NVRAM / auxblob / ConfigFS) without an explicit provenance label.
+        let vcek_source = vcek_source.or_else(|| vcek_der_b64.as_ref().map(|_| "kds".to_string()));
+
         Ok(AttestationResult {
             tpm_quote_msg: STANDARD.encode(msg),
             tpm_quote_sig: STANDARD.encode(sig),
@@ -1571,6 +1666,7 @@ mod tpm {
             signature_binding_pubkey_hash: "".to_string(), // Filled by caller
             vcek_der_b64,
             vlek_der_b64,
+            vcek_source,
             amd_chain_b64,
             google_ak_cert_pem,
             ak_der_sha256,
@@ -1819,7 +1915,7 @@ struct PayPalEmail {
     confirmed: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 struct PayPalUserInfo {
     user_id: String,
     sub: Option<String>,
@@ -1846,6 +1942,27 @@ struct PayPalUserInfo {
     account_type: Option<String>,
     age_range: Option<String>,
     payer_id: Option<String>,
+}
+
+impl PayPalUserInfo {
+    /// Data minimization for the `verified` flow: keep ONLY the verification
+    /// facts PayPal is entitled to return for the `paypalattributes` scope —
+    /// the account alias (`user_id`/`payer_id`) and the verified flag.
+    ///
+    /// Everything else (name, email, address, birthdate, picture, …) is
+    /// dropped *immediately after the fetch*, before it can reach: the
+    /// verified_account gate, the session store, the completion page, the
+    /// nonce hash, or the signed attestation report. Even if the token were
+    /// ever over-scoped or PayPal returned extra fields, no profile data can
+    /// cross the enclave boundary on this flow.
+    fn into_verification_only(self) -> PayPalUserInfo {
+        PayPalUserInfo {
+            user_id: self.user_id,
+            payer_id: self.payer_id,
+            verified_account: self.verified_account,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -3004,6 +3121,17 @@ async fn callback(
         }
     };
 
+    // Data minimization (verified flow): project down to the verification
+    // facts BEFORE anything else happens — the gate below, the session
+    // store, the page, the nonce, and the signed report all only ever see
+    // {user_id, payer_id, verified_account}. The `full` flow keeps the
+    // complete profile (its scope explicitly grants it).
+    let userinfo = if config.label == "verified" {
+        userinfo.into_verification_only()
+    } else {
+        userinfo
+    };
+
     // v74-PROD: Strict verified_account check to prevent resource spend on unverified profiles
     if userinfo.verified_account.as_deref() != Some("true") {
         warn!("Blocked attestation for unverified PayPal account: {:?}", userinfo.payer_id);
@@ -3295,6 +3423,10 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         // tmpfs otherwise). Later quote() calls reuse the cache and only
         // re-download when the TCB changes.
         tokio::spawn(async { tpm::warm_kds_cache().await });
+        // v154: probe the PSP's own endorsement table at boot and log the
+        // host-level key provenance (VCEK vs VLEK vs KDS mismatch) to the
+        // serial console — diagnostics only, zero-nonce report.
+        tokio::spawn(async { tpm::diagnostic_psp_probe().await });
     }
     info!("SECRET_NAME={:?}", std::env::var("SECRET_NAME"));
 
@@ -3792,5 +3924,51 @@ mod security_tests {
             "be61c8edada1a19eb7a08176084fd25c5d2c13621f020ea6c5a5713ee668f2da",
             "nonce formula drifted from the auditor's expectedNonce — update verify.html and this vector together"
         );
+    }
+
+    #[test]
+    fn verified_flow_projection_drops_all_profile_data() {
+        // Even if the token were over-scoped or PayPal returned extra
+        // fields, the verified flow must never let profile data past the
+        // fetch: no name/email/address/birthdate can reach the session
+        // store, the nonce, or the signed report.
+        let full = PayPalUserInfo {
+            user_id: "https://uri.paypal.com/services/paypalaccount/XYZ".to_string(),
+            sub: Some("sub-1".to_string()),
+            name: Some("Alice Example".to_string()),
+            given_name: Some("Alice".to_string()),
+            family_name: Some("Example".to_string()),
+            email: Some("alice@example.com".to_string()),
+            emails: Some(vec![PayPalEmail { value: "alice@example.com".to_string(), primary: Some(true), confirmed: Some(true) }]),
+            email_verified: Some(true),
+            birthdate: Some("1990-01-01".to_string()),
+            picture: Some("https://example.com/a.png".to_string()),
+            phone_number: Some("+15551234567".to_string()),
+            address: Some(PayPalAddress { street_address: Some("1 Main St".to_string()), locality: Some("Berlin".to_string()), region: None, postal_code: Some("10115".to_string()), country: Some("DE".to_string()) }),
+            verified_account: Some("true".to_string()),
+            payer_id: Some("XYZ".to_string()),
+            ..Default::default()
+        };
+
+        let projected = full.clone().into_verification_only();
+
+        // Verification facts survive (the gate + report binding need them).
+        assert_eq!(projected.user_id, full.user_id);
+        assert_eq!(projected.payer_id.as_deref(), Some("XYZ"));
+        assert_eq!(projected.verified_account.as_deref(), Some("true"));
+
+        // Everything else is gone — check the serialized form, which is
+        // what actually reaches the nonce hash and the report.
+        let v = serde_json::to_value(&projected).unwrap();
+        for pii in ["sub", "name", "given_name", "family_name", "middle_name", "nickname",
+                    "preferred_username", "profile", "picture", "website", "email", "emails",
+                    "email_verified", "gender", "birthdate", "zoneinfo", "locale", "phone_number",
+                    "address", "verified", "account_type", "age_range"] {
+            assert!(v.get(pii).is_none() || v[pii].is_null(), "field {} survived projection: {}", pii, v);
+        }
+
+        // Deterministic, and distinct from the unprojected payload.
+        assert_eq!(serde_json::to_value(projected.clone()).unwrap(), serde_json::to_value(projected).unwrap());
+        assert_ne!(serde_json::to_value(&full).unwrap(), serde_json::to_value(&full.clone().into_verification_only()).unwrap());
     }
 }

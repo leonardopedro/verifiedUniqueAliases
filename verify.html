@@ -984,7 +984,16 @@
             }
 
             // 5b. Direct AMD SEV-SNP Root (OCI ships no Google AK cert; SNP is the sole root)
-            if (hw.snp_report_b64 && hw.vcek_der_b64) {
+            if (hw.snp_report_b64 && !hw.vcek_der_b64) {
+                // v154: the enclave only publishes an endorsement leaf that
+                // actually verifies the live report (PSP table first, KDS
+                // only if it verifies). An absent leaf means NEITHER the
+                // silicon-provisioned certs nor AMD KDS held the report's
+                // real signing key — fail closed with a precise reason.
+                const src = hw.vcek_source ? ` (enclave vcek_source=${hw.vcek_source})` : '';
+                siliconMsg += `<br>❌ <b>AMD SEV-SNP report present but NO verifiable endorsement key</b>${src}<br>` +
+                              `⚠️ The enclave verified every key it could obtain (PSP certificate table and AMD KDS) and none of them signs this report. This is consistent with a host whose endorsement key is only known to the cloud provider's PSP. Do NOT trust this report — the silicon binding cannot be established.`;
+            } else if (hw.snp_report_b64 && hw.vcek_der_b64) {
                 try {
                     if (!snp || snp.length < 672 + 144) throw new Error("SNP report truncated (expected ≥ 816 bytes)");
                     // report_data[0..32] MUST equal the session nonce
@@ -1042,14 +1051,19 @@
                                       `🔐 Session nonce bound in report_data<br>` +
                                       `🔏 ECDSA P-384 signature valid<br>` +
                                       `⛓️ VCEK→ASK→ARK chain pinned (ARK ${arkPinHex.substring(0, 16)}…)<br>` +
-                                      `📏 Launch digest pinned: ${measurement.substring(0, 16)}…`;
+                                      `📏 Launch digest pinned: ${measurement.substring(0, 16)}…` +
+                                      (hw.vcek_source ? `<br>🏷️ Endorsement key source: ${hw.vcek_source}` : '');
                     } else {
                         if (!measurementOk) {
                             siliconMsg += `<br>❌ <b>Launch digest (MEASUREMENT) not pinned:</b> ${measurement}<br>` +
                                           `⚠️ This report comes from an AMD SEV-SNP launch whose initial image does not match the expected reproducible OCI image stack — possible "ghost enclave". Do NOT trust this report.`;
                         }
                         if (!snpBindingOk || !snpSigOk || !chainOk) {
-                            siliconMsg += `<br>❌ <b>SEV-SNP verification failed</b> (binding=${snpBindingOk}, sig=${snpSigOk}, chain=${chainOk}, ark=${arkPinHex})`;
+                            siliconMsg += `<br>❌ <b>SEV-SNP verification failed</b> (binding=${snpBindingOk}, sig=${snpSigOk}, chain=${chainOk}, ark=${arkPinHex})` +
+                                          (hw.vcek_source ? `<br>🏷️ Endorsement key source: ${hw.vcek_source}` : '') +
+                                          (!snpSigOk && hw.vcek_source && hw.vcek_source !== 'psp-table' && !hw.vcek_source.startsWith('psp-table')
+                                              ? `<br>💡 The published key came from <b>${hw.vcek_source}</b> and does not sign this report. On hosts whose PSP uses vendor-loaded (VLEK-style) endorsement, only the silicon-provisioned PSP certificate can verify the report — this report's endorsement could not be obtained.`
+                                              : '');
                         }
                     }
                 } catch (err) {

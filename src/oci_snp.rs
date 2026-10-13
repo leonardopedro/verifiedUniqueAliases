@@ -189,6 +189,18 @@ mod ext_report_tests {
         assert!(t.ask.is_none() && t.vlek.is_none());
     }
 
+    /// pem_certs_to_der must split a concatenated PEM chain (what KDS serves
+    /// and what der_to_pem produces) back into exact DER certs — used to
+    /// complete a PSP leaf's chain with the KDS ASK/ARK.
+    #[test]
+    fn pem_bundle_splits_into_ders() {
+        let der1 = vec![0x30u8, 0x82, 0x01, 0x00, 0xAA, 0xBB];
+        let der2 = vec![0x30u8, 0x82, 0x02, 0x00, 0xCC];
+        let pem = format!("{}{}", der_to_pem("CERTIFICATE", &der1), der_to_pem("CERTIFICATE", &der2));
+        assert_eq!(pem_certs_to_der(&pem), vec![der1, der2]);
+        assert!(pem_certs_to_der("not a pem").is_empty());
+    }
+
     #[test]
     fn rejects_out_of_range_cert_entry() {
         fn entry(guid: &[u8; 16], off: u32, len: u32) -> Vec<u8> {
@@ -656,6 +668,24 @@ pub fn find_report(blob: &[u8]) -> Option<SnpReportInfo> {
 /// SHA-256 helper for cert hashing
 pub fn hash_cert(cert_bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(cert_bytes))
+}
+
+/// Split a PEM bundle (concatenated `CERTIFICATE` blocks) into raw DER certs.
+/// Used to complete a PSP-provisioned leaf's chain with the KDS ASK/ARK.
+pub fn pem_certs_to_der(pem: &str) -> Vec<Vec<u8>> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let mut out = Vec::new();
+    let mut rest = pem;
+    while let Some(start) = rest.find("-----BEGIN CERTIFICATE-----") {
+        let after = &rest[start + "-----BEGIN CERTIFICATE-----".len()..];
+        let Some(end) = after.find("-----END CERTIFICATE-----") else { break };
+        let b64: String = after[..end].chars().filter(|c| !c.is_whitespace()).collect();
+        if let Ok(der) = STANDARD.decode(&b64) {
+            out.push(der);
+        }
+        rest = &after[end + "-----END CERTIFICATE-----".len()..];
+    }
+    out
 }
 
 /// Convert DER bytes to PEM format
