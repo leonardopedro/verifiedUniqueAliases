@@ -1041,34 +1041,46 @@ mod tpm {
             tracing::info!("v154: PSP diag skipped (/dev/sev-guest absent)");
             return;
         }
-        let Some(ext) = crate::oci_snp::snp_get_ext_report(&[0u8; 64]) else {
-            tracing::warn!("v154: PSP diag: SNP_GET_EXT_REPORT failed — this host only supports the plain report (KDS is the only cert source)");
-            return;
+        let ext = crate::oci_snp::snp_get_ext_report(&[0u8; 64]);
+        // The plain report works even when the extended request doesn't — the
+        // KDS verdict below must still run: it is the per-host oracle that
+        // decides whether reports from this host are third-party verifiable.
+        let (report, certs) = match &ext {
+            Some(e) => (e.report.clone(), Some(e.certs.clone())),
+            None => {
+                tracing::warn!("v154: PSP diag: SNP_GET_EXT_REPORT failed — hypervisor provides no cert table on this host (SNP_SET_EXT_CONFIG not provisioned); KDS is the only cert source");
+                match crate::oci_snp::snp_get_report(&[0u8; 64]) {
+                    Some(r) => (r, None),
+                    None => { tracing::warn!("v154: PSP diag: zero-nonce SNP report unavailable"); return; }
+                }
+            }
         };
-        let Some(info) = crate::oci_snp::parse_report(&ext.report) else {
+        let Some(info) = crate::oci_snp::parse_report(&report) else {
             tracing::warn!("v154: PSP diag: zero-nonce report unparsable");
             return;
         };
-        let table = crate::oci_snp::parse_snp_cert_table(&ext.certs);
-        tracing::info!("v154: PSP diag: certs blob {} bytes — vcek={} vlek={} ask={} ark={}",
-            ext.certs.len(),
-            table.vcek.as_ref().map(|c| crate::oci_snp::hash_cert(c)).unwrap_or_default(),
-            table.vlek.as_ref().map(|c| crate::oci_snp::hash_cert(c)).unwrap_or_default(),
-            table.ask.is_some(), table.ark.is_some());
-        for (label, leaf) in [("VCEK", &table.vcek), ("VLEK", &table.vlek)] {
-            if let Some(l) = leaf {
-                let sig_ok = crate::oci_snp::verify_report_signature(&ext.report, l);
-                let chain_ok = match (&table.ask, &table.ark) {
-                    (Some(a), Some(k)) => crate::oci_snp::validate_amd_chain(l, a, k),
-                    _ => false,
-                };
-                tracing::info!("v154: PSP diag: {} leaf sig_ok={} chain_ok(table)={}", label, sig_ok, chain_ok);
+        if let Some(certs) = certs.as_ref() {
+            let table = crate::oci_snp::parse_snp_cert_table(certs);
+            tracing::info!("v154: PSP diag: certs blob {} bytes — vcek={} vlek={} ask={} ark={}",
+                certs.len(),
+                table.vcek.as_ref().map(|c| crate::oci_snp::hash_cert(c)).unwrap_or_default(),
+                table.vlek.as_ref().map(|c| crate::oci_snp::hash_cert(c)).unwrap_or_default(),
+                table.ask.is_some(), table.ark.is_some());
+            for (label, leaf) in [("VCEK", &table.vcek), ("VLEK", &table.vlek)] {
+                if let Some(l) = leaf {
+                    let sig_ok = crate::oci_snp::verify_report_signature(&report, l);
+                    let chain_ok = match (&table.ask, &table.ark) {
+                        (Some(a), Some(k)) => crate::oci_snp::validate_amd_chain(l, a, k),
+                        _ => false,
+                    };
+                    tracing::info!("v154: PSP diag: {} leaf sig_ok={} chain_ok(table)={}", label, sig_ok, chain_ok);
+                }
             }
         }
         if let Some(b64) = fetch_vcek(&info.chip_id_hex, info.bl, info.tee, info.snp, info.ucode).await {
             if let Ok(der) = STANDARD.decode(&b64) {
                 tracing::info!("v154: PSP diag: KDS VCEK sig_ok={} (chip {} TCB {:02}{:02}{:02}{:02})",
-                    crate::oci_snp::verify_report_signature(&ext.report, &der),
+                    crate::oci_snp::verify_report_signature(&report, &der),
                     &info.chip_id_hex[..16], info.bl, info.tee, info.snp, info.ucode);
             }
         } else {
