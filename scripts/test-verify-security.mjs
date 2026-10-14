@@ -561,5 +561,63 @@ console.log('\nTest 8: v160 report_data binding + pre-flight pin');
   preFlightPubKeyPem = null;
 }
 
+// Test 9 (v161, plan Pillars 2–5): CLIENT-BOUND report_data binding parity
+// with the Rust enclave — SHA-256(P_enc_SPKI_DER ∥ code_challenge ∥
+// P_client_SPKI_DER ∥ client_nonce) — plus the binding-sensitivity matrix.
+// Mirrors tpm::preflight_report_data_binding() ↔
+// security_tests::preflight_binding_parity_v161 ↔ verify.html
+// preflightBindingHex() (update all three together).
+console.log('\nTest 9: v161 client-bound report_data binding parity');
+{
+  const { createHash } = await import('crypto');
+  const sha256 = (...parts) => createHash('sha256').update(Buffer.concat(parts.map(p => Buffer.from(p)))).digest('hex');
+
+  const pubkeyDer = Buffer.from('fake-der-bytes');
+  const codeChallenge = 'TEST_CHALLENGE_v161_parity';
+  const clientPub = Buffer.from('fake-client-ecdh-der');
+  const clientNonce = Buffer.from('11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff', 'hex');
+  const RUST_PIN = 'eb25571bb08d245e4a89f8903c5d348e193e70fe5c2926e2ab033bdcc6beeba8';
+
+  // JS implementation lifted from verify.html's preflightBindingHex()
+  const jsBinding = async () => {
+    const enc = new TextEncoder();
+    const pre = new Uint8Array(pubkeyDer.length + enc.encode(codeChallenge).length + clientPub.length + clientNonce.length);
+    let o = 0;
+    pre.set(pubkeyDer, o); o += pubkeyDer.length;
+    pre.set(enc.encode(codeChallenge), o); o += enc.encode(codeChallenge).length;
+    pre.set(clientPub, o); o += clientPub.length;
+    pre.set(clientNonce, o);
+    return Buffer.from(await crypto.subtle.digest('SHA-256', pre)).toString('hex');
+  };
+
+  const js = await jsBinding();
+  check('JS preflightBindingHex matches independent reference',
+    js === sha256(pubkeyDer, codeChallenge, clientPub, clientNonce), `js=${js}`);
+  check('JS preflightBindingHex matches the Rust-pinned parity vector',
+    js === RUST_PIN, `js=${js} rustPin=${RUST_PIN}`);
+  check('binding is sensitive to the client nonce',
+    js !== sha256(pubkeyDer, codeChallenge, clientPub, Buffer.alloc(32)));
+  check('binding is sensitive to the PKCE challenge',
+    js !== sha256(pubkeyDer, 'OTHER', clientPub, clientNonce));
+  check('binding is sensitive to the client public key',
+    js !== sha256(pubkeyDer, codeChallenge, Buffer.from('other'), clientNonce));
+  check('binding differs from the v160 session binding by construction',
+    js !== sha256(pubkeyDer, clientNonce));
+
+  // RFC 5869 Test Case 1 via WebCrypto HKDF — pins the browser's deriveKey
+  // to the enclave's crypto::hkdf_sha256 (same vector asserted in Rust
+  // security_tests::preflight_session_is_client_bound), so the E2EE session
+  // key derived on BOTH sides of the v161 callback is byte-identical.
+  const tc1Ikm = Buffer.alloc(22, 0x0b);
+  const tc1Salt = Buffer.from([...Array(13).keys()]);
+  const tc1Info = Buffer.from([...Array(10).keys()].map(i => 0xf0 + i));
+  const baseKey = await crypto.subtle.importKey('raw', tc1Ikm, 'HKDF', false, ['deriveBits']);
+  const okm = new Uint8Array(await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: tc1Salt, info: tc1Info }, baseKey, 42 * 8));
+  check('WebCrypto HKDF matches RFC 5869 TC1 (== enclave hkdf_sha256)',
+    Buffer.from(okm).toString('hex') === '3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865',
+    `okm=${Buffer.from(okm).toString('hex').slice(0, 32)}…`);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

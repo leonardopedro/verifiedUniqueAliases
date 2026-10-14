@@ -64,6 +64,53 @@ Google EK Certificate (NVRAM 0x01c00002, Google-signed, permanent)
 
 ---
 
+## ⚔️ Threat Model: What Is Guaranteed Under a Malicious Owner + Malicious Cloud
+
+The system is designed for the strongest realistic collusion case short of silicon compromise:
+
+| Party | What they hold |
+|---|---|
+| **Service owner** | All secrets by construction: PayPal `client_id`/`client_secret`, DNS, ability to mint genuine TLS certificates, repo/CI/deploy configuration |
+| **Oracle Cloud** | Hypervisor, IMDS (`user_data`), image storage, network path, UEFI launch firmware |
+| **Owner + cloud, colluding** | Everything above combined |
+| **Out of scope (trusted)** | AMD SEV-SNP silicon (VCEK/ASK/ARK chain), the user's own browser, GitHub's Sigstore signing identity |
+
+The asset is **the end user's data**: their PayPal identity, the OAuth access token, and the integrity of the attestation statements made about them.
+
+### Guaranteed cryptographically, even under full collusion
+
+1. **Session-bound report delivery (v161)** — the report leaves the enclave encrypted to an ECDH key the *user's browser* generated; the AMD-signed SNP `report_data` commits to the browser's pre-flight client public key, the PKCE `code_challenge`, and the session nonce. The owner terminating TLS with a genuine certificate, and the cloud reading traffic, both see ciphertext only; a man-in-the-middle cannot substitute their own `P_client` (the quote would commit to it and the browser's stored nonce would no longer match).
+2. **PKCE code interception** — the `code_verifier` exists only in enclave RAM for microseconds; intercepted authorization codes are useless.
+3. **Enclave swap prevention** — the pre-flight `P_enc` (hardware-committed and AMD-signed) is pinned in the browser; a swapped enclave fails the callback signature/pin check.
+4. **RAM secrecy even from the cloud** — with honest code running, tokens, userinfo, signing keys and `code_verifier` live only in SEV-SNP-encrypted memory; the hypervisor sees garbage. On the OCI deployment the report signing key is ephemeral per-boot (`deploy-oci.sh` deletes `attestation_signing_key` from `user_data`, so a fresh key is generated in RAM each boot), so a colluding owner cannot forge callback responses offline — forging requires the live enclave's RAM.
+5. **Attestation freshness & binding** — each report's nonce derives from `SHA-256(paypal hash ∥ SHA-256(pubkey DER) ∥ SHA-256(manifest) ∥ …)` and must be reproduced exactly inside the AMD-signed report; forged identities (claiming user X verified without X's real PayPal login) are impossible under honest code.
+
+### The reduction: it all rests on one property
+
+If — and only if — the colluding parties can make the enclave run **code other than what was audited**, every layer above collapses, because the enclave sees the plaintext before it encrypts. So the real claim is:
+
+> **"The code that touches your data is exactly the publicly auditable, CI-built code."**
+
+This is enforced by, in order of strength:
+
+1. **GitHub Sigstore provenance (unforgeable without GitHub's OIDC identity)** — every reported hash (`binary_sha256`, initramfs, UKI, QCOW2) must exist as an attestation naming the exact workflow run → exact public commit. A deployed build never made by CI fails closed (404 → audit red).
+2. **Image atomicity** — binary + initramfs + UKI must come from *one* CI run; a mixed image fails the `common-run` check.
+3. **Public, reproducible source** — the attested commit is open for review by anyone, and anyone can rebuild it bit-for-bit and confirm the binary matches.
+4. **AMD launch digest pin** — `EXPECTED_SNP_MEASUREMENTS` proves genuine OCI confidential hardware running the pinned Oracle fleet UEFI firmware.
+
+### Honest residual (documented, not hidden)
+
+The hardware quote signs *whatever `report_data` and PCR state the guest presents* — it binds the enclave's **claim** about its code identity (`binary_sha256` + manifest are inputs to the session nonce), it does not independently measure that claim. So the question becomes: what stops a deliberately backdoored enclave from *claiming* the honest, CI-attested hashes while running modified code?
+
+- **On OCI: the claim cannot be independently checked against hardware.** The SNP launch digest measures Oracle's fleet UEFI firmware only — not the kernel, initramfs or disk. A consistent lie (honest hashes in the nonce + honest manifest) passes the full audit. This is the project's standing platform limitation (see `AGENTS.md`): OCI code-integrity rests on GitHub provenance of the *reported* manifest plus the public, reproducible source — not on silicon.
+- **On GCP: the un-lie-able evidence exists but is not yet pinned.** The signed quote contains PCR 0/4/8/9 as measured by firmware/GRUB *before any enclave code runs* — a modified bootloader/kernel/initrd **would** change them. Today the auditor checks their composite consistency and the PCR-15 manifest binding (both computed from enclave-supplied values); pinning expected PCR 4/8/9 constants — analogous to `EXPECTED_SNP_MEASUREMENTS` for OCI's launch digest — is the identified hardening that would make GCP code-integrity hardware-enforced end-to-end.
+
+The practical consequence for auditors: **the GCP path can be brought to hardware-enforced code identity (one pin list away); the OCI path provides hardware-enforced silicon identity + session binding + unforgeable public provenance for code identity, and cannot do better without hardware disk measurement.**
+
+> **Scope note**: if "userdata" means the *instance* `user_data` config, its secrecy is not claimed against either party by construction — the owner wrote it and the cloud serves it (both adversaries see it by definition). The deployment keeps no *critical* long-term secret there (`attestation_signing_key` is stripped so the report key stays ephemeral; set `OCI_SECRET_OCID` to move the whole config into OCI Secret Management instead), but even a plaintext PayPal credential in `user_data` adds nothing to the adversaries' power — they already hold equivalent credentials by assumption. The confidentiality guarantee above is about the **end user's** data.
+
+---
+
 ## 🏗️ Build & Verifiability Workflow
 
 ### 1. Atomic Reproducible Build

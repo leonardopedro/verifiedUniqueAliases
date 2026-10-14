@@ -1173,11 +1173,41 @@ mod tpm {
         out
     }
 
+    /// v161 (plan Pillars 2–5): CLIENT-BOUND SNP report_data —
+    /// bytes 0..32: SHA-256( P_enc SPKI DER ∥ code_challenge ∥
+    ///                       P_client SPKI DER ∥ client_nonce[32] )
+    /// bytes 32..64: zero
+    ///
+    /// The hardware quote commits to the exact browser session that requested
+    /// the pre-flight: the ephemeral enclave signing key, the PKCE challenge
+    /// the enclave will present to PayPal, the browser's ephemeral ECDH key,
+    /// and the browser's nonce. Only a report carrying ALL four inputs in its
+    /// report_data satisfies the auditor (verify.html `preflightBindingHex`,
+    /// pinned by `security_tests::preflight_binding_parity_v161` ↔ node
+    /// harness Test 9 — update all three together). The v160 session binding
+    /// (snp_report_data_binding) stays for the legacy /debug/envelope path.
+    pub(crate) fn preflight_report_data_binding(
+        pubkey_der: &[u8],
+        code_challenge: &str,
+        client_pub_der: &[u8],
+        client_nonce: &[u8; 32],
+    ) -> [u8; 64] {
+        use sha2::{Digest, Sha256};
+        let mut out = [0u8; 64];
+        let mut h = Sha256::new();
+        h.update(pubkey_der);
+        h.update(code_challenge.as_bytes());
+        h.update(client_pub_der);
+        h.update(client_nonce);
+        out[..32].copy_from_slice(&h.finalize());
+        out
+    }
+
     /// v160 (Pillar 2): `pubkey_der` is P_enc's SubjectPublicKeyInfo DER —
     /// bound into the SNP report_data as SHA-256(P_enc ∥ session_nonce) so the
     /// hardware quote commits directly to the ephemeral enclave key. The GCP
     /// TPM-quote extraData keeps carrying the raw session nonce (unchanged).
-    pub async fn quote(nonce_hex: &str, pubkey_der: &[u8]) -> Result<AttestationResult, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn quote(nonce_hex: &str, pubkey_der: &[u8], report_data_override: Option<[u8; 64]>) -> Result<AttestationResult, Box<dyn std::error::Error + Send + Sync>> {
         #[cfg(feature = "oci")]
         if crate::oci_snp::is_sev_snp_available() {
             tracing::info!("AMD SEV-SNP hardware attestation path active (OCI)");
@@ -1390,9 +1420,11 @@ mod tpm {
 
         // v160 (Pillar 2): SNP report_data = SHA-256(P_enc ∥ nonce), rest zero
         // — see snp_report_data_binding() for the full contract.
-        let nonce_bytes = snp_report_data_binding(pubkey_der, nonce_hex);
+        // v161 (Pillars 2–5): pre-flight sessions override this with the
+        // client-bound binding (P_enc ∥ code_challenge ∥ P_client ∥ nonce_c).
+        let nonce_bytes = report_data_override.unwrap_or_else(|| snp_report_data_binding(pubkey_der, nonce_hex));
 
-        tracing::info!("DEBUG: SNP report_data binding prepared (SHA-256(P_enc ∥ nonce))");
+        tracing::info!("DEBUG: SNP report_data binding prepared ({})", if report_data_override.is_some() { "v161 client-bound" } else { "SHA-256(P_enc ∥ nonce)" });
         // 1. Fetch Google AK Certificate (Mandatory Identity Root)
         // v137: Directly fetch from TPM NVRAM (primary path) with enlarged buffer (2048 bytes)
         // to prevent truncation of the hardware-bound AMD SNP extensions.
@@ -1754,6 +1786,95 @@ mod crypto {
         let nonce_arr = Nonce::from_slice(nonce);
         let plaintext = cipher.decrypt(nonce_arr, ciphertext).map_err(|e| format!("AesGcm decrypt failed: {:?}", e))?;
         Ok(plaintext)
+    }
+
+    /// v161: AES-256-GCM with associated data. The client nonce is
+    /// the AAD, so a ciphertext captured in one session cannot be replayed or
+    /// spliced into another — decryption fails without the exact session's
+    /// nonce (which is itself bound into the hardware quote).
+    pub fn encrypt_aad(dek: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+        use aes_gcm::aead::Payload;
+        let key = Key::<Aes256Gcm>::from_slice(dek);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ciphertext = cipher
+            .encrypt(&nonce, Payload { msg: plaintext, aad })
+            .map_err(|e| format!("AesGcm encrypt failed: {:?}", e))?;
+        Ok((nonce.to_vec(), ciphertext))
+    }
+
+    /// v161: decrypt an AAD-bound ciphertext (mirror of encrypt_aad).
+    pub fn decrypt_aad(dek: &[u8], nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        use aes_gcm::aead::Payload;
+        let key = Key::<Aes256Gcm>::from_slice(dek);
+        let cipher = Aes256Gcm::new(key);
+        let nonce_arr = Nonce::from_slice(nonce);
+        let plaintext = cipher
+            .decrypt(nonce_arr, Payload { msg: ciphertext, aad })
+            .map_err(|e| format!("AesGcm decrypt failed: {:?}", e))?;
+        Ok(plaintext)
+    }
+
+    /// v161 (Pillar 5): HKDF-SHA256 (RFC 5869) built on openssl's HMAC — the
+    /// same extract-then-expand primitive WebCrypto exposes, so the browser
+    /// and the enclave derive byte-identical keys from the ECDH shared secret.
+    pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) {
+        use openssl::pkey::PKey;
+        use openssl::sign::Signer;
+        fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+            let k = PKey::hmac(key).expect("HMAC key");
+            // HMAC keys carry the digest in the Signer (not
+            // new_without_digest, which is for raw-signature schemes).
+            let mut s = Signer::new(openssl::hash::MessageDigest::sha256(), &k).expect("HMAC signer");
+            s.update(data).expect("HMAC update");
+            s.sign_to_vec().expect("HMAC sign")
+        }
+        let prk = hmac(salt, ikm);
+        let mut t: Vec<u8> = Vec::new();
+        let mut okm: Vec<u8> = Vec::new();
+        let mut counter: u8 = 1;
+        while okm.len() < out.len() {
+            let mut msg = t.clone();
+            msg.extend_from_slice(info);
+            msg.push(counter);
+            t = hmac(&prk, &msg);
+            okm.extend_from_slice(&t);
+            counter = counter.wrapping_add(1).max(1);
+        }
+        let n = out.len().min(okm.len());
+        out[..n].copy_from_slice(&okm[..n]);
+    }
+
+    /// v161 (Pillars 3+5): ECDH(P-256) → HKDF-SHA256 → 32-byte AES key.
+    /// salt = the client's 32-byte nonce (key is useless outside the exact
+    /// browser session that requested the pre-flight), info = protocol label
+    /// (domain separation from any other HKDF use in this binary).
+    pub fn derive_e2ee_session_key(
+        enclave_ecdh: &openssl::pkey::PKey<openssl::pkey::Private>,
+        client_pub_der: &[u8],
+        client_nonce: &[u8; 32],
+    ) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+        use openssl::derive::Deriver;
+        use openssl::pkey::PKey;
+        let peer = PKey::public_key_from_der(client_pub_der)
+            .map_err(|e| format!("client ECDH public key is not valid SPKI DER: {}", e))?;
+        let mut deriver = Deriver::new(enclave_ecdh)?;
+        deriver.set_peer(&peer)?;
+        let mut ikm = deriver.derive_to_vec()?;
+        let mut key = [0u8; 32];
+        hkdf_sha256(&ikm, client_nonce, b"paypal-auth-vm/e2ee/v1", &mut key);
+        ikm.iter_mut().for_each(|b| *b = 0); // best-effort wipe of the raw secret
+        Ok(key)
+    }
+
+    /// v161: generate the enclave's per-session ECDH keypair (P_enc_ecdh).
+    /// RAM-only, one per pre-flight session, never serialized to disk.
+    pub fn generate_ecdh_keypair() -> Result<openssl::pkey::PKey<openssl::pkey::Private>, Box<dyn std::error::Error + Send + Sync>> {
+        use openssl::ec::{EcGroup, EcKey};
+        use openssl::nid::Nid;
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+        let ec = EcKey::generate(&group)?;
+        Ok(openssl::pkey::PKey::from_ec_key(ec)?)
     }
 }
 
@@ -2745,6 +2866,10 @@ async fn generate_attestation(
     clicked_button_label: String,
     userinfo: PayPalUserInfo,
     custom_info: Option<String>,
+    // v161 (Pillars 2–5): Some(pkce) ⇒ client-bound pre-flight session —
+    // the SNP report_data uses the v161 four-element binding and the report
+    // carries the client inputs so the auditor can recompute the binding.
+    preflight: Option<&PkceSession>,
 ) -> String {
     use sha2::{Digest, Sha256};
     
@@ -2759,8 +2884,10 @@ async fn generate_attestation(
     hasher.update(userinfo_compact.as_bytes());
     let paypal_hash = hex::encode(hasher.finalize());
 
-    println!("DEBUG: userinfo_compact: {}", userinfo_compact);
-    println!("DEBUG: paypal_hash: {}", paypal_hash);
+    // v161 (threat model: colluding owner reads the serial console): the old
+    // DEBUG println!s dumped the plaintext identity + full report payload to
+    // kmsg/console. Identity material now leaves this function only inside
+    // the signed report (and, for pre-flight sessions, its E2EE ciphertext).
 
     // 2.5 Software Hash Check (Self-measure)
     let bin_path = "/init"; 
@@ -2813,7 +2940,13 @@ async fn generate_attestation(
     );
 
     info!("Generating hardware attestation with bound public key hash: {}", pub_key_hash_hex);
-    let mut tpm_report = match tpm::quote(&final_combined_nonce, &pub_key_der).await {
+    // v161 (Pillars 2–5): pre-flight sessions bind the CLIENT's inputs into
+    // the silicon quote instead of the v160 session-nonce binding:
+    // report_data[0..32] = SHA-256(P_enc ∥ code_challenge ∥ P_client ∥ nonce_c)
+    let report_data_override = preflight.map(|pk| {
+        tpm::preflight_report_data_binding(&pub_key_der, &pk.code_challenge, &pk.client_ecdh_pub, &pk.client_nonce)
+    });
+    let mut tpm_report = match tpm::quote(&final_combined_nonce, &pub_key_der, report_data_override).await {
         Ok(r) => r,
         Err(e) => return format!("ERROR: Failed to generate TPM Quote: {}", e),
     };
@@ -2847,15 +2980,31 @@ async fn generate_attestation(
         "session_context": {
             "clicked_button_label": clicked_button_label,
             "tls_certificate_pem": &cert_pem,
+            // v161: the auditor recomputes the four-element hardware binding
+            // from these values; executePreflightAndLogin additionally
+            // asserts them against the inputs this browser generated.
+            "preflight": match preflight {
+                Some(pk) => {
+                    use base64::Engine as _;
+                    serde_json::json!({
+                        "binding": "v161",
+                        "code_challenge": pk.code_challenge,
+                        "client_pub_b64": base64::engine::general_purpose::STANDARD.encode(&pk.client_ecdh_pub),
+                        "client_nonce_hex": hex::encode(pk.client_nonce),
+                    })
+                }
+                None => serde_json::Value::Null,
+            },
         },
         "custom_info": custom_info_str,
         "hardware_level_attestation": tpm_val,
     });
 
     // v70: We use Compact JSON for the signature to ensure deterministic verification (Canonical-lite)
+    // v161: no /tmp/last_payload.json dump and no DEBUG println — under the
+    // collusion threat model the plaintext report must exist only in RAM and
+    // (for pre-flight sessions) inside the client-bound ciphertext.
     let payload_compact = serde_json::to_string(&payload).expect("Failed to serialize compact payload");
-    let _ = std::fs::write("/tmp/last_payload.json", &payload_compact);
-    println!("DEBUG PAYLOAD: {}", payload_compact);
     
     // 6. Sign everything using the enclave-bound asymmetric key
     let signature = if let Some(id) = &state.enclave_identity {
@@ -3007,17 +3156,17 @@ async fn index(
         <div class="info">
             <p><strong>Verified Candidate Login (Recommended First):</strong></p>
             <p>This button uses a restricted PayPal App to only verify your "PayPal Verified" status and perform hardware attestation. No profile or email data is shared yet.</p>
-            <a href="/login?flow=verified" class="btn" style="background:#4caf50;">Check Attestation & PayPal Verification</a>
+            <a href="/verify.html#login-verified" class="btn" style="background:#4caf50;">Check Attestation & PayPal Verification</a>
         </div>
         <div class="info">
             <p><strong>Full Data Login:</strong></p>
             <p>Asks for standard profile and email data for full application functionality.</p>
-            <a href="/login?flow=full" class="btn">Login with PayPal (Full Data)</a>
+            <a href="/verify.html#login-full" class="btn">Login with PayPal (Full Data)</a>
         </div>
         <div class="footer">
             <a href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html">Privacy Policy</a> |
             <a href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html">User Agreement</a> |
-            <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">Official Auditor</a>
+            <a href="/verify.html">Official Auditor</a>
         </div>
         "#,
         state.domain, PLATFORM_LABEL
@@ -3058,11 +3207,18 @@ struct LoginParams {
 struct PkceSession {
     code_verifier: String,
     code_challenge: String,
+    // v161 (Pillars 2–5): client-bound pre-flight session.
+    // client_ecdh_pub empty ⇒ legacy /login session (v160 session binding).
+    client_ecdh_pub: Vec<u8>,
+    client_nonce: [u8; 32],
+    // Enclave's per-session ECDH keypair (P_enc_ecdh / S_enc_ecdh). RAM-only,
+    // never serialized — like S_enc, it exists only inside encrypted memory.
+    enclave_ecdh: Option<openssl::pkey::PKey<openssl::pkey::Private>>,
     created_at: Instant,
 }
 
 impl PkceSession {
-    fn new() -> Self {
+    fn mint() -> (String, String) {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
         use base64::Engine as _;
         use rand::Rng;
@@ -3075,59 +3231,219 @@ impl PkceSession {
         // Code challenge = BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))
         let challenge_hash = Sha256::digest(code_verifier.as_bytes());
         let code_challenge = B64URL.encode(challenge_hash);
+        (code_verifier, code_challenge)
+    }
 
+    fn new() -> Self {
+        let (code_verifier, code_challenge) = Self::mint();
         Self {
             code_verifier,
             code_challenge,
+            client_ecdh_pub: Vec::new(),
+            client_nonce: [0u8; 32],
+            enclave_ecdh: None,
             created_at: Instant::now(),
         }
     }
+
+    /// v161: pre-flight session — the quote will bind (P_enc ∥ code_challenge
+    /// ∥ P_client ∥ client_nonce), and the callback response is E2EE-sealed
+    /// to P_client via the per-session enclave ECDH key.
+    fn new_preflight(client_ecdh_pub: Vec<u8>, client_nonce: [u8; 32]) -> Self {
+        let (code_verifier, code_challenge) = Self::mint();
+        let enclave_ecdh = crate::crypto::generate_ecdh_keypair().ok();
+        Self {
+            code_verifier,
+            code_challenge,
+            client_ecdh_pub,
+            client_nonce,
+            enclave_ecdh,
+            created_at: Instant::now(),
+        }
+    }
+
+    fn is_preflight(&self) -> bool {
+        !self.client_ecdh_pub.is_empty() && self.enclave_ecdh.is_some()
+    }
 }
 
-async fn login(
-    Query(params): Query<LoginParams>,
+// ============================================================================
+// v161 (plan Pillar 4): PRE-FLIGHT ATTESTATION PROTOCOL
+// ============================================================================
+//
+// POST /attest/preflight — the browser (verify.html, same origin) generates an
+// ephemeral ECDH keypair + 32-byte nonce, and the enclave returns a
+// SYNTHETIC-identity attestation envelope whose AMD SEV-SNP report_data binds:
+//
+//     SHA-256( P_enc_SPKI ∥ code_challenge ∥ P_client_SPKI ∥ client_nonce )
+//
+// together with the PKCE material the client needs to construct the PayPal
+// authorize URL ITSELF (plan §6 step 7) — the enclave never redirects. The
+// non-report fields are signed by S_enc (whose P_enc the hardware quote
+// commits to), so the client can authenticate the challenge/state/client_id
+// triple before ever sending the user to PayPal. The code_verifier stays in
+// encrypted RAM; a colluding owner/hypervisor who later intercepts the
+// authorization code cannot redeem it (Pillar 2).
+
+#[derive(Deserialize)]
+pub struct PreflightRequest {
+    /// SPKI DER (base64 STANDARD) of the browser's ephemeral ECDH P-256 key.
+    pub client_ecdh_pub_b64: String,
+    /// 32-byte browser nonce, hex-encoded.
+    pub client_nonce_hex: String,
+    /// "verified" (default) or "full" — selects the PayPal app/scope.
+    pub flow: Option<String>,
+}
+
+async fn serve_verify_html() -> impl IntoResponse {
+    // Same-origin hosting of the auditor is REQUIRED by the v161 flow: the
+    // pre-flight stores S_client in sessionStorage and the /callback page
+    // reads it back — sessionStorage is per-origin, so the auditor MUST be
+    // served by the enclave itself. The github.io copy remains for offline
+    // audits of downloaded reports.
+    Html(include_str!("../verify.html")).into_response()
+}
+
+async fn preflight_cors() -> impl IntoResponse {
+    // OPTIONS preflight for the cross-auditor POST (verify.html may be opened
+    // from file:// or github.io for the hardware check itself; the login
+    // completion always returns to this origin).
+    (
+        [
+            (axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            (axum::http::header::ACCESS_CONTROL_ALLOW_METHODS, "POST, OPTIONS"),
+            (axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS, "content-type"),
+        ],
+        axum::http::StatusCode::NO_CONTENT,
+    )
+}
+
+async fn attest_preflight(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+    Json(payload): Json<PreflightRequest>,
 ) -> Response {
-    if let Err(status) = state.record_egress_data(addr.ip(), 500 /* Estimated redir size */) {
+    if let Err(status) = state.record_egress_data(addr.ip(), 24 * 1024 /* envelope estimate */) {
         return status.into_response();
     }
-    let flow = params.flow.as_deref().unwrap_or("full");
-    let config = state.get_flow_config(flow);
-    
-    let auth_base = if state.staging { PAYPAL_SANDBOX_AUTH } else { PAYPAL_PRODUCTION_AUTH };
+    use base64::engine::general_purpose::STANDARD as B64STD;
+    use base64::Engine as _;
 
-    // v152 SECURITY: RFC 6749 §10.12 — `state` MUST be an unguessable,
-    // per-session value, not a static label. A static state allows Login
-    // CSRF: an attacker captures their own authorization code and tricks a
-    // victim into completing the callback with it. The random token is
-    // (a) stored server-side (single-use, 10 min TTL) carrying the flow
-    // label, and (b) mirrored into an HttpOnly cookie so the callback can
-    // prove the response comes from the browser that started the flow.
+    // Strict input validation: the client key MUST be a parsable SPKI DER of
+    // an EC P-256 key (WebCrypto ECDH export), the nonce exactly 32 bytes.
+    let client_pub = match B64STD.decode(payload.client_ecdh_pub_b64.trim()) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid client_ecdh_pub_b64: {}", e)).into_response(),
+    };
+    match openssl::pkey::PKey::public_key_from_der(&client_pub)
+        .and_then(|k| {
+            k.ec_key()
+                .map(|ec| ec.group().curve_name())
+                .map_err(|_| openssl::error::ErrorStack::get())
+        }) {
+        Ok(Some(nid)) if nid == openssl::nid::Nid::X9_62_PRIME256V1 => {}
+        _ => return (StatusCode::BAD_REQUEST, "client_ecdh_pub_b64 must be an ECDH P-256 SPKI DER public key").into_response(),
+    }
+    let nonce_vec = match hex::decode(payload.client_nonce_hex.trim()) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid client_nonce_hex: {}", e)).into_response(),
+    };
+    if nonce_vec.len() != 32 {
+        return (StatusCode::BAD_REQUEST, "client_nonce_hex must decode to exactly 32 bytes").into_response();
+    }
+    let mut client_nonce = [0u8; 32];
+    client_nonce.copy_from_slice(&nonce_vec);
+
+    let flow = match payload.flow.as_deref().unwrap_or("verified") {
+        "verified" => "verified",
+        "full" => "full",
+        _ => return (StatusCode::BAD_REQUEST, "flow must be 'verified' or 'full'").into_response(),
+    };
+    let config = state.get_flow_config(flow);
+
+    if state.enclave_identity.is_none() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Enclave identity uninitialized").into_response();
+    }
+
+    // Mint the single-use PKCE session (verifier stays in encrypted RAM).
+    let pkce = PkceSession::new_preflight(client_pub.clone(), client_nonce);
+    if pkce.enclave_ecdh.is_none() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Enclave ECDH key generation failed").into_response();
+    }
     use rand::Rng;
     let mut state_bytes = [0u8; 32];
     rand::thread_rng().fill(&mut state_bytes);
     let oauth_state = hex::encode(state_bytes);
 
-    // v160 (Pillar 3): generate the PKCE pair; the challenge rides the
-    // authorize request, the verifier stays server-side in RAM below.
-    let pkce = PkceSession::new();
+    // Synthetic-identity envelope with the REAL hardware evidence + the v161
+    // client-bound report_data (identity is explicitly fake — same discipline
+    // as /debug/envelope; this is hardware+binding proof, never identity).
+    let synthetic: PayPalUserInfo = serde_json::from_str(
+        r#"{"user_id":"PREFLIGHT-ONLY-NOT-A-REAL-PAYPAL-USER","sub":"PREFLIGHT-ONLY","payer_id":"PREFLIGHT","verified_account":"true","verified":"true"}"#,
+    ).expect("static synthetic preflight identity");
+    let envelope_str = generate_attestation(
+        &state,
+        "preflight (synthetic identity — NOT a real PayPal login)".to_string(),
+        synthetic,
+        Some("PREFLIGHT ENVELOPE — synthetic identity, binds this browser session".to_string()),
+        Some(&pkce),
+    ).await;
+    if envelope_str.starts_with("ERROR:") {
+        error!("preflight quote failed: {}", envelope_str);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Hardware quote failed — see enclave log").into_response();
+    }
+    let envelope: serde_json::Value = match serde_json::from_str(&envelope_str) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("preflight envelope serialization failed: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Envelope construction failed").into_response();
+        }
+    };
 
-    let url = format!(
-        "{}?client_id={}&response_type=code&scope={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
-        auth_base,
-        config.client_id,
-        urlencoding::encode(&config.scope),
-        urlencoding::encode(&state.redirect_uri),
-        oauth_state,
-        pkce.code_challenge
+    let id = state.enclave_identity.as_ref().unwrap();
+    let auth_base = if state.staging { PAYPAL_SANDBOX_AUTH } else { PAYPAL_PRODUCTION_AUTH };
+    let ecdh_pub_b64 = match pkce.enclave_ecdh.as_ref().unwrap().public_key_to_der() {
+        Ok(der) => B64STD.encode(der),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "ECDH public export failed").into_response(),
+    };
+
+    // The fields that pin THIS login attempt. Signed by S_enc so the client
+    // can authenticate them against the hardware-committed P_enc BEFORE the
+    // user is sent to PayPal.
+    let signed_fields = serde_json::json!({
+        "binding": "v161",
+        "code_challenge": pkce.code_challenge,
+        "state": oauth_state,
+        "flow": config.label,
+        "paypal_client_id": config.client_id,
+        "redirect_uri": state.redirect_uri,
+        "authorize_base": auth_base,
+        "scope": config.scope,
+        "enclave_ecdh_public_key_b64": ecdh_pub_b64,
+    });
+    let signed_fields_compact = serde_json::to_string(&signed_fields).expect("serialize signed fields");
+    let signature = sign_payload(&signed_fields_compact, &id.pem);
+
+    // Single-use server-side session (10 min TTL, swept with the /login set).
+    state.pending_oauth_states.write().insert(oauth_state.clone(), (config.label.clone(), pkce));
+
+    let body = serde_json::json!({
+        "attestation_envelope": envelope,
+        "enclave_signing_public_key": id.pubkey_pem,
+        "signed_fields": signed_fields,
+        "preflight_signature_b64": signature,
+    });
+
+    let mut resp = ([(axum::http::header::CONTENT_TYPE, "application/json")], Json(body)).into_response();
+    // Same-origin CORS: the auditor may live on file:// or github.io for the
+    // hardware check; no credentials ride this endpoint (the envelope is
+    // synthetic-identity diagnostics + key material for THIS session).
+    resp.headers_mut().insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        axum::http::HeaderValue::from_static("*"),
     );
-
-    state
-        .pending_oauth_states
-        .write()
-        .insert(oauth_state.clone(), (config.label.clone(), pkce));
-    let mut resp = Redirect::temporary(&url).into_response();
+    // Cookie binds the browser that started the flow (Login CSRF defense,
+    // RFC 6749 §10.12) — verified strictly on /callback.
     let cookie = format!(
         "paypal_oauth_state={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600",
         oauth_state
@@ -3138,11 +3454,22 @@ async fn login(
     resp
 }
 
+async fn login(
+    Query(_params): Query<LoginParams>,
+    State(_state): State<Arc<AppState>>,
+) -> Response {
+    // v161 (plan §6): the enclave no longer redirects to PayPal itself. The
+    // client must audit the hardware binding FIRST (pre-flight), then build
+    // the authorize URL from the S_enc-signed fields. /login stays as a
+    // compatibility shim pointing at the auditor.
+    Redirect::temporary("/verify.html").into_response()
+}
+
 async fn debug_attestation() -> impl IntoResponse {
     let mut results = serde_json::Map::new();
     
     // Check TPM Quote
-    let nonce = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";        match tpm::quote(nonce, &[]).await {
+    let nonce = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";        match tpm::quote(nonce, &[], None).await {
         Ok(r) => { 
             results.insert("tpm_quote_status".to_string(), serde_json::Value::String("SUCCESS".to_string())); 
             results.insert("report".to_string(), serde_json::to_value(r).unwrap()); 
@@ -3283,6 +3610,8 @@ async fn debug_envelope(State(state): State<Arc<AppState>>) -> impl IntoResponse
         "debug-envelope (synthetic identity — NOT a real PayPal login)".to_string(),
         synthetic,
         Some("DEBUG ENVELOPE — synthetic identity, no real user attached".to_string()),
+        None, // v161: /debug/envelope keeps the v160 session binding; the
+              // client-bound (v161) binding is minted by /attest/preflight
     )
     .await;
     (
@@ -3343,6 +3672,89 @@ async fn security_headers(req: axum::extract::Request, next: axum::middleware::N
         axum::http::HeaderValue::from_static("camera=(), microphone=(), geolocation=(), usb=()"),
     );
     resp
+}
+
+// v161: best-effort in-place wipe of a sensitive string (tokens, secrets).
+// The allocator may have copied old pages; this closes the window inside our
+// own process image (the plan's "zeroize immediately after userinfo fetch").
+fn zeroize_str(s: &mut String) {
+    unsafe {
+        let bytes = s.as_bytes_mut();
+        for b in bytes.iter_mut() { *b = 0; }
+    }
+    s.clear();
+}
+
+// v161 (Pillar 5): the post-login page. It carries ONLY the ciphertext; the
+// decryption key material never left the browser (S_client in sessionStorage)
+// and the hardware-committed P_enc pin is re-checked after decryption. The
+// page then hands the decrypted report to the same-origin /verify.html
+// auditor via sessionStorage for the full multi-check audit.
+fn render_e2ee_page(blob: &serde_json::Value) -> String {
+    let content = format!(
+        r#"
+        <h1>Authentication Successful</h1>
+        <div class="info">
+            <h3>Hardware-Attested, Client-Encrypted Delivery</h3>
+            <p>Your PayPal identity was fetched inside the SEV-SNP enclave, minimized, encrypted to the
+               session key YOU generated (ECDH → HKDF → AES-256-GCM), and signed by the enclave's
+               hardware-committed signing key. Only this browser can open it.</p>
+            <p id="st" style="color:#e0e0e0;">⏳ Decrypting and verifying…</p>
+            <a id="openAuditor" class="btn" style="display:none; background:#4caf50; margin-top:10px;" href="/verify.html">Open Full Auditor →</a>
+        </div>
+        <script type="application/json" id="e2ee-blob">{}</script>
+        <script>
+        (async () => {{
+            const b64d = s => Uint8Array.from(atob(s.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
+            const pemDer = pem => b64d(pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''));
+            const reorder = o => {{ if (o === null || typeof o !== 'object' || Array.isArray(o)) return o; const out = {{}}; Object.keys(o).sort().forEach(k => out[k] = reorder(o[k])); return out; }};
+            const st = document.getElementById('st');
+            const fail = m => {{ st.innerHTML = '❌ ' + m; }};
+            try {{
+                const blob = JSON.parse(document.getElementById('e2ee-blob').textContent);
+                const jwk = JSON.parse(sessionStorage.getItem('pav_client_jwk') || 'null');
+                const nonceHex = sessionStorage.getItem('pav_client_nonce') || '';
+                const pinned = sessionStorage.getItem('pav_p_enc') || '';
+                if (!jwk || !nonceHex) throw new Error('no pre-flight session in this browser — restart the login from /verify.html');
+                const nonceBytes = Uint8Array.from(nonceHex.match(/.{{2}}/g) || [], h => parseInt(h, 16));
+                if (nonceBytes.length !== 32) throw new Error('stored client nonce is malformed');
+                // 1. ECDH(P-256): deriveBits(S_client, P_enc_ecdh)
+                const priv = await crypto.subtle.importKey('jwk', jwk, {{ name: 'ECDH' }}, false, ['deriveBits']);
+                const peer = await crypto.subtle.importKey('spki', b64d(blob.enclave_ecdh_public_key_b64), {{ name: 'ECDH' }}, false, []);
+                const bits = await crypto.subtle.deriveBits({{ name: 'ECDH', public: peer }}, priv, 256);
+                // 2. HKDF-SHA256(salt=client_nonce, info=protocol label) → AES-256 key
+                const base = await crypto.subtle.importKey('raw', bits, 'HKDF', false, ['deriveKey']);
+                const key = await crypto.subtle.deriveKey(
+                    {{ name: 'HKDF', hash: 'SHA-256', salt: nonceBytes, info: new TextEncoder().encode('paypal-auth-vm/e2ee/v1') }},
+                    base, {{ name: 'AES-GCM', length: 256 }}, false, ['decrypt']);
+                // 3. AES-256-GCM decrypt (AAD = client_nonce → session-bound)
+                const pt = await crypto.subtle.decrypt(
+                    {{ name: 'AES-GCM', iv: b64d(blob.iv_b64), additionalData: nonceBytes }},
+                    key, b64d(blob.ct_b64));
+                const envelope = JSON.parse(new TextDecoder().decode(pt));
+                // 4. PRE-FLIGHT PIN: the report MUST be signed by the P_enc the
+                //    hardware quote committed to at pre-flight time.
+                const reportPem = envelope.enclave_signing_public_key;
+                if (pinned && reportPem !== pinned) throw new Error('PRE-FLIGHT VIOLATION: report key ≠ pinned P_enc — the enclave was swapped. Do NOT trust this payload.');
+                // 5. S_enc signature over the canonical (sorted-key) report
+                const k = await crypto.subtle.importKey('spki', pemDer(reportPem), {{ name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }}, false, ['verify']);
+                const ok = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', k, b64d(envelope.enclave_signature_b64),
+                    new TextEncoder().encode(JSON.stringify(reorder(envelope.attestation_report))));
+                if (!ok) throw new Error('S_enc report signature INVALID — forged or corrupted payload');
+                // 6. Hand the verified report to the same-origin auditor.
+                sessionStorage.setItem('pav_e2ee_report', JSON.stringify(envelope, null, 2));
+                const sub = (envelope.attestation_report.paypal_user_info || {{}}).sub || '(unknown)';
+                st.innerHTML = '✅ Decrypted + signature verified + P_enc pin matched.<br>PayPal identity <b>' + sub + '</b> was delivered inside a client-bound, hardware-attested ciphertext.<br>Open the full auditor for the complete multi-check report.';
+                document.getElementById('openAuditor').style.display = 'inline-block';
+            }} catch (e) {{ fail(e.message); }}
+        }})();
+        </script>
+        "#,
+        // Safe embedding in a raw-text <script> block: neutralize any
+        // `</…` sequence (the only way JSON text can close the tag early).
+        blob.to_string().replace("</", "<\\/")
+    );
+    HTML_TEMPLATE.replace("{{CONTENT}}", &content)
 }
 
 async fn callback(
@@ -3433,6 +3845,73 @@ async fn callback(
         ).into_response();
     }
 
+    // ========================================================================
+    // v161 (plan Pillars 3+5): CLIENT-BOUND E2EE DELIVERY
+    // ========================================================================
+    // A pre-flight session delivers its report encrypted to P_client via
+    // ECDH(P-256) + HKDF-SHA256 + AES-256-GCM, signed by S_enc. Neither the
+    // domain owner (who can terminate TLS with a genuine cert) nor the cloud
+    // provider (who sees plaintext RAM-exit traffic) can read the payload —
+    // it exists in plaintext only inside SEV-SNP-encrypted memory and inside
+    // the ciphertext only the browser holding S_client can open.
+    if pkce.is_preflight() {
+        let report_json = generate_attestation(
+            &state,
+            config.label.clone(),
+            userinfo,
+            None,
+            Some(&pkce),
+        ).await;
+        if report_json.starts_with("ERROR:") {
+            error!("E2EE report quote failed: {}", report_json);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Attestation quote failed — the enclave logged the details.").into_response();
+        }
+        let id = match &state.enclave_identity {
+            Some(id) => id,
+            None => return (StatusCode::INTERNAL_SERVER_ERROR, "Enclave identity uninitialized").into_response(),
+        };
+        let ecdh = pkce.enclave_ecdh.as_ref().unwrap();
+        let session_key = match crypto::derive_e2ee_session_key(ecdh, &pkce.client_ecdh_pub, &pkce.client_nonce) {
+            Ok(k) => k,
+            Err(e) => {
+                error!("E2EE key derivation failed: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Client key agreement failed — the enclave logged the details.").into_response();
+            }
+        };
+        let (iv, ct) = match crypto::encrypt_aad(&session_key, report_json.as_bytes(), &pkce.client_nonce) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("E2EE encryption failed: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Payload encryption failed — the enclave logged the details.").into_response();
+            }
+        };
+        // Zeroize the session key and the PayPal token before rendering.
+        let mut key_wipe = session_key;
+        key_wipe.iter_mut().for_each(|b| *b = 0);
+        let mut token_wipe = token.access_token.clone();
+        zeroize_str(&mut token_wipe);
+        if let Some(mut idt) = token.id_token.clone() { zeroize_str(&mut idt); }
+
+        use base64::engine::general_purpose::STANDARD as B64STD;
+        use base64::Engine as _;
+        let ecdh_pub_b64 = ecdh.public_key_to_der().map(|d| B64STD.encode(d)).unwrap_or_default();
+        let e2ee_blob = serde_json::json!({
+            "alg": "AES-256-GCM+HKDF-SHA256+ECDH-P256",
+            "aad": "client_nonce",
+            "iv_b64": B64STD.encode(&iv),
+            "ct_b64": B64STD.encode(&ct),
+            "enclave_ecdh_public_key_b64": ecdh_pub_b64,
+            "enclave_signing_public_key": &id.pubkey_pem,
+            "state": oauth_state,
+            "flow": config.label,
+        });
+        let html = render_e2ee_page(&e2ee_blob);
+        if let Err(status) = state.record_egress_data(addr.ip(), html.len() as u64) {
+            return status.into_response();
+        }
+        return Html(html).into_response();
+    }
+
     // v116-PROD: Multi-step attestation feature mapping PayPal profile to custom nonce before generation.
     use rand::Rng;
     let session_id: String = rand::thread_rng()
@@ -3501,7 +3980,7 @@ async fn generate_cert(
         Some(form.custom_info.clone())
     };
 
-    let attestation = generate_attestation(&state, label, userinfo.clone(), custom_info).await;
+    let attestation = generate_attestation(&state, label, userinfo.clone(), custom_info, None).await;
     let userinfo_full_json = serde_json::to_string_pretty(&userinfo).unwrap();
 
     let html = HTML_TEMPLATE.replace(
@@ -3709,7 +4188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 #[allow(dead_code)]  // Debug endpoint, not used in production
 async fn test_quote(axum::extract::State(_state): axum::extract::State<Arc<AppState>>) -> impl axum::response::IntoResponse {
-    match tpm::quote("1234", &[]).await {
+    match tpm::quote("1234", &[], None).await {
         Ok(tpm_data) => axum::response::Json(tpm_data).into_response(),
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("TPM Quote Failed: {}", e)).into_response(),
     }
@@ -3913,6 +4392,9 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         .route("/generate", axum::routing::post(generate_cert))
         .route("/debug/attestation", get(debug_attestation))
         .route("/debug/envelope", get(debug_envelope))
+        // v161 (plan Pillars 4+5): pre-flight protocol + same-origin auditor.
+        .route("/attest/preflight", axum::routing::options(preflight_cors).post(attest_preflight))
+        .route("/verify.html", get(serve_verify_html))
         .route("/privacy", get(privacy))
         .route("/terms", get(terms))
         .route("/report", get(|| async { Redirect::to("/") }))
@@ -4211,6 +4693,100 @@ mod security_tests {
             hex::encode(&tpm::snp_report_data_binding(der, nonce)[..32]),
             hex::encode(&tpm::snp_report_data_binding(der, &"00".repeat(32))[..32])
         );
+    }
+
+    // v161 (plan Pillars 2–5) cross-implementation parity pin: the
+    // CLIENT-BOUND SNP report_data binding =
+    //   SHA-256(P_enc_SPKI_DER ∥ code_challenge ∥ P_client_SPKI_DER ∥ client_nonce).
+    // Mirrored by scripts/test-verify-security.mjs Test 9 and verify.html's
+    // preflightBindingHex() — update all three together.
+    #[test]
+    fn preflight_binding_parity_v161() {
+        let pubkey_der = b"fake-der-bytes";
+        let code_challenge = "TEST_CHALLENGE_v161_parity";
+        let client_pub = b"fake-client-ecdh-der";
+        let client_nonce: [u8; 32] =
+            hex::decode("11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff")
+                .unwrap()
+                .try_into()
+                .unwrap();
+
+        let binding = tpm::preflight_report_data_binding(pubkey_der, code_challenge, client_pub, &client_nonce);
+        // [32..64] must be zero; [0..32] the pinned digest.
+        assert_eq!(binding[32..], [0u8; 32]);
+        assert_eq!(
+            hex::encode(&binding[..32]),
+            "eb25571bb08d245e4a89f8903c5d348e193e70fe5c2926e2ab033bdcc6beeba8"
+        );
+        // Every element is live: changing any one input changes the binding
+        // (a replayed/spliced session cannot reuse another's report_data).
+        let base = hex::encode(&binding[..32]);
+        assert_ne!(base, hex::encode(&tpm::preflight_report_data_binding(b"other-der", code_challenge, client_pub, &client_nonce)[..32]));
+        assert_ne!(base, hex::encode(&tpm::preflight_report_data_binding(pubkey_der, "OTHER_CHALLENGE", client_pub, &client_nonce)[..32]));
+        assert_ne!(base, hex::encode(&tpm::preflight_report_data_binding(pubkey_der, code_challenge, b"other-client", &client_nonce)[..32]));
+        let mut other_nonce = client_nonce;
+        other_nonce[0] ^= 0xff;
+        assert_ne!(base, hex::encode(&tpm::preflight_report_data_binding(pubkey_der, code_challenge, client_pub, &other_nonce)[..32]));
+        // …and it differs from the v160 session binding by construction.
+        assert_ne!(base, hex::encode(&tpm::snp_report_data_binding(pubkey_der, &hex::encode(client_nonce))[..32]));
+    }
+
+    // v161: pre-flight sessions are client-bound and carry their own ECDH
+    // key; legacy /login sessions are not (v160 path).
+    #[test]
+    fn preflight_session_is_client_bound() {
+        let mut nonce = [7u8; 32];
+        nonce[0] = 1;
+        let pk = PkceSession::new_preflight(b"client-der".to_vec(), nonce);
+        assert!(pk.is_preflight());
+        assert_eq!(pk.client_ecdh_pub, b"client-der");
+        assert_eq!(pk.client_nonce, nonce);
+        assert!(pk.enclave_ecdh.is_some());
+        // RFC 7636 derivation still holds for pre-flight sessions.
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            pk.code_challenge,
+            B64URL.encode(Sha256::digest(pk.code_verifier.as_bytes()))
+        );
+        // The verifier never appears in the challenge and vice versa.
+        assert_ne!(pk.code_verifier, pk.code_challenge);
+        // Two sessions never share verifier/challenge/nonce-derived material.
+        let other = PkceSession::new_preflight(b"client-der".to_vec(), nonce);
+        assert_ne!(other.code_verifier, pk.code_verifier);
+        // Legacy sessions are NOT client-bound.
+        assert!(!PkceSession::new().is_preflight());
+        // ECDH key agreement round-trip: two sessions derive DIFFERENT keys
+        // for the same client key+nonce (per-session enclave ECDH key).
+        let client = crypto::generate_ecdh_keypair().expect("test ECDH key");
+        let client_der = client.public_key_to_der().unwrap();
+        let k1 = crypto::derive_e2ee_session_key(pk.enclave_ecdh.as_ref().unwrap(), &client_der, &nonce).unwrap();
+        let k2 = crypto::derive_e2ee_session_key(other.enclave_ecdh.as_ref().unwrap(), &client_der, &nonce).unwrap();
+        assert_ne!(k1, k2, "per-session enclave ECDH key must yield distinct session keys");
+        // Encrypt/decrypt round-trip with AAD binding.
+        let (iv, ct) = crypto::encrypt_aad(&k1, b"payload", &nonce).unwrap();
+        assert_eq!(crypto::decrypt_aad(&k1, &iv, &ct, &nonce).unwrap(), b"payload");
+        // AAD-less decryption of an AAD-bound ciphertext fails (GCM
+        // authentication covers the associated data) — replaying the
+        // ciphertext with a stripped/other AAD is rejected by the primitive.
+        assert!(crypto::decrypt(&k1, &iv, &ct).is_err());
+        // RFC 5869 Test Case 1 (HKDF-SHA256): pins the Rust implementation to
+        // the standard WebCrypto implements, so the browser's deriveKey and
+        // the enclave's derive_e2ee_session_key agree byte-for-byte.
+        let tc1_ikm = vec![0x0bu8; 22];
+        let tc1_salt: Vec<u8> = (0x00u8..=0x0c).collect();
+        let tc1_info: Vec<u8> = (0xf0u8..=0xf9).collect();
+        let mut tc1_okm = [0u8; 42];
+        crypto::hkdf_sha256(&tc1_ikm, &tc1_salt, &tc1_info, &mut tc1_okm);
+        assert_eq!(
+            hex::encode(tc1_okm),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        );
+        // Wrong AAD (another session's nonce) must fail closed.
+        let mut other_nonce = nonce;
+        other_nonce[31] ^= 0xff;
+        assert!(crypto::decrypt_aad(&k1, &iv, &ct, &other_nonce).is_err());
     }
 
     // v160 (Pillar 3): PKCE (RFC 7636 §4.2) invariants — the challenge is

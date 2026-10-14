@@ -35,6 +35,9 @@ RUN bash -c ". /usr/local/cargo/env && \
 
 # Layer 2: compile our crate
 COPY src ./src
+# v161: the auditor is embedded into the enclave binary (include_str!) —
+# same file the image-builder stage ships at /verify.html.
+COPY verify.html ./verify.html
 RUN bash -c ". /usr/local/cargo/env && \
     set -euo pipefail && \
     cargo build --release --features oci --target x86_64-unknown-linux-gnu && \
@@ -123,6 +126,9 @@ COPY --from=ol10-builder /ol10 /build/ol10
 
 COPY build-initramfs-tools.sh build-oci-image.sh extract-ol10-binaries.sh ./
 COPY src ./src
+# v161: the auditor is embedded into the enclave binary (same-origin
+# /verify.html — the E2EE flow's sessionStorage lives on this origin).
+COPY verify.html ./verify.html
 
 RUN chmod +x build-initramfs-tools.sh build-oci-image.sh && \
     dpkg-query -W -f='${Package} ${Version} ${Architecture}\n' | sort > /build/packages.txt && \

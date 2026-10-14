@@ -51,9 +51,16 @@ KERNEL_CMDLINE="root=tmpfs rootok=1 console=tty0 console=ttyS0,115200n8 selinux=
 STUB="${UKI_STUB_PATH:-/usr/lib/systemd/boot/efi/linuxx64.efi.stub}"
 UKI_OUTPUT="./output/enclave-uki.efi"
 
+# v161 (plan §3.2): the OCI ESP boots the UKI DIRECTLY (BOOTX64.EFI = UKI,
+# no shim/GRUB chain) — the unmeasured multi-file handoff is collapsed into
+# ONE PE/COFF whose sha256 CI Sigstore-attests. The stub is therefore a hard
+# requirement: a missing stub aborts the build (no silent [gap] fallback).
 if [ ! -f "$STUB" ]; then
-    echo "[gap] UKI not built: systemd EFI stub missing at $STUB (systemd-boot-efi — provided by the Dockerfile.oci image-builder stage)"
-else
+    echo "❌ UKI stub missing at $STUB (systemd-boot-efi — provided by the Dockerfile.oci image-builder stage)."
+    echo "   Direct-boot ESP layout REQUIRES the stub — refusing to build a chain-boot image."
+    exit 1
+fi
+{
     echo "🧩 Assembling monolithic UKI (Pillar 1)..."
     CMDLINE_FILE="$(mktemp)"
     printf '%s' "$KERNEL_CMDLINE" > "$CMDLINE_FILE"
@@ -89,7 +96,7 @@ else
     fi
     touch -d "@$SOURCE_DATE_EPOCH" "$UKI_OUTPUT"
     echo "✅ UKI built: $(sha256sum "$UKI_OUTPUT" | cut -d' ' -f1)  ($UKI_OUTPUT)"
-fi
+}
 
 # Pinned measurement firmware for the CI sev-snp-measure step. OCI/GCP launch
 # with PROVIDER-supplied OVMF (their fleet digest is not computable here — it
@@ -178,7 +185,7 @@ truncate -s 512M $ESP_IMAGE
 # --invariant: replaces all random/time-based values with constants
 mkfs.vfat -F 32 -i 12345678 --invariant -n "EFI" $ESP_IMAGE
 
-echo "📦 Populating ESP via mtools..."
+echo "📦 Populating ESP via mtools (v161: DIRECT UKI BOOT — plan §3.2)..."
 echo "mtools_skip_check=1" > .mtoolsrc
 MTOOLSRC="$(pwd)/.mtoolsrc"
 export MTOOLSRC
@@ -186,13 +193,16 @@ export MTOOLS_NO_CONF=1
 
 mmd -i $ESP_IMAGE ::/EFI
 mmd -i $ESP_IMAGE ::/EFI/BOOT
-# Use -m to preserve timestamp from source files (which are set to SOURCE_DATE_EPOCH)
-mcopy -v -m -i $ESP_IMAGE "$SHIM"   ::/EFI/BOOT/BOOTX64.EFI
-mcopy -v -m -i $ESP_IMAGE "$GRUB"   ::/EFI/BOOT/grubx64.efi
-mcopy -v -m -i $ESP_IMAGE "$KERNEL" ::/EFI/BOOT/vmlinuz
-mcopy -v -m -i $ESP_IMAGE "$INITRD" ::/EFI/BOOT/initrd.img
+# The ESP carries EXACTLY ONE payload: the monolithic UKI. No shim, no GRUB,
+# no loose kernel/initrd/cmdline — every byte the firmware can load is inside
+# the single CI-attested PE/COFF, so the auditor's "Enclave UKI" provenance
+# lookup covers the entire boot payload.
+mcopy -v -m -i $ESP_IMAGE "$UKI_OUTPUT" ::/EFI/BOOT/BOOTX64.EFI
 
-# Create GRUB config for Oracle Cloud (UEFI + SNP memory encryption)
+# grub.cfg is still generated (NOT installed on the ESP): it is the SINGLE
+# SOURCE of the kernel cmdline for CI's sev-snp-measure direct-boot digest
+# computation (grub-<platform>.cfg is docker-cp'd from the container), and a
+# human-readable record of the exact boot arguments baked into the UKI.
 # v155 (SEC-02 Phase 2): lockdown=confidentiality puts the kernel in
 # lockdown mode the moment it starts — unsigned kernel modules cannot be
 # loaded, /dev/mem and kexec are blocked, and the already-measured
@@ -211,7 +221,6 @@ menuentry "Oracle Cloud Confidential PayPal Auth (AMD SEV-SNP)" {
 }
 EOF
 touch -d "@$SOURCE_DATE_EPOCH" grub.cfg
-mcopy -v -m -i $ESP_IMAGE grub.cfg ::/EFI/BOOT/grub.cfg
 
 # ==============================================================================
 # PHASE 2: Extract contents → normalize at file level → rebuild ESP
@@ -228,11 +237,7 @@ mkfs.vfat -F 32 -i 12345678 --invariant -n "EFI" $ESP_NORM
 mkdir -p "$ESP_MOUNT"
 # Use mtools to list and copy each file in deterministic alphabetical order
 for RPATH in \
-    "EFI/BOOT/BOOTX64.EFI" \
-    "EFI/BOOT/grubx64.efi" \
-    "EFI/BOOT/grub.cfg" \
-    "EFI/BOOT/initrd.img" \
-    "EFI/BOOT/vmlinuz"; do
+    "EFI/BOOT/BOOTX64.EFI"; do
     mkdir -p "$ESP_MOUNT/$(dirname $RPATH)"
     mcopy -n -i $ESP_IMAGE "::/$RPATH" "$ESP_MOUNT/$RPATH"
     # Normalize file timestamp
@@ -243,11 +248,7 @@ done
 mmd -i $ESP_NORM ::/EFI
 mmd -i $ESP_NORM ::/EFI/BOOT
 for RPATH in \
-    "EFI/BOOT/BOOTX64.EFI" \
-    "EFI/BOOT/grubx64.efi" \
-    "EFI/BOOT/grub.cfg" \
-    "EFI/BOOT/initrd.img" \
-    "EFI/BOOT/vmlinuz"; do
+    "EFI/BOOT/BOOTX64.EFI"; do
     mcopy -v -m -i $ESP_NORM "$ESP_MOUNT/$RPATH" "::/$RPATH"
 done
 
@@ -285,9 +286,11 @@ if command -v add-det >/dev/null; then
     add-det "$RAW_IMAGE"
 fi
 
-# Keep grub.cfg available in output for attestation
+# Keep grub.cfg available in output for attestation. v161: it is NOT on the
+# ESP (single-UKI layout) — copy the locally generated single-source file
+# (still present here; cleaned up below) that the UKI's .cmdline derives from.
 mkdir -p output
-cp "$ESP_MOUNT/EFI/BOOT/grub.cfg" "output/grub.cfg"
+cp grub.cfg "output/grub.cfg"
 
 # Final Cleanup
 rm -rf "$ESP_MOUNT"
