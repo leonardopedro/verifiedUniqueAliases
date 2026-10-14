@@ -44,6 +44,7 @@ The project uses a **single codebase** with conditional compilation to support b
 - **Egress Hardening & Firewalling**: nftables ruleset enforcing strict TCP/UDP port filtering. TLS pinning enforced at transport layer via embedded `google_ca.pem` and `paypal.pem` compiled into binary via `include_bytes!`. DNS resolution hardcoded via `reqwest::resolver::resolve` to prevent hijacking. Bandwidth throttled per-IP (the old global 512 MB/h cap was removed in v153 — audit SEC-05: it was a self-inflicted service-wide DoS).
 - **Secure Time Synchronization**: RTC pre-seeded to epoch 2026 prevents TLS cert validation failure on cold-boot machines. HTTPS-based time fetch serves as clock source after initial boot; timezone stripped from Date header.
 - **Stable Build OS**: Build system, kernel image, initramfs pinned to Debian 13 (Trixie) using snapshot.debian.org. Reproducible via multi-stage Docker synthesis engine.
+- **v160 Live on login.airma.de (2026-10-14)**: the attested v160 image (commit 713da7d, binary `db57929d…`, provenance gate ON) replaced the pre-v160 `sec02` fleet; E5/AD-3 relaunch landed a KDS-verifiable host on the first attempt (`vcek_source=kds`, VCEK 1796 B). Real `runAudit()`/`runPreflight()` driven from `verify.html` against the live `/debug/envelope` (CORS `*`) pass green: report signature, session binding, v160 `report_data` = SHA-256(P_enc ∥ nonce), ECDSA P-384, VCEK→ASK→ARK (ARK pin), launch-digest pin, Sigstore provenance (binary + image atomicity). PKCE `S256` visible on live `/login`.
 
 ---
 
