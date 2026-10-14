@@ -1149,7 +1149,35 @@ mod tpm {
     }
 
 
-    pub async fn quote(nonce_hex: &str) -> Result<AttestationResult, Box<dyn std::error::Error + Send + Sync>> {
+    /// v160 (Pillar 2): SNP report_data (64 bytes) =
+    /// bytes 0..32: SHA-256( P_enc SPKI DER ∥ session-nonce raw bytes )
+    /// bytes 32..64: zero
+    ///
+    /// The hardware quote commits DIRECTLY to the ephemeral enclave key
+    /// (P_enc) on top of everything the session nonce already covers (paypal
+    /// ∥ pubkey hash ∥ custom_info ∥ binary ∥ manifest). The auditor
+    /// recomputes expectedBinding = SHA-256(pemToBuffer(
+    /// enclave_signing_public_key) ∥ expectedNonce) and requires
+    /// report_data[0..32] === expectedBinding — pinned by
+    /// `security_tests::snp_report_data_binding_parity_v160` ↔ node harness
+    /// Test 8 (update all three together). The GCP TPM-quote extraData path
+    /// is untouched: it still carries the raw session nonce.
+    pub(crate) fn snp_report_data_binding(pubkey_der: &[u8], nonce_hex: &str) -> [u8; 64] {
+        use sha2::{Digest, Sha256};
+        let mut out = [0u8; 64];
+        let nonce_raw = hex::decode(nonce_hex).unwrap_or_default();
+        let mut binding_hasher = Sha256::new();
+        binding_hasher.update(pubkey_der);
+        binding_hasher.update(&nonce_raw);
+        out[..32].copy_from_slice(&binding_hasher.finalize());
+        out
+    }
+
+    /// v160 (Pillar 2): `pubkey_der` is P_enc's SubjectPublicKeyInfo DER —
+    /// bound into the SNP report_data as SHA-256(P_enc ∥ session_nonce) so the
+    /// hardware quote commits directly to the ephemeral enclave key. The GCP
+    /// TPM-quote extraData keeps carrying the raw session nonce (unchanged).
+    pub async fn quote(nonce_hex: &str, pubkey_der: &[u8]) -> Result<AttestationResult, Box<dyn std::error::Error + Send + Sync>> {
         #[cfg(feature = "oci")]
         if crate::oci_snp::is_sev_snp_available() {
             tracing::info!("AMD SEV-SNP hardware attestation path active (OCI)");
@@ -1360,17 +1388,11 @@ mod tpm {
         use sha2::Digest;
         let ak_der_sha256 = hex::encode(sha2::Sha256::digest(&ak_der_bytes));
 
-        // Session nonce binding for the SNP report_data field (64 bytes):
-        // bytes 0..32 = combined session nonce
-        //   SHA-256[paypalHash ∥ pubkeyHash ∥ SHA256(customInfo)] (v152),
-        // bytes 32..64 = zero. The auditor recomputes `expectedNonce` identically
-        // and requires report_data[0..32] === expectedNonce.
-        let mut nonce_bytes = [0u8; 64];
-        let nonce_raw = hex::decode(nonce_hex).unwrap_or_default();
-        let nonce_len = nonce_raw.len().min(32);
-        nonce_bytes[..nonce_len].copy_from_slice(&nonce_raw[..nonce_len]);
+        // v160 (Pillar 2): SNP report_data = SHA-256(P_enc ∥ nonce), rest zero
+        // — see snp_report_data_binding() for the full contract.
+        let nonce_bytes = snp_report_data_binding(pubkey_der, nonce_hex);
 
-        tracing::info!("DEBUG: SNP nonce bytes prepared");
+        tracing::info!("DEBUG: SNP report_data binding prepared (SHA-256(P_enc ∥ nonce))");
         // 1. Fetch Google AK Certificate (Mandatory Identity Root)
         // v137: Directly fetch from TPM NVRAM (primary path) with enlarged buffer (2048 bytes)
         // to prevent truncation of the hardware-bound AMD SNP extensions.
@@ -1843,7 +1865,10 @@ struct AppState {
     staging: bool,
     // v69: For inclusion in remote attestation
     tls_cert_pem: Arc<RwLock<Option<String>>>,
-    attestation_signing_key: Option<String>,        // v70: DDoS Protection for IP tracking
+    // v160 (Pillar 2): the ephemeral enclave identity (P_enc / S_enc) —
+    // private key PEM stays RAM-only; public material is precomputed for the
+    // session nonce and the SNP report_data binding.
+    enclave_identity: Option<EphemeralEnclaveIdentity>,
         ip_stats: Arc<RwLock<std::collections::BTreeMap<IpAddr, u64>>>,
         last_limit_reset: Arc<RwLock<Instant>>,
     connection_semaphore: Arc<Semaphore>,
@@ -1851,9 +1876,11 @@ struct AppState {
     pending_attestations: Arc<RwLock<std::collections::HashMap<String, (String, PayPalUserInfo, Instant)>>>,
     // v152 SECURITY: OAuth CSRF state. Maps the random `state` token sent to
     // PayPal (also mirrored in the browser's HttpOnly cookie) to the flow
-    // label. Verified strictly on /callback: token must exist server-side,
-    // match the cookie, and is single-use.
-    pending_oauth_states: Arc<RwLock<std::collections::HashMap<String, (String, Instant)>>>,
+    // label + the PKCE session. Verified strictly on /callback: token must
+    // exist server-side, match the cookie, and is single-use.
+    // v160 (Pillar 3): value gains the PKCE session — the code_verifier
+    // lives ONLY in this in-RAM map (single-use, 10 min TTL).
+    pending_oauth_states: Arc<RwLock<std::collections::HashMap<String, (String, PkceSession)>>> ,
 }
 
 struct PayPalFlowConfig {
@@ -2584,6 +2611,63 @@ impl GooglePublicCaManager {
 // ATTESTATION
 // ============================================================================
 
+// ============================================================================
+// v160 (Pillar 2): EPHEMERAL ENCLAVE IDENTITY — P_enc / S_enc
+//
+// The RSA keypair that signs attestation reports is generated in encrypted
+// RAM at boot (SEV-SNP memory encryption keeps S_enc from the hypervisor),
+// never written to disk, never logged. Public material is computed once and
+// cached for the two bindings:
+//   * pubkey_sha256 → element 2 of the 160-byte session-nonce pre-image;
+//   * pubkey_der    → first element of the SNP report_data pre-image:
+//     report_data[0..32] = SHA-256(P_enc_SPKI_DER ∥ session_nonce).
+// Private key stays a PEM string (what sign_payload consumes) rather than a
+// stored openssl PKey so AppState stays trivially Send+Sync. Key size:
+// RSA-4096 — the size deployed since v69; the plan's prose allows RSA-4096
+// or ECDSA P-384, and the 3072 in its illustrative snippet would be a
+// downgrade of the deployed size.
+#[derive(Clone)]
+pub struct EphemeralEnclaveIdentity {
+    /// S_enc — private key PEM (PKCS#8). RAM-only; never logged, never persisted.
+    pem: String,
+    /// P_enc — SubjectPublicKeyInfo DER bytes (hashed into report_data).
+    pub pubkey_der: Vec<u8>,
+    /// SHA-256(P_enc SPKI DER) — the pubkey element of the session nonce.
+    pub pubkey_sha256: [u8; 32],
+    /// P_enc PEM — published in the report as `enclave_signing_public_key`.
+    pubkey_pem: String,
+}
+
+impl EphemeralEnclaveIdentity {
+    /// Generate a fresh per-boot RAM-only RSA-4096 keypair.
+    pub fn generate() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        use openssl::pkey::PKey;
+        use openssl::rsa::Rsa;
+        let rsa = Rsa::generate(4096)?;
+        let pkey = PKey::from_rsa(rsa)?;
+        let pem = String::from_utf8(pkey.private_key_to_pem_pkcs8()?)?;
+        Self::from_pem_owned(pem)
+    }
+
+    /// Wrap an operator-supplied key (Vault/config) with cached public material.
+    pub fn from_pem(pem: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::from_pem_owned(pem.to_string())
+    }
+
+    fn from_pem_owned(pem: String) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        use openssl::pkey::PKey;
+        use sha2::{Digest, Sha256};
+        let pkey = PKey::private_key_from_pem(pem.as_bytes())?;
+        let pubkey_der = pkey.public_key_to_der()?;
+        let pubkey_sha256 = Sha256::digest(&pubkey_der).into();
+        // public_key_to_pem() — byte-identical to the pre-v160 helper that
+        // derived this field on the fly, so published report fields are
+        // unchanged by the move to cached identity material.
+        let pubkey_pem = String::from_utf8(pkey.public_key_to_pem()?)?;
+        Ok(Self { pem, pubkey_der, pubkey_sha256, pubkey_pem })
+    }
+}
+
 fn sign_payload(payload: &str, private_key_pem: &str) -> String {
     use openssl::pkey::PKey;
     use openssl::sign::Signer;
@@ -2596,14 +2680,6 @@ fn sign_payload(payload: &str, private_key_pem: &str) -> String {
     signer.update(payload.as_bytes()).expect("Failed to update signer");
     let signature = signer.sign_to_vec().expect("Failed to sign");
     STANDARD.encode(signature)
-}
-
-fn extract_pub_key(private_key_pem: &str) -> String {
-    use openssl::pkey::PKey;
-    let pkey = PKey::private_key_from_pem(private_key_pem.as_bytes()).ok();
-    pkey.and_then(|k| k.public_key_to_pem().ok())
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_else(|| "N/A".to_string())
 }
 
 /// v152: session nonce = SHA-256(paypal_hash ∥ pubkey_hash ∥ SHA-256(custom_info)).
@@ -2626,6 +2702,11 @@ fn canonical_manifest_json(manifest: &std::collections::BTreeMap<String, String>
 ///
 ///   nonce = SHA-256( paypal_hash ∥ pubkey_hash ∥ SHA-256(custom_info)
 ///                    ∥ binary_sha256 ∥ SHA-256(canonical_manifest_json) )
+///
+/// v160 (Pillar 2): the TPM extraData still carries this nonce verbatim;
+/// the SNP report_data[0..32] now carries SHA-256(P_enc_DER ∥ nonce) — the
+/// quote binds the ephemeral enclave key directly, on top of the key hash
+/// that element 2 of this nonce already covers.
 ///
 /// On OCI the SEV-SNP launch digest covers only the fleet-constant OVMF
 /// firmware, so without this fusion a tampered disk would still produce a
@@ -2693,26 +2774,24 @@ async fn generate_attestation(
     // v117 Hardening: Bind the Enclave Signing Public Key to the Hardware Attestation
     // This prevents "Key Substitution" attacks where an attacker replaces the public key
     // in the JSON report with their own.
-    let pub_key_pem = if let Some(key) = &state.attestation_signing_key {
-        extract_pub_key(key)
+    let pub_key_pem = if let Some(id) = &state.enclave_identity {
+        id.pubkey_pem.clone()
     } else {
         "N/A".to_string()
     };
     
-    // CRITICAL: Hash the raw DER bytes of the public key, NOT the PEM string.
-    // verify.html does: strip PEM headers → atob() → SHA256 of raw DER bytes.
-    // Previously this was hashing the full PEM string (with headers + newlines),
-    // which produced a completely different hash, causing the nonce mismatch.
-    let mut pub_key_hasher = Sha256::new();
-    if let Some(key) = &state.attestation_signing_key {
-        use openssl::pkey::PKey;
-        if let Ok(pkey) = PKey::private_key_from_pem(key.as_bytes()) {
-            if let Ok(der_bytes) = pkey.public_key_to_der() {
-                pub_key_hasher.update(&der_bytes);
-            }
-        }
-    }
-    let pub_key_hash_bytes = pub_key_hasher.finalize();
+    // CRITICAL: the nonce hashes the raw DER bytes of the public key, NOT
+    // the PEM string (verify.html: strip PEM headers → atob() → SHA-256 of
+    // raw DER bytes). Both values are precomputed on the identity — same
+    // bytes, no re-parse. The v160 SNP report_data binding also needs the
+    // full DER (report_data[0..32] = SHA-256(P_enc ∥ session nonce)).
+    // No identity (key-less diagnostic path) keeps the legacy bytes: hash of
+    // the empty pre-image.
+    let (pub_key_der, pub_key_hash_bytes): (Vec<u8>, [u8; 32]) = if let Some(id) = &state.enclave_identity {
+        (id.pubkey_der.clone(), id.pubkey_sha256)
+    } else {
+        (Vec::new(), Sha256::digest(b"").into())
+    };
     let pub_key_hash_hex = hex::encode(pub_key_hash_bytes);
 
     // v152: Bind custom_info into the hardware-attested nonce (see
@@ -2734,7 +2813,7 @@ async fn generate_attestation(
     );
 
     info!("Generating hardware attestation with bound public key hash: {}", pub_key_hash_hex);
-    let mut tpm_report = match tpm::quote(&final_combined_nonce).await {
+    let mut tpm_report = match tpm::quote(&final_combined_nonce, &pub_key_der).await {
         Ok(r) => r,
         Err(e) => return format!("ERROR: Failed to generate TPM Quote: {}", e),
     };
@@ -2779,8 +2858,8 @@ async fn generate_attestation(
     println!("DEBUG PAYLOAD: {}", payload_compact);
     
     // 6. Sign everything using the enclave-bound asymmetric key
-    let signature = if let Some(key) = &state.attestation_signing_key {
-        sign_payload(&payload_compact, key)
+    let signature = if let Some(id) = &state.enclave_identity {
+        sign_payload(&payload_compact, &id.pem)
     } else {
         "UNSIGNED_KEY_MISSING".to_string()
     };
@@ -2788,7 +2867,7 @@ async fn generate_attestation(
     let full_report = serde_json::json!({
         "attestation_report": payload,
         "enclave_signature_b64": signature,
-        "enclave_signing_public_key": if let Some(_) = &state.attestation_signing_key {
+        "enclave_signing_public_key": if state.enclave_identity.is_some() {
             pub_key_pem
         } else {
             "N/A".to_string()
@@ -2847,12 +2926,19 @@ fn hardened_client() -> reqwest::Client {
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// v160 (Pillar 3): authorization-code exchange, STRICT PKCE (RFC 7636).
+/// `code_verifier` is generated in enclave RAM at /login and presented only
+/// here. If a malicious owner/provider intercepts `code` at the callback
+/// endpoint, redemption fails at PayPal: the server requires
+/// SHA-256(code_verifier) === code_challenge, and the verifier never left
+/// the enclave.
 async fn exchange_code_for_token(
     code: &str,
     client_id: &str,
     client_secret: &str,
     redirect_uri: &str,
     api_base: &str,
+    code_verifier: &str,
 ) -> Result<TokenResponse, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{}/v1/oauth2/token", api_base);
     let resp = hardened_client()
@@ -2862,6 +2948,7 @@ async fn exchange_code_for_token(
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", redirect_uri),
+            ("code_verifier", code_verifier), // Strict RFC 7636 proof
         ])
         .send()
         .await?;
@@ -2955,6 +3042,48 @@ struct LoginParams {
     flow: Option<String>,
 }
 
+// v160 (Pillar 3): OAuth 2.0 PKCE (RFC 7636) session.
+//
+// code_verifier: 32 random bytes, base64url — exists ONLY in enclave RAM
+// (inside pending_oauth_states, single-use, 10 min TTL) for the lifetime of
+// one authorization request. code_challenge = BASE64URL(SHA256(verifier))
+// goes to PayPal on the authorize request; the verifier is presented only
+// by this enclave on the token exchange. Security invariant: a colluding
+// owner/provider who intercepts the callback URL (code + state) CANNOT
+// redeem the code at PayPal — the authorization server requires
+// SHA-256(code_verifier) === code_challenge and no other party has it.
+//
+// The plan's `session_id` field is deliberately not duplicated here: the
+// random `state` token that keys pending_oauth_states IS the session id.
+struct PkceSession {
+    code_verifier: String,
+    code_challenge: String,
+    created_at: Instant,
+}
+
+impl PkceSession {
+    fn new() -> Self {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+        use base64::Engine as _;
+        use rand::Rng;
+        use sha2::{Digest, Sha256};
+
+        let mut verifier_bytes = [0u8; 64];
+        rand::thread_rng().fill(&mut verifier_bytes);
+        let code_verifier = B64URL.encode(verifier_bytes);
+
+        // Code challenge = BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))
+        let challenge_hash = Sha256::digest(code_verifier.as_bytes());
+        let code_challenge = B64URL.encode(challenge_hash);
+
+        Self {
+            code_verifier,
+            code_challenge,
+            created_at: Instant::now(),
+        }
+    }
+}
+
 async fn login(
     Query(params): Query<LoginParams>,
     State(state): State<Arc<AppState>>,
@@ -2979,19 +3108,25 @@ async fn login(
     let mut state_bytes = [0u8; 32];
     rand::thread_rng().fill(&mut state_bytes);
     let oauth_state = hex::encode(state_bytes);
-    state
-        .pending_oauth_states
-        .write()
-        .insert(oauth_state.clone(), (config.label.clone(), Instant::now()));
+
+    // v160 (Pillar 3): generate the PKCE pair; the challenge rides the
+    // authorize request, the verifier stays server-side in RAM below.
+    let pkce = PkceSession::new();
 
     let url = format!(
-        "{}?client_id={}&response_type=code&scope={}&redirect_uri={}&state={}",
+        "{}?client_id={}&response_type=code&scope={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
         auth_base,
         config.client_id,
         urlencoding::encode(&config.scope),
         urlencoding::encode(&state.redirect_uri),
-        oauth_state
+        oauth_state,
+        pkce.code_challenge
     );
+
+    state
+        .pending_oauth_states
+        .write()
+        .insert(oauth_state.clone(), (config.label.clone(), pkce));
     let mut resp = Redirect::temporary(&url).into_response();
     let cookie = format!(
         "paypal_oauth_state={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600",
@@ -3007,8 +3142,7 @@ async fn debug_attestation() -> impl IntoResponse {
     let mut results = serde_json::Map::new();
     
     // Check TPM Quote
-    let nonce = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
-    match tpm::quote(nonce).await {
+    let nonce = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";        match tpm::quote(nonce, &[]).await {
         Ok(r) => { 
             results.insert("tpm_quote_status".to_string(), serde_json::Value::String("SUCCESS".to_string())); 
             results.insert("report".to_string(), serde_json::to_value(r).unwrap()); 
@@ -3152,7 +3286,15 @@ async fn debug_envelope(State(state): State<Arc<AppState>>) -> impl IntoResponse
     )
     .await;
     (
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            // v160 (Pillar 4): pre-flight. verify.html (local auditor, file://
+            // origin) fetches this endpoint BEFORE the user starts the PayPal
+            // login to pin the live enclave's P_enc and hardware evidence.
+            // The endpoint is public, synthetic-identity diagnostics — CORS
+            // grants browsers read access only, no credentials ride along.
+            (axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+        ],
         envelope,
     )
 }
@@ -3235,10 +3377,10 @@ async fn callback(
         warn!("OAuth state cookie mismatch — possible Login CSRF attempt");
         return (StatusCode::FORBIDDEN, "Invalid OAuth state (session mismatch). Please restart the login from the homepage.").into_response();
     }
-    let flow = {
+    let (flow, pkce) = {
         let mut states = state.pending_oauth_states.write();
         match states.remove(&oauth_state) {
-            Some((flow, issued)) if issued.elapsed() < Duration::from_secs(600) => flow,
+            Some((flow, pkce)) if pkce.created_at.elapsed() < Duration::from_secs(600) => (flow, pkce),
             _ => {
                 warn!("OAuth state unknown or expired — possible replay attempt");
                 return (StatusCode::FORBIDDEN, "Invalid or expired OAuth state. Please restart the login from the homepage.").into_response();
@@ -3251,7 +3393,7 @@ async fn callback(
 
     let api_base = if state.staging { PAYPAL_SANDBOX_API } else { PAYPAL_PRODUCTION_API };
 
-    let token = match exchange_code_for_token(&code, &config.client_id, &config.client_secret, &redirect_uri, api_base).await {
+    let token = match exchange_code_for_token(&code, &config.client_id, &config.client_secret, &redirect_uri, api_base, &pkce.code_verifier).await {
         Ok(t) => t,
         Err(e) => {
             // v156 (audit): the detailed error (reqwest chain, PayPal response
@@ -3567,7 +3709,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 #[allow(dead_code)]  // Debug endpoint, not used in production
 async fn test_quote(axum::extract::State(_state): axum::extract::State<Arc<AppState>>) -> impl axum::response::IntoResponse {
-    match tpm::quote("1234").await {
+    match tpm::quote("1234", &[]).await {
         Ok(tpm_data) => axum::response::Json(tpm_data).into_response(),
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("TPM Quote Failed: {}", e)).into_response(),
     }
@@ -3682,22 +3824,37 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
     let https_ready = Arc::new(AtomicBool::new(false));
     let https_ready_clone = https_ready.clone();
 
-    // v69: Attestation Signing Key handling (cloned to avoid partial move of config)
-    let attestation_signing_key = if let Some(key) = config.attestation_signing_key.clone() {
-        info!("Attestation signing key loaded from Vault");
-        Some(key)
+    // v69/v160: Attestation signing key → EphemeralEnclaveIdentity (P_enc/S_enc).
+    // A Vault/config key is parsed eagerly (an unparseable one fails LOUDLY and
+    // falls back to a fresh ephemeral key rather than shipping a key that can
+    // never sign); otherwise a per-boot RAM-only RSA-4096 key is generated.
+    // v152 SECURITY: never log private key material. On OCI the GRUB cmdline
+    // carries `console=ttyS0`, so every info!() line lands in the Instance
+    // Console History (readable by anyone with console access) — log only the
+    // key's existence and size of its public material.
+    let enclave_identity = if let Some(key) = config.attestation_signing_key.clone() {
+        match EphemeralEnclaveIdentity::from_pem(&key) {
+            Ok(id) => {
+                info!("Attestation signing key loaded from Vault");
+                Some(id)
+            }
+            Err(e) => {
+                error!("Vault attestation key unparseable ({}) — falling back to a fresh ephemeral RAM-only key", e);
+                EphemeralEnclaveIdentity::generate().ok()
+            }
+        }
     } else {
         info!("Attestation signing key missing in Vault, generating ephemeral RAM-ONLY RSA 4096 key...");
-        acme2_eab::gen_rsa_private_key(4096).ok().map(|k| {
-            let pem = String::from_utf8(k.private_key_to_pem_pkcs8().expect("Failed to convert key to PEM")).unwrap();
-            // v152 SECURITY: never log private key material. On OCI the GRUB
-            // cmdline carries `console=ttyS0`, so every info!() line lands in
-            // the Instance Console History, which is readable by anyone with
-            // console access — a logged key would let an attacker sign
-            // attestation reports offline. Log only the key's existence.
-            info!("--- EPHEMERAL RSA KEY GENERATED (RAM ONLY, {} bytes, material never logged) ---", pem.len());
-            pem
-        })
+        match EphemeralEnclaveIdentity::generate() {
+            Ok(id) => {
+                info!("--- EPHEMERAL RSA KEY GENERATED (RAM ONLY, {} pubkey-DER bytes, material never logged) ---", id.pubkey_der.len());
+                Some(id)
+            }
+            Err(e) => {
+                error!("Ephemeral enclave key generation failed: {}", e);
+                None
+            }
+        }
     };
 
     // Initialize app state
@@ -3713,7 +3870,7 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         https_ready: https_ready_clone,
         staging: config.staging,
         tls_cert_pem: Arc::new(RwLock::new(None)),
-        attestation_signing_key,
+        enclave_identity,
         ip_stats: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
         last_limit_reset: Arc::new(RwLock::new(Instant::now())),
         connection_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
@@ -3740,9 +3897,10 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
             }
             drop(pending);
 
-            // v152: same TTL sweep for OAuth CSRF state tokens
+            // v152: same TTL sweep for OAuth CSRF state tokens (v160: the
+            // PKCE session rides in the same entry — its created_at is the TTL clock)
             let mut oauth = state_for_cleanup.pending_oauth_states.write();
-            oauth.retain(|_, (_, timestamp)| now.duration_since(*timestamp) < Duration::from_secs(600));
+            oauth.retain(|_, (_, pkce)| now.duration_since(pkce.created_at) < Duration::from_secs(600));
         }
     });
 
@@ -4029,6 +4187,56 @@ mod security_tests {
     #[test]
     fn require_credentials_accepts_real_credentials() {
         assert!(require_credentials(base_config()).is_ok());
+    }
+
+    // v160 (Pillar 2) cross-implementation parity pin: the SNP report_data
+    // binding = SHA-256(P_enc_SPKI_DER ∥ session_nonce). Mirrored by
+    // scripts/test-verify-security.mjs Test 8 and verify.html's
+    // snpBindingHex() — update all three together (same discipline as the
+    // session-nonce pin below).
+    #[test]
+    fn snp_report_data_binding_parity_v160() {
+        let der = b"fake-der-bytes";
+        let nonce = "398c2c1b18583ac9c3935ffdea04f0b2a3dfdd927140072bd50511e9f77db8f7";
+        let binding = tpm::snp_report_data_binding(der, nonce);
+        // [32..64] must be zero; [0..32] the pinned digest.
+        assert_eq!(binding[32..], [0u8; 32]);
+        assert_eq!(
+            hex::encode(&binding[..32]),
+            "22a092286d97a00032a2c8b1a24b3c4691ff9fad6d1759c18d17b7a5354c248f"
+        );
+        // Determinism + nonce sensitivity (a different session cannot reuse
+        // another session's binding).
+        assert_ne!(
+            hex::encode(&tpm::snp_report_data_binding(der, nonce)[..32]),
+            hex::encode(&tpm::snp_report_data_binding(der, &"00".repeat(32))[..32])
+        );
+    }
+
+    // v160 (Pillar 3): PKCE (RFC 7636 §4.2) invariants — the challenge is
+    // exactly BASE64URL(SHA256(ASCII(verifier))), the verifier is 64 random
+    // bytes in the base64url alphabet (no padding — it rides URL/query
+    // encoding on the token request), and no two sessions repeat.
+    #[test]
+    fn pkce_session_matches_rfc7636() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+
+        let a = PkceSession::new();
+        let b = PkceSession::new();
+
+        assert_eq!(
+            a.code_challenge,
+            B64URL.encode(Sha256::digest(a.code_verifier.as_bytes()))
+        );
+        assert_eq!(a.code_verifier.len(), 86); // 64 bytes → 86 base64url chars, unpadded
+        assert!(a
+            .code_verifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert_ne!(a.code_verifier, b.code_verifier);
+        assert_ne!(a.code_challenge, b.code_challenge);
     }
 
     #[test]

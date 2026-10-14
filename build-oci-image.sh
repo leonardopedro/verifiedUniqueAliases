@@ -31,6 +31,145 @@ fi
 # Normalize all input artifact timestamps
 touch -d "@$SOURCE_DATE_EPOCH" "$KERNEL" "$INITRD" "$SHIM" "$GRUB"
 
+# v160 (plan Pillar 1): kernel command line SINGLE-SOURCED — the GRUB menu
+# entry below and the UKI .cmdline section carry byte-identical args, so boot
+# parameters cannot drift between the chain-boot and direct-boot profiles.
+KERNEL_CMDLINE="root=tmpfs rootok=1 console=tty0 console=ttyS0,115200n8 selinux=0 panic=1 net.ifnames=0 biosdevname=0 mem_encryption=on lockdown=confidentiality"
+
+# =============================================================================
+# PHASE 0 (Pillar 1): Unified Kernel Image + pinned measurement firmware
+# -----------------------------------------------------------------------------
+# UKI = one PE/COFF (EFI stub + .cmdline + .linux + .initrd): the boot payload
+# becomes a single deterministic artifact whose sha256 CI publishes and whose
+# (firmware, kernel, initrd, cmdline) tuple feeds sev-snp-measure.
+# OCI still boots the shim+grub chain below — the hypervisor measures only its
+# own OVMF either way (AGENTS.md "measurement scope"), so the UKI is shipped as
+# the direct-boot profile artifact (QEMU -kernel / kernel-hashes=on platforms,
+# plan §3.3 profile 1) rather than silently swapping an untested boot path.
+# Gated honestly: a missing tool prints an explicit [gap], never a silent skip.
+# UKI_STUB_PATH: override for local dry-runs (the container path is the default)
+STUB="${UKI_STUB_PATH:-/usr/lib/systemd/boot/efi/linuxx64.efi.stub}"
+UKI_OUTPUT="./output/enclave-uki.efi"
+
+if [ ! -f "$STUB" ]; then
+    echo "[gap] UKI not built: systemd EFI stub missing at $STUB (systemd-boot-efi — provided by the Dockerfile.oci image-builder stage)"
+else
+    echo "🧩 Assembling monolithic UKI (Pillar 1)..."
+    CMDLINE_FILE="$(mktemp)"
+    printf '%s' "$KERNEL_CMDLINE" > "$CMDLINE_FILE"
+
+    # Explicit non-overlapping section VMAs are REQUIRED: GNU objcopy's
+    # automatic PE placement puts every added section at the image base
+    # (validated locally against the real Debian stub: three sections sharing
+    # one VMA + "section below image base" warnings = corrupt image). Each VMA
+    # is computed above the stub's own highest section end, 64 KiB-aligned —
+    # a pure function of the pinned inputs, unlike the plan snippet's literal
+    # VMAs (0x30000/0x2000000/0x6000000) which overlap real stub/kernel sizes.
+    stub_max_end() {
+        objdump -h "$1" | awk '/^ *[0-9]+ / {print $3, $4}' | while read -r size vma; do
+            echo $(( 0x$vma + 0x$size ))
+        done | sort -n | tail -1
+    }
+    align_up() { local v=$1 a=$((0x10000)); echo $(( (v + a - 1) & ~(a - 1) )); }
+    CMDLINE_VMA=$(align_up "$(stub_max_end "$STUB")")
+    LINUX_VMA=$(align_up $(( CMDLINE_VMA + $(stat -c%s "$CMDLINE_FILE") )))
+    INITRD_VMA=$(align_up $(( LINUX_VMA + $(stat -c%s "$KERNEL") )))
+
+    objcopy \
+        --add-section .cmdline="$CMDLINE_FILE" \
+            --change-section-vma .cmdline=$(printf '0x%x' "$CMDLINE_VMA") \
+        --add-section .linux="$KERNEL" \
+            --change-section-vma .linux=$(printf '0x%x' "$LINUX_VMA") \
+        --add-section .initrd="$INITRD" \
+            --change-section-vma .initrd=$(printf '0x%x' "$INITRD_VMA") \
+        "$STUB" "$UKI_OUTPUT"
+    rm -f "$CMDLINE_FILE"
+    if command -v add-det >/dev/null; then
+        add-det "$UKI_OUTPUT"
+    fi
+    touch -d "@$SOURCE_DATE_EPOCH" "$UKI_OUTPUT"
+    echo "✅ UKI built: $(sha256sum "$UKI_OUTPUT" | cut -d' ' -f1)  ($UKI_OUTPUT)"
+fi
+
+# Pinned measurement firmware for the CI sev-snp-measure step. OCI/GCP launch
+# with PROVIDER-supplied OVMF (their fleet digest is not computable here — it
+# stays pinned from a live capture); this file pins the firmware of the
+# direct-boot profile so CI can publish its expected digest deterministically.
+# ONLY the amdsev build is accepted: direct-boot measurement needs the
+# SNP_KERNEL_HASHES section, which none of Debian's generic OVMF_CODE*.fd
+# variants carry (sev-snp-measure --kernel errors out on them), so staging a
+# section-less fallback would guarantee a hard CI failure later — a missing
+# amdsev file is an explicit [gap] instead.
+# UKI_OVMF_PATH: override for local dry-runs/tests (container path is default).
+OVMF_SRC=""
+c="${UKI_OVMF_PATH:-/usr/share/ovmf/OVMF.amdsev.fd}"
+if [ -f "$c" ]; then OVMF_SRC="$c"; fi
+if [ -n "$OVMF_SRC" ]; then
+    cp "$OVMF_SRC" ./output/OVMF.fd
+    touch -d "@$SOURCE_DATE_EPOCH" ./output/OVMF.fd
+    echo "📦 Staged measurement firmware: $OVMF_SRC → output/OVMF.fd ($(sha256sum ./output/OVMF.fd | cut -d' ' -f1))"
+    # Regression guard (Pillar 1): assert the staged OVMF carries the
+    # SNP_KERNEL_HASHES metadata section (type 0x10) BEFORE shipping it — a
+    # section-less file makes `sev-snp-measure --kernel` fail in CI much
+    # later with a cryptic error. Mirrors sev-snp-measure's own OVMF
+    # metadata check (sevsnpmeasure/guest.py + ovmf.py) on the exact bytes
+    # CI will consume.
+    if command -v python3 >/dev/null; then
+        python3 - ./output/OVMF.fd <<'PYEOF'
+import struct, sys, uuid
+
+path = sys.argv[1]
+data = open(path, 'rb').read()
+FOOTER = uuid.UUID('{96b582de-1fb2-45f7-baea-a366c55a082d}').bytes_le
+META = uuid.UUID('{dc886566-984a-4798-a75e-5585a7bf67cc}')
+EH = 18  # OvmfFooterTableEntry: u16 size + 16-byte GUID (pack=1)
+
+def die(msg):
+    print('❌ SNP_KERNEL_HASHES guard: ' + msg, file=sys.stderr)
+    sys.exit(1)
+
+if len(data) < 32 + EH:
+    die('OVMF image too small: ' + path)
+pos = len(data) - 32 - EH
+if data[pos + 2:pos + 18] != FOOTER:
+    die('OVMF table footer GUID not found — not an OVMF image? ' + path)
+table_size = struct.unpack_from('<H', data, pos)[0] - EH
+if table_size < 0:
+    die('invalid OVMF footer table size')
+tb = data[pos - table_size:pos]
+entries = {}
+while len(tb) >= EH:
+    size = struct.unpack_from('<H', tb, len(tb) - EH)[0]
+    if size < EH:
+        die('invalid OVMF table entry size')
+    guid = uuid.UUID(bytes_le=bytes(tb[len(tb) - EH + 2:len(tb)])).hex
+    entries[guid] = tb[len(tb) - size:len(tb) - EH]
+    tb = tb[:-size]
+if META.hex not in entries:
+    die('OVMF SEV metadata GUID absent — no SNP_KERNEL_HASHES section; sev-snp-measure --kernel will refuse this file: ' + path)
+entry = entries[META.hex]
+start = len(data) - struct.unpack_from('<I', entry)[0]
+if data[start:start + 4] != b'ASEV':
+    die('bad SEV metadata signature (expected ASEV) in ' + path)
+size, version, num_items = struct.unpack_from('<III', data, start + 4)
+if version != 1:
+    die('unsupported SEV metadata version %d' % version)
+items = data[start + 16:start + size]
+found = any(struct.unpack_from('<I', items, i * 12 + 8)[0] == 0x10
+            for i in range(num_items))
+if not found:
+    die('staged OVMF lacks the SNP_KERNEL_HASHES (0x10) metadata section — '
+        'sev-snp-measure --kernel will refuse it; use ovmf-amdsev '
+        '(pinned fetch in Dockerfile.oci): ' + path)
+print('✅ SNP_KERNEL_HASHES metadata section present: ' + path)
+PYEOF
+    else
+        echo "⚠️ python3 unavailable — SNP_KERNEL_HASHES guard skipped (image-builder stage provides python3; CI's sev-snp-measure re-checks)"
+    fi
+else
+    echo "[gap] OVMF not staged: ovmf-amdsev missing (pinned fetch in the Dockerfile.oci image-builder stage); CI will report the direct-profile launch digest as not-computable"
+fi
+
 # ==============================================================================
 # PHASE 1: Build the ESP partition image
 # ==============================================================================
@@ -67,7 +206,7 @@ cat <<EOF > grub.cfg
 set default=0
 set timeout=0
 menuentry "Oracle Cloud Confidential PayPal Auth (AMD SEV-SNP)" {
-    linux /EFI/BOOT/vmlinuz root=tmpfs rootok=1 console=tty0 console=ttyS0,115200n8 selinux=0 panic=1 net.ifnames=0 biosdevname=0 mem_encryption=on lockdown=confidentiality
+    linux /EFI/BOOT/vmlinuz ${KERNEL_CMDLINE}
     initrd /EFI/BOOT/initrd.img
 }
 EOF

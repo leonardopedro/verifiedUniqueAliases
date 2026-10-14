@@ -83,6 +83,113 @@ async function nonce160Hex(paypalHash, pubkeyHash, customInfoStr, binaryShaHex, 
   return Buffer.from(await crypto.subtle.digest('SHA-256', combined)).toString('hex');
 }
 
+// v160: a fully self-consistent LEGITIMATE GCP report (Google cert with
+// allowlisted issuer + TPM quote whose nonce/PCR digest verify + enclave
+// signature). Shared by Test 5 (regression) and Test 8 (pre-flight happy
+// path) — construction extracted verbatim from Test 5.
+async function buildLegitGcpReport() {
+  const { generateKeyPairSync, sign: rsaSign, createHash } = await import('crypto');
+  const sha256 = (b) => createHash('sha256').update(b).digest();
+
+  // Enclave signing key (attacker-independent; just needs to self-consistently sign)
+  const enc = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const encPem = enc.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+
+  // Session AK keypair (stands in for tpm2_createprimary AK)
+  const ak = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const akPem = ak.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+
+  const customInfo = 'gcp_wallet_xyz';
+  const reportBody = {
+    custom_info: customInfo,
+    enclave_config: {
+      boot_measurements: {
+        binary_sha256: 'bb'.repeat(32),
+        disk_manifest: { 'EFI/BOOT/vmlinuz': 'cc'.repeat(32), 'EFI/BOOT/initrd.img': 'dd'.repeat(32), 'EFI/BOOT/grub.cfg': 'ee'.repeat(32) },
+      },
+      domain: 'login.example.com',
+    },
+    paypal_user_info_raw_hash: '11'.repeat(32),
+    session_context: {},
+    timestamp_ms: Date.now(),
+    hardware_level_attestation: null, // filled below (needs nonce)
+  };
+
+  // Expected nonce — same formula as runAudit step 1 (SEC-02: 160-byte
+  // pre-image including binary_sha256 + canonical manifest composite)
+  // NOTE: pubkey hash is over the raw DER (SPKI), not the PEM text — matches
+  // the enclave's PKey::public_key_to_der() and the page's pemToBuffer().
+  const pemToDer = (pem) => Buffer.from(pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
+  const expectedNonceHex = await nonce160Hex(
+    Buffer.from(reportBody.paypal_user_info_raw_hash, 'hex'),
+    new Uint8Array(sha256(pemToDer(encPem))),
+    customInfo,
+    reportBody.enclave_config.boot_measurements.binary_sha256,
+    reportBody.enclave_config.boot_measurements.disk_manifest,
+  );
+
+  // PCR values: all five quoted PCRs; pcr_15 must equal calculatePcr15(manifest)
+  const pcr15 = await calculatePcr15(reportBody.enclave_config.boot_measurements.disk_manifest);
+  const pcrValues = {};
+  for (const p of [0, 4, 8, 9]) pcrValues['pcr_' + p] = sha256(Buffer.from(`pcr${p}`)).toString('hex');
+  pcrValues['pcr_15'] = pcr15;
+
+  // Composite digest = SHA256(concat of the 5 PCR digests in order 0,4,8,9,15)
+  const composite = sha256(Buffer.concat([0, 4, 8, 9, 15].map(p => Buffer.from(pcrValues['pcr_' + p], 'hex'))));
+
+  // Build TPMS_ATTEST exactly as parseTpmsAttest expects
+  const qSigner = Buffer.alloc(32, 0x41);
+  const extra = Buffer.from(expectedNonceHex, 'hex');
+  const parts = [];
+  const hdr = Buffer.alloc(8);
+  hdr.writeUInt32BE(0xFF544347, 0); // magic
+  hdr.writeUInt16BE(0x8018, 4);     // ST_ATTEST_QUOTE
+  hdr.writeUInt16BE(qSigner.length, 6);
+  parts.push(hdr, qSigner);
+  const edSz = Buffer.alloc(2); edSz.writeUInt16BE(extra.length, 0);
+  parts.push(edSz, extra);
+  const tail = Buffer.alloc(17 + 8, 0); // clockInfo + firmwareVersion
+  parts.push(tail);
+  const selCount = Buffer.alloc(4); selCount.writeUInt32BE(1, 0);
+  parts.push(selCount);
+  const pcrSel = Buffer.from([0x00, 0x0b, 0x03, 0x00, 0x04, 0x0f]); // sha256 bank, 3 bytes select
+  parts.push(pcrSel);
+  const dgSz = Buffer.alloc(2); dgSz.writeUInt16BE(composite.length, 0);
+  parts.push(dgSz, composite);
+  const quoteMsg = Buffer.concat(parts);
+  const quoteSig = rsaSign('sha256', quoteMsg, ak.privateKey);
+
+  // Google AK cert with the allowlisted issuer (public data by design)
+  const gkeys = forge.pki.rsa.generateKeyPair(2048);
+  const gcert = forge.pki.createCertificate();
+  gcert.publicKey = gkeys.publicKey;
+  gcert.serialNumber = '02';
+  gcert.validity.notBefore = new Date(Date.now() - 86400000);
+  gcert.validity.notAfter = new Date(Date.now() + 86400000);
+  const gdn = [{ name: 'commonName', value: 'gcp-instance' }, { name: 'organizationName', value: 'EK/AK CA Intermediate' }];
+  gcert.setSubject(gdn);
+  gcert.setIssuer(gdn);
+  gcert.sign(gkeys.privateKey, forge.md.sha256.create());
+  const googleCertPem = forge.pki.certificateToPem(gcert);
+
+  reportBody.hardware_level_attestation = {
+    ak_pub_pem: akPem,
+    tpm_quote_msg: quoteMsg.toString('base64'),
+    tpm_quote_sig: quoteSig.toString('base64'),
+    pcr_values: pcrValues,
+    google_ak_cert_pem: googleCertPem,
+    platform_type: 'GCP',
+  };
+
+  const payload = JSON.stringify(reorder(reportBody));
+  const sig = rsaSign('sha256', Buffer.from(payload), enc.privateKey);
+  return {
+    attestation_report: reportBody,
+    enclave_signature_b64: sig.toString('base64'),
+    enclave_signing_public_key: encPem,
+  };
+}
+
 // ---- Optional: a genuine captured OCI report (not committed — instance
 // hardware captures are gitignored). Supply via GENUINE_REPORT to enable
 // Tests 1 and 3; the self-contained Tests 2/4/5 always run.
@@ -221,105 +328,7 @@ console.log('\nTest 4: nonce formula parity (SEC-02 code binding)');
 // Test 5: legitimate GCP report (Google cert + fully-verified TPM quote) must PASS
 console.log('\nTest 5: legitimate GCP report still passes (no regression)');
 {
-  const { generateKeyPairSync, sign: rsaSign, createHash } = await import('crypto');
-  const sha256 = (b) => createHash('sha256').update(b).digest();
-
-  // Enclave signing key (attacker-independent; just needs to self-consistently sign)
-  const enc = generateKeyPairSync('rsa', { modulusLength: 2048 });
-  const encPem = enc.publicKey.export({ type: 'spki', format: 'pem' }).toString();
-
-  // Session AK keypair (stands in for tpm2_createprimary AK)
-  const ak = generateKeyPairSync('rsa', { modulusLength: 2048 });
-  const akPem = ak.publicKey.export({ type: 'spki', format: 'pem' }).toString();
-
-  const customInfo = 'gcp_wallet_xyz';
-  const reportBody = {
-    custom_info: customInfo,
-    enclave_config: {
-      boot_measurements: {
-        binary_sha256: 'bb'.repeat(32),
-        disk_manifest: { 'EFI/BOOT/vmlinuz': 'cc'.repeat(32), 'EFI/BOOT/initrd.img': 'dd'.repeat(32), 'EFI/BOOT/grub.cfg': 'ee'.repeat(32) },
-      },
-      domain: 'login.example.com',
-    },
-    paypal_user_info_raw_hash: '11'.repeat(32),
-    session_context: {},
-    timestamp_ms: Date.now(),
-    hardware_level_attestation: null, // filled below (needs nonce)
-  };
-
-  // Expected nonce — same formula as runAudit step 1 (SEC-02: 160-byte
-  // pre-image including binary_sha256 + canonical manifest composite)
-  // NOTE: pubkey hash is over the raw DER (SPKI), not the PEM text — matches
-  // the enclave's PKey::public_key_to_der() and the page's pemToBuffer().
-  const pemToDer = (pem) => Buffer.from(pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
-  const expectedNonceHex = await nonce160Hex(
-    Buffer.from(reportBody.paypal_user_info_raw_hash, 'hex'),
-    new Uint8Array(sha256(pemToDer(encPem))),
-    customInfo,
-    reportBody.enclave_config.boot_measurements.binary_sha256,
-    reportBody.enclave_config.boot_measurements.disk_manifest,
-  );
-
-  // PCR values: all five quoted PCRs; pcr_15 must equal calculatePcr15(manifest)
-  const pcr15 = await calculatePcr15(reportBody.enclave_config.boot_measurements.disk_manifest);
-  const pcrValues = {};
-  for (const p of [0, 4, 8, 9]) pcrValues['pcr_' + p] = sha256(Buffer.from(`pcr${p}`)).toString('hex');
-  pcrValues['pcr_15'] = pcr15;
-
-  // Composite digest = SHA256(concat of the 5 PCR digests in order 0,4,8,9,15)
-  const composite = sha256(Buffer.concat([0, 4, 8, 9, 15].map(p => Buffer.from(pcrValues['pcr_' + p], 'hex'))));
-
-  // Build TPMS_ATTEST exactly as parseTpmsAttest expects
-  const qSigner = Buffer.alloc(32, 0x41);
-  const extra = Buffer.from(expectedNonceHex, 'hex');
-  const parts = [];
-  const hdr = Buffer.alloc(8);
-  hdr.writeUInt32BE(0xFF544347, 0); // magic
-  hdr.writeUInt16BE(0x8018, 4);     // ST_ATTEST_QUOTE
-  hdr.writeUInt16BE(qSigner.length, 6);
-  parts.push(hdr, qSigner);
-  const edSz = Buffer.alloc(2); edSz.writeUInt16BE(extra.length, 0);
-  parts.push(edSz, extra);
-  const tail = Buffer.alloc(17 + 8, 0); // clockInfo + firmwareVersion
-  parts.push(tail);
-  const selCount = Buffer.alloc(4); selCount.writeUInt32BE(1, 0);
-  parts.push(selCount);
-  const pcrSel = Buffer.from([0x00, 0x0b, 0x03, 0x00, 0x04, 0x0f]); // sha256 bank, 3 bytes select
-  parts.push(pcrSel);
-  const dgSz = Buffer.alloc(2); dgSz.writeUInt16BE(composite.length, 0);
-  parts.push(dgSz, composite);
-  const quoteMsg = Buffer.concat(parts);
-  const quoteSig = rsaSign('sha256', quoteMsg, ak.privateKey);
-
-  // Google AK cert with the allowlisted issuer (public data by design)
-  const gkeys = forge.pki.rsa.generateKeyPair(2048);
-  const gcert = forge.pki.createCertificate();
-  gcert.publicKey = gkeys.publicKey;
-  gcert.serialNumber = '02';
-  gcert.validity.notBefore = new Date(Date.now() - 86400000);
-  gcert.validity.notAfter = new Date(Date.now() + 86400000);
-  const gdn = [{ name: 'commonName', value: 'gcp-instance' }, { name: 'organizationName', value: 'EK/AK CA Intermediate' }];
-  gcert.setSubject(gdn); gcert.setIssuer(gdn);
-  gcert.sign(gkeys.privateKey, forge.md.sha256.create());
-  const googleCertPem = forge.pki.certificateToPem(gcert);
-
-  reportBody.hardware_level_attestation = {
-    ak_pub_pem: akPem,
-    tpm_quote_msg: quoteMsg.toString('base64'),
-    tpm_quote_sig: quoteSig.toString('base64'),
-    pcr_values: pcrValues,
-    google_ak_cert_pem: googleCertPem,
-    platform_type: 'GCP',
-  };
-
-  const payload = JSON.stringify(reorder(reportBody));
-  const sig = rsaSign('sha256', Buffer.from(payload), enc.privateKey);
-  const gcpReport = {
-    attestation_report: reportBody,
-    enclave_signature_b64: sig.toString('base64'),
-    enclave_signing_public_key: encPem,
-  };
+  const gcpReport = await buildLegitGcpReport();
 
   const alertMsg = await runAuditWith(gcpReport);
   const fw = fwStatus();
@@ -486,6 +495,70 @@ console.log('\nTest 7: OCI report with SNP evidence but no endorsement leaf');
   check('precise fail-closed explanation is shown',
     /NO verifiable endorsement key/i.test(fwHtml), `fw=${fwHtml.slice(0, 200)}`);
   check('vcek_source is surfaced to the auditor', /kds-undecodable/.test(fwHtml), `fw=${fwHtml.slice(0, 200)}`);
+}
+
+// Test 8 (v160): SNP report_data binding = SHA-256(P_enc ∥ nonce) parity
+// with the Rust enclave, plus the pre-flight (Pillar 4) enforcement: a
+// pinned P_enc must match the audited report's key, and runPreflight pins
+// only on a fully-passing live audit (fails closed otherwise).
+console.log('\nTest 8: v160 report_data binding + pre-flight pin');
+{
+  const { createHash } = await import('crypto');
+  const sha256 = (b) => createHash('sha256').update(b).digest();
+  const der = Buffer.from('fake-der-bytes');
+  const nonce = '398c2c1b18583ac9c3935ffdea04f0b2a3dfdd927140072bd50511e9f77db8f7';
+  const BINDING_PIN = '22a092286d97a00032a2c8b1a24b3c4691ff9fad6d1759c18d17b7a5354c248f';
+
+  const jsBinding = await snpBindingHex(der, nonce);
+  check('JS snpBindingHex matches independent reference',
+    jsBinding === sha256(Buffer.concat([der, Buffer.from(nonce, 'hex')])).toString('hex'), `js=${jsBinding}`);
+  check('JS snpBindingHex matches the Rust-pinned parity vector',
+    jsBinding === BINDING_PIN, `js=${jsBinding} rustPin=${BINDING_PIN}`);
+
+  // 8a. Pre-flight happy path: a fully-valid live envelope pins its P_enc.
+  const legit = await buildLegitGcpReport();
+  const realFetch = globalThis.fetch;
+  const realUrl = document.getElementById('preflightUrl').value;
+  globalThis.fetch = async () => ({
+    ok: true, status: 200,
+    text: async () => JSON.stringify(legit),
+    json: async () => ({ attestations: [] }),
+  });
+  document.getElementById('preflightUrl').value = 'https://legit.example.com';
+  preFlightPubKeyPem = null;
+  const pfOk = await runPreflight();
+  check('runPreflight passes on a fully-valid live envelope', pfOk === true, `pfOk=${pfOk}`);
+  check('runPreflight pins the live enclave P_enc',
+    preFlightPubKeyPem === legit.enclave_signing_public_key,
+    `pinned=${(preFlightPubKeyPem || '').slice(0, 40)}`);
+
+  // 8b. Post-login report signed by a DIFFERENT key → deterministic failure.
+  const swapped = await buildLegitGcpReport();
+  swapped.enclave_signing_public_key = forge.pki.publicKeyToPem(forge.pki.rsa.generateKeyPair(2048).publicKey);
+  let alertMsg = await runAuditWith(swapped);
+  check('swapped enclave key fails the pre-flight pin',
+    !!alertMsg && /PRE-FLIGHT VIOLATION/.test(alertMsg), `alert=${alertMsg}`);
+
+  // 8c. Same key as the pin → no pre-flight failure (audit proceeds).
+  alertMsg = await runAuditWith(legit);
+  check('pinned key accepted (no PRE-FLIGHT failure)',
+    !alertMsg || !/PRE-FLIGHT/.test(alertMsg), `alert=${alertMsg}`);
+
+  // 8d. runPreflight fails closed: unreachable enclave / non-https origin.
+  preFlightPubKeyPem = null;
+  document.getElementById('preflightUrl').value = 'https://legit.example.com';
+  globalThis.fetch = async () => ({ ok: false, status: 503, text: async () => '' });
+  const pfFail = await runPreflight();
+  check('runPreflight fails closed when the enclave is unreachable',
+    pfFail === false && preFlightPubKeyPem === null, `pfFail=${pfFail}`);
+  document.getElementById('preflightUrl').value = 'not-a-url';
+  const pfBad = await runPreflight();
+  check('runPreflight rejects a non-https origin', pfBad === false, `pfBad=${pfBad}`);
+
+  // restore session state for any later runs
+  globalThis.fetch = realFetch;
+  document.getElementById('preflightUrl').value = realUrl;
+  preFlightPubKeyPem = null;
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

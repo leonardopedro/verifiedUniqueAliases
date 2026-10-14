@@ -84,13 +84,36 @@ ENV LC_ALL=C.UTF-8
 # Pin Debian snapshots for 100% stable package versions (Trixie is current stable)
 RUN echo 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/20260406T000000Z\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/20260406T000000Z\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp' > /etc/apt/sources.list.d/debian.sources
 
+# systemd-boot-efi (Pillar 1): the systemd EFI stub (linuxx64.efi.stub) for
+# the monolithic UKI assembly in build-oci-image.sh, from the same pinned
+# Debian snapshot as the rest of this stage → deterministic.
+# Measurement firmware is NOT apt-installed: trixie's generic `ovmf`
+# (OVMF_CODE_4M.fd, and all its sibling variants) has no SNP_KERNEL_HASHES
+# section, so sev-snp-measure refuses --kernel/--initrd/--append against it —
+# the pinned ovmf-amdsev fetch below is the fix (see build-oci-image.sh).
 RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends \
     curl ca-certificates gcc g++ make pkg-config libssl-dev \
     cpio xz-utils zstd qemu-utils mtools gdisk binutils initramfs-tools \
     linux-image-cloud-amd64 shim-signed grub-efi-amd64-signed \
+    systemd-boot-efi \
     tpm2-tools iproute2 kmod python3 file dosfstools bash nftables \
     pciutils \
     && rm -rf /var/lib/apt/lists/*
+
+# SEV-SNP measurement firmware (Pillar 1): Debian's split ovmf-amdsev build —
+# the only Debian OVMF carrying the SNP_KERNEL_HASHES section required by
+# sev-snp-measure's direct-boot flow (verified: every generic OVMF_CODE*.fd
+# errors with "OVMF metadata doesn't include SNP_KERNEL_HASHES section").
+# Snapshot URL + sha256 pin → deterministic even after the file leaves the
+# live pool; the .deb is Architecture: all (data only) and is extracted, not
+# installed, so trixie version drift cannot affect it.
+RUN curl -sfLo /tmp/ovmf-amdsev.deb \
+        "https://snapshot.debian.org/archive/debian/20261010T000000Z/pool/main/e/edk2/ovmf-amdsev_2026.08+ds-2_all.deb" \
+    && echo "92c9b6d15e4eeb371938c3f99080c1a8fc057dfd6bc0509d37f8b615e9edebfb  /tmp/ovmf-amdsev.deb" | sha256sum -c - \
+    && mkdir -p /tmp/ovmf-extract \
+    && (cd /tmp/ovmf-extract && ar x /tmp/ovmf-amdsev.deb && tar -xf data.tar.* ./usr/share/ovmf/OVMF.amdsev.fd) \
+    && install -D -m 0644 /tmp/ovmf-extract/usr/share/ovmf/OVMF.amdsev.fd /usr/share/ovmf/OVMF.amdsev.fd \
+    && rm -rf /tmp/ovmf-extract /tmp/ovmf-amdsev.deb
 
 WORKDIR /build
 COPY --from=rust-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin

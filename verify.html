@@ -206,6 +206,17 @@
         <button onclick="runAudit()">Perform Cryptographic Audit</button>
     </div>
 
+    <div class="grid" style="margin-top: -10px;">
+        <div class="input-card" style="grid-column: span 2;">
+            <label>Step 1 — Pre-Flight: verify the LIVE enclave BEFORE logging in</label>
+            <div style="display: flex; gap: 10px;">
+                <input type="text" id="preflightUrl" placeholder="https://login.example-domain" style="flex: 1; background: #0d1117; border: 1px solid #30363d; border-radius: 8px; color: #58a6ff; padding: 10px; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; outline: none;">
+                <button onclick="runPreflight()" style="grid-column: auto; margin: 0; padding: 10px 18px; font-size: 0.95rem; border-radius: 8px; white-space: nowrap;">Pre-Flight Check</button>
+            </div>
+            <p id="preflightStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;">Fetches <code>/debug/envelope</code> from the enclave, runs the full audit on the live report, and pins its ephemeral key (P_enc). The post-login audit then FAILS if the key changed — you verify the enclave you are about to log in on, not one you met afterwards.</p>
+        </div>
+    </div>
+
     <div id="resultsArea" class="results">
         <div class="status-card">
             <div class="timestamp-box">
@@ -294,6 +305,62 @@
         return atob(padded);
     }
     const pemToBuffer = pemToBytes; // backward compat
+
+    // ── v160: P_enc binding + pre-flight (Pillars 2 & 4) ──────────────────
+    // Pre-flight state: P_enc pinned by the FIRST (pre-login) audit of the
+    // live enclave. Any later audit of the post-login report must carry the
+    // same key or it fails — closing the verify-after-login race.
+    // (var, not let: the audit harness evaluates this script via indirect
+    // eval — top-level `let` stays in the eval scope and would be invisible
+    // to scripts/test-verify-security.mjs, which drives these pins directly.)
+    var preFlightPubKeyPem = null;
+    var lastAuditedPubKeyPem = null;
+
+    // report_data[0..32] = SHA-256(P_enc_SPKI_DER ∥ session_nonce),
+    // [32..64] zero. Mirrors tpm::snp_report_data_binding() in the enclave;
+    // pinned by Rust security_tests::snp_report_data_binding_parity_v160 ↔
+    // harness Test 8 (update all three together).
+    async function snpBindingHex(pubKeyDer, nonceHex) {
+        const nonceBytes = new Uint8Array((nonceHex.match(/.{1,2}/g) || []).map(m => parseInt(m, 16)));
+        const pre = new Uint8Array(pubKeyDer.length + nonceBytes.length);
+        pre.set(pubKeyDer, 0);
+        pre.set(nonceBytes, pubKeyDer.length);
+        const digest = await crypto.subtle.digest('SHA-256', pre);
+        return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // PRE-FLIGHT (Pillar 4): run BEFORE starting the PayPal login. Fetches
+    // the enclave's LIVE synthetic-identity envelope (/debug/envelope;
+    // CORS-open for this page), runs the FULL audit on it — silicon root +
+    // launch-digest pin + report_data binding + provenance — and pins the
+    // live P_enc. Returns true only if the live enclave passed everything.
+    async function runPreflight() {
+        const urlEl = document.getElementById('preflightUrl');
+        const statusEl = document.getElementById('preflightStatus');
+        const base = (urlEl.value || '').trim().replace(/\/+$/, '');
+        if (!/^https:\/\/[^\/]+/.test(base)) {
+            statusEl.innerText = '❌ Pre-flight needs the enclave origin as https://host — copy it from the address bar of the page you are about to log in on.';
+            return false;
+        }
+        try {
+            const resp = await fetch(base + '/debug/envelope', { mode: 'cors' });
+            if (!resp.ok) throw new Error('enclave returned HTTP ' + resp.status);
+            const body = await resp.text();
+            // The full audit pipeline runs on the LIVE report via the textarea.
+            document.getElementById('attestationInput').value = body;
+            const ok = await runAudit();
+            if (ok) {
+                preFlightPubKeyPem = lastAuditedPubKeyPem;
+                statusEl.innerText = '✅ Pre-flight PASSED — live enclave P_enc pinned (' + (preFlightPubKeyPem || '').substring(54, 94) + '…). Start the login from THIS page; the post-login audit fails if the key changes.';
+            } else {
+                statusEl.innerText = '❌ Pre-flight FAILED — do NOT start the login; the live enclave did not verify (audit results below).';
+            }
+            return ok;
+        } catch (e) {
+            statusEl.innerText = '❌ Pre-flight error: ' + e.message;
+            return false;
+        }
+    }
 
     // Robust cert parser (handles PEM, base64-DER, base64-PEM)
     function parseAnyCertToForge(certInput, name) {
@@ -793,6 +860,14 @@
             // 1. Identity Binding (Nonce Generation)
             const pubKeyPem = (rawData.enclave_signing_public_key || report.public_key_pem || "");
             const pubKeyBuffer = pemToBuffer(pubKeyPem);
+            // v160 (Pillar 4): pre-flight enforcement — if a pre-flight pinned
+            // the live enclave's P_enc, this report MUST be signed by that
+            // exact key. Checked FIRST so a swapped enclave fails
+            // deterministically, before any other verdict.
+            lastAuditedPubKeyPem = pubKeyPem;
+            if (preFlightPubKeyPem && pubKeyPem !== preFlightPubKeyPem) {
+                throw new Error("PRE-FLIGHT VIOLATION: this report's enclave key does NOT match the P_enc pinned by the pre-flight check — the enclave was swapped between pre-flight and login. Restart from the pre-flight step.");
+            }
             const pubKeyHash = await crypto.subtle.digest('SHA-256', pubKeyBuffer);
             const paypalHash = new Uint8Array(report.paypal_user_info_raw_hash.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
 
@@ -831,7 +906,7 @@
             const expectedNonce = Array.from(new Uint8Array(combinedHash)).map(b => b.toString(16).padStart(2, '0')).join('');
             
             // Note: The JSON nonce_hex is entirely untrusted. We use expectedNonce moving forward.
-            updateStatus('identityCheck', true, "Identity cryptographically hashed.");
+            updateStatus('identityCheck', true, "Identity cryptographically hashed." + (preFlightPubKeyPem ? " 🔒 P_enc matches the pre-flight pin." : " ℹ️ Pre-flight not performed in this session — run the Pre-Flight Check before logging in to pin the live enclave's key."));
 
             // 2. Enclave Signature Validation
             const sig = pemToBuffer(rawData.enclave_signature_b64 || report.signature_b64);
@@ -1017,10 +1092,11 @@
             } else if (hw.snp_report_b64 && hw.vcek_der_b64) {
                 try {
                     if (!snp || snp.length < 672 + 144) throw new Error("SNP report truncated (expected ≥ 816 bytes)");
-                    // report_data[0..32] MUST equal the session nonce
-                    // (SHA-256(paypal_hash ∥ SHA-256(pubkey DER) ∥ SHA-256(custom_info))); [32..64] zero.
+                    // v160 (Pillar 2): report_data[0..32] MUST equal
+                    // SHA-256(P_enc_SPKI_DER ∥ expectedNonce); [32..64] zero.
                     const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2, '0')).join('');
-                    const snpBindingOk = (reportDataHex === expectedNonce.padEnd(128, '0'));
+                    const expectedBindingHex = (await snpBindingHex(pubKeyBuffer, expectedNonce)).padEnd(128, '0');
+                    const snpBindingOk = (reportDataHex === expectedBindingHex);
 
                     // ECDSA P-384/SHA-384 over signed region snp[0..672]; r/s are
                     // 72-byte little-endian — take low 48 bytes, reverse to big-endian.
@@ -1069,7 +1145,7 @@
                     snpVerified = snpBindingOk && snpSigOk && chainOk && measurementOk;
                     if (snpVerified) {
                         siliconMsg += `<br>✅ <b>Native AMD SEV-SNP Evidence Verified</b><br>` +
-                                      `🔐 Session nonce bound in report_data<br>` +
+                                      `🔐 P_enc ∥ session nonce bound in report_data (v160)<br>` +
                                       `🔏 ECDSA P-384 signature valid<br>` +
                                       `⛓️ VCEK→ASK→ARK chain pinned (ARK ${arkPinHex.substring(0, 16)}…)<br>` +
                                       `📏 Launch digest pinned: ${measurement.substring(0, 16)}…` +
@@ -1078,6 +1154,9 @@
                         if (!measurementOk) {
                             siliconMsg += `<br>❌ <b>Launch digest (MEASUREMENT) not pinned:</b> ${measurement}<br>` +
                                           `⚠️ This report comes from an AMD SEV-SNP launch whose initial image does not match the expected reproducible OCI image stack — possible "ghost enclave". Do NOT trust this report.`;
+                        }
+                        if (!snpBindingOk) {
+                            siliconMsg += `<br>❌ <b>report_data binding mismatch (v160):</b> expected SHA-256(P_enc ∥ session nonce) = ${expectedBindingHex.substring(0, 32)}…<br>⚠️ The hardware quote does not commit to this enclave key + this session — forged, replayed, or from a pre-v160 enclave.`;
                         }
                         if (!snpBindingOk || !snpSigOk || !chainOk) {
                             siliconMsg += `<br>❌ <b>SEV-SNP verification failed</b> (binding=${snpBindingOk}, sig=${snpSigOk}, chain=${chainOk}, ark=${arkPinHex})` +
@@ -1142,9 +1221,11 @@
                 const reportLeaf = getLeafCert(report.session_context.tls_certificate_pem);
                 updateStatus('tlsCheck', userLeaf === reportLeaf, userLeaf === reportLeaf ? "TLS channel bound." : "TLS mismatch!");
             }
+            return true;
         } catch (e) { 
             console.error(e); 
-            alert("Audit Failed: " + e.message); 
+            alert("Audit Failed: " + e.message);
+            return false; 
         }
     }
 </script>
