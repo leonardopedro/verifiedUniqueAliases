@@ -619,5 +619,108 @@ console.log('\nTest 9: v161 client-bound report_data binding parity');
     `okm=${Buffer.from(okm).toString('hex').slice(0, 32)}…`);
 }
 
+// Test 10: the SHIPPED E2EE callback page (render_e2ee_page in src/main.rs)
+// — extract the real embedded JS, de-format the Rust `format!` braces, and
+// drive it in a sandbox against a genuine-shaped enclave blob. Guards the
+// Firefox callback failure: both ECDH importKey calls MUST carry
+// namedCurve: 'P-256' (EcKeyImportParams requires it — without it the
+// callback dies at "An invalid or illegal string was specified").
+console.log('\nTest 10: shipped E2EE callback page decrypts + signature-verifies');
+{
+  const mainRs = readFileSync(new URL('../src/main.rs', import.meta.url), 'utf8');
+  const m = mainRs.match(/fn render_e2ee_page[\s\S]*?r#"([\s\S]*?)"#/);
+  check('render_e2ee_page raw template located in src/main.rs', !!m);
+  const PH = '<script type="application/json" id="e2ee-blob">{}</script>';
+  check('blob placeholder present in template', !!m && m[1].includes(PH));
+
+  // --- Enclave-side fixture mirroring the Rust crypto exactly: ---
+  // ECDH(P-256) → HKDF-SHA256(salt=client_nonce, info=payload label) →
+  // AES-256-GCM(AAD=client_nonce); envelope signed by S_enc over the
+  // canonical (sorted-key) attestation_report — same as
+  // crypto::derive_e2ee_session_key + encrypt_aad + generate_attestation.
+  const clientKp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const jwk = JSON.parse(JSON.stringify(await crypto.subtle.exportKey('jwk', clientKp.privateKey)));
+  const nonceBytes = crypto.getRandomValues(new Uint8Array(32));
+  const nonceHex = Buffer.from(nonceBytes).toString('hex');
+
+  const enclaveKp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const ikm = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: clientKp.publicKey }, enclaveKp.privateKey, 256));
+  const hkdfBase = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveKey']);
+  const aesKey = await crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: nonceBytes, info: new TextEncoder().encode('paypal-auth-vm/e2ee/v1') },
+    hkdfBase, { name: 'AES-GCM', length: 256 }, true, ['encrypt']);
+
+  const rsaKp = await crypto.subtle.generateKey(
+    { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+    true, ['sign', 'verify']);
+  const spkiB64 = Buffer.from(await crypto.subtle.exportKey('spki', rsaKp.publicKey)).toString('base64');
+  const rsaPem = '-----BEGIN PUBLIC KEY-----\n' + spkiB64.match(/.{1,64}/g).join('\n') + '\n-----END PUBLIC KEY-----';
+
+  const reorder = o => (o === null || typeof o !== 'object' || Array.isArray(o)) ? o
+    : Object.keys(o).sort().reduce((acc, k) => (acc[k] = reorder(o[k]), acc), {});
+  const report = { attestation_report: {
+    timestamp_ms: 1760000000000,
+    paypal_user_info: { sub: 'e2ee-qa@test', verified_account: 'true' },
+    paypal_user_info_raw_hash: 'aa'.repeat(32),
+  } };
+  const envelope = {
+    attestation_report: report.attestation_report,
+    enclave_signing_public_key: rsaPem,
+  };
+  envelope.enclave_signature_b64 = Buffer.from(await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5', rsaKp.privateKey,
+    new TextEncoder().encode(JSON.stringify(reorder(envelope.attestation_report))))).toString('base64');
+
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: nonceBytes }, aesKey,
+    new TextEncoder().encode(JSON.stringify(envelope))));
+  const blob = {
+    alg: 'AES-256-GCM+HKDF-SHA256+ECDH-P256', aad: 'client_nonce',
+    iv_b64: Buffer.from(iv).toString('base64'),
+    ct_b64: Buffer.from(ct).toString('base64'),
+    enclave_ecdh_public_key_b64: Buffer.from(await crypto.subtle.exportKey('spki', enclaveKp.publicKey)).toString('base64'),
+    enclave_signing_public_key: rsaPem,
+    state: 'test-state', flow: 'verified',
+  };
+
+  // --- Extract + de-format the shipped page ---
+  let page = m[1].replace(PH, JSON.stringify(blob));
+  page = page.replace(/\{\{/g, '{').replace(/\}\}/g, '}');
+  const pageScript = (page.match(/<script>([\s\S]*)<\/script>/) || [])[1];
+  check('embedded page script extracted', !!pageScript);
+
+  // --- Sandbox: DOM + sessionStorage as the browser would provide ---
+  globalThis.sessionStorage = {
+    _s: { pav_client_jwk: JSON.stringify(jwk), pav_client_nonce: nonceHex, pav_p_enc: rsaPem },
+    getItem(k) { return k in this._s ? this._s[k] : null; },
+    setItem(k, v) { this._s[k] = String(v); },
+  };
+  elements['e2ee-blob'] = Object.assign(makeEl(), { textContent: JSON.stringify(blob) });
+  elements['st'] = makeEl();
+  elements['openAuditor'] = makeEl();
+  const runPage = async () => {
+    elements['st'].innerHTML = '';
+    new Function(pageScript)();
+    for (let i = 0; i < 100 && !elements['st'].innerHTML; i++) await new Promise(r => setTimeout(r, 20));
+    return elements['st'].innerHTML;
+  };
+
+  const okMsg = await runPage();
+  check('callback page decrypts the enclave blob', /✅/.test(okMsg), okMsg.replace(/<[^>]+>/g, ' ').slice(0, 160));
+  check('callback page shows the PayPal identity from inside the ciphertext', okMsg.includes('e2ee-qa@test'), okMsg.slice(0, 160));
+  check('callback page enforced the pre-flight P_enc pin', okMsg.includes('P_enc pin matched'), okMsg.slice(0, 160));
+
+  // Tampered ciphertext must fail closed (AES-GCM tag), not render ✅
+  const badBlob = { ...blob, ct_b64: Buffer.from(ct.map((b, i) => i === 0 ? b ^ 0xff : b)).toString('base64') };
+  let page2 = m[1].replace(PH, JSON.stringify(badBlob)).replace(/\{\{/g, '{').replace(/\}\}/g, '}');
+  const script2 = (page2.match(/<script>([\s\S]*)<\/script>/) || [])[1];
+  elements['e2ee-blob'].textContent = JSON.stringify(badBlob);
+  elements['st'].innerHTML = '';
+  new Function(script2)();
+  for (let i = 0; i < 100 && !elements['st'].innerHTML; i++) await new Promise(r => setTimeout(r, 20));
+  check('tampered ciphertext fails closed', /❌/.test(elements['st'].innerHTML), elements['st'].innerHTML.slice(0, 160));
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

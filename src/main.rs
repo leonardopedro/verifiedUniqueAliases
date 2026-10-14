@@ -3719,8 +3719,8 @@ fn render_e2ee_page(blob: &serde_json::Value) -> String {
                 const nonceBytes = Uint8Array.from(nonceHex.match(/.{{2}}/g) || [], h => parseInt(h, 16));
                 if (nonceBytes.length !== 32) throw new Error('stored client nonce is malformed');
                 // 1. ECDH(P-256): deriveBits(S_client, P_enc_ecdh)
-                const priv = await crypto.subtle.importKey('jwk', jwk, {{ name: 'ECDH' }}, false, ['deriveBits']);
-                const peer = await crypto.subtle.importKey('spki', b64d(blob.enclave_ecdh_public_key_b64), {{ name: 'ECDH' }}, false, []);
+                const priv = await crypto.subtle.importKey('jwk', jwk, {{ name: 'ECDH', namedCurve: 'P-256' }}, false, ['deriveBits']);
+                const peer = await crypto.subtle.importKey('spki', b64d(blob.enclave_ecdh_public_key_b64), {{ name: 'ECDH', namedCurve: 'P-256' }}, false, []);
                 const bits = await crypto.subtle.deriveBits({{ name: 'ECDH', public: peer }}, priv, 256);
                 // 2. HKDF-SHA256(salt=client_nonce, info=protocol label) → AES-256 key
                 const base = await crypto.subtle.importKey('raw', bits, 'HKDF', false, ['deriveKey']);
