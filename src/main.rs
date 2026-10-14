@@ -1181,16 +1181,23 @@ mod tpm {
     /// The hardware quote commits to the exact browser session that requested
     /// the pre-flight: the ephemeral enclave signing key, the PKCE challenge
     /// the enclave will present to PayPal, the browser's ephemeral ECDH key,
-    /// and the browser's nonce. Only a report carrying ALL four inputs in its
-    /// report_data satisfies the auditor (verify.html `preflightBindingHex`,
-    /// pinned by `security_tests::preflight_binding_parity_v161` ↔ node
-    /// harness Test 9 — update all three together). The v160 session binding
+    /// the browser's nonce, and the user's optional custom_info (public key /
+    /// nonce for downstream assurance — v161.2). Only a report carrying ALL
+    /// FIVE inputs in its report_data satisfies the auditor (verify.html
+    /// `preflightBindingHex`, pinned by
+    /// `security_tests::preflight_binding_parity_v161` ↔ node harness Test 9
+    /// — update all three together). The v160 session binding
     /// (snp_report_data_binding) stays for the legacy /debug/envelope path.
+    ///
+    /// `custom_info` MUST be the canonical string ("NONE" when absent) —
+    /// the same value carried in the report and hashed into the session
+    /// nonce, so the hardware quote commits directly to the user's entropy.
     pub(crate) fn preflight_report_data_binding(
         pubkey_der: &[u8],
         code_challenge: &str,
         client_pub_der: &[u8],
         client_nonce: &[u8; 32],
+        custom_info: &str,
     ) -> [u8; 64] {
         use sha2::{Digest, Sha256};
         let mut out = [0u8; 64];
@@ -1199,6 +1206,7 @@ mod tpm {
         h.update(code_challenge.as_bytes());
         h.update(client_pub_der);
         h.update(client_nonce);
+        h.update(custom_info.as_bytes());
         out[..32].copy_from_slice(&h.finalize());
         out
     }
@@ -2944,7 +2952,13 @@ async fn generate_attestation(
     // the silicon quote instead of the v160 session-nonce binding:
     // report_data[0..32] = SHA-256(P_enc ∥ code_challenge ∥ P_client ∥ nonce_c)
     let report_data_override = preflight.map(|pk| {
-        tpm::preflight_report_data_binding(&pub_key_der, &pk.code_challenge, &pk.client_ecdh_pub, &pk.client_nonce)
+        tpm::preflight_report_data_binding(
+            &pub_key_der,
+            &pk.code_challenge,
+            &pk.client_ecdh_pub,
+            &pk.client_nonce,
+            &pk.canonical_custom_info(),
+        )
     });
     let mut tpm_report = match tpm::quote(&final_combined_nonce, &pub_key_der, report_data_override).await {
         Ok(r) => r,
@@ -2991,6 +3005,10 @@ async fn generate_attestation(
                         "code_challenge": pk.code_challenge,
                         "client_pub_b64": base64::engine::general_purpose::STANDARD.encode(&pk.client_ecdh_pub),
                         "client_nonce_hex": hex::encode(pk.client_nonce),
+                        // v161.2: echoed user input — the browser asserts it
+                        // matches what it sent; the auditor recomputes the
+                        // five-element report_data binding from it.
+                        "custom_info": pk.canonical_custom_info(),
                     })
                 }
                 None => serde_json::Value::Null,
@@ -3211,6 +3229,10 @@ struct PkceSession {
     // client_ecdh_pub empty ⇒ legacy /login session (v160 session binding).
     client_ecdh_pub: Vec<u8>,
     client_nonce: [u8; 32],
+    // v161.2: user-supplied custom data (public key / wallet / nonce) for the
+    // pre-flight flow — bound into the hardware report_data and the session
+    // nonce, echoed in session_context.preflight. None ⇒ legacy /login.
+    custom_info: Option<String>,
     // Enclave's per-session ECDH keypair (P_enc_ecdh / S_enc_ecdh). RAM-only,
     // never serialized — like S_enc, it exists only inside encrypted memory.
     enclave_ecdh: Option<openssl::pkey::PKey<openssl::pkey::Private>>,
@@ -3241,15 +3263,32 @@ impl PkceSession {
             code_challenge,
             client_ecdh_pub: Vec::new(),
             client_nonce: [0u8; 32],
+            custom_info: None,
             enclave_ecdh: None,
             created_at: Instant::now(),
         }
     }
 
+    /// v161.2: the canonical custom_info string bound into report_data and
+    /// the session nonce — "NONE" when the user supplied nothing (the same
+    /// canonicalization generate_attestation applies to the legacy flow).
+    fn canonical_custom_info(&self) -> String {
+        self.custom_info
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("NONE")
+            .to_string()
+    }
+
     /// v161: pre-flight session — the quote will bind (P_enc ∥ code_challenge
     /// ∥ P_client ∥ client_nonce), and the callback response is E2EE-sealed
     /// to P_client via the per-session enclave ECDH key.
-    fn new_preflight(client_ecdh_pub: Vec<u8>, client_nonce: [u8; 32]) -> Self {
+    fn new_preflight(
+        client_ecdh_pub: Vec<u8>,
+        client_nonce: [u8; 32],
+        custom_info: Option<String>,
+    ) -> Self {
         let (code_verifier, code_challenge) = Self::mint();
         let enclave_ecdh = crate::crypto::generate_ecdh_keypair().ok();
         Self {
@@ -3257,6 +3296,7 @@ impl PkceSession {
             code_challenge,
             client_ecdh_pub,
             client_nonce,
+            custom_info,
             enclave_ecdh,
             created_at: Instant::now(),
         }
@@ -3293,6 +3333,12 @@ pub struct PreflightRequest {
     pub client_nonce_hex: String,
     /// "verified" (default) or "full" — selects the PayPal app/scope.
     pub flow: Option<String>,
+    /// v161.2: optional user-supplied data (public key, wallet, nonce…) that
+    /// is bound into the HARDWARE quote (report_data) and the session nonce,
+    /// and echoed back in the report. Restores the v15x /generate field for
+    /// the pre-flight flow. Empty/absent → canonical "NONE".
+    #[serde(default)]
+    pub custom_info: Option<String>,
 }
 
 async fn serve_verify_html() -> impl IntoResponse {
@@ -3366,7 +3412,21 @@ async fn attest_preflight(
     }
 
     // Mint the single-use PKCE session (verifier stays in encrypted RAM).
-    let pkce = PkceSession::new_preflight(client_pub.clone(), client_nonce);
+    // v161.2: the user's optional custom_info (public key / wallet / nonce)
+    // is canonicalized ONCE here — trimmed, empty→None — so the hardware
+    // binding, the session nonce, the report field and the S_enc-signed
+    // pre-flight fields all carry the identical string. 512-byte cap
+    // (matches the legacy /generate form's maxlength).
+    let custom_info = payload
+        .custom_info
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    if custom_info.as_deref().map_or(false, |s| s.len() > 512) {
+        return (StatusCode::BAD_REQUEST, "custom_info exceeds 512 bytes").into_response();
+    }
+    let pkce = PkceSession::new_preflight(client_pub.clone(), client_nonce, custom_info);
     if pkce.enclave_ecdh.is_none() {
         return (StatusCode::INTERNAL_SERVER_ERROR, "Enclave ECDH key generation failed").into_response();
     }
@@ -3385,7 +3445,12 @@ async fn attest_preflight(
         &state,
         "preflight (synthetic identity — NOT a real PayPal login)".to_string(),
         synthetic,
-        Some("PREFLIGHT ENVELOPE — synthetic identity, binds this browser session".to_string()),
+        // v161.2: bind the USER's custom_info (canonicalized) rather than a
+        // fixed marker, so report.custom_info === the hardware-bound
+        // session value for pre-flight envelopes too (the auditor cross-
+        // checks this invariant; the synthetic-identity warning lives in
+        // clicked_button_label).
+        Some(pkce.canonical_custom_info()),
         Some(&pkce),
     ).await;
     if envelope_str.starts_with("ERROR:") {
@@ -3420,6 +3485,10 @@ async fn attest_preflight(
         "authorize_base": auth_base,
         "scope": config.scope,
         "enclave_ecdh_public_key_b64": ecdh_pub_b64,
+        // v161.2: the user's custom data, S_enc-signed AND hardware-bound
+        // (report_data + session nonce) — the browser asserts the enclave
+        // echoed the same string back before redirecting to PayPal.
+        "custom_info": pkce.canonical_custom_info(),
     });
     let signed_fields_compact = serde_json::to_string(&signed_fields).expect("serialize signed fields");
     let signature = sign_payload(&signed_fields_compact, &id.pem);
@@ -3859,7 +3928,10 @@ async fn callback(
             &state,
             config.label.clone(),
             userinfo,
-            None,
+            // v161.2: carry the user's hardware-bound custom_info into the
+            // real report (it is already committed to by report_data + the
+            // session nonce; this surfaces it in the delivered payload).
+            pkce.custom_info.clone(),
             Some(&pkce),
         ).await;
         if report_json.starts_with("ERROR:") {
@@ -4711,22 +4783,38 @@ mod security_tests {
                 .try_into()
                 .unwrap();
 
-        let binding = tpm::preflight_report_data_binding(pubkey_der, code_challenge, client_pub, &client_nonce);
-        // [32..64] must be zero; [0..32] the pinned digest.
+        let custom_info = "user_wallet_xyz_v1612";
+        let binding =
+            tpm::preflight_report_data_binding(pubkey_der, code_challenge, client_pub, &client_nonce, custom_info);
+        // [32..64] must be zero; [0..32] the pinned digest (FIVE-element
+        // pre-image — v161.2 folds the user's custom_info into the quote).
         assert_eq!(binding[32..], [0u8; 32]);
         assert_eq!(
             hex::encode(&binding[..32]),
-            "eb25571bb08d245e4a89f8903c5d348e193e70fe5c2926e2ab033bdcc6beeba8"
+            "c459f5fad84e4b00bf1080e7e379ec3d40806edb82de5b2525509f1dc0874f0e"
+        );
+        // The canonical absent-value form pins too ("NONE"): the deployed
+        // flow always binds SOME canonical string, never an empty element.
+        assert_eq!(
+            hex::encode(
+                &tpm::preflight_report_data_binding(pubkey_der, code_challenge, client_pub, &client_nonce, "NONE")[..32]
+            ),
+            "52bc1e5b3d53435f6a6e7fb4cd8d371e9fdefe0232c1fe63b4571e10acd27564"
         );
         // Every element is live: changing any one input changes the binding
         // (a replayed/spliced session cannot reuse another's report_data).
         let base = hex::encode(&binding[..32]);
-        assert_ne!(base, hex::encode(&tpm::preflight_report_data_binding(b"other-der", code_challenge, client_pub, &client_nonce)[..32]));
-        assert_ne!(base, hex::encode(&tpm::preflight_report_data_binding(pubkey_der, "OTHER_CHALLENGE", client_pub, &client_nonce)[..32]));
-        assert_ne!(base, hex::encode(&tpm::preflight_report_data_binding(pubkey_der, code_challenge, b"other-client", &client_nonce)[..32]));
+        assert_ne!(base, hex::encode(&tpm::preflight_report_data_binding(b"other-der", code_challenge, client_pub, &client_nonce, custom_info)[..32]));
+        assert_ne!(base, hex::encode(&tpm::preflight_report_data_binding(pubkey_der, "OTHER_CHALLENGE", client_pub, &client_nonce, custom_info)[..32]));
+        assert_ne!(base, hex::encode(&tpm::preflight_report_data_binding(pubkey_der, code_challenge, b"other-client", &client_nonce, custom_info)[..32]));
         let mut other_nonce = client_nonce;
         other_nonce[0] ^= 0xff;
-        assert_ne!(base, hex::encode(&tpm::preflight_report_data_binding(pubkey_der, code_challenge, client_pub, &other_nonce)[..32]));
+        assert_ne!(base, hex::encode(&tpm::preflight_report_data_binding(pubkey_der, code_challenge, client_pub, &other_nonce, custom_info)[..32]));
+        // v161.2: the user's custom data is bound — substituting a different
+        // custom_info (e.g. an attacker swapping the user's wallet/nonce)
+        // invalidates the hardware binding.
+        assert_ne!(base, hex::encode(&tpm::preflight_report_data_binding(pubkey_der, code_challenge, client_pub, &client_nonce, "attacker_wallet")[..32]));
+        assert_ne!(base, hex::encode(&tpm::preflight_report_data_binding(pubkey_der, code_challenge, client_pub, &client_nonce, "NONE")[..32]));
         // …and it differs from the v160 session binding by construction.
         assert_ne!(base, hex::encode(&tpm::snp_report_data_binding(pubkey_der, &hex::encode(client_nonce))[..32]));
     }
@@ -4737,10 +4825,22 @@ mod security_tests {
     fn preflight_session_is_client_bound() {
         let mut nonce = [7u8; 32];
         nonce[0] = 1;
-        let pk = PkceSession::new_preflight(b"client-der".to_vec(), nonce);
+        let pk = PkceSession::new_preflight(b"client-der".to_vec(), nonce, Some(" wallet:abc123 ".to_string()));
         assert!(pk.is_preflight());
         assert_eq!(pk.client_ecdh_pub, b"client-der");
         assert_eq!(pk.client_nonce, nonce);
+        // v161.2: custom_info canonicalization — trimmed, and empty/absent
+        // collapses to "NONE" so every binding hashes a canonical string.
+        assert_eq!(pk.canonical_custom_info(), "wallet:abc123");
+        assert_eq!(
+            PkceSession::new_preflight(b"client-der".to_vec(), nonce, Some("   ".to_string()))
+                .canonical_custom_info(),
+            "NONE"
+        );
+        assert_eq!(
+            PkceSession::new_preflight(b"client-der".to_vec(), nonce, None).canonical_custom_info(),
+            "NONE"
+        );
         assert!(pk.enclave_ecdh.is_some());
         // RFC 7636 derivation still holds for pre-flight sessions.
         use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
@@ -4753,7 +4853,7 @@ mod security_tests {
         // The verifier never appears in the challenge and vice versa.
         assert_ne!(pk.code_verifier, pk.code_challenge);
         // Two sessions never share verifier/challenge/nonce-derived material.
-        let other = PkceSession::new_preflight(b"client-der".to_vec(), nonce);
+        let other = PkceSession::new_preflight(b"client-der".to_vec(), nonce, None);
         assert_ne!(other.code_verifier, pk.code_verifier);
         // Legacy sessions are NOT client-bound.
         assert!(!PkceSession::new().is_preflight());

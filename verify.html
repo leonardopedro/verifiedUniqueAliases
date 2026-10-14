@@ -225,6 +225,9 @@
                 <button onclick="executePreflightAndLogin('verified')" style="background:#4caf50;">🔒 Secure Login (Verified only)</button>
                 <button onclick="executePreflightAndLogin('full')">🔒 Secure Login (Full Data)</button>
             </div>
+            <input type="text" id="customInfoInput" maxlength="512"
+                placeholder="Optional: your public key / wallet / nonce — bound into the AMD hardware quote and the report"
+                style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
             <p id="secureLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
         </div>
     </div>
@@ -342,19 +345,24 @@
     }
 
     // v161 (plan Pillars 2–5): CLIENT-BOUND report_data binding —
-    //   SHA-256(P_enc_SPKI_DER ∥ code_challenge ∥ P_client_SPKI_DER ∥ client_nonce)
-    // [32..64] zero. Mirrors tpm::preflight_report_data_binding() in the
-    // enclave; pinned by Rust security_tests::preflight_binding_parity_v161 ↔
-    // harness Test 9 (update all three together).
-    async function preflightBindingHex(pubKeyDer, codeChallenge, clientPubDer, clientNonceHex) {
+    //   SHA-256(P_enc_SPKI_DER ∥ code_challenge ∥ P_client_SPKI_DER ∥ client_nonce ∥ custom_info)
+    // [32..64] zero. v161.2 folds the user's optional custom_info (public
+    // key / wallet / nonce; "NONE" when absent) into the quote so the
+    // hardware commits to the user's own entropy. Mirrors
+    // tpm::preflight_report_data_binding() in the enclave; pinned by Rust
+    // security_tests::preflight_binding_parity_v161 ↔ harness Test 9
+    // (update all three together).
+    async function preflightBindingHex(pubKeyDer, codeChallenge, clientPubDer, clientNonceHex, customInfo) {
         const enc = new TextEncoder();
         const nonceBytes = new Uint8Array((clientNonceHex.match(/.{1,2}/g) || []).map(m => parseInt(m, 16)));
         const ch = enc.encode(codeChallenge);
-        const pre = new Uint8Array(pubKeyDer.length + ch.length + clientPubDer.length + nonceBytes.length);
+        const ci = enc.encode(customInfo || 'NONE');
+        const pre = new Uint8Array(pubKeyDer.length + ch.length + clientPubDer.length + nonceBytes.length + ci.length);
         pre.set(pubKeyDer, 0);
         pre.set(ch, pubKeyDer.length);
         pre.set(clientPubDer, pubKeyDer.length + ch.length);
         pre.set(nonceBytes, pubKeyDer.length + ch.length + clientPubDer.length);
+        pre.set(ci, pubKeyDer.length + ch.length + clientPubDer.length + nonceBytes.length);
         const digest = await crypto.subtle.digest('SHA-256', pre);
         return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
     }
@@ -428,12 +436,22 @@
             const nonceHex = Array.from(clientNonce).map(b => b.toString(16).padStart(2, '0')).join('');
             sessionStorage.setItem('pav_client_jwk', JSON.stringify(await crypto.subtle.exportKey('jwk', kp.privateKey)));
             sessionStorage.setItem('pav_client_nonce', nonceHex);
+            // v161.2: optional user data (public key / wallet / nonce) that
+            // gets bound into the HARDWARE quote (report_data) and the
+            // session nonce — not just the software signature. Canonicalized
+            // identically to the enclave (trim; empty → 'NONE').
+            const customInfoRaw = (document.getElementById('customInfoInput') || {}).value || '';
+            const customInfo = customInfoRaw.trim() || 'NONE';
+            if (customInfo !== 'NONE' && customInfo.length > 512) {
+                throw new Error('custom data exceeds 512 characters — shorten it (e.g. hash your key first)');
+            }
+            sessionStorage.setItem('pav_custom_info', customInfo);
 
             say('🔍 Fetching hardware pre-flight attestation…');
             const resp = await fetch('/attest/preflight', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ client_ecdh_pub_b64: pubB64, client_nonce_hex: nonceHex, flow: flow || 'verified' })
+                body: JSON.stringify({ client_ecdh_pub_b64: pubB64, client_nonce_hex: nonceHex, flow: flow || 'verified', custom_info: customInfo === 'NONE' ? '' : customInfo })
             });
             if (!resp.ok) throw new Error('pre-flight request rejected (HTTP ' + resp.status + ')');
             const pf = await resp.json();
@@ -456,6 +474,13 @@
             if (bound.code_challenge !== sf.code_challenge || bound.client_nonce_hex !== nonceHex
                 || b64ToDer(bound.client_pub_b64).some((b, i) => b !== new Uint8Array(pubRaw)[i])) {
                 throw new Error('Hardware-bound client inputs do NOT match what this browser generated — the enclave or the transport lied. Aborting.');
+            }
+            // v161.2: the enclave must echo the SAME custom data (in the
+            // S_enc-signed fields AND the hardware-bound report), or the
+            // enclave/transport substituted the user's key/nonce.
+            if (sf.custom_info !== customInfo || bound.custom_info !== customInfo
+                || pf.attestation_envelope.attestation_report.custom_info !== customInfo) {
+                throw new Error('Custom data echo mismatch — the enclave did not bind what this browser sent. Aborting.');
             }
 
             say('✅ Pre-flight PASSED — hardware-bound P_enc pinned. Redirecting to PayPal…');
@@ -1236,10 +1261,16 @@
                     const pfCtx = report.session_context && report.session_context.preflight;
                     let expectedBindingHex, bindingLabel;
                     if (pfCtx && pfCtx.binding === 'v161') {
+                        // v161.2: five-element binding — pfCtx.custom_info is
+                        // echoed by the enclave inside the signed report and
+                        // hardware-bound; older v161 envelopes without the
+                        // field fail this check by design (same discipline as
+                        // the v160 → v161 transition).
                         expectedBindingHex = (await preflightBindingHex(
-                            pubKeyBuffer, pfCtx.code_challenge, b64ToDer(pfCtx.client_pub_b64), pfCtx.client_nonce_hex
+                            pubKeyBuffer, pfCtx.code_challenge, b64ToDer(pfCtx.client_pub_b64), pfCtx.client_nonce_hex,
+                            pfCtx.custom_info || 'NONE'
                         )).padEnd(128, '0');
-                        bindingLabel = 'v161 client-bound (P_enc ∥ code_challenge ∥ P_client ∥ client_nonce)';
+                        bindingLabel = 'v161.2 client-bound (P_enc ∥ code_challenge ∥ P_client ∥ client_nonce ∥ custom_info)';
                     } else {
                         expectedBindingHex = (await snpBindingHex(pubKeyBuffer, expectedNonce)).padEnd(128, '0');
                         bindingLabel = 'v160 (P_enc ∥ session nonce)';

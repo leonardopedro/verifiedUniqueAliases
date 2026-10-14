@@ -563,7 +563,8 @@ console.log('\nTest 8: v160 report_data binding + pre-flight pin');
 
 // Test 9 (v161, plan Pillars 2–5): CLIENT-BOUND report_data binding parity
 // with the Rust enclave — SHA-256(P_enc_SPKI_DER ∥ code_challenge ∥
-// P_client_SPKI_DER ∥ client_nonce) — plus the binding-sensitivity matrix.
+// P_client_SPKI_DER ∥ client_nonce ∥ custom_info) — plus the
+// binding-sensitivity matrix and a drift guard on the shipped function.
 // Mirrors tpm::preflight_report_data_binding() ↔
 // security_tests::preflight_binding_parity_v161 ↔ verify.html
 // preflightBindingHex() (update all three together).
@@ -576,33 +577,57 @@ console.log('\nTest 9: v161 client-bound report_data binding parity');
   const codeChallenge = 'TEST_CHALLENGE_v161_parity';
   const clientPub = Buffer.from('fake-client-ecdh-der');
   const clientNonce = Buffer.from('11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff', 'hex');
-  const RUST_PIN = 'eb25571bb08d245e4a89f8903c5d348e193e70fe5c2926e2ab033bdcc6beeba8';
+  // v161.2: five-element pre-image — custom_info is the last element.
+  const customInfo = 'user_wallet_xyz_v1612';
+  const RUST_PIN = 'c459f5fad84e4b00bf1080e7e379ec3d40806edb82de5b2525509f1dc0874f0e';
 
   // JS implementation lifted from verify.html's preflightBindingHex()
-  const jsBinding = async () => {
+  const jsBinding = async (ci) => {
     const enc = new TextEncoder();
-    const pre = new Uint8Array(pubkeyDer.length + enc.encode(codeChallenge).length + clientPub.length + clientNonce.length);
+    const cib = enc.encode(ci);
+    const pre = new Uint8Array(pubkeyDer.length + enc.encode(codeChallenge).length + clientPub.length + clientNonce.length + cib.length);
     let o = 0;
     pre.set(pubkeyDer, o); o += pubkeyDer.length;
     pre.set(enc.encode(codeChallenge), o); o += enc.encode(codeChallenge).length;
     pre.set(clientPub, o); o += clientPub.length;
-    pre.set(clientNonce, o);
+    pre.set(clientNonce, o); o += clientNonce.length;
+    pre.set(cib, o);
     return Buffer.from(await crypto.subtle.digest('SHA-256', pre)).toString('hex');
   };
 
-  const js = await jsBinding();
+  const js = await jsBinding(customInfo);
   check('JS preflightBindingHex matches independent reference',
-    js === sha256(pubkeyDer, codeChallenge, clientPub, clientNonce), `js=${js}`);
+    js === sha256(pubkeyDer, codeChallenge, clientPub, clientNonce, customInfo), `js=${js}`);
   check('JS preflightBindingHex matches the Rust-pinned parity vector',
     js === RUST_PIN, `js=${js} rustPin=${RUST_PIN}`);
+  check('canonical absent custom_info ("NONE") matches its Rust-pinned vector',
+    (await jsBinding('NONE')) === '52bc1e5b3d53435f6a6e7fb4cd8d371e9fdefe0232c1fe63b4571e10acd27564');
   check('binding is sensitive to the client nonce',
-    js !== sha256(pubkeyDer, codeChallenge, clientPub, Buffer.alloc(32)));
+    sha256(pubkeyDer, codeChallenge, clientPub, Buffer.alloc(32), customInfo) !== js);
   check('binding is sensitive to the PKCE challenge',
-    js !== sha256(pubkeyDer, 'OTHER', clientPub, clientNonce));
+    sha256(pubkeyDer, 'OTHER', clientPub, clientNonce, customInfo) !== js);
   check('binding is sensitive to the client public key',
-    js !== sha256(pubkeyDer, codeChallenge, Buffer.from('other'), clientNonce));
+    sha256(pubkeyDer, codeChallenge, Buffer.from('other'), clientNonce, customInfo) !== js);
+  check('binding is sensitive to the user custom_info (v161.2)',
+    sha256(pubkeyDer, codeChallenge, clientPub, clientNonce, 'attacker_wallet') !== js);
   check('binding differs from the v160 session binding by construction',
     js !== sha256(pubkeyDer, clientNonce));
+
+  // v161.2 drift guard: the SHIPPED preflightBindingHex in verify.html must
+  // agree with this mirror on the same inputs (same discipline as Test 10 —
+  // a renamed/reordered pre-image element fails here, not in production).
+  {
+    const vhtml = readFileSync(new URL('../verify.html', import.meta.url), 'utf8');
+    const fn = vhtml.match(/async function preflightBindingHex\([\s\S]*?\n    }/);
+    check('preflightBindingHex located in verify.html', !!fn);
+    const realFn = new Function(`${fn[0]}; return preflightBindingHex;`)();
+    const shipped = await realFn(pubkeyDer, codeChallenge, clientPub, clientNonce.toString('hex'), customInfo);
+    check('shipped preflightBindingHex matches the mirror + Rust pin',
+      shipped === RUST_PIN, `shipped=${shipped}`);
+    const shippedNone = await realFn(pubkeyDer, codeChallenge, clientPub, clientNonce.toString('hex'));
+    check('shipped preflightBindingHex defaults absent custom_info to "NONE"',
+      shippedNone === '52bc1e5b3d53435f6a6e7fb4cd8d371e9fdefe0232c1fe63b4571e10acd27564', `shippedNone=${shippedNone}`);
+  }
 
   // RFC 5869 Test Case 1 via WebCrypto HKDF — pins the browser's deriveKey
   // to the enclave's crypto::hkdf_sha256 (same vector asserted in Rust
