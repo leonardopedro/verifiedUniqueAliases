@@ -1,0 +1,15 @@
+{
+  "_note": "TEST vector only — key scalar is 0x1111...1111. Regenerate with `cargo run --bin gen-parity`; update fixtures/parity.json and re-run BOTH cargo test and forge test.",
+  "chainId": "0x0000000000005afd",
+  "challenge": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "channelKey": "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "eip191Digest": "0x3d986c13fc7b991b671de8f48deea885223a7fbd1fcf9cda6161cd717071a9c4",
+  "expiry": "0x00000000f4865700",
+  "measurementId": "0xadc5535ecaa10f19dbdb75006baecbb71f15b66e8fdb67eee0a4223804b91278",
+  "requester": "0x0000000000000000000000000000000000000011",
+  "signature": "0x0f844626347abaaa9f8dc64f0271264adf72dbec4b29a632916617c6c332d8f01948cbb0ecf619201b2688b113ac141ac4073c181382087340e7f429a1ac08971c",
+  "signer": "0x19e7e376e7c213b7e7e7e46cc70a5dd086daff2a",
+  "softwareId": "0xf818afd37a6dc3bc92fb44731011277006db4efa6e9023cd7468c02335d22a4d",
+  "typehash": "0x5752a498c8896ed72a9b70d3efd8ef48e8f9b05a85b86571e036ec8b149b9984",
+  "vault": "0x0000000000000000000000000000000000000042"
+}

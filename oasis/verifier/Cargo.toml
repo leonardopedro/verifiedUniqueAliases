@@ -1,0 +1,44 @@
+[package]
+name = "snp-vault-verifier"
+version = "0.1.0"
+edition = "2021"
+
+# Off-chain SEV-SNP attestation verifier + release-authorization signer for
+# AttestedKeyVault.sol (Oasis Sapphire). Verification logic mirrors the
+# live-validated OCI SEV-SNP stack in verifiedUniqueAliases/src/oci_snp.rs
+# and its web cross-check verifiedUniqueAliases/verify.html (report offsets,
+# AMD VCEK<-ASK<-ARK chain, ARK pins, policy bits, report_data binding).
+
+[dependencies]
+# Hashing (SNP report sigs are ECDSA P-384/SHA-384; software binding SHA-256;
+# release authorization is EIP-191/keccak256 for the Sapphire contract)
+sha2 = { version = "=0.10.9", features = ["oid"] }
+sha3 = "=0.10.8"
+
+# Signatures: P-384 (AMD silicon) + secp256k1 (Ethereum/Sapphire)
+p384 = { version = "=0.13.0", features = ["ecdsa"] }
+# RSA (AMD ASK/ARK issue the VCEK chain with RSASSA-PSS, per verify.html)
+rsa = { version = "=0.9.6", features = ["std", "pem", "getrandom"] }
+k256 = { version = "=0.13.4", features = ["ecdsa"] }
+
+# X.509 parsing (VCEK/ASK/ARK DER certs)
+x509-cert = "=0.2.5"
+der = "=0.7.9"
+const-oid = "=0.9.6"
+
+# Serialization / encoding
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+base64 = "=0.22.1"
+hex = "=0.4.3"
+
+# /dev/sev-guest ioctl path (enclave-evidence binary, Linux only)
+libc = "=0.2.174"
+
+[dev-dependencies]
+# (none — tests build synthetic cert chains with the pure-Rust deps above)
+
+[profile.release]
+opt-level = 3
+lto = false
+codegen-units = 1
