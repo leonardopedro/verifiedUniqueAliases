@@ -42,6 +42,7 @@ globalThis.document = {
 let lastAlert = null;
 globalThis.alert = (msg) => { lastAlert = msg; };
 // Provenance lookups: fail closed (offline auditor must not crash on this)
+const nativeFetch = globalThis.fetch; // kept for the optional live test (Test 12)
 globalThis.fetch = async () => ({ ok: false, json: async () => ({}) });
 
 // Evaluate the page script in this global scope
@@ -330,14 +331,25 @@ console.log('\nTest 5: legitimate GCP report still passes (no regression)');
 {
   const gcpReport = await buildLegitGcpReport();
 
+  // v163 (audit VULN-04 follow-up): the TPM check is TRI-STATE now. With all
+  // four golden pins CAPTURED (set here to this fixture's own quoted values)
+  // a legitimate report must reach full green ✅. Unpinned → amber ⚠️
+  // degraded and mismatch → ❌ hard fail are asserted in Test 11. Pins are
+  // restored right after so later tests see the default (all-null) baseline.
+  const pcrs = gcpReport.attestation_report.hardware_level_attestation.pcr_values;
+  const savedPins = { ...GOLDEN_PCRS };
+  for (const k of Object.keys(GOLDEN_PCRS)) if (pcrs[k]) GOLDEN_PCRS[k] = pcrs[k];
+
   const alertMsg = await runAuditWith(gcpReport);
   const fw = fwStatus();
   check('no audit-failure alert', !alertMsg, `alert=${alertMsg}`);
   check('silicon root verified (firmwareCheck passes)', fw && fw.className.includes('verified'),
     `className=${fw && fw.className}`);
   const tpmEl = document.getElementById('tpmCheck');
-  check('TPM quote verified strictly', tpmEl && tpmEl.className.includes('verified'),
+  check('TPM quote verified strictly + all 4 golden pins enforced (green ✅)',
+    tpmEl && tpmEl.className.includes('verified'),
     `className=${tpmEl && tpmEl.className}`);
+  Object.assign(GOLDEN_PCRS, savedPins);
 }
 
 // Test 6 (audit SEC-04): an OCI-claiming report (SNP evidence present) must
@@ -747,5 +759,212 @@ console.log('\nTest 10: shipped E2EE callback page decrypts + signature-verifies
   check('tampered ciphertext fails closed', /❌/.test(elements['st'].innerHTML), elements['st'].innerHTML.slice(0, 160));
 }
 
+// Test 11 (audit v162): app pin (VULN-03), golden-PCR pins (VULN-04),
+// local-auditor mode (VULN-02), and plaintext-fallback removal (VULN-05).
+console.log('\nTest 11: v162 audit remediations (VULN-02/03/04/05)');
+{
+  const mainRs = readFileSync(new URL('../src/main.rs', import.meta.url), 'utf8');
+
+  // --- static structure ---------------------------------------------------
+  check('local-auditor mode functions shipped in verify.html (VULN-02)',
+    ['localPreflight', 'localClaim', 'localDecryptAndVerify'].every(f => html.includes(`function ${f}`)));
+  check('app pin enforced on BOTH pre-flight paths (VULN-03)',
+    (html.match(/checkExpectedApp\(pf\.signed_fields\)/g) || []).length >= 2);
+  check('EXPECTED_APPS allow-list present',
+    /var EXPECTED_APPS = \[[\s\S]*?client_id/.test(html));
+  check('GOLDEN_PCRS pin mechanism present (VULN-04)',
+    /var GOLDEN_PCRS = \{/.test(html) && html.includes('GOLDEN PCR PIN VIOLATION'));
+  // the identifier may appear in explanatory comments — check live CODE only
+  const codeLines = mainRs.split('\n').filter(l => !l.trim().startsWith('//'));
+  check('plaintext pending_attestations map removed (VULN-05)',
+    !codeLines.some(l => l.includes('pending_attestations')));
+  check('encrypted blob vault + single-use claim shipped',
+    mainRs.includes('e2ee_blobs') && mainRs.includes('take_fresh'));
+  check('callback fails closed on a non-preflight session (VULN-05)',
+    mainRs.includes('non-preflight session reached the callback tail'));
+  check('/e2ee-blob route registered with CORS for file:// claim',
+    mainRs.includes('"/e2ee-blob"') && mainRs.includes('ACCESS_CONTROL_ALLOW_ORIGIN'));
+
+  // --- checkExpectedApp unit (VULN-03) -----------------------------------
+  const EXPECTED_APPS = (0, eval)('EXPECTED_APPS');
+  check('EXPECTED_APPS non-empty + sandbox entries pinned',
+    Array.isArray(EXPECTED_APPS) && EXPECTED_APPS.length >= 2
+    && EXPECTED_APPS.every(a => a.client_id && a.authorize_base && a.scope && a.flow));
+  const app0 = EXPECTED_APPS[0];
+  // signed_fields uses `paypal_client_id`; the pin table uses `client_id`
+  const sfFrom = (app, over = {}) => ({ flow: app.flow, paypal_client_id: app.client_id,
+    authorize_base: app.authorize_base, scope: app.scope, ...over });
+  let threw = null;
+  try { checkExpectedApp(sfFrom(app0)); } catch (e) { threw = e; }
+  check('audited app accepted', !threw, threw && threw.message);
+  for (const [field, evil] of [
+    ['paypal_client_id', 'SWAPPED_OWNER_CLIENT_ID'],
+    ['scope', 'https%3A%2F%2Furi.paypal.com%2Fservices%2Frealtimepayment'],
+    ['authorize_base', 'https://attacker.example/authorize'],
+    ['flow', 'full'],
+  ]) {
+    let err = null;
+    try { checkExpectedApp(sfFrom(app0, { [field]: evil })); } catch (e) { err = e; }
+    check(`swap of ${field} aborts before redirect`, !!err && /APP PIN VIOLATION/.test(err.message),
+      err && err.message.slice(0, 80));
+  }
+
+  // --- localDecryptAndVerify round-trip (VULN-02) -------------------------
+  // Fixture mirrors enclave crypto exactly (same construction as Test 10).
+  const clientKp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const jwkStr = JSON.stringify(await crypto.subtle.exportKey('jwk', clientKp.privateKey));
+  const nonceBytes = crypto.getRandomValues(new Uint8Array(32));
+  const nonceHex = Buffer.from(nonceBytes).toString('hex');
+  const enclaveKp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const ikm = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: clientKp.publicKey }, enclaveKp.privateKey, 256));
+  const hkdfBase = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveKey']);
+  const aesKey = await crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: nonceBytes, info: new TextEncoder().encode('paypal-auth-vm/e2ee/v1') },
+    hkdfBase, { name: 'AES-GCM', length: 256 }, true, ['encrypt']);
+  const rsaKp = await crypto.subtle.generateKey(
+    { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+    true, ['sign', 'verify']);
+  const spkiB64 = Buffer.from(await crypto.subtle.exportKey('spki', rsaKp.publicKey)).toString('base64');
+  const rsaPem = '-----BEGIN PUBLIC KEY-----\n' + spkiB64.match(/.{1,64}/g).join('\n') + '\n-----END PUBLIC KEY-----';
+  const reorder = o => (o === null || typeof o !== 'object' || Array.isArray(o)) ? o
+    : Object.keys(o).sort().reduce((acc, k) => (acc[k] = reorder(o[k]), acc), {});
+  const envelope = {
+    attestation_report: { timestamp_ms: 1760000000000, paypal_user_info: { sub: 'local-auditor@test' } },
+    enclave_signing_public_key: rsaPem,
+  };
+  envelope.enclave_signature_b64 = Buffer.from(await crypto.subtle.sign(
+    'RSASSA-PKCS1-v1_5', rsaKp.privateKey,
+    new TextEncoder().encode(JSON.stringify(reorder(envelope.attestation_report))))).toString('base64');
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: nonceBytes }, aesKey,
+    new TextEncoder().encode(JSON.stringify(envelope))));
+  const blob = {
+    alg: 'AES-256-GCM+HKDF-SHA256+ECDH-P256', aad: 'client_nonce',
+    iv_b64: Buffer.from(iv).toString('base64'), ct_b64: Buffer.from(ct).toString('base64'),
+    enclave_ecdh_public_key_b64: Buffer.from(await crypto.subtle.exportKey('spki', enclaveKp.publicKey)).toString('base64'),
+    enclave_signing_public_key: rsaPem, state: 'test-state', flow: 'verified',
+  };
+  const dec = await localDecryptAndVerify(blob, jwkStr, nonceHex, rsaPem);
+  check('local claim decrypts + S_enc-verifies + P_enc-pins',
+    dec.attestation_report.paypal_user_info.sub === 'local-auditor@test');
+  const otherRsa = await crypto.subtle.generateKey(
+    { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+    true, ['sign', 'verify']);
+  const otherSpki = Buffer.from(await crypto.subtle.exportKey('spki', otherRsa.publicKey)).toString('base64');
+  const otherPem = '-----BEGIN PUBLIC KEY-----\n' + otherSpki.match(/.{1,64}/g).join('\n') + '\n-----END PUBLIC KEY-----';
+  const badPin = await localDecryptAndVerify(blob, jwkStr, nonceHex, otherPem).then(
+    () => null, e => e);
+  check('substituted blob fails closed against the P_enc pin',
+    !!badPin && /P_enc/.test(badPin.message), badPin && badPin.message.slice(0, 80));
+  const badCt = await localDecryptAndVerify(
+    { ...blob, ct_b64: Buffer.from(Buffer.from(blob.ct_b64, 'base64').map((b, i) => i === 0 ? b ^ 0xff : b)).toString('base64') },
+    jwkStr, nonceHex, rsaPem).then(() => null, e => e);
+  check('tampered ciphertext fails closed (AES-GCM tag)', !!badCt, badCt && String(badCt));
+
+  // --- golden-PCR enforcement (VULN-04, tri-state follow-up) --------------
+  const gcp = await buildLegitGcpReport();
+  const gcpPcr0 = gcp.attestation_report.hardware_level_attestation.pcr_values.pcr_0;
+  const tpmCls = () => (document.getElementById('tpmCheck') || {}).className || '';
+  const tpmDesc = () => {
+    const el = document.getElementById('tpmCheck');
+    const p = el && el.querySelector('p');
+    return (p && p.innerHTML) || '';
+  };
+
+  // static: the tri-state machinery itself must be shipped (CSS + updateStatus)
+  check('amber .warning state styled in CSS',
+    /\.warning\s*\{\s*border-left: 4px solid var\(--warning\)/.test(html));
+  check('updateStatus accepts the tri-state warning value',
+    /state === 'warning'/.test(html) && /--warning:/.test(html));
+
+  GOLDEN_PCRS.pcr_0 = gcpPcr0;
+  let gAlert = await runAuditWith(gcp);
+  check('audit passes when the golden pin matches the quoted PCR', !gAlert, `alert=${gAlert}`);
+  check('PARTIAL pins (1/4) render amber ⚠️ degraded, never green ✅',
+    tpmCls().includes('warning') && !tpmCls().includes('verified'), `className=${tpmCls()}`);
+
+  GOLDEN_PCRS.pcr_0 = 'ff'.repeat(32);
+  gAlert = await runAuditWith(gcp);
+  check('audit FAILS on golden pin mismatch (self-consistent forged quote)',
+    !!gAlert && /GOLDEN PCR PIN VIOLATION/.test(gAlert), `alert=${gAlert}`);
+  check('pin mismatch renders failed ❌ state on the TPM check',
+    tpmCls().includes('failed'), `className=${tpmCls()}`);
+
+  GOLDEN_PCRS.pcr_0 = null;
+  gAlert = await runAuditWith(gcp);
+  check('unset pin degrades to warning-only (pre-capture baseline)', !gAlert, `alert=${gAlert}`);
+  check('unpinned quote shows DEGRADED TRUST warning, not a silent pass',
+    tpmCls().includes('warning') && !tpmCls().includes('verified')
+    && /Degraded Trust/.test(tpmDesc()) && /UNPINNED/.test(tpmDesc()),
+    `className=${tpmCls()} desc=${tpmDesc().slice(0, 140)}`);
+
+  // all four pins captured + matching → full green ✅ (the complete tri-state)
+  const allPcrs = gcp.attestation_report.hardware_level_attestation.pcr_values;
+  for (const k of Object.keys(GOLDEN_PCRS)) if (allPcrs[k]) GOLDEN_PCRS[k] = allPcrs[k];
+  gAlert = await runAuditWith(gcp);
+  check('ALL four golden pins matched → verified ✅ (tri-state complete)',
+    !gAlert && tpmCls().includes('verified'), `alert=${gAlert} className=${tpmCls()}`);
+  for (const k of Object.keys(GOLDEN_PCRS)) GOLDEN_PCRS[k] = null;
+}
+
+// Test 12 (optional, live): end-to-end LOCAL-AUDITOR round-trip against a
+// running enclave. Needs a human to complete the PayPal login, so it only
+// runs when PAV_HOST is set:
+//   PAV_HOST=https://staging.host PAV_EMAIL=you@test node scripts/test-verify-security.mjs
+console.log('\nTest 12: live local-auditor E2EE round-trip');
+{
+  const liveHost = (process.env.PAV_HOST || '').replace(/\/$/, '');
+  if (!liveHost) {
+    console.log('  ⚠️ skipped — set PAV_HOST (+ PAV_EMAIL) to exercise the live vault claim');
+  } else {
+    globalThis.fetch = nativeFetch;
+    const store = new Map();
+    globalThis.localStorage = {
+      getItem: k => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => store.set(k, String(v)),
+      removeItem: k => store.delete(k),
+    };
+    globalThis.location = { protocol: 'file:', hash: '' };
+    elements['localEnclaveHost'] = makeEl();
+    elements['localEnclaveHost'].value = liveHost;
+    elements['customInfoInput'] = makeEl();
+    elements['customInfoInput'].value = process.env.PAV_EMAIL || 'v162-e2e';
+    elements['localLoginStatus'] = makeEl();
+    elements['localPaypalUrl'] = makeEl();
+
+    await localPreflight();
+    let st = elements['localLoginStatus'].innerText;
+    check('local pre-flight: hardware audit + app pin passed', st.startsWith('✅'), st.slice(0, 200));
+    const sess = JSON.parse(store.get('pav_local_session') || 'null');
+    check('keys + state stored in the LOCAL origin only', !!sess && !!sess.jwk && !!sess.p_enc && !!sess.state);
+    const authUrl = elements['localPaypalUrl'].href || '';
+    check('authorize URL built after pin checks', /state=/.test(authUrl), authUrl.slice(0, 120));
+    if (sess && authUrl) {
+      console.log('  ▶ Open this URL, log in with ' + (process.env.PAV_EMAIL || '(your PayPal test account)') + ':');
+      console.log('    ' + authUrl);
+      console.log('  ▶ Waiting for the callback to vault the blob…');
+      let blob = null;
+      const deadline = Date.now() + Number(process.env.PAV_TIMEOUT_S || 300) * 1000;
+      while (Date.now() < deadline && !blob) {
+        const r = await nativeFetch(`${liveHost}/e2ee-blob?state=${encodeURIComponent(sess.state)}`);
+        if (r.ok) blob = await r.json();
+        else await new Promise(res => setTimeout(res, 4000));
+      }
+      check('vault yielded the single-use blob after login', !!blob, blob ? '' : 'timeout — login not completed in time');
+      if (blob) {
+        const env = await localDecryptAndVerify(blob, sess.jwk, sess.nonceHex, sess.p_enc);
+        check('live blob decrypted + S_enc verified against pinned P_enc', !!env.attestation_report);
+        const dAlert = await runAuditWith(env);
+        check('full audit passes on the live delivered report', !dAlert, `alert=${dAlert}`);
+        const sub = env.attestation_report.paypal_user_info && env.attestation_report.paypal_user_info.sub;
+        check('PayPal identity recovered from inside the ciphertext', !!sub, `sub=${sub}`);
+        store.delete('pav_local_session');
+      }
+    }
+  }
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
+if (fail > 0) process.exit(1);
 process.exit(fail ? 1 : 0);

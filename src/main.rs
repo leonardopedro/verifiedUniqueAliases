@@ -2002,7 +2002,6 @@ struct AppState {
         last_limit_reset: Arc<RwLock<Instant>>,
     connection_semaphore: Arc<Semaphore>,
     boot_manifest: BTreeMap<String, String>,
-    pending_attestations: Arc<RwLock<std::collections::HashMap<String, (String, PayPalUserInfo, Instant)>>>,
     // v152 SECURITY: OAuth CSRF state. Maps the random `state` token sent to
     // PayPal (also mirrored in the browser's HttpOnly cookie) to the flow
     // label + the PKCE session. Verified strictly on /callback: token must
@@ -2010,6 +2009,12 @@ struct AppState {
     // v160 (Pillar 3): value gains the PKCE session — the code_verifier
     // lives ONLY in this in-RAM map (single-use, 10 min TTL).
     pending_oauth_states: Arc<RwLock<std::collections::HashMap<String, (String, PkceSession)>>> ,
+    // v162 (audit VULN-02/05): the encrypted delivery blob, vaulted by OAuth
+    // state so a LOCAL auditor (file://verify.html talking to the enclave
+    // over its own TLS channel) can claim it — the decryption key never
+    // touches the enclave origin. Replaces the deleted unencrypted
+    // pending_attestations plaintext path entirely.
+    e2ee_blobs: Arc<RwLock<E2eeBlobVault>>,
 }
 
 struct PayPalFlowConfig {
@@ -3206,7 +3211,9 @@ async fn terms() -> Response {
 
 #[derive(Deserialize)]
 struct LoginParams {
-    flow: Option<String>,
+    // `flow` was dropped with the plaintext fallback (v162): the login page
+    // no longer routes flows — preflight does. Kept as a zero-field shell so
+    // legacy `/login?flow=…` URLs still deserialize harmlessly.
 }
 
 // v160 (Pillar 3): OAuth 2.0 PKCE (RFC 7636) session.
@@ -3304,6 +3311,45 @@ impl PkceSession {
 
     fn is_preflight(&self) -> bool {
         !self.client_ecdh_pub.is_empty() && self.enclave_ecdh.is_some()
+    }
+}
+
+// ============================================================================
+// v162 (audit VULN-02): ORIGIN-INDEPENDENT E2EE DELIVERY VAULT
+// ============================================================================
+//
+// A TLS-terminating owner can inject <script> into ANY page served from the
+// enclave origin — including the v161 callback page — and steal a key that
+// lives in that origin's sessionStorage. The local-auditor flow closes this:
+// S_client is generated in (and never leaves) a locally-run verify.html
+// (file:// or a trusted mirror); after PayPal redirects to /callback the
+// enclave vaults the ciphertext here, and the LOCAL auditor claims it via
+// GET /e2ee-blob?state= over its own TLS view of the enclave. An injected
+// callback page sees only the ciphertext — never the key — and a substituted
+// blob fails the S_enc signature check against the P_enc pinned at
+// pre-flight. Single-use take(), 10-minute TTL, swept with the PKCE map.
+#[derive(Default)]
+struct E2eeBlobVault {
+    entries: std::collections::HashMap<String, (serde_json::Value, Instant)>,
+}
+
+impl E2eeBlobVault {
+    fn insert(&mut self, state: String, blob: serde_json::Value) {
+        self.entries.insert(state, (blob, Instant::now()));
+    }
+
+    /// Single-use: the blob is REMOVED on read, so a claim is one-shot.
+    fn take_fresh(&mut self, state: &str) -> Option<serde_json::Value> {
+        match self.entries.remove(state) {
+            Some((blob, at)) if at.elapsed() < Duration::from_secs(600) => Some(blob),
+            _ => None,
+        }
+    }
+
+    fn sweep(&mut self) {
+        let now = Instant::now();
+        self.entries
+            .retain(|_, (_, at)| now.duration_since(*at) < Duration::from_secs(600));
     }
 }
 
@@ -3854,10 +3900,16 @@ async fn callback(
                 .map(str::trim)
                 .find_map(|kv| kv.strip_prefix("paypal_oauth_state="))
         });
-    if cookie_state != Some(oauth_state.as_str()) {
+    if cookie_state.is_some() && cookie_state != Some(oauth_state.as_str()) {
         warn!("OAuth state cookie mismatch — possible Login CSRF attempt");
         return (StatusCode::FORBIDDEN, "Invalid OAuth state (session mismatch). Please restart the login from the homepage.").into_response();
     }
+    // v162 (audit VULN-02): an ABSENT cookie is tolerated — the
+    // local-auditor (file://) flow never stores cross-origin cookies; there
+    // the 32-byte state held ONLY by that auditor is the binding, and the
+    // delivery is E2EE sealed to the auditor's own P_client, so a forged
+    // callback can only ever hand the attacker's identity to nobody. A
+    // PRESENT-but-mismatched cookie stays a hard Login-CSRF failure.
     let (flow, pkce) = {
         let mut states = state.pending_oauth_states.write();
         match states.remove(&oauth_state) {
@@ -3978,146 +4030,70 @@ async fn callback(
             "flow": config.label,
         });
         let html = render_e2ee_page(&e2ee_blob);
+        // v162: vault the SAME ciphertext for the local-auditor claim path
+        // (GET /e2ee-blob?state=…). Keyed by state, single-use, 10-min TTL.
+        state
+            .e2ee_blobs
+            .write()
+            .insert(oauth_state.clone(), e2ee_blob.clone());
         if let Err(status) = state.record_egress_data(addr.ip(), html.len() as u64) {
             return status.into_response();
         }
         return Html(html).into_response();
     }
 
-    // v116-PROD: Multi-step attestation feature mapping PayPal profile to custom nonce before generation.
-    use rand::Rng;
-    let session_id: String = rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect();
-
-    state.pending_attestations.write().insert(session_id.clone(), (config.label.clone(), userinfo.clone(), Instant::now()));
-
-    let html = HTML_TEMPLATE.replace(
-        "{{CONTENT}}",
-        &format!(
-            r#"
-        <h1>Authentication Successful</h1>
-        <div class="info">
-            <h3>Verified PayPal Profile Linked</h3>
-            <p>Your PayPal identity has been successfully secured in RAM. You may now generate your one-time Hardware Attestation Certificate.</p>
-        </div>
-        <div class="info" style="border-color: #2196f3;">
-            <h3>Optional: Attach Custom Data</h3>
-            <p>You may optionally attach a custom string (e.g. a Wallet Address, a nonce, or a public key) strictly bound to this attestation report.</p>
-            <form action="/generate" method="POST">
-                <input type="hidden" name="session_id" value="{}">
-                <input type="text" name="custom_info" placeholder="Enter custom data here..." style="width: 100%; padding: 12px; margin-bottom: 20px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;" maxlength="512">
-                <button type="submit" class="btn" style="background:#4caf50; width: 100%;">Generate Certificate (One-Time)</button>
-            </form>
-        </div>
-        "#,
-            session_id
-        ),
-    );
-    
-    if let Err(status) = state.record_egress_data(addr.ip(), html.len() as u64) {
-        return status.into_response();
-    }
-
-    Html(html).into_response()
+    // v162 (audit VULN-05): the unencrypted delivery fallback is GONE.
+    // Every OAuth session is minted by /attest/preflight — the pre-flight
+    // handler is the ONLY writer of pending_oauth_states, so
+    // `is_preflight()` is always true here; reaching this tail would mean a
+    // forged or degenerate session, and we fail closed. Plaintext identity
+    // is never serialized, buffered, or rendered — the only delivery channel
+    // is the E2EE envelope above.
+    error!("non-preflight session reached the callback tail — invariant violated");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Attestation delivery requires a pre-flight session — restart the login from /verify.html",
+    )
+        .into_response()
 }
 
-#[derive(serde::Deserialize)]
-struct GenerateCertForm {
-    session_id: String,
-    custom_info: String,
-}
-
-async fn generate_cert(
+// ============================================================================
+// v162 (audit VULN-02): LOCAL-AUDITOR BLOB CLAIM
+// ============================================================================
+//
+// GET /e2ee-blob?state=<oauth_state> — hands the vaulted ciphertext to a
+// local auditor (file://verify.html) over its own TLS view of the enclave.
+// The response is ciphertext only; an origin-injecting adversary sees the
+// same. Security rests on: (1) the 32-byte state exists only in the
+// auditor's memory, (2) the blob is single-use with a 10-minute TTL, and
+// (3) the envelope is S_enc-signed — the auditor verifies it against the
+// P_enc pinned from the HARDWARE-audited pre-flight, so a substituted blob
+// from a TLS-terminating proxy fails closed.
+async fn get_e2ee_blob(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
-    axum::extract::Form(form): axum::extract::Form<GenerateCertForm>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let pending = state.pending_attestations.write().remove(&form.session_id);
-    let (label, userinfo, _timestamp) = match pending {
-        Some(p) => p,
-        None => {
-            return (
-                StatusCode::FORBIDDEN,
-                "Invalid Session ID or Certificate already generated. You may only generate the certificate once per PayPal authentication.",
-            ).into_response();
-        }
+    let state_token = match params.get("state") {
+        Some(s) if !s.is_empty() && s.len() <= 128 => s.clone(),
+        _ => return (StatusCode::BAD_REQUEST, "missing or malformed state").into_response(),
     };
-
-    let custom_info = if form.custom_info.trim().is_empty() {
-        None
-    } else {
-        Some(form.custom_info.clone())
-    };
-
-    let attestation = generate_attestation(&state, label, userinfo.clone(), custom_info, None).await;
-    let userinfo_full_json = serde_json::to_string_pretty(&userinfo).unwrap();
-
-    let html = HTML_TEMPLATE.replace(
-        "{{CONTENT}}",
-        &format!(
-            r#"
-        <h1>Attestation Complete</h1>
-        <div class="info">
-            <h3>Verified PayPal User Profile</h3>
-            <pre>{}</pre>
-        </div>
-        <div class="attestation">
-            <h3>Hardware-Attested Enclave Report</h3>
-            <p><strong>Certificate Authority:</strong> Google Public CA</p>
-            <p><strong>Enclave Mode:</strong> {}</p>
-            <p><strong>Hashed & Signed Evidence:</strong></p>
-            <pre id="raw_report">{}</pre>
-        </div>
-        <div class="links-grid">
-            <div class="card" style="grid-column: 1 / -1; border-color: #4caf50;">
-                <h3 style="color: #4caf50;">✅ Download Attestation & Auditor (Recommended)</h3>
-                <p>For maximum security, download both your generated report and the auditor file, then verify locally.</p>
-                <div style="margin-top: 15px;">
-                    <button onclick="downloadReport()" class="btn" style="background:#4caf50; margin-right: 10px; font-family: inherit;">Download Report (.json)</button>
-                    <a href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/refs/heads/main/verify.html" class="btn" target="_blank" style="background:#238636; margin-right: 10px; font-family: inherit;">Download Auditor (.html)</a>
-                    <span style="font-size: 0.85rem; color: #888;">(Right-click the second link and choose "Save Link As...")</span>
-                </div>
-            </div>
-
-            <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" target="_blank" class="card" style="border-color: #d29922;">
-                <h3 style="color: #d29922;">⚠️ Web Auditor (Less Safe)</h3>
-                <p>Verify your generated JSON directly on the hosted GitHub Pages domain.</p>
-            </a>
-            
-            <a href="/" class="card" style="border-color: #30363d; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center;">
-                <h3 style="color: #c9d1d9;">Return Home</h3>
-            </a>
-        </div>
-
-        <script>
-            function downloadReport() {{
-                const data = document.getElementById('raw_report').innerText;
-                const blob = new Blob([data], {{ type: 'application/json' }});
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.style.display = 'none';
-                a.href = url;
-                a.download = 'attestation_report.json';
-                document.body.appendChild(a);
-                a.click();
-                window.URL.revokeObjectURL(url);
-            }}
-        </script>
-        "#,
-            html_escape::encode_text(&userinfo_full_json),
-            if state.staging { "Confidential Sandbox" } else { "Confidential Production" },
-            html_escape::encode_text(&attestation),
-        ),
-    );
-    
-    if let Err(status) = state.record_egress_data(addr.ip(), html.len() as u64) {
+    if let Err(status) = state.record_egress_data(addr.ip(), 24 * 1024 /* blob estimate */) {
         return status.into_response();
     }
-
-    Html(html).into_response()
+    match state.e2ee_blobs.write().take_fresh(&state_token) {
+        Some(blob) => {
+            let mut resp = Json(blob).into_response();
+            // No credentials ride this endpoint (ciphertext keyed by a secret
+            // state); CORS * lets the local auditor claim from file://.
+            resp.headers_mut().insert(
+                axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                axum::http::HeaderValue::from_static("*"),
+            );
+            resp
+        }
+        None => (StatusCode::NOT_FOUND, "unknown, expired, or already-claimed state").into_response(),
+    }
 }
 
 async fn acme_challenge(
@@ -4426,32 +4402,27 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         last_limit_reset: Arc::new(RwLock::new(Instant::now())),
         connection_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         boot_manifest,
-        pending_attestations: Arc::new(RwLock::new(std::collections::HashMap::new())),
         pending_oauth_states: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        e2ee_blobs: Arc::new(RwLock::new(E2eeBlobVault::default())),
     });
 
-    // v117: Background task for cleaning up expired pending attestations (DoS mitigation)
+    // v117/v152: background TTL sweep (DoS mitigation) for the OAuth CSRF
+    // state map and — v162 — the E2EE blob vault.
     let state_for_cleanup = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
             let now = Instant::now();
-            let mut pending = state_for_cleanup.pending_attestations.write();
-            let before = pending.len();
-            pending.retain(|_, (_, _, timestamp)| {
-                now.duration_since(*timestamp) < Duration::from_secs(600) // 10 minute TTL
-            });
-            let after = pending.len();
-            if before != after {
-                info!("Cleaned up {} expired pending attestations ({} remaining)", before - after, after);
-            }
-            drop(pending);
 
             // v152: same TTL sweep for OAuth CSRF state tokens (v160: the
             // PKCE session rides in the same entry — its created_at is the TTL clock)
             let mut oauth = state_for_cleanup.pending_oauth_states.write();
             oauth.retain(|_, (_, pkce)| now.duration_since(pkce.created_at) < Duration::from_secs(600));
+            drop(oauth);
+
+            // v162: expired (unclaimed) delivery blobs.
+            state_for_cleanup.e2ee_blobs.write().sweep();
         }
     });
 
@@ -4461,7 +4432,7 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         .route("/", get(index))
         .route("/login", get(login))
         .route("/callback", get(callback))
-        .route("/generate", axum::routing::post(generate_cert))
+        .route("/e2ee-blob", get(get_e2ee_blob))
         .route("/debug/attestation", get(debug_attestation))
         .route("/debug/envelope", get(debug_envelope))
         // v161 (plan Pillars 4+5): pre-flight protocol + same-origin auditor.
@@ -4817,6 +4788,22 @@ mod security_tests {
         assert_ne!(base, hex::encode(&tpm::preflight_report_data_binding(pubkey_der, code_challenge, client_pub, &client_nonce, "NONE")[..32]));
         // …and it differs from the v160 session binding by construction.
         assert_ne!(base, hex::encode(&tpm::snp_report_data_binding(pubkey_der, &hex::encode(client_nonce))[..32]));
+    }
+
+    // v162 (audit VULN-02): the delivery vault is single-use — a claim
+    // consumes the blob, so an observer of a state token cannot race the
+    // real auditor, and unknown/expired states fail closed.
+    #[test]
+    fn e2ee_blob_vault_is_single_use_and_fresh() {
+        let mut vault = E2eeBlobVault::default();
+        assert!(vault.take_fresh("unknown").is_none());
+        vault.insert("s1".into(), serde_json::json!({ "ct_b64": "AA==" }));
+        vault.insert("s2".into(), serde_json::json!({ "ct_b64": "BB==" }));
+        assert_eq!(vault.take_fresh("s1").unwrap()["ct_b64"], "AA==");
+        assert!(vault.take_fresh("s1").is_none(), "second claim must fail (single-use)");
+        vault.sweep();
+        assert!(vault.take_fresh("s2").is_some(), "fresh entries must survive the sweep");
+        assert!(vault.take_fresh("s2").is_none());
     }
 
     // v161: pre-flight sessions are client-bound and carry their own ECDH

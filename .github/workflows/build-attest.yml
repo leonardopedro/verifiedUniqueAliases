@@ -6,6 +6,25 @@ on:
   workflow_dispatch:
 
 jobs:
+  # v162: external-audit regression gate — the EXPECTED_APPS pin, GOLDEN_PCRS
+  # mechanism, local-auditor E2EE mode, and plaintext-fallback removal are
+  # all enforced by scripts/test-verify-security.mjs + the Rust security_tests.
+  # Standalone (does not gate attestation) so a test-infrastructure hiccup can
+  # never stall provenance; a red run here means the shipped pins regressed.
+  security-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust security tests
+        run: cargo test --quiet
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: verify.html security regression suite
+        run: |
+          npm install --no-save node-forge
+          node scripts/test-verify-security.mjs
+
   build:
     runs-on: ubuntu-latest
     permissions:

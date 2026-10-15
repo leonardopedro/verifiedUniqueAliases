@@ -42,10 +42,13 @@ KERNEL_CMDLINE="root=tmpfs rootok=1 console=tty0 console=ttyS0,115200n8 selinux=
 # UKI = one PE/COFF (EFI stub + .cmdline + .linux + .initrd): the boot payload
 # becomes a single deterministic artifact whose sha256 CI publishes and whose
 # (firmware, kernel, initrd, cmdline) tuple feeds sev-snp-measure.
-# OCI still boots the shim+grub chain below — the hypervisor measures only its
-# own OVMF either way (AGENTS.md "measurement scope"), so the UKI is shipped as
-# the direct-boot profile artifact (QEMU -kernel / kernel-hashes=on platforms,
-# plan §3.3 profile 1) rather than silently swapping an untested boot path.
+# v161: the OCI ESP boots this UKI DIRECTLY (PHASE 1 below — the ESP carries
+# only BOOTX64.EFI = UKI; live-proven on real OCI E5 2026-10-15). The
+# hypervisor still measures only its own OVMF either way (AGENTS.md
+# "measurement scope"), so the UKI's (firmware, kernel, initrd, cmdline)
+# tuple ALSO feeds sev-snp-measure as the direct-boot profile artifact
+# (QEMU -kernel / kernel-hashes=on platforms, plan §3.3 profile 1) —
+# computed in CI and reproduced locally 2026-10-15 (digests in AGENTS.md).
 # Gated honestly: a missing tool prints an explicit [gap], never a silent skip.
 # UKI_STUB_PATH: override for local dry-runs (the container path is the default)
 STUB="${UKI_STUB_PATH:-/usr/lib/systemd/boot/efi/linuxx64.efi.stub}"

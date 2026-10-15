@@ -13,6 +13,7 @@
             --primary: #58a6ff;
             --success: #3fb950;
             --error: #f85149;
+            --warning: #d29922;
             --text: #c9d1d9;
             --text-dim: #8b949e;
             --accent: #1f6feb;
@@ -140,8 +141,10 @@
 
         .verified { border-left: 4px solid var(--success); }
         .failed { border-left: 4px solid var(--error); }
+        .warning { border-left: 4px solid var(--warning); }
         .verified .check-icon { color: var(--success); }
         .failed .check-icon { color: var(--error); }
+        .warning .check-icon { color: var(--warning); }
 
         .timestamp-box {
             text-align: center;
@@ -229,6 +232,19 @@
                 placeholder="Optional: your public key / wallet / nonce — bound into the AMD hardware quote and the report"
                 style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
             <p id="secureLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
+        </div>
+
+        <div class="info">
+            <label>Step 0-L — Local Auditor (strongest): keys never touch the enclave origin</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">Audit VULN-02: a TLS-terminating owner can inject script into any page served from the enclave origin. This flow closes it — run THIS page from a trusted local copy (right-click → Save As from the GitHub raw URL, then open as a <code>file://</code> page): your keys are generated here and the encrypted report is claimed from <code>/e2ee-blob</code> over your own channel. Anything injected on the enclave origin sees ciphertext only.</p>
+            <input type="text" id="localEnclaveHost" placeholder="https://login.airma.de"
+                style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
+            <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px;">
+                <button onclick="localPreflight()" style="background:#4caf50;">🔐 1. Local Pre-flight &amp; Hardware Audit</button>
+                <button onclick="localClaim()">🔓 2. Claim Encrypted Report</button>
+            </div>
+            <a id="localPaypalUrl" style="display:none; margin-top:10px;" class="btn" target="_blank" rel="noopener">Continue to PayPal →</a>
+            <p id="localLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
         </div>
     </div>
 
@@ -462,6 +478,13 @@
                 new TextEncoder().encode(JSON.stringify(reorder(pf.signed_fields))));
             if (!sigOk) throw new Error('PRE-FLIGHT SIGNATURE INVALID — the login fields were tampered in transit. Aborting.');
 
+            // v162 (audit VULN-03): the S_enc signature proves the ENCLAVE
+            // said it — it does not prove the app is the audited one. A
+            // malicious owner can point the enclave at any PayPal app it
+            // controls (over-scoped) and still produce a valid signature, so
+            // the app identifiers are pinned HERE, before any redirect.
+            checkExpectedApp(pf.signed_fields);
+
             say('💎 Running the full hardware audit on the live report…');
             document.getElementById('attestationInput').value = JSON.stringify(pf.attestation_envelope);
             const auditOk = await runAudit();
@@ -490,6 +513,169 @@
                 `&response_type=code&scope=${sf.scope}&redirect_uri=${encodeURIComponent(sf.redirect_uri)}` +
                 `&state=${sf.state}&code_challenge=${sf.code_challenge}&code_challenge_method=S256`;
             location.assign(url);
+        } catch (e) {
+            say('❌ ' + e.message);
+        }
+    }
+
+    // ========================================================================
+    // v162 (audit VULN-03): APP PIN — the audited PayPal applications.
+    // The S_enc signature only proves the enclave said "use this app"; a
+    // malicious owner controls the enclave's config and could swap in its
+    // own over-scoped PayPal app. These constants are the audited allow-list
+    // (flow, client_id, authorize_base, scope) — anything else aborts
+    // BEFORE the user is sent to PayPal. Rotate them DELIBERATELY (commit
+    // + audit) when the app legitimately changes.
+    // ========================================================================
+    var EXPECTED_APPS = [
+        // Sandbox (staging deployment — live-captured 2026-10-14)
+        { flow: 'verified', client_id: 'ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
+        { flow: 'full', client_id: 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address%20profile%20email%20https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
+        // Production entries: add here at cutover (www.paypal.com authorize_base).
+    ];
+
+    // ========================================================================
+    // v162 (audit VULN-04): GOLDEN PCR PINS — CI-captured constants for the
+    // boot-chain PCRs on the GCP/vTPM path. The signed composite digest only
+    // proves the quote is self-consistent: a tampered kernel yields a
+    // self-consistent composite over ITS OWN PCRs. When a pin below is set,
+    // the quoted value MUST equal it (mismatch = hard fail). PCR 15 stays
+    // dynamic (computed from the report's manifest); 0/4/8/9 are the fixed
+    // boot chain and get pinned here.
+    //
+    // Capture (only from a deployment whose provenance gate passed):
+    //     node scripts/capture-golden-pcrs.mjs <https://host> --update
+    // then commit verify.html so the pin enters the audited history.
+    // ========================================================================
+    var GOLDEN_PCRS = {
+        pcr_0: null, // firmware          — capture from a known-good GCP boot
+        pcr_4: null, // bootloader        — shim/grub/UKI as measured at boot
+        pcr_8: null, // kernel cmdline
+        pcr_9: null, // kernel + initramfs payload
+    };
+    function checkExpectedApp(sf) {
+        const hit = EXPECTED_APPS.find(a => a.flow === sf.flow && a.client_id === sf.paypal_client_id
+            && a.authorize_base === sf.authorize_base && a.scope === sf.scope);
+        if (!hit) {
+            throw new Error('APP PIN VIOLATION: the enclave presented a PayPal app/scope NOT in the audited allow-list — a swapped or over-scoped app would let the domain owner harvest your data directly from PayPal. Aborting. (Auditors: EXPECTED_APPS may be rotated only via a deliberate, reviewed commit.)');
+        }
+        return hit;
+    }
+
+    // ========================================================================
+    // v162 (audit VULN-02): LOCAL AUDITOR MODE — origin-independent delivery.
+    // Run this page from a trusted local copy (file://); the pre-flight,
+    // authorize-URL construction, AND the final decryption all happen in the
+    // LOCAL context. S_client never exists on the enclave origin, so a
+    // TLS-terminating owner injecting script into any enclave-served page
+    // gains nothing: it sees ciphertext only. Trust anchors are unchanged —
+    // the AMD quote's report_data binds this browser's P_client + nonce +
+    // custom_info at pre-flight, and the claimed blob must be signed by the
+    // pinned P_enc (a substituted blob fails closed).
+    // ========================================================================
+    async function localDecryptAndVerify(blob, jwkStr, nonceHex, pinnedPem) {
+        const b64d = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+        const jwk = JSON.parse(jwkStr);
+        const nonceBytes = Uint8Array.from(nonceHex.match(/.{2}/g) || [], h => parseInt(h, 16));
+        if (nonceBytes.length !== 32) throw new Error('stored client nonce is malformed');
+        const priv = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+        const peer = await crypto.subtle.importKey('spki', b64d(blob.enclave_ecdh_public_key_b64), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+        const bits = await crypto.subtle.deriveBits({ name: 'ECDH', public: peer }, priv, 256);
+        const base = await crypto.subtle.importKey('raw', bits, 'HKDF', false, ['deriveKey']);
+        const key = await crypto.subtle.deriveKey(
+            { name: 'HKDF', hash: 'SHA-256', salt: nonceBytes, info: new TextEncoder().encode('paypal-auth-vm/e2ee/v1') },
+            base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+        const pt = await crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv: b64d(blob.iv_b64), additionalData: nonceBytes }, key, b64d(blob.ct_b64));
+        const envelope = JSON.parse(new TextDecoder().decode(pt));
+        const reportPem = envelope.enclave_signing_public_key;
+        if (pinnedPem && reportPem !== pinnedPem) throw new Error('PRE-FLIGHT VIOLATION: report key ≠ pinned P_enc — the enclave was swapped. Do NOT trust this payload.');
+        const k = await crypto.subtle.importKey('spki', pemToBuffer(reportPem), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+        const ok = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', k, pemToBuffer(envelope.enclave_signature_b64),
+            new TextEncoder().encode(JSON.stringify(reorder(envelope.attestation_report))));
+        if (!ok) throw new Error('S_enc report signature INVALID — forged or substituted blob');
+        return envelope;
+    }
+
+    async function localPreflight() {
+        const log = document.getElementById('localLoginStatus');
+        const say = m => { if (log) log.innerText = m; };
+        try {
+            const host = (document.getElementById('localEnclaveHost').value || '').trim().replace(/\/$/, '');
+            if (!/^https:\/\//.test(host)) throw new Error('Enter the enclave origin, e.g. https://login.airma.de');
+            if (location.protocol !== 'file:' && location.protocol !== 'https:') throw new Error('Run this page as a local file (file://) for the local-auditor guarantees to hold.');
+            say('⏳ Generating LOCAL session keypair (ECDH P-256) + nonce…');
+            const kp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+            const pubRaw = await crypto.subtle.exportKey('spki', kp.publicKey);
+            const pubB64 = btoa(String.fromCharCode(...new Uint8Array(pubRaw)));
+            const clientNonce = crypto.getRandomValues(new Uint8Array(32));
+            const nonceHex = Array.from(clientNonce).map(b => b.toString(16).padStart(2, '0')).join('');
+            const customInfoRaw = (document.getElementById('customInfoInput') || {}).value || '';
+            const customInfo = customInfoRaw.trim() || 'NONE';
+            if (customInfo !== 'NONE' && customInfo.length > 512) throw new Error('custom data exceeds 512 characters');
+
+            say('🔍 Fetching hardware pre-flight attestation over YOUR channel…');
+            const resp = await fetch(host + '/attest/preflight', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ client_ecdh_pub_b64: pubB64, client_nonce_hex: nonceHex, flow: 'verified', custom_info: customInfo === 'NONE' ? '' : customInfo })
+            });
+            if (!resp.ok) throw new Error('pre-flight rejected (HTTP ' + resp.status + ')');
+            const pf = await resp.json();
+
+            say('🔏 Verifying S_enc signature + app pin + hardware binding…');
+            const sigKey = await crypto.subtle.importKey('spki', pemToBuffer(pf.enclave_signing_public_key), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+            const sigOk = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', sigKey, pemToBuffer(pf.preflight_signature_b64),
+                new TextEncoder().encode(JSON.stringify(reorder(pf.signed_fields))));
+            if (!sigOk) throw new Error('PRE-FLIGHT SIGNATURE INVALID — aborting.');
+            checkExpectedApp(pf.signed_fields);
+            const sf = pf.signed_fields;
+            const bound = (pf.attestation_envelope.attestation_report.session_context || {}).preflight || {};
+            if (bound.code_challenge !== sf.code_challenge || bound.client_nonce_hex !== nonceHex
+                || (bound.custom_info || 'NONE') !== customInfo
+                || b64ToDer(bound.client_pub_b64).some((b, i) => b !== new Uint8Array(pubRaw)[i])) {
+                throw new Error('Hardware-bound client inputs do NOT match what this browser generated — aborting.');
+            }
+
+            say('💎 Running the full hardware audit on the live report…');
+            preFlightPubKeyPem = pf.enclave_signing_public_key;
+            document.getElementById('attestationInput').value = JSON.stringify(pf.attestation_envelope);
+            if (!(await runAudit())) throw new Error('Hardware audit FAILED on the pre-flight envelope — do NOT log in.');
+
+            // Keys stay in THIS file origin's storage — never the enclave's.
+            localStorage.setItem('pav_local_session', JSON.stringify({
+                host, jwk: JSON.stringify(await crypto.subtle.exportKey('jwk', kp.privateKey)),
+                nonceHex, customInfo, p_enc: pf.enclave_signing_public_key, state: sf.state,
+            }));
+            const url = `${sf.authorize_base}?client_id=${encodeURIComponent(sf.paypal_client_id)}` +
+                `&response_type=code&scope=${sf.scope}&redirect_uri=${encodeURIComponent(sf.redirect_uri)}` +
+                `&state=${sf.state}&code_challenge=${sf.code_challenge}&code_challenge_method=S256`;
+            const link = document.getElementById('localPaypalUrl');
+            link.href = url; link.style.display = 'inline-block';
+            say('✅ Pre-flight PASSED (audited + app-pinned). Log in via the PayPal link, then run step 2 HERE.');
+        } catch (e) {
+            say('❌ ' + e.message);
+        }
+    }
+
+    async function localClaim() {
+        const log = document.getElementById('localLoginStatus');
+        const say = m => { if (log) log.innerText = m; };
+        try {
+            const s = JSON.parse(localStorage.getItem('pav_local_session') || 'null');
+            if (!s) throw new Error('no local session — run step 1 first (from a local copy of this page)');
+            say('🔓 Claiming the encrypted report from the enclave vault…');
+            const resp = await fetch(`${s.host}/e2ee-blob?state=${encodeURIComponent(s.state)}`);
+            if (!resp.ok) throw new Error('claim failed (HTTP ' + resp.status + ') — the blob may already be claimed or expired; redo step 1');
+            const blob = await resp.json();
+            say('🔐 Decrypting + verifying against the pinned P_enc…');
+            const envelope = await localDecryptAndVerify(blob, s.jwk, s.nonceHex, s.p_enc);
+            preFlightPubKeyPem = s.p_enc;
+            sessionStorage.setItem('pav_e2ee_report', JSON.stringify(envelope, null, 2));
+            document.getElementById('attestationInput').value = JSON.stringify(envelope, null, 2);
+            const sub = (envelope.attestation_report.paypal_user_info || {}).sub || '(unknown)';
+            if (!(await runAudit())) throw new Error('Full audit FAILED on the delivered report');
+            localStorage.removeItem('pav_local_session');
+            say(`✅ Decrypted + signature-verified + P_enc-pinned + full audit run. PayPal identity: ${sub}`);
         } catch (e) {
             say('❌ ' + e.message);
         }
@@ -885,10 +1071,18 @@
         if (certInput) certInput.addEventListener('change', (e) => loadFile(e.target, 'certInput'));
     });
 
-    function updateStatus(id, success, desc) {
+    // v163 (audit VULN-04 follow-up): TRI-STATE status. Booleans keep their
+    // meaning (true = verified, false = failed); the string 'warning' renders
+    // the amber DEGRADED state — a check that could only verify what it had
+    // (e.g. a self-consistent TPM quote over UNPINNED boot-chain PCRs) must
+    // never look like a full green pass.
+    function updateStatus(id, state, desc) {
         const el = document.getElementById(id);
         if (!el) return;
-        el.className = 'check-item ' + (success ? 'verified' : 'failed');
+        let statusClass = 'failed';
+        if (state === true || state === 'verified') statusClass = 'verified';
+        else if (state === 'warning') statusClass = 'warning';
+        el.className = 'check-item ' + statusClass;
         if (desc) {
             const p = el.querySelector('p');
             if (p) p.innerHTML = desc;
@@ -1083,6 +1277,38 @@
                 const expectedComposite = await calculatePcrCompositeDigest(hw.pcr_values);
                 pcrDigestOk = (parsedAttest.pcrDigestHex === expectedComposite);
 
+                // v162 (audit VULN-04): golden-PCR pin check. The composite
+                // digest above is an INTERNAL consistency check only — it
+                // passes for any quote, including one over a tampered boot
+                // chain. v163 (audit follow-up): the outcome is TRI-STATE —
+                //   ❌ set pin mismatch → hard audit failure (thrown below)
+                //   ⚠️ any unset pin   → amber DEGRADED state, never green
+                //   ✅ all 4 pins set  → green VERIFIED against CI constants
+                const PCR_DESC = { pcr_0: 'firmware', pcr_4: 'bootloader', pcr_8: 'kernel cmdline', pcr_9: 'kernel + initramfs' };
+                const goldenFails = [];
+                const goldenDetails = [];
+                let goldenPinned = 0;
+                for (const gpcr of Object.keys(GOLDEN_PCRS)) {
+                    const pin = GOLDEN_PCRS[gpcr];
+                    const actual = ((hw.pcr_values || {})[gpcr] || '').replace(/^0x/i, '').toLowerCase();
+                    if (!pin) {
+                        goldenDetails.push(`⚠️ ${gpcr} (${PCR_DESC[gpcr] || 'boot chain'}): UNPINNED — quoted value ${actual ? actual.substring(0, 16) + '…' : '(absent)'}`);
+                        continue;
+                    }
+                    goldenPinned++;
+                    if (actual !== pin.toLowerCase()) {
+                        goldenFails.push(`${gpcr}: expected ${pin.substring(0, 16)}…, got ${actual ? actual.substring(0, 16) + '…' : '(absent)'}`);
+                    } else {
+                        goldenDetails.push(`✅ ${gpcr} (${PCR_DESC[gpcr] || 'boot chain'}): matches CI golden pin`);
+                    }
+                }
+                if (goldenFails.length) {
+                    updateStatus('tpmCheck', 'failed',
+                        `<b>❌ Golden PCR pin mismatch (VULN-04):</b> the quoted boot chain differs from the CI-captured golden build:<br>` +
+                        goldenFails.map(f => `<span style="font-size: 0.85rem;">${f}</span>`).join('<br>'));
+                    throw new Error(`GOLDEN PCR PIN VIOLATION — the boot chain differs from the CI-captured golden build: ${goldenFails.join('; ')}. This is the "modified kernel or /init with a valid self-consistent quote" case.`);
+                }
+
                 const tpmFinal = tpmSigOk && tpmNonceOk && pcrDigestOk;
                 if (!tpmNonceOk) {
                     throw new Error("CRITICAL: TPM Quote Nonce does not match the expected Session Nonce! (Did the user profile hash change?)");
@@ -1091,7 +1317,25 @@
                 if (!tpmSigOk) tpmMsgText += "Signature Invalid. ";
                 if (!tpmNonceOk) tpmMsgText += "Nonce Mismatch. ";
                 if (!pcrDigestOk) tpmMsgText += "PCR Composite Hash Mismatch. ";
-                updateStatus('tpmCheck', tpmFinal, tpmMsgText);
+                if (!tpmFinal) {
+                    updateStatus('tpmCheck', false, tpmMsgText);
+                } else if (goldenPinned < 4) {
+                    // ⚠️ DEGRADED TRUST (audit VULN-04): the quote is
+                    // internally consistent but NOT every boot-chain PCR is
+                    // pinned — a colluding host could produce this same valid
+                    // quote over modified firmware/bootloader/cmdline/kernel
+                    // files. Code identity then rests on the self-reported
+                    // manifest + GitHub provenance, NOT hardware measurement.
+                    updateStatus('tpmCheck', 'warning',
+                        `<b>⚠️ TPM Hardware Proof (Degraded Trust — VULN-04):</b><br>` +
+                        `Quote signature, session nonce, and internal composite digest strictly verified.<br>` +
+                        `<b>${goldenPinned}/4 boot-chain PCRs are pinned</b> against golden CI baselines — the remaining ones are UNPINNED, so this quote does NOT hardware-prove the running boot chain:<br>` +
+                        `<span style="font-size: 0.85rem;">${goldenDetails.join('<br>')}</span><br>` +
+                        `Capture pins from a provenance-gated deployment with <code>node scripts/capture-golden-pcrs.mjs &lt;host&gt; --update</code> and commit verify.html.`);
+                } else {
+                    updateStatus('tpmCheck', 'verified',
+                        tpmMsgText + ` 📏 All 4/4 golden PCR pins enforced — firmware, bootloader, cmdline, and kernel+initramfs match the CI-captured golden build.`);
+                }
             } else {
                 updateStatus('tpmCheck', true, "No TPM evidence in report — expected on AMD SEV-SNP platforms without a vTPM (Oracle Cloud). Session bound by the SNP report_data instead.");
             }
