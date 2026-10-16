@@ -22,6 +22,7 @@ use sha2::Sha256;
 use sha2::Digest;
 use serde::{Serialize, Deserialize};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use tracing::warn;
 
 /// Intel PCS (Provisioning Certificate Service) base URL for PCK certificate retrieval
 const INTEL_PCS_BASE_URL: &str = "https://api.trustedservices.intel.com/tdx/certification/v4";
@@ -64,13 +65,61 @@ pub struct TdInfo {
     pub rtmr3: String,
 }
 
-/// Check if this platform supports Intel TDX hardware extensions
+/// Check if this platform supports Intel TDX hardware extensions.
+///
+/// Every signal is probed because no single one is guaranteed across vendors:
+/// Alibaba ECS exposes the TDX-enabled kernel without necessarily publishing a
+/// quote device node, while GCP-style platforms register the platform driver.
 pub fn is_intel_tdx_available() -> bool {
-    let driver_path = std::path::Path::new("/sys/bus/platform/drivers/tdx");
-    let tpm_path = std::path::Path::new("/dev/tpmrm0");
-    let tdx_guest = std::path::Path::new("/dev/tdx-guest");
-    let tdx_attest = std::path::Path::new("/dev/tdx_guest");
-    driver_path.exists() || (tpm_path.exists() && (tdx_guest.exists() || tdx_attest.exists()))
+    let probes = [
+        "/sys/bus/platform/drivers/tdx",
+        "/dev/tdx-guest",
+        "/dev/tdx_guest",
+        "/sys/module/tdx_guest",
+    ];
+    if probes.iter().any(|p| std::path::Path::new(p).exists()) {
+        return true;
+    }
+    // The kernel prints "Memory Encryption Features active: Intel TDX" at boot even
+    // when no userspace TDX device node is exposed — that banner is authoritative
+    // for "this guest runs inside a TDX TD".
+    if kernel_log_reports_tdx() {
+        return true;
+    }
+    // Legacy fallback: TPM-backed platform that also exposes a TDX device node.
+    std::path::Path::new("/dev/tpmrm0").exists()
+        && (std::path::Path::new("/dev/tdx-guest").exists()
+            || std::path::Path::new("/dev/tdx_guest").exists())
+}
+
+/// Scan the kernel ring buffer for the boot-time TDX banner.
+///
+/// `/dev/kmsg` is opened O_NONBLOCK: once the buffered messages are consumed a
+/// plain read blocks forever, which would hang PID 1.
+fn kernel_log_reports_tdx() -> bool {
+    use std::io::BufRead;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open("/dev/kmsg")
+    {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("TDX probe: cannot open /dev/kmsg: {}", e);
+            return false;
+        }
+    };
+    for line in std::io::BufReader::new(file).lines().take(4096) {
+        let Ok(line) = line else { break }; // EAGAIN = end of buffered log
+        if line.contains("Memory Encryption Features active: Intel TDX")
+            || line.contains("TDX aware idle routine")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Check if the TDX guest device is available for direct TDCALL attestation

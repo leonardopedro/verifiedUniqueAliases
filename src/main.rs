@@ -125,7 +125,14 @@ mod enclave_init {
             "add rule inet filter output udp dport 53 accept",
             "add rule inet filter output tcp dport 53 accept",
             "add rule inet filter output ip daddr 169.254.169.254 accept",
+            // Alibaba Cloud's instance metadata service is 100.100.100.200 (GCP/AWS use
+            // 169.254.169.254) and it serves plain HTTP only — without this rule the
+            // enclave can never read user_data and boot-loops on a missing config.
+            "add rule inet filter output ip daddr 100.100.100.200 accept",
             "add rule inet filter output tcp dport 443 accept",
+            // Documented egress policy: 53 (DNS), 80 and 443. Port 80 was missing here
+            // even though the policy (and Alibaba IMDS) require it.
+            "add rule inet filter output tcp dport 80 accept",
         ];
 
         for cmd in commands {
@@ -1519,17 +1526,36 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
             {
                 if resp.status().is_success() {
                     if let Ok(text) = resp.text().await {
-                        let text = text.trim().to_string();
-                        // Guard: user_data may be a legacy bash script (not JSON) — skip it
-                        if text.starts_with('{') {
-                            if let Ok(config) = serde_json::from_str::<Config>(&text) {
-                                let _ = std::fs::create_dir_all("/etc/paypal-auth");
-                                let _ = std::fs::write("/etc/paypal-auth/config.json", &text);
-                                info!("Loaded configuration from instance user_data");
-                                return apply_config_fallbacks(config);
-                            } else {
-                                warn!("user_data present but is not valid Config JSON — ignoring");
+                        let raw = text.trim().to_string();
+                        // ECS takes user_data base64-encoded on input, and depending on the
+                        // console/CLI path the metadata endpoint may hand it back still
+                        // encoded. Accept both forms — a delivery quirk must never hide a
+                        // valid config and boot-loop the enclave.
+                        let decoded = if raw.starts_with('{') {
+                            None
+                        } else {
+                            use base64::Engine as _;
+                            base64::engine::general_purpose::STANDARD
+                                .decode(raw.trim())
+                                .ok()
+                                .and_then(|bytes| String::from_utf8(bytes).ok())
+                        };
+                        for cand in [&raw, decoded.as_deref().unwrap_or("")] {
+                            if !cand.starts_with('{') {
+                                continue;
                             }
+                            match serde_json::from_str::<Config>(cand) {
+                                Ok(config) => {
+                                    let _ = std::fs::create_dir_all("/etc/paypal-auth");
+                                    let _ = std::fs::write("/etc/paypal-auth/config.json", cand);
+                                    info!("Loaded configuration from instance user_data");
+                                    return apply_config_fallbacks(config);
+                                }
+                                Err(e) => warn!("user_data candidate is not valid Config JSON: {}", e),
+                            }
+                        }
+                        if raw.starts_with('{') {
+                            warn!("user_data present but is not valid Config JSON — ignoring");
                         } else {
                             info!("user_data present but not JSON — skipping metadata config");
                         }
@@ -2653,7 +2679,21 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
             },
             Err(e) => warn!("Alibaba Cloud metadata service unavailable: {}", e),
         }
-        // Check Intel TDX availability
+        // Check Intel TDX availability (log every probe so the serial console shows
+        // exactly which signal is present on this instance type)
+        let tdx_probes = [
+            "/dev/tdx-guest",
+            "/dev/tdx_guest",
+            "/sys/bus/platform/drivers/tdx",
+            "/sys/module/tdx_guest",
+            "/dev/tpmrm0",
+        ];
+        let probe_state = tdx_probes
+            .iter()
+            .map(|p| format!("{}={}", p, std::path::Path::new(p).exists()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        info!("TDX probe: {}", probe_state);
         if crate::intel_tdx::is_intel_tdx_available() {
             info!("Intel TDX hardware attestation available on this Alibaba Cloud instance");
         } else {

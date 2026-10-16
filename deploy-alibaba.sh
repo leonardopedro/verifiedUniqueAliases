@@ -158,7 +158,7 @@ RUN_ARGS=(--RegionId "$ALI_REGION" --ZoneId "$ALI_ZONE"
 [[ "$ALI_TDX" == "1" ]] && RUN_ARGS+=(--SecurityOptions.ConfidentialComputingMode TDX)
 
 CREATE_OUTPUT=$(aliyun ecs RunInstances "${RUN_ARGS[@]}" 2>&1) || true
-INSTANCE_ID=$(echo "$CREATE_OUTPUT" | jq -r '.InstanceIdSets.InstanceidSet[0] // empty' 2>/dev/null || true)
+INSTANCE_ID=$(echo "$CREATE_OUTPUT" | jq -r '.InstanceIdSets.InstanceIdSet[0] // .InstanceIdSets.InstanceidSet[0] // empty' 2>/dev/null || true)
 
 if [[ -z "$INSTANCE_ID" ]]; then
     echo "❌ Failed to create instance:"
