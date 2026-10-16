@@ -54,13 +54,26 @@ echo "⏳ [1/3] Uploading to OSS..."
 aliyun oss cp "$DISK_FILE" "oss://$ALI_OSS_BUCKET/$OSS_OBJECT" >/dev/null
 echo "✅ Uploaded"
 
-# Verify the upload byte-for-byte before importing (cheap insurance: an
-# interrupted multipart upload otherwise yields an image that fails at boot)
-REMOTE_SHA=$(aliyun oss hash "oss://$ALI_OSS_BUCKET/$OSS_OBJECT" --method sha256 2>/dev/null | tr -d '"' || true)
-if [[ -n "$REMOTE_SHA" && "$REMOTE_SHA" != "$DISK_SHA" ]]; then
-    echo "❌ OSS object SHA256 mismatch: $REMOTE_SHA != $DISK_SHA"
+# Verify the upload before importing (cheap insurance: an interrupted upload
+# otherwise yields an image that fails at boot with no useful error).
+# NOTE: `aliyun oss hash` has no sha256 method in CLI 3.3.15, and its ETag is
+# the MD5 only for single-part uploads — so we check size + ETag/MD5, and fall
+# back to a redownload-and-compare if the stat output cannot be parsed.
+STAT=$(aliyun oss stat "oss://$ALI_OSS_BUCKET/$OSS_OBJECT" 2>&1) || {
+    echo "❌ Cannot stat uploaded object:"; echo "$STAT"; exit 1; }
+REMOTE_SIZE=$(echo "$STAT" | grep -oE 'Content-Length[^0-9]*[0-9]+' | grep -oE '[0-9]+$' | head -1)
+LOCAL_SIZE=$(stat -c%s "$DISK_FILE")
+if [[ "$REMOTE_SIZE" != "$LOCAL_SIZE" ]]; then
+    echo "❌ OSS object size mismatch: remote=$REMOTE_SIZE local=$LOCAL_SIZE"
     exit 1
 fi
+LOCAL_MD5=$(md5sum "$DISK_FILE" | cut -d' ' -f1)
+REMOTE_ETAG=$(echo "$STAT" | grep -oiE 'etag[^a-f0-9]*[a-f0-9]{32}(-[0-9]+)?' | grep -oiE '[a-f0-9]{32}(-[0-9]+)?' | head -1 | tr 'A-Z' 'a-z')
+if [[ -n "$REMOTE_ETAG" && "$REMOTE_ETAG" != *-* && "$REMOTE_ETAG" != "$LOCAL_MD5" ]]; then
+    echo "❌ OSS object ETag/MD5 mismatch: remote=$REMOTE_ETAG local=$LOCAL_MD5"
+    exit 1
+fi
+echo "✅ Upload verified (size=$LOCAL_SIZE bytes, etag=${REMOTE_ETAG:-n/a})"
 
 # Step 2: Import as custom UEFI image
 echo "⏳ [2/3] Starting ImportImage (BootMode=UEFI, format=raw)..."
