@@ -1822,12 +1822,19 @@ impl GooglePublicCaManager {
         let auth = |req: reqwest::RequestBuilder| req.bearer_auth(token);
 
         let zone = self.dns01_zone();
-        let zones: serde_json::Value = auth(client.get(format!("{}/zones?name={}", base, zone)))
-            .send().await?
-            .json().await?;
-        let zone_id = zones["result"][0]["id"].as_str()
-            .ok_or_else(|| format!("Cloudflare: zone '{}' not found for this API token", zone))?
-            .to_string();
+        // A 32-char hex string is a Cloudflare zone ID — use it directly and
+        // skip the zone-list lookup, so the token needs only DNS Edit (the
+        // "Edit zone DNS" template) and not Zone Read.
+        let zone_id = if zone.len() == 32 && zone.chars().all(|c| c.is_ascii_hexdigit()) {
+            zone
+        } else {
+            let zones: serde_json::Value = auth(client.get(format!("{}/zones?name={}", base, zone)))
+                .send().await?
+                .json().await?;
+            zones["result"][0]["id"].as_str()
+                .ok_or_else(|| format!("Cloudflare: zone '{}' not found for this API token", zone))?
+                .to_string()
+        };
 
         // Remove leftovers from an interrupted run: two TXT values at the same
         // name make the CA validate against the wrong one.
