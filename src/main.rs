@@ -1696,12 +1696,23 @@ impl GooglePublicCaManager {
         }
     }
 
+    /// Whether External Account Binding credentials are present and usable
+    #[cfg(feature = "alibabacloud")]
+    fn has_eab(&self) -> bool {
+        self.eab_key_id.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
+            && self.eab_hmac_key.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
+    }
+
     /// Select the appropriate ACME directory based on platform and EAB availability
     fn acme_directory(&self) -> &str {
         #[cfg(feature = "alibabacloud")]
         {
-            // Alibaba Cloud: Use Let's Encrypt (no EAB required)
-            LETSENCRYPT_CA_DIRECTORY
+            // Same policy as the OCI build (origin/main): Google Public CA when EAB
+            // credentials are provisioned in the instance config — the CA the GCP and
+            // OCI fleets use, which avoids Let's Encrypt's per-week rate limits, which
+            // the boot-time re-issuance cycle burns through — falling back to
+            // Let's Encrypt (no EAB required) when they are absent.
+            if self.has_eab() { GOOGLE_PUBLIC_CA_DIRECTORY } else { LETSENCRYPT_CA_DIRECTORY }
         }
         #[cfg(not(feature = "alibabacloud"))]
         {
@@ -1713,7 +1724,7 @@ impl GooglePublicCaManager {
     /// Whether this CA requires External Account Binding (EAB) credentials
     fn requires_eab(&self) -> bool {
         #[cfg(feature = "alibabacloud")]
-        { false }
+        { self.has_eab() }
         #[cfg(not(feature = "alibabacloud"))]
         { true }
     }
@@ -1730,6 +1741,7 @@ impl GooglePublicCaManager {
 
         info!("Obtaining TLS certificate via ACME...");
         let acme_url = self.acme_directory();
+        info!("ACME directory: {} (EAB required: {})", acme_url, self.requires_eab());
         let account_path = "/tmp/acme-account.json";
         
         // ... (rest of account logic)
