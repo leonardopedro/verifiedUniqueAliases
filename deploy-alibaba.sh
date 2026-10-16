@@ -1,216 +1,122 @@
 #!/bin/bash
-set -eo pipefail
-
-# ==============================================================================
+# =============================================================================
 # deploy-alibaba.sh - Deploy PayPal Auth Confidential VM to Alibaba Cloud ECS
 #
-# Target:  ecs.r9i.xlarge (Intel TDX) or AMD Rome SEV-SNP depending on pool
-# Region:  configurable via ALI_REGION
-# Network: VPC with security group allowing HTTP/HTTPS
+# Launches a TDX-enabled spot instance from the custom ESP image.
+#
+# Cheapest TDX-capable shape is ecs.c9i.xlarge (4 vCPU / 8 GiB) in
+# cn-beijing-i — TDX is only offered on xlarge-and-larger, and Beijing's c9i is
+# ~40% cheaper than Hangzhou's r9i minimum. Verify current spot prices with:
+#   aliyun ecs DescribeSpotPriceHistory --RegionId cn-beijing --ZoneId cn-beijing-i \
+#     --InstanceType ecs.c9i.xlarge --NetworkType vpc
 #
 # Prerequisites:
-#   - aliyun CLI installed and configured
-#   - Custom VM image uploaded to OSS (initramfs-based or disk image)
-#   - PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET etc. set as env vars OR config file
-#   - A domain with DNS pointing to the ECS instance IP
+#   - aliyun CLI configured
+#   - ALI_IMAGE_ID set (from import-alibaba-image.sh)
+#   - Network: pass ALI_VPC_ID/ALI_VSWITCH_ID/ALI_SECURITY_GROUP_ID, or let this
+#     script find/create a "paypal-tdx-vpc" in the target region
 #
-# Boot Architecture:
-#   GRUB → kernel + initramfs (20M, contains binary inside)
-#     └── /build/paypal-auth-vm-bin runs as PID 1
+# Config delivery: the enclave fetches config JSON from the instance user_data
+# metadata endpoint (http://100.100.100.200/latest/user-data). Set PayPal creds
+# via env vars below, or provide ALI_CONFIG_FILE_PATH.
 #
 # Usage:
-#   export ALI_ACCESS_KEY_ID=xxx
-#   export ALI_ACCESS_KEY_SECRET=xxx
-#   export ALI_IMAGE_ID=xxx        # After importing custom image
-#   export ALI_VPC_ID=vpc-xxx
-#   export ALI_VSWITCH_ID=vsw-xxx
-#   export ALI_SECURITY_GROUP_ID=sg-xxx
-#   export DOMAIN=your-domain.example.com
-#   # Optional: export PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=...
-#   ./deploy-alibaba.sh
-# ==============================================================================
+#   export ALI_IMAGE_ID=m-xxxxxxxx
+#   export PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... DOMAIN=...
+#   bash deploy-alibaba.sh
+# =============================================================================
+set -eo pipefail
 
 echo "============================================================"
 echo "🚀 Deploying Alibaba Cloud Confidential Auth VM (Intel TDX)"
 echo "============================================================"
 
-# --- Configuration Defaults ---
-ALI_REGION="${ALI_REGION:-cn-hangzhou}"
-ALI_ZONE="${ALI_ZONE:-cn-hangzhou-j}"
-ALI_INSTANCE_TYPE="ecs.r9i.xlarge"
+# --- Configuration defaults: cheapest TDX-capable shape -----------------------
+ALI_REGION="${ALI_REGION:-cn-beijing}"
+ALI_ZONE="${ALI_ZONE:-cn-beijing-i}"
+ALI_INSTANCE_TYPE="${ALI_INSTANCE_TYPE:-ecs.c9i.xlarge}"   # 4 vCPU / 8 GiB, TDX-capable, $0.024/h spot
 ALI_INSTANCE_NAME="${ALI_INSTANCE_NAME:-paypal-auth-vm}"
 ALI_IMAGE_ID="${ALI_IMAGE_ID:-}"
-ALI_VPC_ID="${ALI_VPC_ID}"
-ALI_VSWITCH_ID="${ALI_VSWITCH_ID}"
-ALI_SECURITY_GROUP_ID="${ALI_SECURITY_GROUP_ID}"
+ALI_VPC_ID="${ALI_VPC_ID:-}"
+ALI_VSWITCH_ID="${ALI_VSWITCH_ID:-}"
+ALI_SECURITY_GROUP_ID="${ALI_SECURITY_GROUP_ID:-}"
 ALI_SYSTEM_DISK_SIZE="${ALI_SYSTEM_DISK_SIZE:-20}"
-ALI_SYSTEM_DISK_CATEGORY="${ALI_SYSTEM_DISK_CATEGORY:-cloud_efficiency}"
+# TDX shapes reject cloud_efficiency/cloud_ssd — verified via RunInstances --DryRun
+ALI_SYSTEM_DISK_CATEGORY="${ALI_SYSTEM_DISK_CATEGORY:-cloud_essd}"
 ALI_INTERNET_BW="${ALI_INTERNET_BW:-5}"
-ALI_CONFIG_CONTENT="${ALI_CONFIG_CONTENT}"
-ALI_CONFIG_FILE_PATH="${ALI_CONFIG_FILE_PATH:-/etc/paypal-auth/config.json}"
 
-# Spot strategy: SpotAsPriceGo = pay market price up to OnPrice; no guaranteed duration
+# Spot: pay market price, NO protection period (reclaimable immediately)
 ALI_SPOT_STRATEGY="${ALI_SPOT_STRATEGY:-SpotAsPriceGo}"
-ALI_SPOT_PRICE_LIMIT="${ALI_SPOT_PRICE_LIMIT:-0}"
+ALI_SPOT_DURATION="${ALI_SPOT_DURATION:-0}"
 
-# ------------------------------------------------------------------
-# Prerequisites
-# ------------------------------------------------------------------
-if [[ -z "$ALI_ACCESS_KEY_ID" || -z "$ALI_ACCESS_KEY_SECRET" ]]; then
-    echo "❌ Set ALI_ACCESS_KEY_ID and ALI_ACCESS_KEY_SECRET environment variables"
+# TDX toggle (set ALI_TDX=0 to launch a plain instance)
+ALI_TDX="${ALI_TDX:-1}"
+
+ALI_CONFIG_FILE_PATH="${ALI_CONFIG_FILE_PATH:-./config.example.json}"
+
+command -v jq >/dev/null || { echo "❌ jq is required"; exit 1; }
+command -v aliyun >/dev/null || { echo "❌ aliyun CLI not found — run: bash build-scripts/create-alien-deb.sh"; exit 1; }
+
+# ------------------------------------------------------------------ Guards
+if [[ -z "$ALI_IMAGE_ID" ]]; then
+    echo "❌ ALI_IMAGE_ID not set. Run import-alibaba-image.sh first."
     exit 1
 fi
 
-if ! command -v aliyun &> /dev/null; then
-    echo "❌ 'aliyun' CLI not found"
-    echo "   Download from: https://github.com/aliyun/aliyun-cli"
-    echo "   Or run: bash build-scripts/create-alien-deb.sh && sudo dpkg -i packages/aliyun-cli-*.deb"
-    exit 1
+# --- Resolve network: use provided IDs, else find/create paypal-tdx-vpc ------
+if [[ -z "$ALI_VPC_ID" || -z "$ALI_VSWITCH_ID" || -z "$ALI_SECURITY_GROUP_ID" ]]; then
+    echo "⏳ Resolving network in $ALI_REGION..."
+    ALI_VPC_ID="${ALI_VPC_ID:-$(aliyun ecs DescribeVpcs --RegionId "$ALI_REGION" 2>/dev/null \
+        | jq -r '.Vpcs.Vpc[]? | select(.VpcName=="paypal-tdx-vpc") | .VpcId' | head -1)}"
+    if [[ -z "$ALI_VPC_ID" ]]; then
+        echo "   Creating paypal-tdx-vpc..."
+        ALI_VPC_ID=$(aliyun ecs CreateVpc --RegionId "$ALI_REGION" --CidrBlock 172.16.0.0/12 \
+            --VpcName paypal-tdx-vpc | jq -r '.VpcId')
+        for _ in $(seq 1 24); do
+            ST=$(aliyun ecs DescribeVpcs --RegionId "$ALI_REGION" --VpcId "$ALI_VPC_ID" \
+                | jq -r '.Vpcs.Vpc[0].Status')
+            [[ "$ST" == "Available" ]] && break
+            sleep 5
+        done
+    fi
+    ALI_VSWITCH_ID="${ALI_VSWITCH_ID:-$(aliyun ecs DescribeVSwitches --RegionId "$ALI_REGION" \
+        --VpcId "$ALI_VPC_ID" 2>/dev/null \
+        | jq -r --arg z "$ALI_ZONE" '.VSwitches.VSwitch[]? | select(.ZoneId==$z) | .VSwitchId' | head -1)}"
+    if [[ -z "$ALI_VSWITCH_ID" ]]; then
+        echo "   Creating vSwitch in $ALI_ZONE..."
+        ALI_VSWITCH_ID=$(aliyun ecs CreateVSwitch --RegionId "$ALI_REGION" --ZoneId "$ALI_ZONE" \
+            --VpcId "$ALI_VPC_ID" --CidrBlock 172.16.0.0/24 --VSwitchName paypal-tdx-vsw \
+            | jq -r '.VSwitchId')
+        sleep 10
+    fi
+    ALI_SECURITY_GROUP_ID="${ALI_SECURITY_GROUP_ID:-$(aliyun ecs DescribeSecurityGroups \
+        --RegionId "$ALI_REGION" --VpcId "$ALI_VPC_ID" 2>/dev/null \
+        | jq -r '.SecurityGroups.SecurityGroup[]? | select(.SecurityGroupName=="paypal-tdx-sg") | .SecurityGroupId' | head -1)}"
+    if [[ -z "$ALI_SECURITY_GROUP_ID" ]]; then
+        echo "   Creating security group..."
+        ALI_SECURITY_GROUP_ID=$(aliyun ecs CreateSecurityGroup --RegionId "$ALI_REGION" \
+            --VpcId "$ALI_VPC_ID" --SecurityGroupName paypal-tdx-sg | jq -r '.SecurityGroupId')
+        for P in 80 443; do
+            aliyun ecs AuthorizeSecurityGroup --RegionId "$ALI_REGION" \
+                --SecurityGroupId "$ALI_SECURITY_GROUP_ID" --IpProtocol tcp \
+                --PortRange "$P/$P" --SourceCidrIp 0.0.0.0/0 >/dev/null 2>&1 || true
+        done
+    fi
 fi
-
-export ALIBABA_ACCESS_KEY_ID="$ALI_ACCESS_KEY_ID"
-export ALIBABA_ACCESS_KEY_SECRET="$ALI_ACCESS_KEY_SECRET"
 
 echo "✅ Configuration:"
-echo "   Region: $ALI_REGION ($ALI_ZONE)"
-echo "   Instance Type: $ALI_INSTANCE_TYPE"
-if [[ -n "$ALI_IMAGE_ID" ]]; then
-    echo "   Image ID: $ALI_IMAGE_ID (already imported)"
-else
-    echo "   ⚠️  ALI_IMAGE_ID not set - you need to import the image first:"
-    echo ""
-    echo "   Step 1: Upload initramfs to OSS"
-    echo "     ossutil cp initramfs-alibaba.img oss://your-bucket/paypal-auth-vm/"
-    echo ""
-    echo "   Step 2: Import as custom image"
-    echo "     aliyun ecs ImportImage \\"
-    echo "       --RegionId $ALI_REGION \\"
-    echo "       --ImageName paypal-auth-vm \\"
-    echo "       --DiskDeviceMapping.1.OSSBucket your-bucket \\"
-    echo "       --DiskDeviceMapping.1.OSSObject paypal-auth-vm/initramfs-alibaba.img \\"
-    echo "       --DiskDeviceMapping.1.ImageFormat raw \\"
-    echo "       --DiskDeviceMapping.1.Device /dev/sda"
-    echo ""
-    echo "   Then set ALI_IMAGE_ID=m-xxxxxxxxx and re-run this script"
-    exit 1
-fi
-
-if [[ -z "$ALI_VPC_ID" || -z "$ALI_VSWITCH_ID" || -z "$ALI_SECURITY_GROUP_ID" ]]; then
-    echo "❌ ALI_VPC_ID, ALI_VSWITCH_ID, and ALI_SECURITY_GROUP_ID are required"
-    exit 1
-fi
-
-echo "   VPC: $ALI_VPC_ID"
-echo "   VSwitch: $ALI_VSWITCH_ID"
-echo "   Security Group: $ALI_SECURITY_GROUP_ID"
+echo "   Region/Zone : $ALI_REGION / $ALI_ZONE"
+echo "   Instance    : $ALI_INSTANCE_TYPE (spot: $ALI_SPOT_STRATEGY, duration=${ALI_SPOT_DURATION}h)"
+echo "   TDX         : $([[ "$ALI_TDX" == "1" ]] && echo enabled || echo disabled)"
+echo "   Image       : $ALI_IMAGE_ID"
+echo "   VPC/Switch/SG: $ALI_VPC_ID / $ALI_VSWITCH_ID / $ALI_SECURITY_GROUP_ID"
 echo ""
 
-# ------------------------------------------------------------------
-# [1/4] Launch EC
-# ------------------------------------------------------------------
-echo "⏳ [1/4] Launching $ALI_INSTANCE_TYPE Spot Instance..."
-
-CREATE_OUTPUT=$(aliyun ecs RunInstances \
-    --RegionId "$ALI_REGION" \
-    --ZoneId "$ALI_ZONE" \
-    --InstanceName "$ALI_INSTANCE_NAME" \
-    --VpcId "$ALI_VPC_ID" \
-    --VSwitchId "$ALI_VSWITCH_ID" \
-    --SecurityGroupId "$ALI_SECURITY_GROUP_ID" \
-    --ImageId "$ALI_IMAGE_ID" \
-    --InstanceType "$ALI_INSTANCE_TYPE" \
-    --InternetMaxBandwidthOut "$ALI_INTERNET_BW" \
-    --IoOptimized enhanced \
-    --SpotStrategy "$ALI_SPOT_STRATEGY" \
-    ${ALI_SPOT_PRICE_LIMIT:+--SpotPriceLimit "$ALI_SPOT_PRICE_LIMIT"} \
-    --SystemDiskSize "$ALI_SYSTEM_DISK_SIZE" \
-    --SystemDiskCategory "$ALI_SYSTEM_DISK_CATEGORY" \
-    --Amount 1 \
-    --Output json \
-    2>&1) || true
-
-# Parse instance ID
-INSTANCE_ID=$(echo "$CREATE_OUTPUT" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-ids = d.get('InstanceIdSets', {}).get('InstanceidSet', [])
-print(ids[0]) if ids else print('')
-" 2>/dev/null)
-
-if [[ -z "$INSTANCE_ID" ]]; then
-    echo "❌ Failed to create instance:"
-    echo "$CREATE_OUTPUT"
-    exit 1
-fi
-
-echo "✅ Instance created: $INSTANCE_ID"
-
-# ------------------------------------------------------------------
-# [2/4] Wait for RUNNING state and public IP
-# ------------------------------------------------------------------
-echo "⏳ [2/4] Waiting for instance to start and get public IP..."
-
-PUBLIC_IP=""
-for i in $(seq 1 60); do
-    DESC_OUT=$(aliyun ecs DescribeInstances \
-        --RegionId "$ALI_REGION" \
-        --InstanceIds "[\"$INSTANCE_ID\"]" \
-        --Output json 2>/dev/null) || true
-
-    # Check status
-    STATUS=$(echo "$DESC_OUT" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-instances = d.get('Instances', {}).get('Instance', [])
-if instances:
-    print(instances[0].get('Status', ''))
-else:
-    print('')
-" 2>/dev/null)
-
-    if [[ "$STATUS" == "Running" ]]; then
-        PUBLIC_IP=$(echo "$DESC_OUT" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-instances = d.get('Instances', {}).get('Instance', [])
-if instances:
-    ips = instances[0].get('PublicIpAddress', {}).get('IpAddress', [])
-    if ips:
-        print(ips[0])
-    else:
-        eip = instances[0].get('EipAddress', {}).get('IpAddress', '')
-        print(eip)
-" 2>/dev/null)
-
-        if [[ -n "$PUBLIC_IP" ]]; then
-            echo "✅ Instance is Running with IP: $PUBLIC_IP"
-            break
-        fi
-    fi
-
-    if [[ $i -eq 60 ]]; then
-        echo "⚠️ Instance status: $STATUS"
-        echo "   Waiting for public IP timed out. Check ECS console."
-    fi
-
-    sleep 5
-done
-
-if [[ -z "$PUBLIC_IP" ]]; then
-    echo "❌ No public IP obtained. Check ECS console: $INSTANCE_ID"
-    exit 1
-fi
-
-# ------------------------------------------------------------------
-# [3/4] Upload config file
-# ------------------------------------------------------------------
-echo "⏳ [3/4] Pushing configuration to instance..."
-
-# Config priority: env vars -> config JSON content -> local config file
+# --- Build config JSON for user_data ----------------------------------------
 CONFIG_TMPFILE=$(mktemp)
+trap 'rm -f "$CONFIG_TMPFILE"' EXIT
 
 if [[ -n "${PAYPAL_CLIENT_ID:-}" && -n "${PAYPAL_CLIENT_SECRET:-}" && -n "${DOMAIN:-}" ]]; then
-    # Generate config from environment
     cat > "$CONFIG_TMPFILE" << JSONEOF
 {
     "paypal_client_id": "${PAYPAL_CLIENT_ID}",
@@ -223,72 +129,71 @@ if [[ -n "${PAYPAL_CLIENT_ID:-}" && -n "${PAYPAL_CLIENT_SECRET:-}" && -n "${DOMA
     "eab_hmac_key": "${EAB_HMAC_KEY:-}"
 }
 JSONEOF
-    echo "   Generated config from environment variables"
-elif [[ -n "$ALI_CONFIG_CONTENT" ]]; then
-    echo "$ALI_CONFIG_CONTENT" > "$CONFIG_TMPFILE"
-    echo "   Using provided ALI_CONFIG_CONTENT"
-elif [[ -f "${ALI_CONFIG_FILE_PATH:-./config.example.json}" || -f "./config.example.json" ]]; then
-    if [[ -f "${ALI_CONFIG_FILE_PATH}" ]]; then
-        cp "${ALI_CONFIG_FILE_PATH}" "$CONFIG_TMPFILE"
-    else
-        cp "./config.example.json" "$CONFIG_TMPFILE"
-    fi
-    # Replace placeholders with env vars if set
-    if [[ -n "${PAYPAL_CLIENT_ID:-}" ]]; then
-        sed -i "s/YOUR_PAYPAL_CLIENT_ID/${PAYPAL_CLIENT_ID}/g" "$CONFIG_TMPFILE"
-        sed -i "s/YOUR_PAYPAL_CLIENT_SECRET/${PAYPAL_CLIENT_SECRET}/g" "$CONFIG_TMPFILE"
-        sed -i "s/YOUR_PAYPAL_VERIFIED_CLIENT_ID/${PAYPAL_VERIFIED_CLIENT_ID:-$PAYPAL_CLIENT_ID}/g" "$CONFIG_TMPFILE"
-        sed -i "s/YOUR_PAYPAL_VERIFIED_CLIENT_SECRET/${PAYPAL_VERIFIED_CLIENT_SECRET:-$PAYPAL_CLIENT_SECRET}/g" "$CONFIG_TMPFILE"
-    fi
-    if [[ -n "${DOMAIN:-}" ]]; then
-        sed -i "s/your-domain.example.com/${DOMAIN}/g" "$CONFIG_TMPFILE"
-    fi
-    echo "   Using local config file"
+    echo "   Config      : generated from env vars"
+elif [[ -f "$ALI_CONFIG_FILE_PATH" ]]; then
+    cp "$ALI_CONFIG_FILE_PATH" "$CONFIG_TMPFILE"
+    echo "   Config      : $ALI_CONFIG_FILE_PATH"
 else
-    echo "⚠️ No PayPal credentials provided. Service will only accept env-based config."
-    echo "   Set PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, and DOMAIN to enable configuration"
+    echo "⚠️  No PayPal credentials — enclave will log config errors at boot."
+    echo "   Set PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, DOMAIN."
+    echo '{}' > "$CONFIG_TMPFILE"
 fi
 
-# Use aliyun to execute command and upload config
-# Note: aliyun InvokeCommand is simpler, but requires the instance to have cloud-init/agent
-echo "   Creating User Data to inject config at boot..."
+# user_data = raw JSON (the enclave reads /latest/user-data directly; there is
+# no cloud-init in the initramfs to interpret a bash script)
+USER_DATA_B64=$(base64 -w0 < "$CONFIG_TMPFILE")
 
-USER_DATA="#!/bin/bash
-mkdir -p /etc/paypal-auth
-cat > /etc/paypal-auth/config.json << 'CONFEOF'
-$(cat "$CONFIG_TMPFILE")
-CONFEOF
-"
+# ------------------------------------------------------------------ [1/4] Launch
+echo "⏳ [1/4] Launching $ALI_INSTANCE_TYPE spot instance (TDX=$ALI_TDX)..."
 
-# Encode user data
-USER_DATA_B64=$(echo "$USER_DATA" | base64 -w0)
+RUN_ARGS=(--RegionId "$ALI_REGION" --ZoneId "$ALI_ZONE"
+    --InstanceName "$ALI_INSTANCE_NAME"
+    --VSwitchId "$ALI_VSWITCH_ID" --SecurityGroupId "$ALI_SECURITY_GROUP_ID"
+    --ImageId "$ALI_IMAGE_ID" --InstanceType "$ALI_INSTANCE_TYPE"
+    --InternetMaxBandwidthOut "$ALI_INTERNET_BW"
+    --SystemDisk.Category "$ALI_SYSTEM_DISK_CATEGORY" --SystemDisk.Size "$ALI_SYSTEM_DISK_SIZE"
+    --SpotStrategy "$ALI_SPOT_STRATEGY" --SpotDuration "$ALI_SPOT_DURATION"
+    --UserData "$USER_DATA_B64" --Amount 1)
 
-aliyun ecs ModifyInstanceAttribute \
-    --RegionId "$ALI_REGION" \
-    --InstanceId "$INSTANCE_ID" \
-    --UserData "$USER_DATA_B64" \
-    --Output json 2>/dev/null || true
+[[ "$ALI_TDX" == "1" ]] && RUN_ARGS+=(--SecurityOptions.ConfidentialComputingMode TDX)
 
-echo "✅ User data injected"
+CREATE_OUTPUT=$(aliyun ecs RunInstances "${RUN_ARGS[@]}" 2>&1) || true
+INSTANCE_ID=$(echo "$CREATE_OUTPUT" | jq -r '.InstanceIdSets.InstanceidSet[0] // empty' 2>/dev/null || true)
 
-# ------------------------------------------------------------------
-# [4/4] Summary
-# ------------------------------------------------------------------
-echo ""
-echo "============================================================"
-echo "🎉 Deployment Complete!"
-echo "============================================================"
-echo "   Instance ID : $INSTANCE_ID"
-echo "   Public IP   : https://$PUBLIC_IP/"
-echo "   Region      : $ALI_REGION"
-echo "============================================================"
-echo ""
-echo "Next steps:"
-echo "  1. Ensure your DNS points to $PUBLIC_IP"
-echo "  2. SSH in and check logs: ssh root@$PUBLIC_IP"
-echo "     (or use Alibaba Cloud VNC console)"
-echo "  3. Monitor service: curl https://$PUBLIC_IP/debug/attestation"
-echo "  4. Check boot logs: dmesg | grep -i paypal"
-echo ""
+if [[ -z "$INSTANCE_ID" ]]; then
+    echo "❌ Failed to create instance:"
+    echo "$CREATE_OUTPUT"
+    exit 1
+fi
+echo "✅ Instance created: $INSTANCE_ID"
 
-rm -f "$CONFIG_TMPFILE"
+# ------------------------------------------------------------------ [2/4] Wait for IP
+echo "⏳ [2/4] Waiting for instance to start and get public IP..."
+PUBLIC_IP=""
+for _ in $(seq 1 60); do
+    INST=$(aliyun ecs DescribeInstances --RegionId "$ALI_REGION" 2>/dev/null \
+        | jq -r --arg id "$INSTANCE_ID" '.Instances.Instance[]? | select(.InstanceId==$id)')
+    STATUS=$(echo "$INST" | jq -r '.Status // empty')
+    if [[ "$STATUS" == "Running" ]]; then
+        PUBLIC_IP=$(echo "$INST" | jq -r '.PublicIpAddress.IpAddress[0] // .EipAddress.IpAddress // empty')
+        [[ -n "$PUBLIC_IP" ]] && { echo "✅ Running: https://$PUBLIC_IP"; break; }
+    fi
+    sleep 5
+done
+
+if [[ -z "$PUBLIC_IP" ]]; then
+    echo "⚠️  No public IP yet. Status: ${STATUS:-unknown}. Check ECS console: $INSTANCE_ID"
+else
+    echo ""
+    echo "============================================================"
+    echo "🎉 Deployment Complete!"
+    echo "============================================================"
+    echo "   Instance ID : $INSTANCE_ID"
+    echo "   Public IP   : https://$PUBLIC_IP/"
+    echo "   Region      : $ALI_REGION / $ALI_ZONE"
+    echo "============================================================"
+    echo ""
+    echo "Debug: aliyun ecs GetInstanceConsoleOutput --InstanceId $INSTANCE_ID --RegionId $ALI_REGION"
+    echo "       (TDX has no VNC; serial console is the only boot log channel)"
+    echo ""
+fi
