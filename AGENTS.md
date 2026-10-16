@@ -1,5 +1,19 @@
 # AGENTS.md - Status Guidelines for PayPal Auth Confidential VM
 
+## Branch Layout (updated 2026-10-16)
+
+| Branch | Status | Contents |
+|---|---|---|
+| **`alibabacloud`** (default branch) | ✅ Active line of work | Alibaba Cloud / **aliyun CLI** stack: `Dockerfile.alibaba`, `build-alibaba{,-docker,-disk,-simple}.sh`, `deploy-alibaba.sh`, `import-alibaba-image.sh`, `build-scripts/create-alien-deb.sh` |
+| `oraclecloud` | 🧊 Archive — do not develop here | Former `main`: Oracle OCI stack (`Dockerfile.oci`, `build-oci-*.sh`, `deploy-oci.sh`, `import-oci-image.sh`), the v161–v162 security hardenings, and the `oasis/` Sapphire + SEV-SNP sub-project |
+| `origin/main` | 🧊 Archive ref — unchanged on GitHub | `oraclecloud` content minus the final `capture-golden-pcrs.mjs` commit |
+
+- **The OCI files are NOT on this branch.** `build-oci-*.sh`, `Dockerfile.oci`, the v161+ `verify.html`/`scripts/` tooling and `oasis/` live only on `oraclecloud`. To resume Oracle work: `git switch oraclecloud`.
+- OCI local build state (host `ol10/` staging, `.build-provenance`, qcow2/UKI/initramfs images, `node_modules/`) was deliberately deleted from this worktree on 2026-10-16 — it is all gitignored/regenerable (`bash build-oci-docker.sh`, `bash extract-ol10-platform.sh`).
+- Alibaba/aliyun CLI work happens **here**; see "Alibaba Cloud Platform Notes" below for the packaging → import → deploy workflow.
+
+---
+
 ## Project Overview
 
 `paypal-auth-vm` (crate name: `paypal-auth-vm`) is a hardware-attested Rust service that provides a secure bridge for PayPal OAuth tokens across **multi-cloud confidential compute**:
@@ -89,15 +103,23 @@ GCP Confidential VMs (n2d with AMD SEV-SNP) **do not pre-provision persistent At
 - Relies on Intel PCK certificates from Intel PKI as primary hardware root of trust
 - TDX policy reads may be available via sysfs paths like `sysfs/firmware/intel/tdx/policy`
 
-### Alibaba CLI Packaging Script
-```
-build-scripts/create-alien-deb.sh
-```
-- Downloads official release tarball from GitHub releases
-- Verifies SHA-256 against SHASUMS256.txt
-- Builds a proper .deb package with profile.d PATH injection
-- Supports auto-version resolution (`ALIYUN_CLI_VERSION=auto`)
-- Output format: `packages/aliyun-cli-{VERSION}_{VERSION}-1_{ARCH}.deb`
+### Aliyun CLI Workflow (this branch's core tooling)
+
+The provisioning stack depends on the official `aliyun` CLI, shipped as a locally built `.deb` (no apt repo, no GPG — the tarball is checksum-verified instead):
+
+1. **Package** — `bash build-scripts/create-alien-deb.sh`
+   - Downloads the official release tarball from `github.com/aliyun/aliyun-cli` (default `3.3.14`; `ALIYUN_CLI_VERSION=auto` resolves the latest tag, `ARCHITECTURE=arm64` for arm)
+   - Verifies the asset against the release's `SHASUMS256.txt` (cached in `build-scripts/work/`) and **fails closed on mismatch**
+   - Installs the ELF binary to `/opt/alibabacloud-cli/bin` plus `/etc/profile.d` PATH injection
+   - Output: `build-scripts/packages/aliyun-cli-{VERSION}_{VERSION}-1_{ARCH}.deb` (override dir with `ALIYUN_DEB_OUT`)
+   - Host tools required: `dpkg-deb curl sha256sum readelf file tar awk grep`
+2. **Install** — `sudo dpkg -i build-scripts/packages/aliyun-cli-*.deb`
+3. **Authenticate** — export `ALI_ACCESS_KEY_ID` + `ALI_ACCESS_KEY_SECRET`; `deploy-alibaba.sh` re-exports them as `ALIBABA_ACCESS_KEY_ID` / `ALIBABA_ACCESS_KEY_SECRET` (the CLI's native env names). `aliyun configure` also works.
+4. **Build image** — `bash build-alibaba-docker.sh` → `initramfs-alibaba.img` (Debian Trixie, snapshot-pinned via `Dockerfile.alibaba`; apt package pins in `packages-alibaba.txt`, incl. `tpm2-tools 5.7-1`)
+5. **Import image** — `bash import-alibaba-image.sh` (requires `ossutil` + `ALI_OSS_BUCKET`; uploads the initramfs to OSS and imports it as a custom ECS image → yields `ALI_IMAGE_ID`)
+6. **Deploy** — `bash deploy-alibaba.sh` (target `ecs.r9i.xlarge`, `ALI_REGION=cn-hangzhou` default, spot strategy `SpotAsPriceGo`; enclave config delivered to `/etc/paypal-auth/config.json`)
+
+The enclave image itself never contains the aliyun CLI — the CLI runs on the operator host; only the checksum-verified provisioning flow touches ECS.
 
 ---
 
