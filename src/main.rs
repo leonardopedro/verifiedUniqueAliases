@@ -1504,6 +1504,41 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
 
     #[cfg(feature = "alibabacloud")]
     {
+        // Priority 3: Alibaba Cloud instance user_data (IMDSv1-compatible raw endpoint).
+        // The deploy script injects the config JSON as instance user_data; there is no
+        // cloud-init in the initramfs, so we fetch it ourselves from the metadata service.
+        info!("Alibaba Cloud build: trying instance metadata user_data for config...");
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            if let Ok(resp) = client
+                .get("http://100.100.100.200/latest/user-data")
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    if let Ok(text) = resp.text().await {
+                        let text = text.trim().to_string();
+                        // Guard: user_data may be a legacy bash script (not JSON) — skip it
+                        if text.starts_with('{') {
+                            if let Ok(config) = serde_json::from_str::<Config>(&text) {
+                                let _ = std::fs::create_dir_all("/etc/paypal-auth");
+                                let _ = std::fs::write("/etc/paypal-auth/config.json", &text);
+                                info!("Loaded configuration from instance user_data");
+                                return apply_config_fallbacks(config);
+                            } else {
+                                warn!("user_data present but is not valid Config JSON — ignoring");
+                            }
+                        } else {
+                            info!("user_data present but not JSON — skipping metadata config");
+                        }
+                    }
+                }
+            } else {
+                warn!("Alibaba metadata user_data endpoint unreachable");
+            }
+        }
         info!("Alibaba Cloud build: config provided via environment variables or CONFIG_FILE");
     }
 

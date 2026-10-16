@@ -79,6 +79,43 @@ RUN chmod +x build-initramfs-tools.sh && \
 RUN cp /build/output/initramfs-paypal-auth.img /initramfs-paypal-auth.img && \
     cp /build/packages.txt /packages.txt && \
     cp /build/paypal-auth-vm-bin /paypal-auth-vm-bin && \
+    cp /build/output/vmlinuz /vmlinuz && \
+    cp /build/output/shimx64.efi /shimx64.efi && \
+    cp /build/output/grubx64.efi /grubx64.efi && \
     sha256sum /initramfs-paypal-auth.img
+
+# =============================================================================
+# Stage: assembler — builds the minimal reproducible EFI RAW disk INSIDE the
+# container (parted/mtools available here, no loop devices needed), so the
+# disk image is a deterministic build artifact rather than something assembled
+# ad-hoc on the host. Ported from l-branch-1 (2026-07).
+# =============================================================================
+FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a AS assembler
+ENV DEBIAN_FRONTEND=noninteractive
+ENV SOURCE_DATE_EPOCH=1712260800
+ENV TZ=UTC
+ENV LC_ALL=C.UTF-8
+
+RUN echo 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/20260406T000000Z\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/20260406T000000Z\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp' > /etc/apt/sources.list.d/debian.sources
+
+RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends \
+    mtools parted dosfstools util-linux coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY --from=image-builder /initramfs-paypal-auth.img /build/output/initramfs-paypal-auth.img
+COPY --from=image-builder /vmlinuz /build/output/vmlinuz
+COPY --from=image-builder /shimx64.efi /build/output/shimx64.efi
+COPY --from=image-builder /grubx64.efi /build/output/grubx64.efi
+COPY --from=image-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin
+COPY --from=image-builder /packages.txt /build/packages.txt
+COPY build-alibaba-image.sh ./
+
+RUN chmod +x build-alibaba-image.sh && ./build-alibaba-image.sh && \
+    cp /build/output-alibaba/disk-alibaba.raw /disk-alibaba.raw && \
+    cp /build/output/initramfs-paypal-auth.img /initramfs-paypal-auth.img && \
+    cp /build/paypal-auth-vm-bin /paypal-auth-vm-bin && \
+    cp /build/packages.txt /packages.txt && \
+    sha256sum /disk-alibaba.raw
 
 CMD ["/bin/bash"]
