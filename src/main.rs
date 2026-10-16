@@ -1266,6 +1266,21 @@ struct Config {
     eab_hmac_key: Option<String>,
     #[serde(default)]
     staging: bool,
+    /// DNS-01 credentials. When `dns_api_token` is present the enclave proves
+    /// domain control with a DNS TXT record instead of HTTP-01. This is not an
+    /// optional refinement: on a mainland-China IP the carrier intercepts
+    /// port 80 for any domain without an ICP filing, so HTTP-01 challenges can
+    /// never be validated there (proven live on 2026-10-16 — the CA's fetch
+    /// returns a carrier "Non-compliance ICP Filing" 403 page instead of our
+    /// challenge file). DNS-01 touches only port 443, which is unaffected.
+    #[serde(default)]
+    dns_provider: Option<String>,
+    #[serde(default)]
+    dns_api_token: Option<String>,
+    /// Zone holding the challenge record; defaults to the parent of `domain`
+    /// (login.airma.de -> airma.de).
+    #[serde(default)]
+    dns_zone: Option<String>,
     #[allow(dead_code)]  // Used in GCP builds for ACME account persistence
     acme_account_json: Option<String>,
     // v69: Asymmetric key for signing the attestation payload
@@ -1485,6 +1500,9 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
             eab_hmac_key: std::env::var("EAB_HMAC_KEY").ok(),
             staging: std::env::var("STAGING").map(|s| s == "true").unwrap_or(false),
             acme_account_json: std::env::var("ACME_ACCOUNT_JSON").ok(),
+            dns_provider: std::env::var("DNS_PROVIDER").ok(),
+            dns_api_token: std::env::var("DNS_API_TOKEN").ok(),
+            dns_zone: std::env::var("DNS_ZONE").ok(),
             attestation_signing_key: std::env::var("ATTESTATION_SIGNING_KEY").ok(),
         });
     }
@@ -1684,6 +1702,9 @@ struct GooglePublicCaManager {
     // The `staging` flag in the Vault secret controls PayPal Sandbox mode only.
     // ACME/TLS certificates always use the production CA endpoint.
     acme_account_json: Option<String>,
+    dns_provider: Option<String>,
+    dns_api_token: Option<String>,
+    dns_zone: Option<String>,
 }
 
 impl GooglePublicCaManager {
@@ -1693,6 +1714,9 @@ impl GooglePublicCaManager {
             eab_key_id: config.eab_key_id.clone(),
             eab_hmac_key: config.eab_hmac_key.clone(),
             acme_account_json: config.acme_account_json.clone(),
+            dns_provider: config.dns_provider.clone(),
+            dns_api_token: config.dns_api_token.clone(),
+            dns_zone: config.dns_zone.clone(),
         }
     }
 
@@ -1727,6 +1751,144 @@ impl GooglePublicCaManager {
         { self.has_eab() }
         #[cfg(not(feature = "alibabacloud"))]
         { true }
+    }
+
+    // ---------------------------------------------------------------------
+    // DNS-01 support
+    //
+    // The bundled ACME client (acme2-eab 0.5) understands the dns-01
+    // challenge type but has no provider integration, so the enclave performs
+    // the TXT record dance itself against the DNS provider's API. Everything
+    // here travels over port 443, which is why this works from a
+    // mainland-China IP where port 80 is carrier-intercepted.
+    // ---------------------------------------------------------------------
+
+    fn dns01_enabled(&self) -> bool {
+        self.dns_api_token.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
+    }
+
+    fn dns01_provider(&self) -> &str {
+        match self.dns_provider.as_deref().map(str::trim) {
+            Some(p) if !p.is_empty() => p,
+            _ => "cloudflare",
+        }
+    }
+
+    /// Zone the challenge record belongs to: explicit config, else the parent
+    /// of the served name (login.airma.de -> airma.de).
+    fn dns01_zone(&self) -> String {
+        if let Some(z) = self.dns_zone.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            return z.to_string();
+        }
+        match self.domain.split_once('.') {
+            Some((_, rest)) if !rest.is_empty() => rest.to_string(),
+            _ => self.domain.clone(),
+        }
+    }
+
+    fn dns01_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    }
+
+    /// The digest the CA looks for in the TXT record:
+    /// BASE64URL-NO-PAD(SHA-256(key_authorization))
+    fn dns01_txt_value(key_auth: &str) -> String {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(key_auth.as_bytes()))
+    }
+
+    /// Publish the challenge TXT record and wait until the provider reports it
+    /// as live. Returns (zone_id, record_id) so the caller can clean up.
+    async fn dns01_publish(
+        &self,
+        fqdn: &str,
+        value: &str,
+    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+        if self.dns01_provider() != "cloudflare" {
+            return Err(format!(
+                "DNS-01 provider '{}' is not implemented (only 'cloudflare')",
+                self.dns01_provider()
+            )
+            .into());
+        }
+        let token = self.dns_api_token.as_deref().unwrap_or_default();
+        let client = Self::dns01_client();
+        let base = "https://api.cloudflare.com/client/v4";
+        let auth = |req: reqwest::RequestBuilder| req.bearer_auth(token);
+
+        let zone = self.dns01_zone();
+        let zones: serde_json::Value = auth(client.get(format!("{}/zones?name={}", base, zone)))
+            .send().await?
+            .json().await?;
+        let zone_id = zones["result"][0]["id"].as_str()
+            .ok_or_else(|| format!("Cloudflare: zone '{}' not found for this API token", zone))?
+            .to_string();
+
+        // Remove leftovers from an interrupted run: two TXT values at the same
+        // name make the CA validate against the wrong one.
+        let existing: serde_json::Value = auth(client.get(format!(
+            "{}/zones/{}/dns_records?type=TXT&name={}", base, zone_id, fqdn
+        )))
+        .send().await?
+        .json().await?;
+        if let Some(records) = existing["result"].as_array() {
+            for rec in records {
+                if let Some(rid) = rec["id"].as_str() {
+                    warn!("DNS-01: removing stale challenge record {}", rid);
+                    let _ = auth(client.delete(format!("{}/zones/{}/dns_records/{}", base, zone_id, rid)))
+                        .send().await;
+                }
+            }
+        }
+
+        let body = serde_json::json!({ "type": "TXT", "name": fqdn, "content": value, "ttl": 60 });
+        let created: serde_json::Value = auth(client.post(format!("{}/zones/{}/dns_records", base, zone_id)))
+            .json(&body)
+            .send().await?
+            .json().await?;
+        let record_id = created["result"]["id"].as_str()
+            .ok_or_else(|| format!("Cloudflare: TXT create failed: {}", created))?
+            .to_string();
+        info!("DNS-01: published challenge TXT at {} (record {})", fqdn, record_id);
+
+        // The authoritative zone is Cloudflare itself, so polling this API IS
+        // the propagation check — no DNS query needed, which matters because
+        // public resolvers are unreliable from mainland China. A short grace
+        // period follows for the CA's own recursive lookups.
+        for attempt in 0..12 {
+            let check: serde_json::Value = auth(client.get(format!(
+                "{}/zones/{}/dns_records?type=TXT&name={}", base, zone_id, fqdn
+            )))
+            .send().await?
+            .json().await?;
+            let live = check["result"].as_array()
+                .map(|rs| rs.iter().any(|r| r["content"].as_str() == Some(value)))
+                .unwrap_or(false);
+            if live {
+                info!("DNS-01: challenge TXT live in zone after {} attempt(s)", attempt + 1);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+        Ok((zone_id, record_id))
+    }
+
+    async fn dns01_cleanup(&self, zone_id: &str, record_id: &str) {
+        let token = self.dns_api_token.as_deref().unwrap_or_default();
+        let client = Self::dns01_client();
+        let url = format!("https://api.cloudflare.com/client/v4/zones/{}/dns_records/{}", zone_id, record_id);
+        match client.delete(&url).bearer_auth(token).send().await {
+            Ok(r) if r.status().is_success() => info!("DNS-01: challenge TXT removed"),
+            Ok(r) => warn!("DNS-01: could not remove challenge TXT (HTTP {})", r.status()),
+            Err(e) => warn!("DNS-01: could not remove challenge TXT: {}", e),
+        }
     }
 
     async fn ensure_certificate(&self) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
@@ -1801,17 +1963,42 @@ impl GooglePublicCaManager {
         let authorizations = order.authorizations().await?;
         for auth in authorizations {
             if matches!(auth.status, AuthorizationStatus::Valid) { continue; }
-            let challenge = auth.challenges.iter().find(|c| c.r#type == "http-01")
-                .ok_or("No HTTP-01 challenge found")?.clone();
 
-            let challenge_dir = "/tmp/acme-challenge";
-            tokio::fs::create_dir_all(challenge_dir).await?;
-            let token = challenge.token.as_ref().ok_or("Missing token")?;
-            let key_auth = challenge.key_authorization()?.ok_or("Missing key authorization")?;
-            tokio::fs::write(format!("{}/{}", challenge_dir, token.replace("/", "_")), key_auth.as_bytes()).await?;
+            if self.dns01_enabled() {
+                // DNS-01: prove control with a TXT record. The only viable
+                // challenge type from a mainland-China IP, where port 80 is
+                // carrier-intercepted for unfiled domains.
+                let challenge = auth.challenges.iter().find(|c| c.r#type == "dns-01")
+                    .ok_or("CA offered no DNS-01 challenge")?.clone();
+                let key_auth = challenge.key_authorization()?.ok_or("Missing key authorization")?;
+                let fqdn = format!("_acme-challenge.{}", self.domain);
+                let txt = Self::dns01_txt_value(&key_auth);
 
-            challenge.validate().await?;
-            challenge.wait_done(Duration::from_secs(5), 72).await?;
+                let (zone_id, record_id) = self.dns01_publish(&fqdn, &txt).await?;
+                let outcome = match challenge.validate().await {
+                    Err(e) => Err(format!("dns-01 validate: {:?}", e)),
+                    Ok(_) => match challenge.wait_done(Duration::from_secs(5), 72).await {
+                        Err(e) => Err(format!("dns-01 wait: {:?}", e)),
+                        Ok(_) => Ok(()),
+                    },
+                };
+                // Always remove the record, even on failure: a leftover
+                // challenge TXT breaks the next attempt at the same name.
+                self.dns01_cleanup(&zone_id, &record_id).await;
+                if let Err(msg) = outcome { return Err(msg.into()); }
+            } else {
+                let challenge = auth.challenges.iter().find(|c| c.r#type == "http-01")
+                    .ok_or("No HTTP-01 challenge found")?.clone();
+
+                let challenge_dir = "/tmp/acme-challenge";
+                tokio::fs::create_dir_all(challenge_dir).await?;
+                let token = challenge.token.as_ref().ok_or("Missing token")?;
+                let key_auth = challenge.key_authorization()?.ok_or("Missing key authorization")?;
+                tokio::fs::write(format!("{}/{}", challenge_dir, token.replace("/", "_")), key_auth.as_bytes()).await?;
+
+                challenge.validate().await?;
+                challenge.wait_done(Duration::from_secs(5), 72).await?;
+            }
         }
 
         order = order.wait_ready(Duration::from_secs(5), 72).await?;
