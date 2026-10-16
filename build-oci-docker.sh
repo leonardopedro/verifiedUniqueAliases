@@ -32,6 +32,11 @@ echo "📦 Extracting artifacts..."
 "$ENGINE" cp tmp_oci:/initramfs-paypal-auth.img ./initramfs-oci.img
 "$ENGINE" cp tmp_oci:/grub.cfg ./grub-oci.cfg
 "$ENGINE" cp tmp_oci:/packages.txt ./packages-oci.txt
+# v161 (Pillar 1): the monolithic UKI — the OCI ESP's ENTIRE boot payload
+# (BOOTX64.EFI). Its hash must be CI-attested for verify.html's UKI
+# provenance + Image Atomicity checks to pass.
+"$ENGINE" cp tmp_oci:/build/output/enclave-uki.efi ./enclave-uki.efi \
+    || { echo "❌ could not extract the UKI from the image (build-oci-image.sh must produce output/enclave-uki.efi)" >&2; exit 1; }
 # The binary lives at /build/paypal-auth-vm-bin in the image-builder stage;
 # the old single-path copy silently kept a STALE host-side ./paypal-auth-vm
 # (|| true), which made the provenance preflight hash the wrong file.
@@ -45,6 +50,7 @@ echo ""
 echo "📋 Computing SHA256 hashes..."
 QCOW_SHA=$(sha256sum paypal-auth-vm-oci.qcow2 | cut -d' ' -f1)
 INITRD_SHA=$(sha256sum initramfs-oci.img | cut -d' ' -f1)
+UKI_SHA=$(sha256sum enclave-uki.efi | cut -d' ' -f1)
 
 # ---------------------------------------------------------------------------
 # GitHub provenance preflight (audit follow-up — the "❌ Binary" trap).
@@ -74,6 +80,7 @@ if command -v curl &>/dev/null; then
         check_attested "Enclave Binary" "$(sha256sum paypal-auth-vm | cut -d' ' -f1)"
     fi
     check_attested "Initramfs" "$INITRD_SHA"
+    check_attested "Enclave UKI" "$UKI_SHA"
     check_attested "QCOW2 Disk"  "$QCOW_SHA"
     echo "   (a ❌ means: commit + push first so CI attests, then rebuild from"
     echo "    the clean checkout — the build is bitwise-reproducible)"
@@ -101,8 +108,8 @@ BUILD_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 jq -n \
     --arg commit "$BUILD_COMMIT" \
     --arg dirty "$(git status --porcelain 2>/dev/null | head -1 | wc -l)" \
-    --arg bin "$BIN_SHA" --arg initrd "$INITRD_SHA" --arg qcow "$QCOW_SHA" \
-    '{commit: $commit, dirty_files: ($dirty != "0"), binary_sha256: $bin, initramfs_sha256: $initrd, qcow2_sha256: $qcow}' \
+    --arg bin "$BIN_SHA" --arg initrd "$INITRD_SHA" --arg uki "$UKI_SHA" --arg qcow "$QCOW_SHA" \
+    '{commit: $commit, dirty_files: ($dirty != "0"), binary_sha256: $bin, initramfs_sha256: $initrd, uki_sha256: $uki, qcow2_sha256: $qcow}' \
     > .build-provenance
 echo "📝 Wrote .build-provenance (commit=${BUILD_COMMIT:0:7}, deploy-oci.sh will gate on it)"
 

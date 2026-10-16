@@ -64,6 +64,67 @@ Google EK Certificate (NVRAM 0x01c00002, Google-signed, permanent)
 
 ---
 
+## ⚔️ Threat Model: What Is Guaranteed Under a Malicious Owner + Malicious Cloud
+
+The system is designed for the strongest realistic collusion case short of silicon compromise:
+
+| Party | What they hold |
+|---|---|
+| **Service owner** | All secrets by construction: PayPal `client_id`/`client_secret`, DNS, ability to mint genuine TLS certificates, repo/CI/deploy configuration |
+| **Oracle Cloud** | Hypervisor, IMDS (`user_data`), image storage, network path, UEFI launch firmware |
+| **Owner + cloud, colluding** | Everything above combined |
+| **Out of scope (trusted)** | AMD SEV-SNP silicon (VCEK/ASK/ARK chain), the user's own browser, GitHub's Sigstore signing identity |
+
+The asset is **the end user's data**: their PayPal identity, the OAuth access token, and the integrity of the attestation statements made about them.
+
+### Guaranteed cryptographically, even under full collusion
+
+1. **Session-bound report delivery (v161.2)** — the report leaves the enclave encrypted to an ECDH key the *user's browser* generated; the AMD-signed SNP `report_data` commits to the browser's pre-flight client public key, the PKCE `code_challenge`, the session nonce, **and the user's own `custom_info`** (a public key / wallet / nonce typed into the optional verify.html field — restored in v161.2 and hardware-bound, not merely signed). The owner terminating TLS with a genuine certificate, and the cloud reading traffic, both see ciphertext only; a man-in-the-middle cannot substitute their own `P_client` or the user's custom data (the quote would commit to the substituted values and the browser's stored inputs would no longer match).
+2. **PKCE code interception** — the `code_verifier` exists only in enclave RAM for microseconds; intercepted authorization codes are useless.
+3. **Enclave swap prevention** — the pre-flight `P_enc` (hardware-committed and AMD-signed) is pinned in the browser; a swapped enclave fails the callback signature/pin check.
+4. **RAM secrecy even from the cloud** — with honest code running, tokens, userinfo, signing keys and `code_verifier` live only in SEV-SNP-encrypted memory; the hypervisor sees garbage. On the OCI deployment the report signing key is ephemeral per-boot (`deploy-oci.sh` deletes `attestation_signing_key` from `user_data`, so a fresh key is generated in RAM each boot), so a colluding owner cannot forge callback responses offline — forging requires the live enclave's RAM.
+5. **Attestation freshness & binding** — each report's nonce derives from `SHA-256(paypal hash ∥ SHA-256(pubkey DER) ∥ SHA-256(manifest) ∥ …)` and must be reproduced exactly inside the AMD-signed report; forged identities (claiming user X verified without X's real PayPal login) are impossible under honest code.
+
+### The reduction: it all rests on one property
+
+If — and only if — the colluding parties can make the enclave run **code other than what was audited**, every layer above collapses, because the enclave sees the plaintext before it encrypts. So the real claim is:
+
+> **"The code that touches your data is exactly the publicly auditable, CI-built code."**
+
+This is enforced by, in order of strength:
+
+1. **GitHub Sigstore provenance (unforgeable without GitHub's OIDC identity)** — every reported hash (`binary_sha256`, initramfs, UKI, QCOW2) must exist as an attestation naming the exact workflow run → exact public commit. A deployed build never made by CI fails closed (404 → audit red).
+2. **Image atomicity** — binary + initramfs + UKI must come from *one* CI run; a mixed image fails the `common-run` check.
+3. **Public, reproducible source** — the attested commit is open for review by anyone, and anyone can rebuild it bit-for-bit and confirm the binary matches.
+4. **AMD launch digest pin** — `EXPECTED_SNP_MEASUREMENTS` proves genuine OCI confidential hardware running the pinned Oracle fleet UEFI firmware.
+
+### Honest residual (documented, not hidden)
+
+The hardware quote signs *whatever `report_data` and PCR state the guest presents* — it binds the enclave's **claim** about its code identity (`binary_sha256` + manifest are inputs to the session nonce), it does not independently measure that claim. So the question becomes: what stops a deliberately backdoored enclave from *claiming* the honest, CI-attested hashes while running modified code?
+
+- **On OCI: the claim cannot be independently checked against hardware.** The SNP launch digest measures Oracle's fleet UEFI firmware only — not the kernel, initramfs or disk. A consistent lie (honest hashes in the nonce + honest manifest) passes the full audit. This is the project's standing platform limitation (see `AGENTS.md`): OCI code-integrity rests on GitHub provenance of the *reported* manifest plus the public, reproducible source — not on silicon.
+- **On GCP: the un-lie-able evidence exists — pin mechanism shipped (v162), pins pending capture.** The signed quote contains PCR 0/4/8/9 as measured by firmware/GRUB *before any enclave code runs* — a modified bootloader/kernel/initrd **would** change them. `verify.html` now enforces `GOLDEN_PCRS` constants against those quoted values (mismatch = hard audit failure, exactly the "self-consistent quote over a tampered boot chain" case); pins are captured from a known-good, provenance-gated deployment with `node scripts/capture-golden-pcrs.mjs <host> --update` and enter the audited git history on commit. Until the first capture the check degrades to an amber ⚠️ **Degraded Trust** state (v163 tri-state — an unpinned quote never renders the green ✅), not a silent pass.
+
+The practical consequence for auditors: **the GCP path can be brought to hardware-enforced code identity (one pin list away); the OCI path provides hardware-enforced silicon identity + session binding + unforgeable public provenance for code identity, and cannot do better without hardware disk measurement.**
+
+> **Scope note**: if "userdata" means the *instance* `user_data` config, its secrecy is not claimed against either party by construction — the owner wrote it and the cloud serves it (both adversaries see it by definition). The deployment keeps no *critical* long-term secret there (`attestation_signing_key` is stripped so the report key stays ephemeral; set `OCI_SECRET_OCID` to move the whole config into OCI Secret Management instead), but even a plaintext PayPal credential in `user_data` adds nothing to the adversaries' power — they already hold equivalent credentials by assumption. The confidentiality guarantee above is about the **end user's** data.
+
+### v162 hardenings (external audit: "NOT SAFE" verdict, five findings)
+
+An external review of the collusion threat model raised five findings. Status against the actual code:
+
+| # | Finding | Status |
+|---|---|---|
+| VULN-01 | OCI launch digest measures fleet OVMF only — a disk-swapped rogue `BOOTX64.EFI` produces a genuine AMD quote | ⚠️ **Platform limit, documented above** — no custom-image path on OCI measures the disk; mitigated by the deploy-time provenance gate (unattested binary/initramfs/UKI/QCOW2 → `deploy-oci.sh` refuses) + pinned `EXPECTED_SNP_MEASUREMENTS`. Direct measured boot (`SNP_KERNEL_HASHES`) is not available through OCI's launch API. **UKI finished 2026-10-15**: the deployed boot payload IS the single CI-attested `enclave-uki.efi` (live ESP manifest contains only `EFI/BOOT/BOOTX64.EFI`; deployed UKI `b3559f12…` attested by run 38624597877), and the UKI direct-boot launch digest was computed in CI **and reproduced locally** — `6019f67a…` (1 vCPU) / `03db0644…` (2 vCPU), see `AGENTS.md` "SNP MEASUREMENT pinning". On OCI that digest is *not* what the hardware reports (fleet OVMF-only, pinned `8f58e1cc…`); provenance + the deploy gate cover the gap. |
+| VULN-02 | Owner terminates TLS on the enclave origin and injects script to steal the browser's E2EE key | ✅ **Local-auditor mode shipped** — run `verify.html` from a trusted `file://` copy: keys are generated locally, pre-flight runs over your own channel, and the decrypted report is claimed from `GET /e2ee-blob?state=…` (single-use, 10-min TTL, CORS-open, ciphertext-only). Nothing secret ever exists on the enclave origin. The hosted callback page remains for convenience (it is P_enc-pinned), but local mode is the answer when the origin is hostile. |
+| VULN-03 | `verify.html` accepted any `client_id`/`scope` the enclave signed | ✅ **`EXPECTED_APPS` pin** — the audited (flow, client_id, authorize_base, scope) allow-list is checked on *both* pre-flight paths before any redirect; an unlisted/over-scoped app aborts with `APP PIN VIOLATION`. Rotation = deliberate, reviewed commit. |
+| VULN-04 | GCP PCRs 0/4/8/9 checked only for composite self-consistency | ✅ **`GOLDEN_PCRS` + tri-state UI shipped** (v162 mechanism, v163 state model), pins pending first capture (see *Honest residual* above). Set pin mismatch ⇒ ❌ hard audit failure; unset or partially-set pins ⇒ amber ⚠️ **Degraded Trust** state (`updateStatus(..., 'warning')`), never a green pass; all four set and matching ⇒ ✅ verified. Regression-tested in Test 11 (CSS + tri-state helper, partial → warning, mismatch → failed, unpinned → degraded text, all-4 → verified). |
+| VULN-05 | Plaintext (`pending_attestations`) fallback in `/callback` | ✅ **Removed** — `/attest/preflight` is the only session writer; a non-preflight session at the callback tail now fails closed with 500; identity is never serialized outside the E2EE envelope. Regression-tested in `scripts/test-verify-security.mjs` (Test 11). |
+
+> **OAuth `code` path note (local mode)**: the authorization code still transits `https://<enclave>/callback` — PayPal requires an HTTPS `redirect_uri`, and the PKCE `code_verifier` + `client_secret` live only in enclave RAM. A hostile origin sees `code` + `state` but can neither exchange the code (PKCE verification fails without the enclave's verifier) nor decrypt the vaulted blob (the E2EE key never left the local browser); the worst case is racing the single-use vault claim as a denial of service.
+
+---
+
 ## 🏗️ Build & Verifiability Workflow
 
 ### 1. Atomic Reproducible Build

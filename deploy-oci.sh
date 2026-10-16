@@ -277,6 +277,10 @@ if [[ "${PROVENANCE_GATE:-on}" != "off" ]]; then
     echo "🔐 [1c] Provenance gate: verifying GitHub attestations for this build..."
     check_gate "Enclave Binary" "$(jq -r '.binary_sha256' "$PROV")"
     check_gate "Initramfs"      "$(jq -r '.initramfs_sha256' "$PROV")"
+    # v161 (Pillar 1): the UKI IS the ESP's boot payload on OCI — it must be
+    # attested like the disk itself (skip-with-warning only for pre-v161
+    # provenance files that predate the field).
+    check_gate "Enclave UKI"    "$(jq -r '.uki_sha256 // empty' "$PROV")"
     check_gate "QCOW2 Disk"     "$(jq -r '.qcow2_sha256' "$PROV")"
     if [[ "$GATE_FAIL" != "0" ]]; then
         echo "❌ Provenance gate: refusing to deploy an unattested image to confidential compute."

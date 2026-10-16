@@ -6,6 +6,25 @@ on:
   workflow_dispatch:
 
 jobs:
+  # v162: external-audit regression gate — the EXPECTED_APPS pin, GOLDEN_PCRS
+  # mechanism, local-auditor E2EE mode, and plaintext-fallback removal are
+  # all enforced by scripts/test-verify-security.mjs + the Rust security_tests.
+  # Standalone (does not gate attestation) so a test-infrastructure hiccup can
+  # never stall provenance; a red run here means the shipped pins regressed.
+  security-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust security tests
+        run: cargo test --quiet
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: verify.html security regression suite
+        run: |
+          npm install --no-save node-forge
+          node scripts/test-verify-security.mjs
+
   build:
     runs-on: ubuntu-latest
     permissions:
@@ -40,6 +59,8 @@ jobs:
           docker cp $CONTAINER_ID:/build/output/initramfs-paypal-auth.img ./initramfs-${{ matrix.platform }}.img || docker cp $CONTAINER_ID:/initramfs-paypal-auth.img ./initramfs-${{ matrix.platform }}.img || true
           docker cp $CONTAINER_ID:/build/output/shimx64.efi ./shimx64-${{ matrix.platform }}.efi || true
           docker cp $CONTAINER_ID:/build/output/grubx64.efi ./grubx64-${{ matrix.platform }}.efi || true
+          docker cp $CONTAINER_ID:/build/output/OVMF.fd ./OVMF-${{ matrix.platform }}.fd || true
+          docker cp $CONTAINER_ID:/build/output/enclave-uki.efi ./enclave-uki-${{ matrix.platform }}.efi || true
           docker cp $CONTAINER_ID:/grub.cfg ./grub-${{ matrix.platform }}.cfg || true
           docker cp $CONTAINER_ID:/disk.tar.gz ./disk-${{ matrix.platform }}.tar.gz || true
           docker cp $CONTAINER_ID:/paypal-auth-vm-oci.qcow2 ./disk-oci.qcow2 || true
@@ -47,8 +68,51 @@ jobs:
           docker cp $CONTAINER_ID:/build/packages.txt ./packages-${{ matrix.platform }}.txt || true
           docker rm $CONTAINER_ID
           echo "==== ARTIFACT HASHES (${{ matrix.label }}) ===="
-          sha256sum paypal-auth-vm-${{ matrix.platform }}.bin vmlinuz-${{ matrix.platform }} initramfs-${{ matrix.platform }}.img shimx64-${{ matrix.platform }}.efi grubx64-${{ matrix.platform }}.efi grub-${{ matrix.platform }}.cfg ${{ matrix.disk-file }} 2>/dev/null || true
+          sha256sum paypal-auth-vm-${{ matrix.platform }}.bin vmlinuz-${{ matrix.platform }} initramfs-${{ matrix.platform }}.img shimx64-${{ matrix.platform }}.efi grubx64-${{ matrix.platform }}.efi grub-${{ matrix.platform }}.cfg enclave-uki-${{ matrix.platform }}.efi OVMF-${{ matrix.platform }}.fd ${{ matrix.disk-file }} 2>/dev/null || true
           echo "========================="
+
+      - name: Compute SEV-SNP expected launch measurement (Pillar 1)
+        run: |
+          # Deterministic LAUNCH_DIGEST for OUR image stack under a pinned
+          # firmware (plan §3.2/§3.3). Platform split:
+          #  * OCI/GCP launch with provider-supplied OVMF — that fleet digest
+          #    is NOT computable here and stays pinned from a live capture
+          #    (verify.html EXPECTED_SNP_MEASUREMENTS, AGENTS.md "SNP MEASUREMENT
+          #    pinning").
+          #  * With the staged OVMF (direct-boot profile), the digests below
+          #    are exact for EPYC-Genoa at each vCPU count.
+          # A missing input is an explicit [gap], never a silent pass.
+          python3 -m pip install --quiet --user sev-snp-measure==0.0.13
+          export PATH="$HOME/.local/bin:$PATH"
+          P=${{ matrix.platform }}
+          if [ ! -f "vmlinuz-$P" ] || [ ! -f "initramfs-$P.img" ] || [ ! -f "grub-$P.cfg" ] || [ ! -f "OVMF-$P.fd" ]; then
+            echo "[gap] sev-snp-measure inputs not staged for $P — launch digest NOT computable in CI (provider-supplied firmware; pin from a live capture instead)"
+            echo "::notice::[gap] SNP launch digest not computable for $P"
+            exit 0
+          fi
+          # cmdline single-sourced from the built grub.cfg — the same bytes
+          # the UKI .cmdline section carries (KERNEL_CMDLINE in build script)
+          CMDLINE=$(sed -n 's/^[[:space:]]*linux [^ ]* //p' "grub-$P.cfg")
+          if [ -z "$CMDLINE" ]; then
+            echo "[gap] could not extract the kernel cmdline from grub-$P.cfg"
+            exit 0
+          fi
+          : > "snp-measure-$P.txt"
+          for VCPU in 1 2; do
+            DIGEST=$(sev-snp-measure --mode snp --vcpus=$VCPU --vcpu-type=EPYC-Genoa \
+              --ovmf="OVMF-$P.fd" --kernel="vmlinuz-$P" --initrd="initramfs-$P.img" \
+              --append="$CMDLINE")
+            echo "EXPECTED_SNP_MEASUREMENT_${P}_${VCPU}VCPU=$DIGEST" >> "$GITHUB_ENV"
+            echo "$P EPYC-Genoa ${VCPU}vCPU LAUNCH_DIGEST=$DIGEST" | tee -a "snp-measure-$P.txt"
+          done
+          cat "snp-measure-$P.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest SEV-SNP expected launch measurements
+        if: matrix.platform == 'oci'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: AMD SEV-SNP expected launch measurements (OL10 UKI profile)
+          subject-path: snp-measure-oci.txt
 
       - name: Attest Enclave Binary
         uses: actions/attest-build-provenance@v2
@@ -83,6 +147,17 @@ jobs:
           subject-name: VM Disk Image (${{ matrix.label }})
           subject-path: ${{ matrix.disk-file }}
 
+      # v161 (plan Pillar 1): the OCI ESP boots this UKI DIRECTLY as
+      # EFI/BOOT/BOOTX64.EFI — its hash IS the disk's boot payload, so
+      # verify.html's "Enclave UKI" provenance lookup + the Image Atomicity
+      # common-run check anchor the entire monolithic boot image to CI.
+      - name: Attest Enclave UKI (monolithic direct-boot payload)
+        if: matrix.platform == 'oci'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: Enclave UKI (Oracle Cloud AMD SEV-SNP)
+          subject-path: enclave-uki-${{ matrix.platform }}.efi
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -91,5 +166,7 @@ jobs:
             paypal-auth-vm-${{ matrix.platform }}.bin
             initramfs-${{ matrix.platform }}.img
             vmlinuz-${{ matrix.platform }}
+            enclave-uki-${{ matrix.platform }}.efi
+            snp-measure-${{ matrix.platform }}.txt
             ${{ matrix.disk-file }}
           retention-days: 7

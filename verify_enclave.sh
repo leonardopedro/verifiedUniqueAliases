@@ -6,7 +6,7 @@
 #   * TPM device present (/dev/tpmrm0 | /dev/tpm0) → GCP-style TPM attestation (strict)
 #   * No TPM device                                → Oracle Cloud AMD SEV-SNP, TPM-less
 #     by design: no EK certificate, no NVRAM, no PCR 15. Evidence = SNP report
-#     (report_data = session nonce) + AMD VCEK chain instead.
+#     (report_data = SHA-256(P_enc ∥ nonce)) + AMD VCEK chain instead.
 
 set -e
 
@@ -249,7 +249,7 @@ echo "4-6. TPM Evidence Skipped (TPM-less Platform)"
 echo "--------------------------------------------------------------"
 note "No TPM on this platform — NVRAM/EK cert, persistent AK handles and TPM quote do not apply"
 note "Evidence path instead:"
-echo "    Session nonce → SNP report_data[0..32] (via /dev/sev-guest ioctl)"
+echo "    Session nonce + P_enc → SNP report_data[0..32] = SHA-256(P_enc ∥ nonce) (via /dev/sev-guest ioctl)"
 echo "    → AMD VCEK (kdsintf.amd.com) → ASK → ARK, ECDSA P-384/SHA-384 over report[0..672)"
 echo "    → verified by verify.html against the downloaded report"
 
