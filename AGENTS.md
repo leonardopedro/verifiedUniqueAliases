@@ -93,15 +93,53 @@ GCP Confidential VMs (n2d with AMD SEV-SNP) **do not pre-provision persistent At
 
 ## Alibaba Cloud Platform Notes
 
-### Target Instance Type: ECS.r9i.xlarge
-- Processor: Intel Xeon Platinum 8475L (Sapphire Rapids) with Intel TDX or AMD Rome with SEV-SNP depending on allocation
+### Target Instance Type: ecs.c9i.xlarge (4 vCPU / 8 GiB, Intel TDX) in cn-beijing-i
+- Live-proven 2026-10-16: spot `ecs.c9i.xlarge` (SpotAsPriceGo, no protection period) boots the ESP image end-to-end — DHCP, IMDS, `user_data` config load, NVMe ESP measurement (6 files), HTTP:80 + HTTPS:443, all green
+- Cheapest TDX shape available: Beijing quotes **$0.024/h** spot vs $0.040/h for Hangzhou's minimum (Hangzhou only offers TDX on `r9i.xlarge` and up, i.e. 32 GiB). Everything (bucket, image, instance) must live in one region
+- TDX is real but **unexposed to userspace**: no `/dev/tdx-guest`, no `/sys/module/tdx_guest`, no `/sys/bus/platform/drivers/tdx`. The only reliable probe is the kernel banner (`Memory Encryption Features active: Intel TDX`) read from `/dev/kmsg` — see `intel_tdx::kernel_log_reports_tdx()`. The boot log prints every probe (`TDX probe: …=false`) so the serial console diagnoses it directly
+- **Imported images must be flagged NVMe-capable or the launch is refused**: `RunInstances` fails with `The specified instance type requires NVMe but the image does not support NVMe` until `Features.NvmeSupport=supported` is set (the flag is an image attribute — the guest itself has NVMe built into Debian's cloud kernel, no module needed)
 - Alibaba Cloud does **not** expose `/dev/sev-guest` or ConfigFS TSM interfaces out of the box for Spot instances
+
+### IMDS delivery (config via `user_data`)
+- Alibaba's metadata service is `http://100.100.100.200` (not `169.254.169.254`)
+  and serves **plain HTTP only** — the nftables ruleset must allow
+  `ip daddr 100.100.100.200` *and* outbound `tcp dport 80`, otherwise the
+  enclave times out on config, panics as PID 1 and enters a reboot loop. Both
+  rules are in `setup_firewall()` (2026-10-16 fix)
+- `RunInstances --UserData` takes base64; the metadata endpoint returned the
+  raw JSON in the live test, but `fetch_config()` accepts either form
 
 ### Alibaba-Specific Provisions Required
 - Provisioning relies on downloading a versioned asset (`aliyun-cli`) and extracting it manually to bypass GPG restrictions
 - Requires proprietary utility installation via `.deb` packaging
 - Relies on Intel PCK certificates from Intel PKI as primary hardware root of trust
 - TDX policy reads may be available via sysfs paths like `sysfs/firmware/intel/tdx/policy`
+
+### 🚫 OSS data APIs are blocked from outside mainland China (since 2025-03-20)
+`PutObject`/`GetObject`/`SetObjectAcl` from a non-ECS host return
+`403 AccessDenied "must be addressed using the specified endpoint"` or
+`400 PublicEndpointForbidden "please use CNAME instead"`, regardless of
+region/endpoint. Bucket control-plane calls (`ls`, `stat`, `bucket-cname`)
+still work, so the failure looks like a bucket misconfiguration — it is not.
+Workaround used by `import-alibaba-image.sh`: push the bytes to a **same-region
+ECS instance** and PUT them there over the **intranet** endpoint, addressed in
+virtual-host style (`$BUCKET.oss-cn-beijing-internal.aliyuncs.com`, path-style
+returns `SecondLevelDomainForbidden`). Verified: 46 MB in 0.5 s, ETag == local
+MD5. A custom CNAME domain is the other sanctioned route.
+The standard path cannot be avoided: `CreateImage` refuses a data-disk
+snapshot (`does not contain system disk snapshot`), so an image can only be
+made from an OSS object via `ImportImage`.
+
+### API traps (all hit live, all still present upstream)
+- `ImportImage` takes `--DiskDeviceMapping.n.Format`, **not** `.ImageFormat`
+- `ModifyImageAttribute --Features` must be sent in **flat** wire format
+  (`Features.NvmeSupport=supported`). The `aliyun` CLI serializes its JSON
+  struct form and the server rejects it; `--Features.NvmeSupport` is not a
+  valid flag either. Bypass with a hand-signed RPC call (`SignatureMethod=HMAC-SHA1`,
+  `SignatureNonce`, `Timestamp`) — see `/tmp/ecs-call.mjs` pattern
+- `RunInstances` returns `InstanceIdSets.InstanceIdSet` (capital D) — reading
+  `.InstanceidSet` silently yields an empty instance id
+- `DeleteDisk` takes lowercase `--force`; `StopInstance` takes `--ForceStop`
 
 ### Aliyun CLI Workflow (this branch's core tooling)
 
