@@ -3076,38 +3076,59 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
     eprintln!("[DEBUG] starting ACME cert obtain");
     info!("Obtaining TLS certificate via ACME...");
     let ca = GooglePublicCaManager::new(&config);
-    let (cert_pem, key_pem) = match ca.ensure_certificate().await {
-        Ok(r) => {
-            info!("Certificate obtained via ACME");
-            https_ready.store(true, Ordering::Relaxed);
-            *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&r.0).to_string());
-            r
-        }
-        Err(e) => {
-            #[cfg(feature = "alibabacloud")]
-            {
-                error!("ACME certificate failed: {}. Generating self-signed certificate as fallback...", e);
-                match generate_self_signed_cert(&config.domain) {
-                    Ok(r) => {
-                        warn!("Using SELF-SIGNED certificate — not suitable for production without a reverse proxy");
-                        https_ready.store(true, Ordering::Relaxed);
-                        *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&r.0).to_string());
-                        r
-                    }
-                    Err(e2) => {
-                        error!("Self-signed cert also failed: {}. Keeping process alive for debugging...", e2);
-                        loop { tokio::time::sleep(Duration::from_secs(3600)).await; }
-                    }
+    let (cert_pem, key_pem) = {
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match ca.ensure_certificate().await {
+                Ok(r) => {
+                    info!("Certificate obtained via ACME (attempt {})", attempt);
+                    https_ready.store(true, Ordering::Relaxed);
+                    *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&r.0).to_string());
+                    break r;
                 }
-            }
-            #[cfg(not(feature = "alibabacloud"))]
-            {
-                error!(
-                    "Failed to get certificate: {}. Keeping process alive for debugging...",
-                    e
-                );
-                loop {
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                Err(e) => {
+                    // Transient transport failures to the ACME CA are common from
+                    // mainland-China egress (live-observed 2026-10-17: one boot got
+                    // a real LE certificate, the next died on a 36s timeout fetching
+                    // the directory, the one after failed post-validation) — retry
+                    // with backoff before falling back, never give up on first error.
+                    const MAX_ATTEMPTS: u32 = 5;
+                    if attempt < MAX_ATTEMPTS {
+                        let backoff = [15u64, 30, 45, 60][(attempt - 1) as usize];
+                        warn!(
+                            "ACME attempt {}/{} failed: {}. Retrying in {}s...",
+                            attempt, MAX_ATTEMPTS, e, backoff
+                        );
+                        tokio::time::sleep(Duration::from_secs(backoff)).await;
+                        continue;
+                    }
+                    #[cfg(feature = "alibabacloud")]
+                    {
+                        error!("ACME certificate failed: {}. Generating self-signed certificate as fallback...", e);
+                        match generate_self_signed_cert(&config.domain) {
+                            Ok(r) => {
+                                warn!("Using SELF-SIGNED certificate — not suitable for production without a reverse proxy");
+                                https_ready.store(true, Ordering::Relaxed);
+                                *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&r.0).to_string());
+                                break r;
+                            }
+                            Err(e2) => {
+                                error!("Self-signed cert also failed: {}. Keeping process alive for debugging...", e2);
+                                loop { tokio::time::sleep(Duration::from_secs(3600)).await; }
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "alibabacloud"))]
+                    {
+                        error!(
+                            "Failed to get certificate: {}. Keeping process alive for debugging...",
+                            e
+                        );
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(3600)).await;
+                        }
+                    }
                 }
             }
         }
