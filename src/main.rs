@@ -2700,7 +2700,12 @@ async fn load_tls_config(
     tokio::fs::write("/tmp/tls-key.pem", key_pem).await?;
 
     let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())?;
-    builder.set_certificate_file("/tmp/tls-cert.pem", SslFiletype::PEM)?;
+    // Chain file, not certificate file: ACME returns leaf + intermediate, and
+    // set_certificate_file() (SSL_CTX_use_certificate_file) loads ONLY the first
+    // PEM block — serving a bare leaf makes every client that lacks the CA's
+    // intermediate (LE YR2) fail verification (live-proven 2026-10-17:
+    // `openssl s_client` showed 1 cert, verify error 21).
+    builder.set_certificate_chain_file("/tmp/tls-cert.pem")?;
     builder.set_private_key_file("/tmp/tls-key.pem", SslFiletype::PEM)?;
     builder.check_private_key()?;
 
