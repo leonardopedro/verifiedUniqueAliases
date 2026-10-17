@@ -751,9 +751,85 @@ mod tpm {
     }
 
 
+    /// Collect Intel TDX evidence (PCK cert, policy, MRTD/RTMRs). Shared by the
+    /// normal TPM path and the TPM-less path below.
+    fn collect_tdx_fields() -> (Option<String>, Option<String>, String, Option<serde_json::Value>) {
+        if super::intel_tdx::is_intel_tdx_available() {
+            let tdx_base = super::intel_tdx::collect_tdx_report();
+            let pck_pem = tdx_base.as_ref().and_then(|b| {
+                b.pck_cert_from_nvram.as_deref().map(|der| {
+                    super::intel_tdx::der_to_pem("CERTIFICATE", der)
+                })
+            });
+            let policy = tdx_base.as_ref().and_then(|b| b.tdx_policy.clone());
+            let td_info = tdx_base.as_ref().and_then(|b| {
+                b.td_info.as_ref().map(|info| serde_json::json!({
+                    "attributes": info.attributes,
+                    "mrtd": info.mrtd,
+                    "rtmr0": info.rtmr0,
+                    "rtmr1": info.rtmr1,
+                    "rtmr2": info.rtmr2,
+                    "rtmr3": info.rtmr3,
+                }))
+            });
+            tracing::info!("Intel TDX platform detected — PCK hash: {}", 
+                tdx_base.as_ref().and_then(|b| {
+                    b.pck_cert_from_nvram.as_deref().map(|d| super::intel_tdx::hash_cert(d))
+                }).unwrap_or_else(|| "none".to_string()));
+            if td_info.is_some() {
+                tracing::info!("Intel TDX TDINFO measurements available");
+            }
+            (pck_pem, policy, "Intel TDX".to_string(), td_info)
+        } else {
+            (None, None, "AMD SEV-SNP".to_string(), None)
+        }
+    }
+
+    /// TPM-less platform report: Alibaba Cloud Intel TDX provides no
+    /// /dev/tpmrm0, so there is no AK and no TPM quote — the TPM evidence
+    /// fields serialize empty (the auditor's documented "TPM-less platform"
+    /// signal, same discipline as the OCI builds) and the Intel TDX evidence
+    /// carries the hardware claim instead.
+    pub fn tpm_less_tdx_report(nonce_hex: &str) -> AttestationResult {
+        let (pck_cert_pem, tdx_policy, platform_type, td_info) = collect_tdx_fields();
+        AttestationResult {
+            tpm_quote_msg: String::new(),
+            tpm_quote_sig: String::new(),
+            ak_pub_pem: String::new(),
+            ek_cert: None,
+            pcrs: String::new(),
+            pcr_values: std::collections::BTreeMap::new(),
+            nonce_hex: nonce_hex.to_string(),
+            snp_report_b64: None,
+            auxblob_b64: None,
+            signature_binding_pubkey_hash: String::new(),
+            vcek_der_b64: None,
+            amd_chain_b64: None,
+            google_ak_cert_pem: None,
+            ak_der_sha256: String::new(),
+            pck_cert_pem,
+            tdx_policy,
+            platform_type,
+            td_info,
+        }
+    }
+
     pub async fn quote(nonce_hex: &str) -> Result<AttestationResult, Box<dyn std::error::Error + Send + Sync>> {
         if crate::intel_tdx::is_intel_tdx_available() {
             tracing::info!("Intel TDX hardware attestation path active"); 
+        }
+
+        // TPM-less platforms (Alibaba Cloud Intel TDX): no TPM device exists, so
+        // AK discovery below can only end in "Could not find or derive a
+        // hardware-bound AK" (live-observed 2026-10-17 during a user test — the
+        // whole attestation payload was replaced by that error string). Return
+        // the TPM-empty TDX report instead of failing.
+        if cfg!(feature = "alibabacloud")
+            && !std::path::Path::new("/dev/tpmrm0").exists()
+            && !std::path::Path::new("/dev/tpm0").exists()
+        {
+            tracing::warn!("No TPM device present — returning TPM-less Intel TDX attestation report");
+            return Ok(tpm_less_tdx_report(nonce_hex));
         }
         
         let work_dir = format!("/tmp/tpm_{}", hex::encode(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos().to_be_bytes()));
@@ -1114,35 +1190,7 @@ mod tpm {
         let _ = tokio::fs::remove_dir_all(&work_dir).await;
 
         // Collect Intel TDX-specific data when available
-        let (pck_cert_pem, tdx_policy, platform_type, td_info_json) = if super::intel_tdx::is_intel_tdx_available() {
-            let tdx_base = super::intel_tdx::collect_tdx_report();
-            let pck_pem = tdx_base.as_ref().and_then(|b| {
-                b.pck_cert_from_nvram.as_deref().map(|der| {
-                    super::intel_tdx::der_to_pem("CERTIFICATE", der)
-                })
-            });
-            let policy = tdx_base.as_ref().and_then(|b| b.tdx_policy.clone());
-            let td_info = tdx_base.as_ref().and_then(|b| {
-                b.td_info.as_ref().map(|info| serde_json::json!({
-                    "attributes": info.attributes,
-                    "mrtd": info.mrtd,
-                    "rtmr0": info.rtmr0,
-                    "rtmr1": info.rtmr1,
-                    "rtmr2": info.rtmr2,
-                    "rtmr3": info.rtmr3,
-                }))
-            });
-            tracing::info!("Intel TDX platform detected — PCK hash: {}", 
-                tdx_base.as_ref().and_then(|b| {
-                    b.pck_cert_from_nvram.as_deref().map(|d| super::intel_tdx::hash_cert(d))
-                }).unwrap_or_else(|| "none".to_string()));
-            if td_info.is_some() {
-                tracing::info!("Intel TDX TDINFO measurements available");
-            }
-            (pck_pem, policy, "Intel TDX".to_string(), td_info)
-        } else {
-            (None, None, "AMD SEV-SNP".to_string(), None)
-        };
+        let (pck_cert_pem, tdx_policy, platform_type, td_info_json) = collect_tdx_fields();
 
         Ok(AttestationResult {
             tpm_quote_msg: STANDARD.encode(msg),
@@ -1804,6 +1852,21 @@ impl GooglePublicCaManager {
 
     /// Publish the challenge TXT record and wait until the provider reports it
     /// as live. Returns (zone_id, record_id) so the caller can clean up.
+    /// Deterministic (stateless) rotating second order identifier, e.g.
+    /// `rate-limit-3-login.airma.de`. Rotation is by UTC hour over K=6 slots so
+    /// consecutive boots rarely share an exact-set bucket, and nothing has to be
+    /// persisted across boots (the enclave is RAM-only by threat model).
+    fn rotation_extra_identifier(domain: &str) -> Option<String> {
+        const K: i64 = 6;
+        let hours = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64
+            / 3600;
+        let idx = (hours % K + K) % K;
+        Some(format!("rate-limit-{}-{}", idx, domain))
+    }
+
     async fn dns01_publish(
         &self,
         fqdn: &str,
@@ -1964,6 +2027,18 @@ impl GooglePublicCaManager {
         info!("Creating ACME order for domain: {}", self.domain);
         let mut order_builder = OrderBuilder::new(account.clone());
         order_builder.add_dns_identifier(self.domain.clone());
+        // Rate-limit rotation (Alibaba/spot): Let's Encrypt caps certificates per
+        // EXACT SET of identifiers at 5 per 7 days (refill 1/34h) — a per-boot
+        // re-issuance of the same single name exhausts that bucket in two days on
+        // a spot instance. Adding a time-rotated second identifier makes each
+        // hour's order a different exact set (LE's documented workaround),
+        // multiplying the budget K× while DNS-01 still proves the same zone.
+        if cfg!(feature = "alibabacloud") {
+            if let Some(extra) = Self::rotation_extra_identifier(&self.domain) {
+                info!("Rate-limit rotation: ordering identifiers [{}] + [{}]", self.domain, extra);
+                order_builder.add_dns_identifier(extra);
+            }
+        }
         let mut order = order_builder.build().await?;
 
         // ... (authorizations)
@@ -1978,7 +2053,9 @@ impl GooglePublicCaManager {
                 let challenge = auth.challenges.iter().find(|c| c.r#type == "dns-01")
                     .ok_or("CA offered no DNS-01 challenge")?.clone();
                 let key_auth = challenge.key_authorization()?.ok_or("Missing key authorization")?;
-                let fqdn = format!("_acme-challenge.{}", self.domain);
+                // The TXT record name follows THIS authorization's identifier —
+                // with the rotated second identifier the two authz differ.
+                let fqdn = format!("_acme-challenge.{}", auth.identifier.value);
                 let txt = Self::dns01_txt_value(&key_auth);
 
                 let (zone_id, record_id) = self.dns01_publish(&fqdn, &txt).await?;
@@ -2233,7 +2310,20 @@ async fn generate_attestation(
     info!("Generating hardware attestation with bound public key hash: {}", pub_key_hash_hex);
     let mut tpm_report = match tpm::quote(&final_combined_nonce).await {
         Ok(r) => r,
-        Err(e) => return format!("ERROR: Failed to generate TPM Quote: {}", e),
+        Err(e) => {
+            #[cfg(feature = "alibabacloud")]
+            {
+                // A TPM failure must never blank the attestation on a TPM-less
+                // TDX platform — serve the TPM-empty TDX report instead of an
+                // error string as the whole payload.
+                error!("TPM quote failed: {}; continuing with TPM-less TDX report", e);
+                tpm::tpm_less_tdx_report(&final_combined_nonce)
+            }
+            #[cfg(not(feature = "alibabacloud"))]
+            {
+                return format!("ERROR: Failed to generate TPM Quote: {}", e);
+            }
+        }
     };
     tpm_report.signature_binding_pubkey_hash = pub_key_hash_hex;
     
@@ -3140,11 +3230,14 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
     info!("Loading TLS config...");
     let tls_config = load_tls_config(&cert_pem, &key_pem).await?;
     eprintln!("[DEBUG] TLS config loaded");
+    // Shared holder: the renewal loop swaps in a fresh acceptor live, no restart.
+    let tls_holder: Arc<std::sync::RwLock<Option<Arc<SslAcceptor>>>> =
+        Arc::new(std::sync::RwLock::new(Some(tls_config)));
     let https_addr = SocketAddr::from(([0, 0, 0, 0], 443));
     info!("HTTPS listening on {}", https_addr);
 
     let https_listener = TcpListener::bind(https_addr).await?;
-    let https_tls_config = tls_config.clone();
+    let https_tls_holder = tls_holder.clone();
 
     let state_for_https = state.clone();
     let https_handle = tokio::spawn(async move {
@@ -3156,7 +3249,10 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
                     continue;
                 }
             };
-            let ssl_config = https_tls_config.clone();
+            let ssl_config = match https_tls_holder.read().expect("tls holder lock").clone() {
+                Some(cfg) => cfg,
+                None => continue,
+            };
             let app = app.clone();
             let semaphore = state_for_https.connection_semaphore.clone();
 
@@ -3202,21 +3298,49 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
     });
     eprintln!("[DEBUG] HTTPS server spawned");
 
-    // Certificate renewal loop (renew every 12 hours)
+    // Certificate renewal: only re-issuance when the served certificate is close
+    // to expiry, and apply it live. The old loop re-issued every 12h unconditionally
+    // — on Alibaba (no cert cache) every tick burned one Let's Encrypt
+    // "exact set of identifiers" quota unit (5 per 7 days, refill 1/34h) for a cert
+    // that was never even applied ("restart needed", no restart).
     let ca = GooglePublicCaManager::new(&config);
+    let state_for_renewal = state.clone();
+    let tls_holder_for_renewal = tls_holder.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(12 * 3600));
         interval.tick().await;
         loop {
             interval.tick().await;
-            info!("Attempting certificate renewal...");
+            let days_left = state_for_renewal
+                .tls_cert_pem
+                .read()
+                .clone()
+                .and_then(|pem| {
+                    let cert = openssl::x509::X509::from_pem(pem.as_bytes()).ok()?;
+                    let now = openssl::asn1::Asn1Time::days_from_now(0).ok()?;
+                    // diff(from=now, to=not_after) → positive = time remaining
+                    let remaining = now.diff(cert.not_after()).ok()?;
+                    Some(remaining.days as i64)
+                });
+            match days_left {
+                Some(d) if d > 21 => {
+                    info!("Certificate still valid for ~{} days — skipping renewal (ACME rate limits)", d);
+                    continue;
+                }
+                Some(d) => info!("Certificate expires in ~{} days — attempting renewal...", d),
+                None => warn!("Could not parse the current certificate — attempting renewal..."),
+            }
             match ca.ensure_certificate().await {
-                Ok(_) => {
-                    info!("Certificate renewed successfully (restart needed for full effect)");
-                }
-                Err(e) => {
-                    error!("Certificate renewal failed: {}", e);
-                }
+                Ok((cert, key)) => match load_tls_config(&cert, &key).await {
+                    Ok(new_cfg) => {
+                        *state_for_renewal.tls_cert_pem.write() =
+                            Some(String::from_utf8_lossy(&cert).to_string());
+                        *tls_holder_for_renewal.write().expect("tls holder lock") = Some(new_cfg);
+                        info!("Certificate renewed and applied live");
+                    }
+                    Err(e) => error!("Certificate renewed but could not be loaded: {}", e),
+                },
+                Err(e) => error!("Certificate renewal failed: {}", e),
             }
         }
     });
