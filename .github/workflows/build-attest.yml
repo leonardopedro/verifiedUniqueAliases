@@ -13,6 +13,12 @@ jobs:
       contents: read
       id-token: write
     strategy:
+      # One leg failing must not cancel the other: the alibabacloud leg is the
+      # line of record on its branch, and the GCP leg cannot even build there
+      # (Dockerfile.repro COPYs build-gcp-gpt-image.sh, which only exists on
+      # main — the alibabacloud branch deliberately dropped the GCP image
+      # tooling). The GCP leg is therefore gated to main below.
+      fail-fast: false
       matrix:
         include:
           - platform: gcp
@@ -30,6 +36,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - name: Build and extract artifacts
+        if: matrix.platform != 'gcp' || github.ref == 'refs/heads/main'
         run: |
           docker build --no-cache --load --target image-builder -f ${{ matrix.dockerfile }} -t paypal-auth-vm:${{ matrix.platform }} .
           CONTAINER_ID=$(docker create paypal-auth-vm:${{ matrix.platform }})
@@ -48,26 +55,28 @@ jobs:
           echo "========================="
 
       - name: Attest Enclave Binary
+        if: matrix.platform != 'gcp' || github.ref == 'refs/heads/main'
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: Enclave Binary (${{ matrix.label }})
           subject-path: paypal-auth-vm-${{ matrix.platform }}.bin
 
       - name: Attest Kernel
-        if: matrix.platform == 'gcp'
+        if: matrix.platform == 'gcp' && github.ref == 'refs/heads/main'
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: Linux Kernel (${{ matrix.label }})
           subject-path: vmlinuz-${{ matrix.platform }}
 
       - name: Attest Initrd
+        if: matrix.platform != 'gcp' || github.ref == 'refs/heads/main'
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: Initramfs (${{ matrix.label }})
           subject-path: initramfs-${{ matrix.platform }}.img
 
       - name: Attest Bootloader
-        if: matrix.platform == 'gcp'
+        if: matrix.platform == 'gcp' && github.ref == 'refs/heads/main'
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: EFI Bootloader (${{ matrix.label }})
@@ -77,13 +86,14 @@ jobs:
             grub-${{ matrix.platform }}.cfg
 
       - name: Attest VM Disk Image
-        if: matrix.platform == 'gcp'
+        if: matrix.platform == 'gcp' && github.ref == 'refs/heads/main'
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: VM Disk Image (${{ matrix.label }})
           subject-path: disk-${{ matrix.platform }}.tar.gz
 
       - name: Upload artifacts
+        if: matrix.platform != 'gcp' || github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
           name: vm-artifacts-${{ matrix.platform }}

@@ -282,8 +282,8 @@
             <div id="firmwareCheck" class="check-item">
                 <div class="check-icon">💎</div>
                 <div class="check-text">
-                    <h4>AMD Silicon Root of Trust</h4>
-                    <p id="firmwareDesc">Proves the platform is a genuine AMD SEV-SNP processor with untampered firmware.</p>
+                    <h4>Silicon Root of Trust (AMD SEV-SNP / Intel TDX)</h4>
+                    <p id="firmwareDesc">Proves the platform is genuine confidential-compute silicon (AMD SEV-SNP or Intel TDX) with untampered measurements.</p>
                 </div>
             </div>
 
@@ -1402,6 +1402,7 @@
             let siliconOk = false;
             let snpVerified = false;
             let googleVerified = false;
+            let tdxVerified = false;
             let siliconMsg = "";
 
             // Pinned AMD SEV-SNP LAUNCH_DIGEST values (MEASUREMENT field,
@@ -1595,6 +1596,113 @@
                 }
             }
 
+            // 5c. Intel TDX Root (Alibaba Cloud ECS confidential instances).
+            //
+            // The enclave publishes `tdx_quote_b64` ONLY when the platform
+            // actually produced a signed TD Quote (Intel quote ABI v4/v5,
+            // ECDSA-P256/P-384 by the Quoting Enclave). The auditor verifies:
+            //   1. quote header (tee_type == 0x81 TDX, version 4/5, lengths);
+            //   2. report_data[0..32] == this session's combined nonce,
+            //      [32..64] == zero (session binding, same discipline as SNP);
+            //   3. the ECDSA signature over the quote body by the PCK leaf
+            //      key (hw.pck_cert_pem), with the leaf→PCK-CA chain link
+            //      verified and the issuer required to be Intel's PCK CA;
+            //   4. MRTD/RTMRs are surfaced for the auditor's comparison.
+            // A bare TDREPORT (tdx_td_report_b64) is generated INSIDE the
+            // guest and is UNSIGNED — it can NEVER satisfy the silicon root.
+            const claimsTdx = !!(hw.tdx_quote_b64 || hw.tdx_td_report_b64 || hw.pck_cert_pem
+                || (hw.platform_type || '').indexOf('TDX') !== -1);
+            if (claimsTdx) {
+                if (hw.tdx_quote_b64) {
+                    try {
+                        const quote = Uint8Array.from(atob(hw.tdx_quote_b64), c => c.charCodeAt(0));
+                        if (quote.length < 56 + 48 + 96) throw new Error(`quote truncated (${quote.length} bytes)`);
+                        const qdv = new DataView(quote.buffer, quote.byteOffset, quote.byteLength);
+                        const qVersion = qdv.getUint16(0, true);            // version u16 @0
+                        const qAttKeyType = qdv.getUint16(2, true);        // att_key_type u16 @2 (2=P-256, 16=P-384)
+                        const qTeeType = qdv.getUint32(4, true);           // tee_type u32 @4
+                        if (qTeeType !== 0x00000081) throw new Error(`tee_type 0x${qTeeType.toString(16)} is not TDX (expected 0x81)`);
+                        if (qVersion !== 4 && qVersion !== 5) throw new Error(`unsupported quote version ${qVersion}`);
+                        const qBodySize = qdv.getUint32(48, true);         // body_size u32 @48
+                        const qSigSize = qdv.getUint32(52, true);          // signature_size u32 @52
+                        if (56 + qBodySize + qSigSize > quote.length) throw new Error('quote length fields inconsistent with blob size');
+                        // Signed region = body_size field (4 B LE) || body.
+                        const qBody = quote.slice(48, 52 + qBodySize);
+                        const qSig = quote.slice(52 + qBodySize, 52 + qBodySize + qSigSize);
+                        // ECDSA sig blob: uint32le rSize | r | uint32le sSize | s
+                        const sdv = new DataView(qSig.buffer, qSig.byteOffset, qSig.byteLength);
+                        let soff = 0;
+                        const rSize = sdv.getUint32(soff, true); soff += 4;
+                        const rBytes = qSig.slice(soff, soff + rSize); soff += rSize;
+                        const sSize = sdv.getUint32(soff, true); soff += 4;
+                        const sBytes = qSig.slice(soff, soff + sSize);
+                        const curveSize = (qAttKeyType === 16) ? 48 : 32;
+                        if (rBytes.length > curveSize || sBytes.length > curveSize) throw new Error('signature width mismatch');
+                        const qrs = new Uint8Array(curveSize * 2);
+                        qrs.set(rBytes, curveSize - rBytes.length);
+                        qrs.set(sBytes, curveSize * 2 - sBytes.length);
+                        // report_data = last 64 bytes of body: [0..32] session nonce, [32..64] zero.
+                        const qReportDataHex = Array.from(qBody.slice(qBody.length - 64)).map(b => b.toString(16).padStart(2, '0')).join('');
+                        const qBindingOk = (qReportDataHex.slice(0, 64) === expectedNonce)
+                            && (qReportDataHex.slice(64) === '0'.repeat(64));
+                        if (!hw.pck_cert_pem) throw new Error('no PCK certificate in report — quote signature cannot be verified');
+                        const pckPems = hw.pck_cert_pem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
+                        if (!pckPems || !pckPems.length) throw new Error('pck_cert_pem contains no PEM certificate');
+                        const pckLeaf = x509ParseAny(pckPems[0], 'Intel PCK');
+                        const pckKey = await crypto.subtle.importKey('spki', pckLeaf.spkiDer, ecCurveParams(pckLeaf.spkiDer), false, ['verify']);
+                        // QGS signatures: SHA-384 on P-384; P-256 quotes are seen
+                        // with SHA-256 and (in older QGS) SHA-384 — try both.
+                        let qSigOk = await crypto.subtle.verify({ name: 'ECDSA', hash: qAttKeyType === 16 ? 'SHA-384' : 'SHA-256' }, pckKey, qrs, qBody);
+                        let usedHash = qAttKeyType === 16 ? 'SHA-384' : 'SHA-256';
+                        if (!qSigOk && qAttKeyType === 2) {
+                            qSigOk = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-384' }, pckKey, qrs, qBody);
+                            if (qSigOk) usedHash = 'SHA-384';
+                        }
+                        const pckForge = parseAnyCertToForge(pckPems[0], 'Intel PCK');
+                        const pckIssuer = pckForge.issuer.attributes.map(a => a.value).join(', ');
+                        const pckSubject = pckForge.subject.attributes.map(a => a.value).join(', ');
+                        const issuerIntelOk = /Intel/i.test(pckIssuer) && /PCK/i.test(pckIssuer);
+                        let pckChainOk = true; // leaf-only report: chain link unverifiable, issuer still enforced
+                        let chainLabel = 'leaf-only (no intermediate in report)';
+                        if (pckPems.length >= 2) {
+                            const pckCa = x509ParseAny(pckPems[1], 'Intel PCK CA');
+                            pckChainOk = await x509SignedBy(pckLeaf, pckCa);
+                            chainLabel = pckChainOk ? 'leaf→CA link verified' : 'leaf→CA link INVALID';
+                        }
+                        // MRTD = bytes 16..64 of the V4/V5 body; RTMR0..7 follow.
+                        const qMrtdHex = Array.from(qBody.slice(16, 64)).map(b => b.toString(16).padStart(2, '0')).join('');
+                        tdxVerified = qBindingOk && qSigOk && issuerIntelOk && pckChainOk;
+                        if (tdxVerified) {
+                            siliconMsg = `✅ <b>Intel TDX Silicon Root Verified</b><br>` +
+                                `🔏 Quoting Enclave ECDSA-${curveSize === 48 ? '384' : '256'}/SHA-${usedHash} signature over quote body valid<br>` +
+                                `⛓️ PCK leaf "${pckSubject}" issued by: ${pckIssuer} (${chainLabel})<br>` +
+                                `🔐 report_data[0..32] == this session's combined nonce, [32..64] zero — bound ✓<br>` +
+                                `📏 MRTD: ${qMrtdHex.substring(0, 32)}… (quote v${qVersion}, source: ${hw.tdx_evidence_source || 'unknown'})`;
+                        } else {
+                            siliconMsg = `❌ <b>Intel TDX quote present but verification FAILED</b> ` +
+                                `(binding=${qBindingOk}, sig=${qSigOk}, issuer_intel=${issuerIntelOk}, chain=${pckChainOk})<br>` +
+                                `⚠️ PCK issuer was: "${pckIssuer}" — do NOT trust this report.`;
+                        }
+                    } catch (err) {
+                        tdxVerified = false;
+                        siliconMsg = `❌ <b>Intel TDX verification error:</b> ${err.message}`;
+                    }
+                } else {
+                    // No signed quote. A TDREPORT is generated inside the TD and
+                    // is UNSIGNED; MRTD/RTMRs from sysfs are guest-internal.
+                    // Neither can anchor a silicon root — say so precisely
+                    // (honest verdict, no generic abort) and surface the
+                    // enclave's own probe transcript for diagnosis.
+                    const marker = hw.tdx_evidence_marker || {};
+                    const probe = hw.tdx_evidence_probe || {};
+                    const notes = Array.isArray(probe.notes) ? probe.notes.slice(0, 10) : [];
+                    siliconMsg = `❌ <b>No hardware-signed TDX evidence in this report.</b><br>` +
+                        `⚠️ A bare TDREPORT (1024 B) is generated inside the guest and is UNSIGNED; sysfs MRTD/RTMRs are guest-internal self-reports. Neither is a silicon root.<br>` +
+                        `ℹ️ Enclave marker: hardware_signed_tdx_quote=${marker.hardware_signed_tdx_quote ? 'true' : 'false'}, status=${marker.tdx_quote_status || 'n/a'}, source=${hw.tdx_evidence_source || 'none'}${marker.tdx_td_report_present ? ', td_report_present=true' : ''}.` +
+                        (notes.length ? `<br>ℹ️ Probe transcript:<br>ℹ️ ${notes.join('<br>ℹ️ ')}` : '');
+                }
+            }
+
             // v153 SECURITY (audit SEC-04): platform-enforced silicon root.
             // The old `googleVerified || snpVerified` OR allowed a report
             // CLAIMING OCI to satisfy the silicon check with a locally-made
@@ -1623,6 +1731,12 @@
                 }
             } else if (claimsGcp) {
                 siliconOk = googleVerified;
+            } else if (claimsTdx) {
+                // Intel TDX reports are ONLY trusted through the quote path.
+                siliconOk = tdxVerified;
+                if (!tdxVerified && siliconMsg.indexOf('❌') === -1) {
+                    siliconMsg += `<br>❌ <b>Intel TDX evidence did not verify</b> — a TDX report is only trusted when the Quoting Enclave's ECDSA signature, the PCK issuer chain, and the session-nonce binding all verify.`;
+                }
             } else {
                 siliconOk = false;
             }
@@ -1631,10 +1745,10 @@
             // shows WHICH sub-check failed (binding / sig / chain / ark pin).
             updateStatus('firmwareCheck', siliconOk, siliconMsg || (siliconOk
                 ? "✅ Silicon root verified"
-                : "❌ No AMD SNP or Google AK evidence present in report"));
+                : "❌ No AMD SNP, Google AK, or Intel TDX evidence present in report"));
 
             if (!siliconOk) {
-                throw new Error("CRITICAL: No valid Silicon Root of Trust (AMD or Google) found in report.");
+                throw new Error("CRITICAL: No valid Silicon Root of Trust (AMD, Google, or Intel TDX) found in report.");
             }
 
             // 6. TLS Binding
