@@ -500,16 +500,19 @@ const TDX_QUOTE_HDR_PREFIX: usize = 24;
 const TDX_QUOTE_HDR_DATA: usize = 4 * 4 * 1024; // ReqBufSize (16 KiB)
 const TDX_QUOTE_HDR_SIZE: usize = TDX_QUOTE_HDR_PREFIX + TDX_QUOTE_HDR_DATA;
 
-/// A real TDX Quote starts with: version u32 (2..=5), att_key_type u32,
-/// tee_type u32 == 0x00000081 (TDX). A TDREPORT is exactly 1024 bytes and
-/// starts with version byte 0x01 — the two are trivial to tell apart.
+/// A real TDX Quote starts with: version u16 (4 or 5), att_key_type u16
+/// (2 = ECDSA-256), tee_type u32 == 0x00000081 (TDX) — the Intel quote
+/// header layout (48 bytes). A TDREPORT is exactly 1024 bytes and starts
+/// with version byte 0x01 — the two are trivial to tell apart.
+/// (Offsets per Intel's quote ABI as implemented in go-tdx-guest/abi:
+///  version@0 u16, att_key_type@2 u16, tee_type@4 u32.)
 fn looks_like_tdx_quote(b: &[u8]) -> bool {
     if b.len() < 48 {
         return false;
     }
-    let version = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-    let tee_type = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
-    (2..=5).contains(&version) && tee_type == 0x81
+    let version = u16::from_le_bytes([b[0], b[1]]);
+    let tee_type = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+    (4..=5).contains(&version) && tee_type == 0x81
 }
 
 fn looks_like_td_report(b: &[u8]) -> bool {
@@ -651,8 +654,17 @@ fn device_quote(report_data: &[u8; 64], ev: &mut TdxEvidence) {
         }
     };
 
-    // (in_len, out_len) header conventions to try.
-    let variants: [(u32, u32); 3] = [(1024, 0), (1024, TDX_QUOTE_HDR_DATA as u32), (1024, 4608)];
+    // (version, in_len, out_len) header conventions to try — the driver/VMM
+    // fills most of the header, so which fields the guest must preset varies
+    // by kernel/QEMU; every combination is recorded in `notes`.
+    let variants: [(u64, u32, u32); 6] = [
+        (0, 1024, 0),
+        (0, 1024, TDX_QUOTE_HDR_DATA as u32),
+        (0, 1024, 4608),
+        (1, 1024, 0),
+        (1, 1024, TDX_QUOTE_HDR_DATA as u32),
+        (1, 1024, 4608),
+    ];
     for dev in TDX_DEVICES {
         if !std::path::Path::new(dev).exists() {
             continue;
@@ -665,8 +677,9 @@ fn device_quote(report_data: &[u8; 64], ev: &mut TdxEvidence) {
             }
         };
         let mut got_enotty = false;
-        for (in_len, out_len) in variants {
+        for (version, in_len, out_len) in variants {
             let mut hdr = vec![0u8; TDX_QUOTE_HDR_SIZE];
+            hdr[0..8].copy_from_slice(&version.to_le_bytes());
             hdr[16..20].copy_from_slice(&in_len.to_le_bytes());
             hdr[20..24].copy_from_slice(&out_len.to_le_bytes());
             hdr[TDX_QUOTE_HDR_PREFIX..TDX_QUOTE_HDR_PREFIX + 1024].copy_from_slice(&report);
