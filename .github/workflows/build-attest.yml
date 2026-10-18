@@ -38,7 +38,16 @@ jobs:
       - name: Build and extract artifacts
         if: matrix.platform != 'gcp' || github.ref == 'refs/heads/main'
         run: |
-          docker build --no-cache --load --target image-builder -f ${{ matrix.dockerfile }} -t paypal-auth-vm:${{ matrix.platform }} .
+          # Shared-runner registry pulls (dockerhub anonymous rate limits,
+          # snapshot.debian.org hiccups) are the only observed CI failure
+          # mode — the identical build+extract sequence passes locally, so
+          # retry the build once before failing the job.
+          for attempt in 1 2; do
+            if docker build --no-cache --load --target image-builder -f ${{ matrix.dockerfile }} -t paypal-auth-vm:${{ matrix.platform }} .; then
+              break
+            fi
+            [ "$attempt" = 1 ] && { echo "build attempt 1 failed — retrying once"; sleep 20; } || exit 1
+          done
           CONTAINER_ID=$(docker create paypal-auth-vm:${{ matrix.platform }})
           docker cp $CONTAINER_ID:/build/paypal-auth-vm-bin ./paypal-auth-vm-${{ matrix.platform }}.bin || docker cp $CONTAINER_ID:/paypal-auth-vm-bin ./paypal-auth-vm-${{ matrix.platform }}.bin
           docker cp $CONTAINER_ID:/build/output/vmlinuz ./vmlinuz-${{ matrix.platform }} || true
