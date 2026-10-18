@@ -57,7 +57,22 @@ mod enclave_init {
         
         #[cfg(feature = "alibabacloud")]
         {
-            // Keep TPM subsystem for Intel TDX but drop AMD-specific sev modules
+            // v131: the TDX evidence interfaces ship as loadable modules
+            // (CONFIG_TDX_GUEST_DRIVER=m, CONFIG_TSM_REPORTS=m) and were never
+            // loaded before — so /dev/tdx_guest and
+            // /sys/kernel/config/tsm/report were absent at runtime even though
+            // the Debian 6.12 cloud kernel supports both.
+            modprobe("tsm");
+            modprobe("tdx-guest");
+            modprobe("tdx_guest");
+            // Subsystems registered by freshly loaded modules appear on the
+            // already-mounted configfs; remount defensively (a duplicate mount
+            // failure is harmless and ignored here).
+            let _ = std::process::Command::new("/bin/mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
+            kmsg(&format!(
+                "TDX modules: {}",
+                super::intel_tdx::modules_matching(&["tdx", "report", "tsm"]).join(", ")
+            ));
         }
         
         #[cfg(not(feature = "alibabacloud"))]
@@ -260,7 +275,7 @@ mod enclave_init {
             if let Ok(output) = std::process::Command::new(path).args(["/lib/modules", "-name", "*.ko"]).output() {
                 let s = String::from_utf8_lossy(&output.stdout);
                 for line in s.lines() {
-                    if line.contains("tsm") || line.contains("sev") || line.contains("coco") || line.contains("anchor") || line.contains("virtio") || line.contains("gve") || line.contains("configfs") {
+                    if line.contains("tsm") || line.contains("sev") || line.contains("coco") || line.contains("anchor") || line.contains("virtio") || line.contains("gve") || line.contains("configfs") || line.contains("tdx") || line.contains("report") {
                         kmsg(&format!("insmod {}", line));
                         let _ = std::process::Command::new("/sbin/insmod").arg(line).status();
                     }
@@ -572,6 +587,58 @@ mod tpm {
         pub platform_type: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub td_info: Option<serde_json::Value>,
+        /// Honest provenance marker for `platform_type` — see `evidence_marker`.
+        pub tdx_evidence_marker: serde_json::Value,
+        /// v131: TDXMODULE-generated TDREPORT (1024 B, binds REPORTDATA = this
+        /// session nonce). NOT signed — corroborating context only.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tdx_td_report_b64: Option<String>,
+        /// v131: Intel-QE-signed TD Quote (ECDSA P-384 + PCK chain) when the
+        /// platform's quote path is available — the real silicon root.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tdx_quote_b64: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tdx_evidence_source: Option<String>,
+        /// Full probe transcript (sources, ioctl status codes, failures).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tdx_evidence_probe: Option<serde_json::Value>,
+    }
+
+    /// Threat-model honesty: `platform_type` is a *software probe result*
+    /// (kernel boot banner read from /dev/kmsg, plus sysfs node existence),
+    /// NOT attestation evidence. No TDX quote (TDCALL/MRTD+RTMR signature by
+    /// the Quote Enclave) is obtainable in this build — Alibaba exposes no
+    /// /dev/tdx-guest — and the sysfs TDINFO values are guest-internal and
+    /// unsigned. An auditor must never mistake the label for hardware proof,
+    /// so the report states its own epistemic status explicitly:
+    ///
+    ///   - `tpm_quote_present` is the ONLY hardware-signed evidence class in
+    ///     the report (PCR 0,4,8,9,15 signed by the session AK).
+    ///   - `hardware_signed_tdx_quote` is always false in this build; flip it
+    ///     only if a real TDCALL quote path is ever wired in.
+    ///   - `mrtd_rtmrs_source: "sysfs_unsigned"` marks MRTD/RTMRs as
+    ///     self-reported guest state, not silicon-signed measurements.
+    pub fn evidence_marker(
+        platform_type: &str,
+        tpm_quote_present: bool,
+        td_info_present: bool,
+        pck_cert_present: bool,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "platform_type": platform_type,
+            "platform_type_basis": "software_probe",
+            "platform_type_detail": "kernel boot banner (Memory Encryption Features active: Intel TDX) via /dev/kmsg + sysfs probe — software evidence only",
+            "hardware_signed_tdx_quote": false,
+            "tdx_quote_status": "unavailable_no_guest_device",
+            "mrtd_rtmrs_source": if td_info_present { "sysfs_unsigned" } else { "absent" },
+            "pck_cert_present": pck_cert_present,
+            "tpm_quote_present": tpm_quote_present,
+            "auditor_note": if tpm_quote_present {
+                "platform_type is a software probe, not attestation. The hardware-signed evidence in this report is the TPM quote (PCR 0,4,8,9,15 under the session AK); verify that first. TDX fields are corroborating context only."
+            } else {
+                "platform_type is a software probe, not attestation, and this report contains NO hardware-signed quote of any kind (TPM-less platform). Treat the entire report as software self-attestation."
+            },
+        })
     }
 
     pub mod snp {
@@ -637,11 +704,21 @@ mod tpm {
     }
 
     pub async fn run_cmd(cmd: &str, args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let output = Command::new(cmd)
+        // Bound every tpm2 invocation: a wedged TPM driver or a tool waiting on
+        // a missing TCTI must not hang the request task forever (previously an
+        // unbounded .output().await — one stuck tool froze the attestation
+        // handler and held a connection-semaphore permit until restart).
+        let fut = Command::new(cmd)
             .args(args)
             .env("TCTI", "device:/dev/tpmrm0")
             .env("TPM2TOOLS_TCTI", "device:/dev/tpmrm0")
-            .output().await?;
+            .kill_on_drop(true)
+            .output();
+        let output = match tokio::time::timeout(std::time::Duration::from_secs(20), fut).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => return Err(format!("{} failed to spawn: {}", cmd, e).into()),
+            Err(_) => return Err(format!("{} timed out after 20s (TPM/TCTI unresponsive)", cmd).into()),
+        };
         if !output.status.success() {
             return Err(format!("{} failed: {}", cmd, String::from_utf8_lossy(&output.stderr)).into());
         }
@@ -785,6 +862,50 @@ mod tpm {
         }
     }
 
+    /// v131: shared TDX silicon-evidence collection. Returns
+    /// (tdreport_b64, quote_b64, source, probe-transcript) and upgrades `marker`
+    /// ONLY when the corresponding hardware-signed evidence was really obtained.
+    fn collect_silicon_evidence_into(
+        nonce_hex: &str,
+        marker: &mut serde_json::Value,
+    ) -> (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<serde_json::Value>,
+    ) {
+        if !super::intel_tdx::is_intel_tdx_available() {
+            return (None, None, None, None);
+        }
+        let silicon = super::intel_tdx::collect_silicon_evidence(nonce_hex);
+        for note in silicon.notes.iter() {
+            tracing::info!("TDX silicon probe: {}", note);
+        }
+        let quote_present = silicon.quote_b64.is_some();
+        let report_present = silicon.td_report_b64.is_some();
+        if quote_present {
+            marker["hardware_signed_tdx_quote"] = serde_json::Value::Bool(true);
+            marker["tdx_quote_present"] = serde_json::Value::Bool(true);
+            marker["tdx_quote_source"] =
+                serde_json::json!(silicon.quote_source.clone().unwrap_or_default());
+            marker["auditor_note"] = serde_json::json!(
+                "platform_type is a software probe. This report DOES contain hardware-signed evidence: an Intel TDX TD Quote (Quoting Enclave ECDSA P-384 signature, embedded PCK certificate chain) with REPORTDATA bound to this session nonce. Verify the quote signature, the PCK -> Intel root chain, and the report_data binding."
+            );
+        } else if report_present {
+            marker["tdx_td_report_present"] = serde_json::Value::Bool(true);
+            marker["tdx_td_report_source"] =
+                serde_json::json!(silicon.td_report_source.clone().unwrap_or_default());
+            // No quote => evidence_marker's honest TPM-less auditor_note stands
+            // (a bare TDREPORT is UNSIGNED and remote-unverifiable).
+        }
+        let probe = serde_json::to_value(&silicon).unwrap_or_default();
+        let source = silicon
+            .quote_source
+            .clone()
+            .or(silicon.td_report_source.clone());
+        (silicon.td_report_b64, silicon.quote_b64, source, Some(probe))
+    }
+
     /// TPM-less platform report: Alibaba Cloud Intel TDX provides no
     /// /dev/tpmrm0, so there is no AK and no TPM quote — the TPM evidence
     /// fields serialize empty (the auditor's documented "TPM-less platform"
@@ -792,6 +913,9 @@ mod tpm {
     /// carries the hardware claim instead.
     pub fn tpm_less_tdx_report(nonce_hex: &str) -> AttestationResult {
         let (pck_cert_pem, tdx_policy, platform_type, td_info) = collect_tdx_fields();
+        let mut marker = evidence_marker(&platform_type, false, td_info.is_some(), pck_cert_pem.is_some());
+        let (tdx_td_report_b64, tdx_quote_b64, tdx_evidence_source, tdx_evidence_probe) =
+            collect_silicon_evidence_into(nonce_hex, &mut marker);
         AttestationResult {
             tpm_quote_msg: String::new(),
             tpm_quote_sig: String::new(),
@@ -811,6 +935,11 @@ mod tpm {
             tdx_policy,
             platform_type,
             td_info,
+            tdx_evidence_marker: marker,
+            tdx_td_report_b64,
+            tdx_quote_b64,
+            tdx_evidence_source,
+            tdx_evidence_probe,
         }
     }
 
@@ -1191,6 +1320,14 @@ mod tpm {
 
         // Collect Intel TDX-specific data when available
         let (pck_cert_pem, tdx_policy, platform_type, td_info_json) = collect_tdx_fields();
+        let mut marker = evidence_marker(
+            &platform_type,
+            true, // this path produced a real TPM quote (hardware-signed)
+            td_info_json.is_some(),
+            pck_cert_pem.is_some(),
+        );
+        let (tdx_td_report_b64, tdx_quote_b64, tdx_evidence_source, tdx_evidence_probe) =
+            collect_silicon_evidence_into(nonce_hex, &mut marker);
 
         Ok(AttestationResult {
             tpm_quote_msg: STANDARD.encode(msg),
@@ -1211,6 +1348,11 @@ mod tpm {
             tdx_policy,
             platform_type,
             td_info: td_info_json,
+            tdx_evidence_marker: marker,
+            tdx_td_report_b64,
+            tdx_quote_b64,
+            tdx_evidence_source,
+            tdx_evidence_probe,
         })
     }
 }
@@ -1252,6 +1394,10 @@ const GLOBAL_EGRESS_BYTES_PER_HOUR: u64 = 512 * 1024 * 1024; // 512 MB
 const IP_EGRESS_BYTES_PER_HOUR: u64 = 25 * 1024 * 1024;     // 25 MB
 const GOOGLE_PUBLIC_CA_DIRECTORY: &str = "https://dv.acme-v02.api.pki.goog/directory";
 const LETSENCRYPT_CA_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
+// ZeroSSL (EAB-enabled) — the Alibaba build's ACME CA. Google Public CA's
+// China coverage and LE's rate limits both burned us; ZeroSSL takes the new
+// EAB creds provisioned in the deploy config.
+const ZEROSSL_CA_DIRECTORY: &str = "https://acme.zerossl.com/v2/DV90";
 
 const PAYPAL_PRODUCTION_API: &str = "https://api-m.paypal.com";
 const PAYPAL_SANDBOX_API: &str = "https://api-m.sandbox.paypal.com";
@@ -1297,6 +1443,146 @@ const HTML_TEMPLATE: &str = r#"
 
 // Legal policies migrated to GitHub Pages
 
+/// Run a synchronous subprocess with a hard wall-clock timeout.
+///
+/// `std::process::Child::wait` has no deadline of its own, so a hung child
+/// (wedged TPM device, blocked kernel log, full pipe) would otherwise park the
+/// calling thread forever — in an async handler that stalls a tokio worker.
+/// On timeout the child is SIGKILLed and `None` is returned.
+pub fn cmd_output_timeout(
+    cmd: &str,
+    args: &[&str],
+    envs: &[(String, String)],
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    let mut command = Command::new(cmd);
+    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    for (k, v) in envs {
+        command.env(k, v);
+    }
+    let mut child = command.spawn().ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None; // timed out — never leave a zombie or a stuck thread
+            }
+        }
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut so) = child.stdout.take() { let _ = so.read_to_end(&mut stdout); }
+    if let Some(mut se) = child.stderr.take() { let _ = se.read_to_end(&mut stderr); }
+    let _ = child.wait();
+    Some(std::process::Output { status, stdout, stderr })
+}
+
+// ============================================================================
+// NON-BLOCKING LOG SINK — tracing must never write to the serial console tty
+// ============================================================================
+//
+// tracing_subscriber's default writer is stderr, which on this image is the
+// serial console. A busy/slow UART (or one with flow control stalled) blocks
+// the writing thread — i.e. a runtime worker or PID 1 — and the process stops
+// serving TLS while the kernel console drains. That failure class is exactly
+// "TCP 443 accepts, no TLS". All runtime logging instead goes to /dev/kmsg
+// opened O_NONBLOCK: the kernel ring buffer absorbs it asynchronously (printk
+// echoes to the console via irq-work, not from our write path), and backpressure
+// (ENOSPC/EAGAIN) drops the line instead of stalling the worker.
+mod kmsg_log {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::OnceLock;
+
+    fn kmsg_fd() -> Option<&'static std::fs::File> {
+        static FD: OnceLock<Option<std::fs::File>> = OnceLock::new();
+        FD.get_or_init(|| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open("/dev/kmsg")
+                .ok()
+        })
+        .as_ref()
+    }
+
+    /// Write one line to the kernel log, never blocking. A line the ring
+    /// buffer can't take right now is dropped — losing a log beats wedging
+    /// the enclave. Embedded newlines are flattened: /dev/kmsg rejects
+    /// multi-line writes.
+    pub fn line(msg: &str) {
+        let Some(fd) = kmsg_fd() else { return };
+        let flat = msg.replace('\n', " | ");
+        // <6> = KERN_INFO. Console echo is chosen by the kernel's console
+        // loglevel, not by this write, so this cannot block on the UART.
+        let mut buf = format!("<6>[paypal-auth] {}\n", flat);
+        let _ = (&*fd).write(buf.as_bytes());
+        buf.clear();
+    }
+
+    pub fn critical(msg: &str) {
+        let Some(fd) = kmsg_fd() else { return };
+        let flat = msg.replace('\n', " | ");
+        let buf = format!("<2>[paypal-auth] CRITICAL: {}\n", flat);
+        let _ = (&*fd).write(buf.as_bytes());
+    }
+
+    /// tracing_subscriber writer: accumulates one event, flushes to kmsg on
+    /// completion (and on Drop), never touching the console tty.
+    pub struct KmsgLineWriter {
+        buf: Vec<u8>,
+    }
+
+    impl Write for KmsgLineWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.buf.extend_from_slice(data);
+            if self.buf.last() == Some(&b'\n') {
+                self.flush_line();
+            }
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flush_line();
+            Ok(())
+        }
+    }
+
+    impl Drop for KmsgLineWriter {
+        fn drop(&mut self) {
+            self.flush_line();
+        }
+    }
+
+    impl KmsgLineWriter {
+        fn flush_line(&mut self) {
+            if self.buf.is_empty() {
+                return;
+            }
+            let text = String::from_utf8_lossy(&self.buf).trim_end_matches('\n').to_string();
+            self.buf.clear();
+            line(&text);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct KmsgMakeWriter;
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for KmsgMakeWriter {
+        type Writer = KmsgLineWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            KmsgLineWriter { buf: Vec::with_capacity(256) }
+        }
+    }
+}
+
 // ============================================================================
 // CONFIG (single JSON secret)
 // ============================================================================
@@ -1323,11 +1609,15 @@ struct Config {
     /// challenge file). DNS-01 touches only port 443, which is unaffected.
     #[serde(default)]
     dns_provider: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "dns01_secret")]
     dns_api_token: Option<String>,
     /// Zone holding the challenge record; defaults to the parent of `domain`
-    /// (login.airma.de -> airma.de).
-    #[serde(default)]
+    /// (login.airma.de -> airma.de). Accepts a raw 32-hex Cloudflare zone ID.
+    /// The deploy config ships these as `dns01` (zone) / `dns01_secret`
+    /// (token) — both spellings deserialize, so a config with either name
+    /// still gets DNS-01 (an unrecognized name silently falls back to
+    /// HTTP-01, which the mainland-China carrier intercepts).
+    #[serde(default, alias = "dns01")]
     dns_zone: Option<String>,
     #[allow(dead_code)]  // Used in GCP builds for ACME account persistence
     acme_account_json: Option<String>,
@@ -1484,6 +1774,44 @@ struct PayPalUserInfo {
     account_type: Option<String>,
     age_range: Option<String>,
     payer_id: Option<String>,
+}
+
+impl PayPalUserInfo {
+    /// v130 PRIVACY: Verified-flow projection. The restricted "Verified
+    /// Candidate" login attests ONLY whether the account is PayPal-verified.
+    /// Every personal field (name, email, address, payer_id, picture, …) is
+    /// dropped here — *before* the identity hash of the report is computed —
+    /// so neither the signed payload nor the success page ever sees profile
+    /// data in that flow.
+    fn verified_only(&self) -> Self {
+        PayPalUserInfo {
+            user_id: String::new(),
+            sub: None,
+            name: None,
+            given_name: None,
+            family_name: None,
+            middle_name: None,
+            nickname: None,
+            preferred_username: None,
+            profile: None,
+            picture: None,
+            website: None,
+            email: None,
+            emails: None,
+            email_verified: None,
+            gender: None,
+            birthdate: None,
+            zoneinfo: None,
+            locale: None,
+            phone_number: None,
+            address: None,
+            verified_account: self.verified_account.clone(),
+            verified: self.verified.clone(),
+            account_type: None,
+            age_range: None,
+            payer_id: None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1779,12 +2107,13 @@ impl GooglePublicCaManager {
     fn acme_directory(&self) -> &str {
         #[cfg(feature = "alibabacloud")]
         {
-            // Same policy as the OCI build (origin/main): Google Public CA when EAB
-            // credentials are provisioned in the instance config — the CA the GCP and
-            // OCI fleets use, which avoids Let's Encrypt's per-week rate limits, which
-            // the boot-time re-issuance cycle burns through — falling back to
-            // Let's Encrypt (no EAB required) when they are absent.
-            if self.has_eab() { GOOGLE_PUBLIC_CA_DIRECTORY } else { LETSENCRYPT_CA_DIRECTORY }
+            // ZeroSSL whenever EAB credentials are provisioned: the instance
+            // config's EAB pair is ZeroSSL's (Google Public CA EAB is only used
+            // by the GCP fleet), and ZeroSSL doesn't sit on Let's Encrypt's
+            // 5-certificates-per-exact-set-per-week budget that the boot-time
+            // re-issuance cycle burns through on a spot instance. Absent EAB,
+            // fall back to Let's Encrypt (no EAB required).
+            if self.has_eab() { ZEROSSL_CA_DIRECTORY } else { LETSENCRYPT_CA_DIRECTORY }
         }
         #[cfg(not(feature = "alibabacloud"))]
         {
@@ -1990,12 +2319,23 @@ impl GooglePublicCaManager {
             info!("Creating new ACME account with EAB Key ID: {}...", &kid[..8.min(kid.len())]);
             let hmac_str = self.eab_hmac_key.as_ref().ok_or("Missing EAB HMAC key")?;
 
-            use base64::{engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-            let hmac_bytes = if hmac_str.contains('-') || hmac_str.contains('_') {
-                URL_SAFE_NO_PAD.decode(hmac_str.trim()).map_err(|e| format!("EAB HMAC URL-Safe decode failed: {}", e))?
-            } else {
-                STANDARD.decode(hmac_str.trim()).map_err(|e| format!("EAB HMAC Standard decode failed: {}", e))?
+            use base64::{
+                engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+                Engine as _,
             };
+            // Try every common base64 flavor rather than sniffing '-'/ '_' —
+            // a ZeroSSL/Google EAB HMAC can be padded or unpadded, url-safe or
+            // standard, and guessing by character class fails on keys that
+            // happen to contain a '-' in the standard alphabet's view.
+            let trimmed = hmac_str.trim();
+            let hmac_bytes = [URL_SAFE_NO_PAD, URL_SAFE, STANDARD, STANDARD_NO_PAD]
+                .iter()
+                .find_map(|eng| eng.decode(trimmed).ok())
+                .ok_or_else(|| {
+                    format!(
+                        "EAB HMAC decode failed: not valid in url-safe (pad/no-pad) or standard (pad/no-pad) base64"
+                    )
+                })?;
             let hmac_pkey = openssl::pkey::PKey::hmac(&hmac_bytes)?;
 
             let dir = DirectoryBuilder::new(acme_url.to_string()).build().await?;
@@ -2223,18 +2563,21 @@ impl GooglePublicCaManager {
 // ATTESTATION
 // ============================================================================
 
-fn sign_payload(payload: &str, private_key_pem: &str) -> String {
+fn sign_payload(payload: &str, private_key_pem: &str) -> Option<String> {
     use openssl::pkey::PKey;
     use openssl::sign::Signer;
     use openssl::hash::MessageDigest;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
 
-    let pkey = PKey::private_key_from_pem(private_key_pem.as_bytes()).expect("Invalid private key");
-    let mut signer = Signer::new(MessageDigest::sha256(), &pkey).expect("Failed to create signer");
-    signer.update(payload.as_bytes()).expect("Failed to update signer");
-    let signature = signer.sign_to_vec().expect("Failed to sign");
-    STANDARD.encode(signature)
+    // Never panic on the request path: an invalid/garbage key from config
+    // previously hit `.expect()` here, and with panic = "abort" that took
+    // down PID 1 (the whole enclave) in the middle of a user's /generate.
+    let pkey = PKey::private_key_from_pem(private_key_pem.as_bytes()).ok()?;
+    let mut signer = Signer::new(MessageDigest::sha256(), &pkey).ok()?;
+    signer.update(payload.as_bytes()).ok()?;
+    let signature = signer.sign_to_vec().ok()?;
+    Some(STANDARD.encode(signature))
 }
 
 fn extract_pub_key(private_key_pem: &str) -> String {
@@ -2367,7 +2710,13 @@ async fn generate_attestation(
     
     // 6. Sign everything using the enclave-bound asymmetric key
     let signature = if let Some(key) = &state.attestation_signing_key {
-        sign_payload(&payload_compact, key)
+        match sign_payload(&payload_compact, key) {
+            Some(sig) => sig,
+            None => {
+                error!("Attestation signing key is unusable — refusing to emit an unsigned report");
+                return "ERROR: enclave signing key rejected by OpenSSL; report NOT issued".to_string();
+            }
+        }
     } else {
         "UNSIGNED_KEY_MISSING".to_string()
     };
@@ -2570,8 +2919,22 @@ async fn debug_attestation() -> impl IntoResponse {
     results.insert("tsm_loaded".to_string(), serde_json::Value::Bool(std::path::Path::new("/sys/kernel/config/tsm").exists()));
     results.insert("amd_tsm_loaded".to_string(), serde_json::Value::Bool(std::path::Path::new("/sys/bus/platform/drivers/amd_tsm").exists() || std::path::Path::new("/sys/bus/platform/drivers/amd-tsm").exists()));
     results.insert("sev_guest_device".to_string(), serde_json::Value::Bool(std::path::Path::new("/dev/sev-guest").exists()));
+    results.insert("tsm_report_dir".to_string(), serde_json::Value::Bool(std::path::Path::new("/sys/kernel/config/tsm/report").exists()));
+    results.insert("tdx_guest_dev".to_string(), serde_json::Value::Bool(crate::intel_tdx::has_tdx_guest_device()));
+    results.insert("tdx_modules".to_string(), serde_json::json!(crate::intel_tdx::modules_matching(&["tdx", "report", "tsm"])));
+    results.insert("virtio_ports".to_string(), serde_json::json!(
+        std::fs::read_dir("/dev/virtio-ports")
+            .map(|rd| rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>())
+            .unwrap_or_default()
+    ));
+    let silicon_probe = crate::intel_tdx::collect_silicon_evidence(
+        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    );
+    results.insert("tdx_silicon_evidence".to_string(), serde_json::to_value(&silicon_probe).unwrap_or_default());
     
-    if let Ok(output) = std::process::Command::new("dmesg").output() {
+    if let Some(output) = crate::cmd_output_timeout("dmesg", &[], &[], std::time::Duration::from_secs(5)) {
         let s = String::from_utf8_lossy(&output.stdout);
         let sev_logs: Vec<String> = s.lines()
             .filter(|l| l.contains("SEV") || l.contains("SNP") || l.contains("tsm") || l.contains("coco") || l.contains("guest"))
@@ -2617,12 +2980,23 @@ async fn callback(
 
     // v74-PROD: Strict verified_account check to prevent resource spend on unverified profiles
     if userinfo.verified_account.as_deref() != Some("true") {
-        warn!("Blocked attestation for unverified PayPal account: {:?}", userinfo.payer_id);
+        // v130: no payer_id in the log either — the verified flow must not
+        // retain account identifiers at all.
+        warn!("Blocked attestation for unverified PayPal account (flow={})", config.label);
         return (
             StatusCode::FORBIDDEN,
             "Verification Failed: Your PayPal account must be fully verified to obtain a hardware-attested report."
         ).into_response();
     }
+
+    // v130 PRIVACY: the Verified flow attests only the verification verdict.
+    // The full profile is projected down before it is hashed, stored, or
+    // rendered; the Full Data flow keeps the complete userinfo unchanged.
+    let userinfo = if config.label == "verified" {
+        userinfo.verified_only()
+    } else {
+        userinfo
+    };
 
     // v116-PROD: Multi-step attestation feature mapping PayPal profile to custom nonce before generation.
     use rand::Rng;
@@ -2634,14 +3008,28 @@ async fn callback(
 
     state.pending_attestations.write().insert(session_id.clone(), (config.label.clone(), userinfo.clone(), Instant::now()));
 
+    // v130 PRIVACY: honest copy per flow — the verified flow never asked for
+    // profile data, so it must not claim that a "profile" was secured.
+    let (intro_heading, intro_body) = if config.label == "verified" {
+        (
+            "PayPal Verification Confirmed".to_string(),
+            "Your account is <strong>PayPal-verified</strong>. No name, email or other personal data was requested in this flow — only the verification verdict will be attested. You may now generate your one-time Hardware Attestation Certificate.".to_string(),
+        )
+    } else {
+        (
+            "Verified PayPal Profile Linked".to_string(),
+            "Your PayPal identity has been successfully secured in RAM. You may now generate your one-time Hardware Attestation Certificate.".to_string(),
+        )
+    };
+
     let html = HTML_TEMPLATE.replace(
         "{{CONTENT}}",
         &format!(
             r#"
         <h1>Authentication Successful</h1>
         <div class="info">
-            <h3>Verified PayPal Profile Linked</h3>
-            <p>Your PayPal identity has been successfully secured in RAM. You may now generate your one-time Hardware Attestation Certificate.</p>
+            <h3>{}</h3>
+            <p>{}</p>
         </div>
         <div class="info" style="border-color: #2196f3;">
             <h3>Optional: Attach Custom Data</h3>
@@ -2653,6 +3041,8 @@ async fn callback(
             </form>
         </div>
         "#,
+            intro_heading,
+            intro_body,
             session_id
         ),
     );
@@ -2692,8 +3082,22 @@ async fn generate_cert(
         Some(form.custom_info.clone())
     };
 
-    let attestation = generate_attestation(&state, label, userinfo.clone(), custom_info).await;
+    let attestation = generate_attestation(&state, label.clone(), userinfo.clone(), custom_info).await;
     let userinfo_full_json = serde_json::to_string_pretty(&userinfo).unwrap();
+
+    // v130 PRIVACY: only the Full Data flow may print profile fields. The
+    // verified flow renders the verdict — nothing else was ever stored.
+    let (profile_heading, profile_body) = if label == "verified" {
+        (
+            "PayPal Verification Status".to_string(),
+            "verified_account: true\n\nNo name, email, payer_id or any other personal data was requested, stored, or attested in this flow — only the verification verdict is bound into the report below.".to_string(),
+        )
+    } else {
+        (
+            "Verified PayPal User Profile".to_string(),
+            userinfo_full_json,
+        )
+    };
 
     let html = HTML_TEMPLATE.replace(
         "{{CONTENT}}",
@@ -2701,7 +3105,7 @@ async fn generate_cert(
             r#"
         <h1>Attestation Complete</h1>
         <div class="info">
-            <h3>Verified PayPal User Profile</h3>
+            <h3>{}</h3>
             <pre>{}</pre>
         </div>
         <div class="attestation">
@@ -2747,7 +3151,8 @@ async fn generate_cert(
             }}
         </script>
         "#,
-            html_escape::encode_text(&userinfo_full_json),
+            html_escape::encode_text(&profile_heading),
+            html_escape::encode_text(&profile_body),
             if state.staging { "Confidential Sandbox" } else { "Confidential Production" },
             html_escape::encode_text(&attestation),
         ),
@@ -2915,11 +3320,16 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
     std::io::stderr().flush()?;
     std::io::stdout().flush()?;
 
+    // Log to /dev/kmsg (O_NONBLOCK), never the serial console tty: a stalled
+    // UART write used to park runtime workers mid-request ("TCP 443 accepts,
+    // no TLS"). See mod kmsg_log.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_writer(kmsg_log::KmsgMakeWriter)
+        .with_ansi(false)
         .init();
 
     eprintln!("[DEBUG] tracing initialized");
@@ -3151,7 +3561,14 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
                 let svc = hyper::service::service_fn(move |mut req| {
                     let router = router.clone();
                     req.extensions_mut().insert(axum::extract::ConnectInfo(addr));
-                    async move { Ok::<_, std::convert::Infallible>(router.oneshot(req).await.unwrap()) }
+                    async move {
+                        // Infallible error type: unwrap can never fire, but the
+                        // explicit match documents the contract and guarantees
+                        // the closure itself holds no panic path.
+                        Ok::<_, std::convert::Infallible>(
+                            router.oneshot(req).await.unwrap_or_else(|never| match never {}),
+                        )
+                    }
                 });
                 let _ = hyper_util::server::conn::auto::Builder::new(
                     hyper_util::rt::TokioExecutor::new(),
@@ -3278,25 +3695,137 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
                         return;
                     }
                 };
-                if let Err(e) = std::pin::Pin::new(&mut tls_stream).accept().await {
-                    error!("TLS handshake failed: {}", e);
-                    return;
+                // Handshake deadline: a slowloris client that opens TCP and
+                // trickles (or stops sending) ClientHello bytes would hold this
+                // task and its semaphore permit forever — 50 such connections
+                // permanently wedge TLS for everyone (the "TCP 443 accepts, no
+                // TLS" failure mode). 10s is generous; a real handshake on the
+                // same continent finishes in <1s.
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    std::pin::Pin::new(&mut tls_stream).accept(),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        error!("TLS handshake failed: {}", e);
+                        return;
+                    }
+                    Err(_) => {
+                        warn!("TLS handshake timed out after 10s — dropping slow client");
+                        return;
+                    }
                 }
                 let io = hyper_util::rt::TokioIo::new(tls_stream);
                 let svc = hyper::service::service_fn(move |mut req| {
                     let app = app.clone();
                     req.extensions_mut().insert(axum::extract::ConnectInfo(addr));
-                    async move { Ok::<_, std::convert::Infallible>(app.oneshot(req).await.unwrap()) }
+                    async move {
+                        // Infallible error type: unwrap can never fire, but the
+                        // explicit match documents the contract and guarantees
+                        // the closure itself holds no panic path.
+                        Ok::<_, std::convert::Infallible>(
+                            app.oneshot(req).await.unwrap_or_else(|never| match never {}),
+                        )
+                    }
                 });
-                let _ = hyper_util::server::conn::auto::Builder::new(
-                    hyper_util::rt::TokioExecutor::new(),
+                // Whole-connection deadline so a stuck keep-alive or mid-body
+                // stall can never pin a semaphore permit; permits are the
+                // enclave's only backpressure valve.
+                if let Err(e) = tokio::time::timeout(
+                    Duration::from_secs(120),
+                    hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc),
                 )
-                .serve_connection(io, svc)
-                .await;
+                .await
+                {
+                    // Only the Elapsed arm reaches here; the inner
+                    // serve_connection result is handled by hyper itself.
+                    warn!("HTTPS connection hit 120s cap ({}); closing", e);
+                }
             });
         }
     });
     eprintln!("[DEBUG] HTTPS server spawned");
+
+    // ------------------------------------------------------------------
+    // WATCHDOG: self-heal the two failure classes that require a human today
+    //   (a) semaphore exhaustion (permits pinned by stuck connections),
+    //   (b) TLS acceptor lost/corrupt (accept loop serves nothing).
+    // Runs entirely off /dev/kmsg, so its diagnostics are visible on the
+    // serial console even though the logging path itself never blocks on it.
+    // ------------------------------------------------------------------
+    {
+        let state_wd = state.clone();
+        let tls_holder_wd = tls_holder.clone();
+        let https_ready_wd = https_ready.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            let mut exhausted_streak: u32 = 0;
+            loop {
+                tick.tick().await;
+
+                // (b) TLS acceptor self-heal: if we are past certificate
+                // acquisition but the holder is empty (lock poison or a bug
+                // swapped in None), rebuild from the on-disk PEMs that
+                // load_tls_config() already wrote — no ACME round-trip, no
+                // restart, seconds of downtime instead of a redeploy.
+                if https_ready_wd.load(Ordering::Relaxed)
+                    && tls_holder_wd.read().map(|g| g.is_none()).unwrap_or(true)
+                {
+                    kmsg_log::critical("watchdog: TLS acceptor missing while serving — rebuilding from disk");
+                    match (std::fs::read("/tmp/tls-cert.pem"), std::fs::read("/tmp/tls-key.pem")) {
+                        (Ok(cert), Ok(key)) => match load_tls_config(&cert, &key).await {
+                            Ok(cfg) => {
+                                if let Ok(mut g) = tls_holder_wd.write() {
+                                    *g = Some(cfg);
+                                }
+                                kmsg_log::critical("watchdog: TLS acceptor RESTORED from disk");
+                            }
+                            Err(e) => kmsg_log::critical(&format!("watchdog: TLS rebuild failed: {}", e)),
+                        },
+                        _ => kmsg_log::critical("watchdog: no on-disk PEMs to rebuild TLS from"),
+                    }
+                }
+
+                // (a) Semaphore starvation detection + slow drain. We cannot
+                // force-drop foreign tasks, but a sustained zero-permit state
+                // with the server "ready" means clients are being refused at
+                // accept; log it loudly and lower the blast radius by logging
+                // the live connection count for the operator.
+                let available = state_wd.connection_semaphore.available_permits();
+                if https_ready_wd.load(Ordering::Relaxed) && available == 0 {
+                    exhausted_streak += 1;
+                    kmsg_log::critical(&format!(
+                        "watchdog: 0/{} connection permits available (streak {}s) — server may be refusing connections",
+                        MAX_CONCURRENT_CONNECTIONS,
+                        exhausted_streak * 30
+                    ));
+                } else {
+                    if exhausted_streak > 0 {
+                        kmsg_log::line(&format!(
+                            "watchdog: connection pool recovered ({}/{} available)",
+                            available, MAX_CONCURRENT_CONNECTIONS
+                        ));
+                    }
+                    exhausted_streak = 0;
+                }
+
+                // Liveness heartbeat: presence in kmsg proves the runtime is
+                // scheduling; absence of this line in the next 30s of console
+                // output is itself the diagnosis (frozen runtime / blocked
+                // worker pool — the old serial-tty logging bug).
+                kmsg_log::line(&format!(
+                    "watchdog: ok, {} permits free, https_ready={}",
+                    available,
+                    https_ready_wd.load(Ordering::Relaxed)
+                ));
+            }
+        });
+    }
 
     // Certificate renewal: only re-issuance when the served certificate is close
     // to expiry, and apply it live. The old loop re-issued every 12h unconditionally
