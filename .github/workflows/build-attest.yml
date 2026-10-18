@@ -38,14 +38,19 @@ jobs:
       - name: Build and extract artifacts
         if: matrix.platform != 'gcp' || github.ref == 'refs/heads/main'
         run: |
+          set -o pipefail
           # Shared-runner registry pulls (dockerhub anonymous rate limits,
           # snapshot.debian.org hiccups) are the only observed CI failure
           # mode — the identical build+extract sequence passes locally, so
-          # retry the build once before failing the job.
+          # retry the build once before failing the job. The tail of each
+          # failed attempt is surfaced as a job annotation (publicly
+          # readable via the check-run annotations API) because raw job
+          # logs require repo-admin access.
           for attempt in 1 2; do
-            if docker build --no-cache --load --target image-builder -f ${{ matrix.dockerfile }} -t paypal-auth-vm:${{ matrix.platform }} .; then
+            if docker build --no-cache --load --target image-builder -f ${{ matrix.dockerfile }} -t paypal-auth-vm:${{ matrix.platform }} . 2>&1 | tee /tmp/docker-build.log; then
               break
             fi
+            echo "::error title=docker build failed (attempt $attempt)::$(tail -c 1800 /tmp/docker-build.log | tr '\n' '|' )"
             [ "$attempt" = 1 ] && { echo "build attempt 1 failed — retrying once"; sleep 20; } || exit 1
           done
           CONTAINER_ID=$(docker create paypal-auth-vm:${{ matrix.platform }})
