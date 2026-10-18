@@ -889,7 +889,7 @@ mod tpm {
             marker["tdx_quote_source"] =
                 serde_json::json!(silicon.quote_source.clone().unwrap_or_default());
             marker["auditor_note"] = serde_json::json!(
-                "platform_type is a software probe. This report DOES contain hardware-signed evidence: an Intel TDX TD Quote (Quoting Enclave ECDSA P-384 signature, embedded PCK certificate chain) with REPORTDATA bound to this session nonce. Verify the quote signature, the PCK -> Intel root chain, and the report_data binding."
+                "platform_type is a software probe. This report DOES contain hardware-signed evidence: an Intel TDX TD Quote (Quoting Enclave ECDSA P-256 attestation key, embedded PCK certificate chain) with REPORTDATA bound to this session nonce. Verify the quote signature, the attestation-key -> QE-report -> PCK binding, the PCK -> Intel SGX Root CA chain, and the report_data session binding."
             );
         } else if report_present {
             marker["tdx_td_report_present"] = serde_json::Value::Bool(true);
@@ -2888,11 +2888,18 @@ async fn login(
     
     let auth_base = if state.staging { PAYPAL_SANDBOX_AUTH } else { PAYPAL_PRODUCTION_AUTH };
 
+    // v164 (live E2E fix): `config.scope` is stored ALREADY percent-encoded
+    // (see FlowConfig construction — the same strings are compared verbatim
+    // against verify.html's EXPECTED_APPS and inserted as-is by the browser
+    // pre-flight). Re-encoding here turned every %20/%3A into %2520/%253A:
+    // the verified flow survived (single token, PayPal decodes tokens
+    // individually) but the full flow collapsed into ONE invalid scope token
+    // and PayPal rejected the authorize request with "(invalid scope)".
     let url = format!(
         "{}?client_id={}&response_type=code&scope={}&redirect_uri={}&state={}",
         auth_base,
         config.client_id,
-        urlencoding::encode(&config.scope),
+        config.scope, // already query-encoded — do NOT encode again
         urlencoding::encode(&state.redirect_uri),
         config.label
     );

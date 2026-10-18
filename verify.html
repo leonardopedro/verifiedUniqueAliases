@@ -553,6 +553,42 @@
         pcr_8: null, // kernel cmdline
         pcr_9: null, // kernel + initramfs payload
     };
+    // ========================================================================
+    // Intel SGX trust anchors for the TDX path (Alibaba ECS). Same discipline
+    // as GOLDEN_PCRS and TRUSTED_AMD_ARKS: a PCK issuer *regex* is spoofable
+    // (anyone can mint a CA called "Intel SGX PCK …"), so the chain MUST
+    // terminate in a root whose DER sha256 is pinned here AND whose PEM (the
+    // cert the walk appends when the quote's chain stops short) is the very
+    // same certificate:
+    //   https://certificates.trustedservices.intel.com/Intel_SGX_Provisioning_Certification_RootCA.cer
+    // SHA-256 corroborated against Intel's dcap-qvl reference crate (which
+    // bundles the same DER) and independent published verifiers.
+    // `var` — like GOLDEN_PCRS — so the offline harness can substitute its
+    // synthetic root for positive-path fixtures; scripts/test-verify-security.mjs
+    // asserts the DEFAULT entry (pem sha256 == pinned sha256 == Intel root)
+    // and must fail if it ever drifts.
+    // ========================================================================
+    var TRUSTED_INTEL_ROOTS = [{
+        sha256: '44a0196b2b99f889b8e149e95b807a350e7424964399e885a7cbb8ccfab674d3',
+        pem: [
+            '-----BEGIN CERTIFICATE-----',
+            'MIICjzCCAjSgAwIBAgIUImUM1lqdNInzg7SVUr9QGzknBqwwCgYIKoZIzj0EAwIw',
+            'aDEaMBgGA1UEAwwRSW50ZWwgU0dYIFJvb3QgQ0ExGjAYBgNVBAoMEUludGVsIENv',
+            'cnBvcmF0aW9uMRQwEgYDVQQHDAtTYW50YSBDbGFyYTELMAkGA1UECAwCQ0ExCzAJ',
+            'BgNVBAYTAlVTMB4XDTE4MDUyMTEwNDUxMFoXDTQ5MTIzMTIzNTk1OVowaDEaMBgG',
+            'A1UEAwwRSW50ZWwgU0dYIFJvb3QgQ0ExGjAYBgNVBAoMEUludGVsIENvcnBvcmF0',
+            'aW9uMRQwEgYDVQQHDAtTYW50YSBDbGFyYTELMAkGA1UECAwCQ0ExCzAJBgNVBAYT',
+            'AlVTMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEC6nEwMDIYZOj/iPWsCzaEKi7',
+            '1OiOSLRFhWGjbnBVJfVnkY4u3IjkDYYL0MxO4mqsyYjlBalTVYxFP2sJBK5zlKOB',
+            'uzCBuDAfBgNVHSMEGDAWgBQiZQzWWp00ifODtJVSv1AbOScGrDBSBgNVHR8ESzBJ',
+            'MEegRaBDhkFodHRwczovL2NlcnRpZmljYXRlcy50cnVzdGVkc2VydmljZXMuaW50',
+            'ZWwuY29tL0ludGVsU0dYUm9vdENBLmRlcjAdBgNVHQ4EFgQUImUM1lqdNInzg7SV',
+            'Ur9QGzknBqwwDgYDVR0PAQH/BAQDAgEGMBIGA1UdEwEB/wQIMAYBAf8CAQEwCgYI',
+            'KoZIzj0EAwIDSQAwRgIhAOW/5QkR+S9CiSDcNoowLuPRLsWGf/Yi7GSX94BgwTwg',
+            'AiEA4J0lrHoMs+Xo5o/sX6O9QWxHRAvZUGOdRQ7cvqRXaqI=',
+            '-----END CERTIFICATE-----'
+        ].join('\n'),
+    }];
     function checkExpectedApp(sf) {
         const hit = EXPECTED_APPS.find(a => a.flow === sf.flow && a.client_id === sf.paypal_client_id
             && a.authorize_base === sf.authorize_base && a.scope === sf.scope);
@@ -808,6 +844,51 @@
             throw new Error(`Failed to parse ${name} Certificate: ` + e.message);
         }
     }
+    // ---- EC-safe X.509 DN extraction ---------------------------------------
+    // forge's pki.certificateFrom* is RSA-only (it throws "OID is not RSA" on
+    // EC certificates like the Intel PCK and AMD VCEK leaves), and its
+    // attribute API needs a fully parsed cert. These helpers work straight on
+    // the ASN.1 nodes, so issuer/subject extraction works for RSA and EC alike.
+    const DN_ATTR_NAMES = {
+        '2.5.4.3': 'CN', '2.5.4.6': 'C', '2.5.4.7': 'L', '2.5.4.8': 'ST',
+        '2.5.4.10': 'O', '2.5.4.11': 'OU', '2.5.4.5': 'serialNumber',
+        '2.5.4.4': 'SN', '2.5.4.9': 'street', '1.2.840.113549.1.9.1': 'email',
+    };
+    function dnFromNode(seqNode) {
+        const parts = [];
+        for (const setNode of (seqNode && seqNode.value) || []) {
+            const attr = (setNode && Array.isArray(setNode.value)) ? setNode.value[0] : null;
+            if (!attr || !Array.isArray(attr.value) || attr.value.length < 2) continue;
+            const oid = oidBytesToDotted(attr.value[0].value);
+            let v = attr.value[1].value;
+            if (v instanceof Uint8Array) v = String.fromCharCode.apply(null, Array.from(v));
+            else if (Array.isArray(v)) v = String(v);
+            parts.push((DN_ATTR_NAMES[oid] || oid) + '=' + v);
+        }
+        return parts.join(', ');
+    }
+    function x509NamesFromTbs(tbs) {
+        const kids = (tbs && tbs.value) || [];
+        let i = 0;
+        while (i < kids.length && kids[i].tagClass !== forge.asn1.Class.UNIVERSAL) i++; // skip [0] version
+        i += 2; // serialNumber + signatureAlgorithm
+        return {
+            issuer: dnFromNode(kids[i]),      // issuer  Name
+            subject: dnFromNode(kids[i + 2]), // subject Name (validity sits between)
+        };
+    }
+    function x509Names(parsedCert) { return x509NamesFromTbs(parsedCert.nodes.tbs); }
+    // Raw SEC1 P-256 point (X||Y, 64 bytes) → SubjectPublicKeyInfo DER so
+    // WebCrypto can import Intel quote attestation keys (raw points, no SPKI).
+    function p256SpkiFromRaw(rawXY) {
+        if (!rawXY || rawXY.length !== 64) throw new Error('attestation key is not a raw P-256 point (64 bytes)');
+        const der = new Uint8Array(26 + 65);
+        der.set([0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+                 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00], 0);
+        der[26] = 0x04; // uncompressed point
+        der.set(rawXY, 27);
+        return der;
+    }
     // ECDSA AlgorithmIdentifier → WebCrypto curve params (AMD uses P-384).
     function ecCurveParams(spkiDer) {
         const spki = forge.asn1.fromDer(derBytesToBinary(spkiDer));
@@ -980,9 +1061,12 @@
             const tbsDer = binaryToBytes(forge.asn1.toDer(child.nodes.tbs).getBytes());
             const sigAlgOid = child.nodes.sigAlgOid;
 
-            // BIT STRING: [unused-bits byte] || raw RSA signature
-            const rsaSigContent = (sigBin.length > 0 && sigBin.charCodeAt(0) === 0) ? sigBin.slice(1) : sigBin;
-            const rsaSigBytes = binaryToBytes(rsaSigContent);
+            // BIT STRING: [unused-bits byte] || raw signature. forge 1.3.x
+            // (the CDN-pinned build) returns this as a binary string; forge
+            // 1.4.x returns a parsed node array — forgeValueToBytes accepts
+            // both, so chain links keep verifying across either representation.
+            const sigRawBytes = forgeValueToBytes(sigBin);
+            const rsaSigBytes = (sigRawBytes.length > 0 && sigRawBytes[0] === 0) ? sigRawBytes.slice(1) : sigRawBytes;
 
             // RSASSA-PSS (AMD ASK/ARK chain): hash/MGF1/salt parsed from the
             // AlgorithmIdentifier params. Defaults: SHA-256, saltLen = hLen.
@@ -1012,10 +1096,9 @@
                 return await rsaVerifyPkcs1(parent.spkiDer, hash, tbsDer, rsaSigBytes);
             }
 
-            // ECDSA path (VCEK leaf, P-384): BIT STRING = DER SEQUENCE { r, s }
-            const sigBytes2 = binaryToBytes(sigBin);
-            const content = (sigBin.length > 0 && sigBin.charCodeAt(0) === 0) ? sigBin.slice(1) : sigBin;
-            const seq = forge.asn1.fromDer(content);
+            // ECDSA path (VCEK/PCK leaves): BIT STRING = DER SEQUENCE { r, s }
+            const content = (sigRawBytes.length > 0 && sigRawBytes[0] === 0) ? sigRawBytes.slice(1) : sigRawBytes;
+            const seq = forge.asn1.fromDer(derBytesToBinary(content));
             const toInt = (n) => {
                 let b = binaryToBytes(n.value);
                 let i = 0;
@@ -1254,6 +1337,10 @@
             const payload = new TextEncoder().encode(JSON.stringify(reorder(report)));
             const sigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, enclaveKey, sig, payload);
             updateStatus('enclaveCheck', sigOk, sigOk ? "Report mathematically verified." : "Signature invalid!");
+            // v164: fail closed. A report whose enclave signature does not
+            // verify is UNAUTHENTICATED — continuing to green sub-checks would
+            // let a fabricated report render mostly-verified rows.
+            if (!sigOk) throw new Error("CRITICAL: the enclave signature over this report is INVALID — the report content is unauthenticated (tampered or fabricated). Failing closed.");
 
             // 3. TPM Hardware Audit (Strict Binary Parsing)
             // GCP reports always carry TPM evidence and are checked strictly.
@@ -1436,10 +1523,14 @@
 
             if (akCertPem) {
                 try {
-                    const akCert = parseAnyCertToForge(akCertPem, "Google AK");
+                    // EC-safe parse + DN extraction: forge's certificateFrom*
+                    // throws "OID is not RSA" on an EC EK cert — issuer/subject
+                    // are read straight from the ASN.1 nodes instead.
+                    const akCert = x509ParseAny(akCertPem, "Google AK");
+                    const akNames = x509NamesFromTbs(akCert.nodes.tbs);
                     
                     // 1. IDENTITY INTEGRITY: Verify Issuer
-                    const issuer = akCert.issuer.attributes.map(a => a.value).join(', ');
+                    const issuer = akNames.issuer;
                     const validIssuers = [
                         'Google Cloud Confidential Computing OS Root CA',
                         'EK/AK CA Intermediate'
@@ -1472,7 +1563,7 @@
                     googleVerified = true;
                     
                     // 3. EXTRACT GCP IDENTITY
-                    const subject = akCert.subject.attributes.map(a => `${a.shortName || a.name}: ${a.value}`).join(', ');
+                    const subject = akNames.subject;
 
                     siliconMsg = `✅ <b>Silicon Anchor: Google Confidential Hardware Verified</b><br>` +
                                  `📜 EK Cert Issuer: ${issuer}<br>` +
@@ -1599,15 +1690,27 @@
             // 5c. Intel TDX Root (Alibaba Cloud ECS confidential instances).
             //
             // The enclave publishes `tdx_quote_b64` ONLY when the platform
-            // actually produced a signed TD Quote (Intel quote ABI v4/v5,
-            // ECDSA-P256/P-384 by the Quoting Enclave). The auditor verifies:
-            //   1. quote header (tee_type == 0x81 TDX, version 4/5, lengths);
-            //   2. report_data[0..32] == this session's combined nonce,
-            //      [32..64] == zero (session binding, same discipline as SNP);
-            //   3. the ECDSA signature over the quote body by the PCK leaf
-            //      key (hw.pck_cert_pem), with the leaf→PCK-CA chain link
-            //      verified and the issuer required to be Intel's PCK CA;
-            //   4. MRTD/RTMRs are surfaced for the auditor's comparison.
+            // actually produced a hardware-signed TD Quote (Intel quote ABI
+            // v4/v5, ECDSA P-256 by the Quoting Enclave). The auditor follows
+            // Intel's reference DCAP verification order (dcap-qvl verify.rs):
+            //   1. header: version 4|5, tee_type 0x81, Intel QE vendor id,
+            //      att_key_type 2 (ECDSA P-256). Signed scope =
+            //      header (+v5 6-byte body preamble) || TDREPORT body —
+            //      dcap-qvl Quote::signed_length().
+            //   2. session binding: TDREPORT10.report_data @520..584 holds
+            //      [nonce || zeros] (TDREPORT15 appends its two extra fields
+            //      AFTER report_data, so "last 64 bytes" would be wrong).
+            //   3. QUOTE signature: raw r||s (64 B) ECDSA P-256/SHA-256 over
+            //      the signed scope, verified with the quote's OWN attestation
+            //      key (raw X||Y) — NOT with the PCK key.
+            //   4. attestation-key binding: SHA-256(attkey || qe_auth_data)
+            //      == QE-report.report_data[0..32], and the QE report (384 B)
+            //      is itself signed by the PCK leaf — this is what anchors the
+            //      ephemeral attestation key to Intel's provisioning chain.
+            //   5. PCK leaf → … → Intel SGX Root CA, whose DER sha256 is
+            //      pinned below (an issuer regex alone is spoofable — same
+            //      class of bug as the unpinned AMD ARK).
+            //   6. MRTD (mr_td @136..184 of the body) surfaced for display.
             // A bare TDREPORT (tdx_td_report_b64) is generated INSIDE the
             // guest and is UNSIGNED — it can NEVER satisfy the silicon root.
             const claimsTdx = !!(hw.tdx_quote_b64 || hw.tdx_td_report_b64 || hw.pck_cert_pem
@@ -1616,72 +1719,203 @@
                 if (hw.tdx_quote_b64) {
                     try {
                         const quote = Uint8Array.from(atob(hw.tdx_quote_b64), c => c.charCodeAt(0));
-                        if (quote.length < 56 + 48 + 96) throw new Error(`quote truncated (${quote.length} bytes)`);
-                        const qdv = new DataView(quote.buffer, quote.byteOffset, quote.byteLength);
-                        const qVersion = qdv.getUint16(0, true);            // version u16 @0
-                        const qAttKeyType = qdv.getUint16(2, true);        // att_key_type u16 @2 (2=P-256, 16=P-384)
-                        const qTeeType = qdv.getUint32(4, true);           // tee_type u32 @4
-                        if (qTeeType !== 0x00000081) throw new Error(`tee_type 0x${qTeeType.toString(16)} is not TDX (expected 0x81)`);
-                        if (qVersion !== 4 && qVersion !== 5) throw new Error(`unsupported quote version ${qVersion}`);
-                        const qBodySize = qdv.getUint32(48, true);         // body_size u32 @48
-                        const qSigSize = qdv.getUint32(52, true);          // signature_size u32 @52
-                        if (56 + qBodySize + qSigSize > quote.length) throw new Error('quote length fields inconsistent with blob size');
-                        // Signed region = body_size field (4 B LE) || body.
-                        const qBody = quote.slice(48, 52 + qBodySize);
-                        const qSig = quote.slice(52 + qBodySize, 52 + qBodySize + qSigSize);
-                        // ECDSA sig blob: uint32le rSize | r | uint32le sSize | s
-                        const sdv = new DataView(qSig.buffer, qSig.byteOffset, qSig.byteLength);
-                        let soff = 0;
-                        const rSize = sdv.getUint32(soff, true); soff += 4;
-                        const rBytes = qSig.slice(soff, soff + rSize); soff += rSize;
-                        const sSize = sdv.getUint32(soff, true); soff += 4;
-                        const sBytes = qSig.slice(soff, soff + sSize);
-                        const curveSize = (qAttKeyType === 16) ? 48 : 32;
-                        if (rBytes.length > curveSize || sBytes.length > curveSize) throw new Error('signature width mismatch');
-                        const qrs = new Uint8Array(curveSize * 2);
-                        qrs.set(rBytes, curveSize - rBytes.length);
-                        qrs.set(sBytes, curveSize * 2 - sBytes.length);
-                        // report_data = last 64 bytes of body: [0..32] session nonce, [32..64] zero.
-                        const qReportDataHex = Array.from(qBody.slice(qBody.length - 64)).map(b => b.toString(16).padStart(2, '0')).join('');
-                        const qBindingOk = (qReportDataHex.slice(0, 64) === expectedNonce)
-                            && (qReportDataHex.slice(64) === '0'.repeat(64));
-                        if (!hw.pck_cert_pem) throw new Error('no PCK certificate in report — quote signature cannot be verified');
-                        const pckPems = hw.pck_cert_pem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
-                        if (!pckPems || !pckPems.length) throw new Error('pck_cert_pem contains no PEM certificate');
-                        const pckLeaf = x509ParseAny(pckPems[0], 'Intel PCK');
-                        const pckKey = await crypto.subtle.importKey('spki', pckLeaf.spkiDer, ecCurveParams(pckLeaf.spkiDer), false, ['verify']);
-                        // QGS signatures: SHA-384 on P-384; P-256 quotes are seen
-                        // with SHA-256 and (in older QGS) SHA-384 — try both.
-                        let qSigOk = await crypto.subtle.verify({ name: 'ECDSA', hash: qAttKeyType === 16 ? 'SHA-384' : 'SHA-256' }, pckKey, qrs, qBody);
-                        let usedHash = qAttKeyType === 16 ? 'SHA-384' : 'SHA-256';
-                        if (!qSigOk && qAttKeyType === 2) {
-                            qSigOk = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-384' }, pckKey, qrs, qBody);
-                            if (qSigOk) usedHash = 'SHA-384';
+                        const hx = (u8) => Array.from(u8).map(b => b.toString(16).padStart(2, '0')).join('');
+                        const le16 = (a, o) => a[o] | (a[o + 1] << 8);
+                        const le32u = (a, o) => a[o] + a[o + 1] * 256 + a[o + 2] * 65536 + a[o + 3] * 16777216;
+                        if (quote.length < 48 + 584 + 4 + 64 + 64 + 6) throw new Error(`quote truncated (${quote.length} bytes)`);
+                        // ---- header (48 B): version u16@0, att_key_type u16@2,
+                        // tee_type u32@4, qe_svn@8, pce_svn@10, vendor id@12 ----
+                        const qVersion = le16(quote, 0);
+                        const qAttKeyType = le16(quote, 2);
+                        const qTeeType = le32u(quote, 4);
+                        const qVendorHex = hx(quote.subarray(12, 28));
+                        if (qTeeType !== 0x81) throw new Error(`tee_type 0x${qTeeType.toString(16)} is not TDX (expected 0x81)`);
+                        if (qVersion !== 4 && qVersion !== 5) throw new Error(`unsupported quote version ${qVersion} — TDX quotes are v4 or v5`);
+                        if (qVendorHex !== '939a7233f79c4ca9940a0db3957f0607') {
+                            throw new Error(`unknown QE vendor id ${qVendorHex} — quote not produced by Intel's Quoting Enclave`);
                         }
-                        const pckForge = parseAnyCertToForge(pckPems[0], 'Intel PCK');
-                        const pckIssuer = pckForge.issuer.attributes.map(a => a.value).join(', ');
-                        const pckSubject = pckForge.subject.attributes.map(a => a.value).join(', ');
+                        if (qAttKeyType !== 2) throw new Error(`attestation key type ${qAttKeyType} unsupported — Intel TDX quotes use ECDSA P-256 (type 2)`);
+                        // ---- body: v4 carries TDREPORT10 inline (fixed 584 B);
+                        // v5 adds a 6-byte preamble (body_type u16 + body_size u32 LE) ----
+                        let bodyOff = 48, bodyLen = 584, bodyType = null;
+                        if (qVersion === 5) {
+                            bodyType = le16(quote, 48);
+                            bodyLen = le32u(quote, 50);
+                            const expectLen = bodyType === 2 ? 584 : bodyType === 3 ? 648 : null;
+                            if (expectLen === null) throw new Error(`unsupported v5 body type ${bodyType} (2 = TDREPORT10, 3 = TDREPORT15)`);
+                            if (bodyLen !== expectLen) throw new Error(`v5 body_type ${bodyType} implies ${expectLen} bytes, size field says ${bodyLen}`);
+                            bodyOff = 54;
+                        }
+                        const signedLen = bodyOff + bodyLen; // == dcap-qvl Quote::signed_length()
+                        if (quote.length < signedLen + 4 + 64 + 64 + 6) throw new Error('quote truncated before auth data');
+                        const signedRegion = quote.subarray(0, signedLen);
+                        const qBody = quote.subarray(bodyOff, signedLen);
+                        // ---- session binding: TDREPORT10.report_data @520..584 ----
+                        if (qBody.length < 584) throw new Error(`TDREPORT body ${qBody.length} bytes < 584`);
+                        const qReportDataHex = hx(qBody.subarray(520, 584));
+                        const qBindingOk = qReportDataHex.slice(0, 64) === expectedNonce
+                            && qReportDataHex.slice(64) === '0'.repeat(64);
+                        // MRTD (mr_td): after tee_tcb_svn16 + mr_seam48 + mr_signer_seam48
+                        // + seam_attributes8 + td_attributes8 + xfam8 = offset 136.
+                        const qMrtdHex = hx(qBody.subarray(136, 184));
+                        // ---- auth data (v4/v5 AuthDataV4):
+                        //   u32 LE len | sig64 (raw r||s) | attkey64 (raw X||Y)
+                        //   | cert_type u16 | cert_len u32 | cert body ----
+                        const authLen = le32u(quote, signedLen);
+                        if (signedLen + 4 + authLen > quote.length) throw new Error('auth data length exceeds quote size');
+                        const auth = quote.subarray(signedLen + 4, signedLen + 4 + authLen);
+                        if (auth.length < 64 + 64 + 6) throw new Error('auth data truncated');
+                        const qSigRaw = auth.subarray(0, 64);      // ECDSA P-256 raw r||s
+                        const attKeyRaw = auth.subarray(64, 128);  // attestation key raw X||Y
+                        const certType = le16(auth, 128);
+                        const certLen = le32u(auth, 130);
+                        const certBody = auth.subarray(134, 134 + certLen);
+                        if (certBody.length !== certLen) throw new Error('certification data truncated');
+                        // cert_type 6 = QE-report certification data:
+                        //   qe_report384 | qe_report_sig64 | auth_len u16 | auth32
+                        //   | inner cert_type u16 | inner_len u32 | PCK chain (PEM)
+                        if (certType !== 6) {
+                            throw new Error(`certification data type ${certType} unsupported — type 6 (QE-report cert) is required to bind the attestation key to the PCK chain`);
+                        }
+                        if (certBody.length < 384 + 64 + 2 + 32 + 6) throw new Error('QE report certification data truncated');
+                        const qeReport = certBody.subarray(0, 384);
+                        const qeReportSig = certBody.subarray(384, 448);
+                        const qeAuthLen = le16(certBody, 448);
+                        if (qeAuthLen !== 32) throw new Error(`QE auth data length ${qeAuthLen}, expected 32`);
+                        const qeAuthData = certBody.subarray(450, 482);
+                        const innerType = le16(certBody, 482);
+                        const innerLen = le32u(certBody, 484);
+                        const innerBody = certBody.subarray(488, 488 + innerLen);
+                        if (innerBody.length !== innerLen) throw new Error('inner certification data truncated');
+                        if (innerType !== 5 && innerType !== 4) {
+                            throw new Error(`inner certification type ${innerType} unsupported (5 = PCK cert chain, 4 = PCK leaf)`);
+                        }
+                        // ---- certificate material: quote-carried chain first,
+                        // then the enclave-published hw.pck_cert_pem ----
+                        let innerText = '';
+                        for (let i = 0; i < innerBody.length; i += 0x8000) {
+                            innerText += String.fromCharCode.apply(null, innerBody.subarray(i, i + 0x8000));
+                        }
+                        if (innerText.indexOf('-----BEGIN') === -1) {
+                            // type-4 style raw DER blob → wrap as one PEM block
+                            innerText = '-----BEGIN CERTIFICATE-----\n' + btoa(innerText).replace(/(.{64})/g, '$1\n') + '\n-----END CERTIFICATE-----';
+                        }
+                        const pemRe = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
+                        const parseAll = async (text, label) => {
+                            const pems = (text || '').match(pemRe) || [];
+                            const out = [];
+                            for (let i = 0; i < pems.length; i++) {
+                                const o = x509ParseAny(pems[i], label + '[' + i + ']');
+                                const m = pems[i].match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);
+                                o.pem = pems[i];
+                                o.derBytes = Uint8Array.from(atob(m[1].replace(/\s+/g, '')), c => c.charCodeAt(0));
+                                o.derHex = hx(o.derBytes); // identity (dedupe)
+                                o.derSha256 = hx(new Uint8Array(await crypto.subtle.digest('SHA-256', o.derBytes))); // pin compare
+                                out.push(o);
+                            }
+                            return out;
+                        };
+                        const parsedQuote = await parseAll(innerText, 'quote PCK');
+                        const parsedPub = await parseAll(hw.pck_cert_pem, 'published PCK');
+                        if (!parsedQuote.length && !parsedPub.length) {
+                            throw new Error('no PCK certificate in the quote or the report — chain cannot be verified');
+                        }
+                        // Candidate chains, hardware-quoted first. Same-leaf
+                        // published certs complete a leaf-only quote chain.
+                        const groups = [];
+                        if (parsedQuote.length) {
+                            let g = parsedQuote;
+                            if (parsedPub.length && parsedPub[0].derHex === parsedQuote[0].derHex && parsedPub.length > 1) {
+                                // same leaf: extend with published intermediates (deduped —
+                                // a cert must never follow itself in the walk)
+                                const have = new Set(parsedQuote.map(c => c.derHex));
+                                g = parsedQuote.concat(parsedPub.slice(1).filter(c => !have.has(c.derHex)));
+                            }
+                            groups.push(g);
+                        }
+                        if (parsedPub.length && (!parsedQuote.length || parsedPub[0].derHex !== parsedQuote[0].derHex)) {
+                            groups.push(parsedPub);
+                        }
+                        // ---- 4a. QE report signature: signed by the PCK LEAF
+                        // (Intel: PCK cert signs the QE report; the QE report
+                        // then binds the attestation key) ----
+                        let qeRepSigOk = false, usedGroup = null;
+                        for (const g of groups) {
+                            try {
+                                const leafKey = await crypto.subtle.importKey('spki', g[0].spkiDer, ecCurveParams(g[0].spkiDer), false, ['verify']);
+                                if (await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, leafKey, qeReportSig, qeReport)) {
+                                    qeRepSigOk = true; usedGroup = g; break;
+                                }
+                            } catch (e) { /* try next candidate */ }
+                        }
+                        const pckLeafParsed = usedGroup ? usedGroup[0] : (groups[0] && groups[0][0]) || null;
+                        let pckIssuer = '', pckSubject = '';
+                        if (pckLeafParsed) {
+                            const names = x509Names(pckLeafParsed);
+                            pckIssuer = names.issuer; pckSubject = names.subject;
+                        }
                         const issuerIntelOk = /Intel/i.test(pckIssuer) && /PCK/i.test(pckIssuer);
-                        let pckChainOk = true; // leaf-only report: chain link unverifiable, issuer still enforced
-                        let chainLabel = 'leaf-only (no intermediate in report)';
-                        if (pckPems.length >= 2) {
-                            const pckCa = x509ParseAny(pckPems[1], 'Intel PCK CA');
-                            pckChainOk = await x509SignedBy(pckLeaf, pckCa);
-                            chainLabel = pckChainOk ? 'leaf→CA link verified' : 'leaf→CA link INVALID';
+                        // ---- 4b. Chain walk to the PINNED roots (root PEMs
+                        // travel with the code, never with the quote) ----
+                        let chainOk = false, chainLabel = 'no usable PCK chain in this report';
+                        if (qeRepSigOk && usedGroup) {
+                            const roots = (Array.isArray(TRUSTED_INTEL_ROOTS) ? TRUSTED_INTEL_ROOTS : [])
+                                .map(r => ({ sha256: String((r && r.sha256) || '').toLowerCase(), pem: (r && r.pem) || '' }))
+                                .filter(r => /^[0-9a-f]{64}$/.test(r.sha256) && r.pem.indexOf('-----BEGIN CERTIFICATE-----') !== -1);
+                            const pins = roots.map(r => r.sha256);
+                            const chain = usedGroup.slice();
+                            // append every pinned root the chain doesn't already carry
+                            for (const rt of roots) {
+                                const m = rt.pem.match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);
+                                if (!m) continue;
+                                const rp = x509ParseAny(rt.pem, 'pinned Intel root');
+                                rp.pem = rt.pem;
+                                rp.derBytes = Uint8Array.from(atob(m[1].replace(/\s+/g, '')), c => c.charCodeAt(0));
+                                rp.derSha256 = hx(new Uint8Array(await crypto.subtle.digest('SHA-256', rp.derBytes)));
+                                if (chain.some(c => c.derSha256 === rp.derSha256)) continue;
+                                chain.push(rp);
+                            }
+                            let links = 0;
+                            for (let i = 0; i < chain.length; i++) {
+                                const cur = chain[i];
+                                if (i > 0 && pins.includes(cur.derSha256)) { chainOk = true; break; }
+                                if (i + 1 >= chain.length) break;
+                                if (!(await x509SignedBy(cur, chain[i + 1]))) break;
+                                links++;
+                            }
+                            chainLabel = chainOk
+                                ? `${links + 1} certs, leaf → Intel SGX Root CA pinned (${pins[0] ? pins[0].substring(0, 16) : '?'}…)`
+                                : `chain does NOT reach a pinned Intel root (walked ${links} link(s))`;
                         }
-                        // MRTD = bytes 16..64 of the V4/V5 body; RTMR0..7 follow.
-                        const qMrtdHex = Array.from(qBody.slice(16, 64)).map(b => b.toString(16).padStart(2, '0')).join('');
-                        tdxVerified = qBindingOk && qSigOk && issuerIntelOk && pckChainOk;
+                        // ---- 3. QUOTE signature: attestation key over header+body ----
+                        const attKey = await crypto.subtle.importKey('spki', p256SpkiFromRaw(attKeyRaw),
+                            { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+                        const qSigOk = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, attKey, qSigRaw, signedRegion);
+                        // ---- 4c. attestation key bound into the QE report:
+                        // SHA-256(attkey || qe_auth_data) == report_data[0..32] ----
+                        const qePreimage = new Uint8Array(64 + 32);
+                        qePreimage.set(attKeyRaw, 0);
+                        qePreimage.set(qeAuthData, 64);
+                        const qeHash = new Uint8Array(await crypto.subtle.digest('SHA-256', qePreimage));
+                        const qeReportData = qeReport.subarray(320, 384); // EnclaveReport.report_data @320
+                        const attKeyBound = hx(qeHash) === hx(qeReportData.subarray(0, 32));
+                        tdxVerified = qBindingOk && qSigOk && attKeyBound && qeRepSigOk && issuerIntelOk && chainOk;
                         if (tdxVerified) {
                             siliconMsg = `✅ <b>Intel TDX Silicon Root Verified</b><br>` +
-                                `🔏 Quoting Enclave ECDSA-${curveSize === 48 ? '384' : '256'}/SHA-${usedHash} signature over quote body valid<br>` +
-                                `⛓️ PCK leaf "${pckSubject}" issued by: ${pckIssuer} (${chainLabel})<br>` +
+                                `🔏 Quote signature ECDSA P-256/SHA-256 by its attestation key over header+TDREPORT (v${qVersion}${bodyType ? ', body type ' + bodyType : ''}) valid<br>` +
+                                `⛓️ Attestation key bound into the QE report (SHA-256) and the QE report signed by the PCK leaf ✓<br>` +
+                                `⛓️ PCK chain: ${chainLabel}<br>` +
+                                `📜 PCK leaf "${pckSubject}" issued by: ${pckIssuer}<br>` +
                                 `🔐 report_data[0..32] == this session's combined nonce, [32..64] zero — bound ✓<br>` +
-                                `📏 MRTD: ${qMrtdHex.substring(0, 32)}… (quote v${qVersion}, source: ${hw.tdx_evidence_source || 'unknown'})`;
+                                `📏 MRTD: ${qMrtdHex.substring(0, 32)}… (source: ${hw.tdx_evidence_source || 'unknown'})`;
                         } else {
                             siliconMsg = `❌ <b>Intel TDX quote present but verification FAILED</b> ` +
-                                `(binding=${qBindingOk}, sig=${qSigOk}, issuer_intel=${issuerIntelOk}, chain=${pckChainOk})<br>` +
-                                `⚠️ PCK issuer was: "${pckIssuer}" — do NOT trust this report.`;
+                                `(binding=${qBindingOk}, quote_sig=${qSigOk}, attkey_bind=${attKeyBound}, qe_report_sig=${qeRepSigOk}, issuer_intel=${issuerIntelOk}, root_chain=${chainOk})<br>` +
+                                `⚠️ PCK issuer was: "${pckIssuer || 'n/a'}" — do NOT trust this report.<br>` +
+                                `⛓️ ${chainLabel}` +
+                                (!qBindingOk
+                                    ? `<br>ℹ️ quote report_data[0..32] = ${qReportDataHex.slice(0, 32)}…, expected session nonce = ${expectedNonce.slice(0, 32)}…`
+                                    : '');
                         }
                     } catch (err) {
                         tdxVerified = false;
@@ -1702,7 +1936,6 @@
                         (notes.length ? `<br>ℹ️ Probe transcript:<br>ℹ️ ${notes.join('<br>ℹ️ ')}` : '');
                 }
             }
-
             // v153 SECURITY (audit SEC-04): platform-enforced silicon root.
             // The old `googleVerified || snpVerified` OR allowed a report
             // CLAIMING OCI to satisfy the silicon check with a locally-made

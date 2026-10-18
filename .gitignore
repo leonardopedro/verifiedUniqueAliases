@@ -53,3 +53,5 @@ run-initramfs-build.sh
 repomix-output.xml
 
 paypal-auth-vm-alibaba
+# Test harness dependencies (npm)
+node_modules/

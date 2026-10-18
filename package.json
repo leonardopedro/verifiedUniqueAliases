@@ -1,0 +1,11 @@
+{
+  "name": "paypal-auth-vm-auditor-tests",
+  "private": true,
+  "description": "Offline security regression tests for verify.html. The enclave itself has no Node dependency — this only pins node-forge at the exact version verify.html loads from the CDN (forge/1.3.1) so the harness evaluates the page script against the same library its auditors get.",
+  "scripts": {
+    "test": "node scripts/test-verify-security.mjs"
+  },
+  "devDependencies": {
+    "node-forge": "1.3.1"
+  }
+}
