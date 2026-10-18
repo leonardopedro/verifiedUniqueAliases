@@ -2,7 +2,7 @@ name: Build VM Image and Attest
 
 on:
   push:
-    branches: [main, l-branch-1]
+    branches: [main, l-branch-1, alibabacloud]
   workflow_dispatch:
 
 jobs:
