@@ -65,7 +65,12 @@ jobs:
           docker cp $CONTAINER_ID:/build/packages.txt ./packages-${{ matrix.platform }}.txt || true
           docker rm $CONTAINER_ID
           echo "==== ARTIFACT HASHES (${{ matrix.label }}) ===="
-          sha256sum paypal-auth-vm-${{ matrix.platform }}.bin vmlinuz-${{ matrix.platform }} initramfs-${{ matrix.platform }}.img shimx64-${{ matrix.platform }}.efi grubx64-${{ matrix.platform }}.efi grub-${{ matrix.platform }}.cfg disk-${{ matrix.platform }}.tar.gz 2>/dev/null
+          # `|| true` is REQUIRED here: the alibabacloud image has no
+          # /grub.cfg or disk.tar.gz (those come from build-gcp-gpt-image.sh),
+          # sha256sum exits 1 on any missing file, and `bash -e` would kill the
+          # step after all the real work already succeeded. This missing
+          # tolerance was the deterministic CI failure of the alibabacloud leg.
+          sha256sum paypal-auth-vm-${{ matrix.platform }}.bin vmlinuz-${{ matrix.platform }} initramfs-${{ matrix.platform }}.img shimx64-${{ matrix.platform }}.efi grubx64-${{ matrix.platform }}.efi grub-${{ matrix.platform }}.cfg disk-${{ matrix.platform }}.tar.gz 2>/dev/null || true
           echo "========================="
 
       - name: Attest Enclave Binary
