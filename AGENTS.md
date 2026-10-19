@@ -154,8 +154,8 @@ The provisioning stack depends on the official `aliyun` CLI, shipped as a locall
 2. **Install** — `sudo dpkg -i build-scripts/packages/aliyun-cli-*.deb`
 3. **Authenticate** — export `ALI_ACCESS_KEY_ID` + `ALI_ACCESS_KEY_SECRET`; `deploy-alibaba.sh` re-exports them as `ALIBABA_ACCESS_KEY_ID` / `ALIBABA_ACCESS_KEY_SECRET` (the CLI's native env names). `aliyun configure` also works.
 4. **Build image** — `bash build-alibaba-docker.sh` → `initramfs-alibaba.img` (Debian Trixie, snapshot-pinned via `Dockerfile.alibaba`; apt package pins in `packages-alibaba.txt`, incl. `tpm2-tools 5.7-1`)
-5. **Import image** — `bash import-alibaba-image.sh` (requires `ossutil` + `ALI_OSS_BUCKET`; uploads the initramfs to OSS and imports it as a custom ECS image → yields `ALI_IMAGE_ID`)
-6. **Deploy** — `bash deploy-alibaba.sh` (target `ecs.r9i.xlarge`, `ALI_REGION=cn-hangzhou` default, spot strategy `SpotAsPriceGo`; enclave config delivered to `/etc/paypal-auth/config.json`)
+5. **Import image** — `bash import-alibaba-image.sh` (requires the aliyun CLI's built-in `oss` subcommand — **no ossutil** — plus `ALI_OSS_BUCKET`; uploads the ESP disk `output-alibaba/disk-alibaba.raw` to OSS, imports it via `ImportImage` using the flat `--DiskDeviceMapping.1.Format raw` flag — the CLI rejects `--DiskDeviceMapping.1.ImageFormat` — then polls the image `Status` until `Available` → yields `ALI_IMAGE_ID`; note `DescribeTasks` polling does NOT work with the current CLI: `--TaskId` is rejected and `--TaskIds '[...]'` returns an empty TaskSet)
+6. **Deploy** — `bash deploy-alibaba.sh` (target `ecs.c9i.xlarge`, `ALI_REGION=cn-beijing` default, spot strategy `SpotAsPriceGo`, `SecurityOptions.ConfidentialComputingMode=TDX`; enclave config delivered to `/etc/paypal-auth/config.json`)
 
 The enclave image itself never contains the aliyun CLI — the CLI runs on the operator host; only the checksum-verified provisioning flow touches ECS.
 
@@ -168,9 +168,13 @@ GitHub Provenance
     └─► PCR 15 (disk_manifest SHA-256 measured into TPM at boot)
             └─► PCR Composite Hash (SHA-256 of all quoted PCRs 0,4,8,9,15)
                     └─► TPMS_ATTEST binary (signed by Session AK over PCR composite + session nonce)
-                            └─► Session Nonce (SHA-256[PayPal User Hash ∥ Enclave PubKey Hash])
+                            └─► Session Nonce (SEC-02 5-component: SHA-256 over
+                                     │        [paypal_hash ∥ pubkey_SPKI_hash ∥ custom_info_hash
+                                     │         ∥ binary_sha256 ∥ canonical-manifest_hash] — 160 bytes)
                                      │                │
-                                     │                └── Enclave Asymmetric RSA signing key DER
+                                     │                └── inputs: enclave pubkey SPKI DER, custom_info
+                                     │                     ("NONE" if absent/empty), binary_sha256 (/init),
+                                     │                     SHA-256 of sorted [path, sha256] manifest JSON
                                      └── PayPal OAuth userinfo JSON (compact sorted)
 
 Google EK Certificate (NVRAM 0x01c00002)
@@ -267,7 +271,7 @@ The system presents a signed **Remote Attestation Report** on the OAuth callback
 - **EK Certificate ≠ Session AK** (by design): Never compare them during any verification pass. This mismatch is expected.
 - **No persistent AK handles on GCP**: `tpm2 getcap handles-persistent` always returns empty on GCP Confidential VMs — the enclave creates a session signing AK via `tpm2_createprimary` each boot.
 - **NVRAM buffer must be unbounded**: `tpm2 nvread -s <size>` truncates large certs. Always use `tpm2 nvread` without a size argument to retrieve the complete 1560-byte EC certificate blob.
-- **Nonce binding formula**: `SHA-256(SHA-256(PayPal user JSON compacted) ∥ SHA-256(enclave asymmetric signing key DER bytes))`. The TPM quote's `extraData` MUST contain exactly this 32-byte digest or the entire attestation fails validation.
+- **Nonce binding formula (SEC-02 / verify.html v160 — the 5-component form)**: `nonce = SHA-256` over the 160-byte concatenation `[0..32] sha256(compact sorted PayPal userinfo JSON)` ∥ `[32..64] sha256(enclave signing pubkey SPKI DER)` ∥ `[64..96] sha256(custom_info string — `"NONE"` when absent or empty)` ∥ `[96..128] boot_measurements.binary_sha256 (self-measure of /init)` ∥ `[128..160] sha256(canonical compact JSON of sorted [path, sha256] disk-manifest pairs)`. The TPM quote's `extraData` and the TDX quote's `report_data[0..32]` MUST contain exactly this 32-byte digest or the entire attestation fails validation. (The old 2-component formula — `SHA-256(SHA-256(user JSON) ∥ SHA-256(key DER))` — was pre-SEC-02 and produced `binding=false` against every current verify.html build; the enclave was fixed 2026-10-19.)
 - **`tpm2` standalone binary vs wrapper**: In the minimal initramfs filesystem, the unified `tpm2` binary should always be invoked directly — wrapper aliases like `tpm2_getcap` often don't exist, causing silent failures. Use pattern `tpm2 getcap` instead of `tpm2-getcap`.
 - **DHCP timeout**: NATIVE implementation waits up to 30 seconds for DHCPAC before rejecting. If the cloud metadata service is slow responding, increase the socket timeout in PID-1 init (currently set to 30 seconds in the socket setup path).
 - **PCIe slot exhaustion**: Each module loaded via `insmod` occupies PCI space on bare-metal virtualized infrastructures; batch loads where possible in `insmod_all()` function.

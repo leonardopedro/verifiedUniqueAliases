@@ -749,8 +749,37 @@ console.log('\nTest 21: nonce formula parity (SEC-02 reference vector)');
   check('harness mirror matches independent reference', jsNonce === reference, `js=${jsNonce} ref=${reference}`);
 }
 
+console.log('\nTest 21b: untrusted-report HTML injection neutralized (esc() sink audit)');
+{
+  // The report under audit is UNTRUSTED input: updateStatus() renders with
+  // innerHTML, so report-derived fragments (marker fields, probe notes,
+  // error messages, cert DNs) MUST arrive escaped — otherwise a forged
+  // report can inject markup into the auditor's verdict DOM even while every
+  // cryptographic gate fails.
+  const IMG = '<img src=x onerror="window.__pwned=1">';
+  const built = await buildEnvelope({
+    hwBuilder: async () => tdxHw({
+      quoteB64: null,
+      markerOverrides: {
+        auditor_note: IMG,
+        tdx_quote_status: '">' + IMG,
+      },
+      probeNotes: ['<svg onload="window.__pwned=1"> configfs ok'],
+    }),
+  });
+  const { ok } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('injected-marker report still fails closed (no silicon root)', ok === false, `ok=${ok}`);
+  check('auditor_note rendered escaped (no raw <img tag in HTML)',
+    !fw.includes('<img src=x') && fw.includes('&lt;img src=x'), fw.slice(0, 400));
+  check('probe note rendered escaped (no raw <svg tag in HTML)',
+    !fw.includes('<svg') && fw.includes('&lt;svg'), fw.slice(0, 400));
+  check('marker status rendered escaped (no attribute-breakout quote pair)',
+    !fw.includes('">' + '<img'), fw.slice(0, 400));
+}
+
 // ---- Optional: a REAL report captured from the live enclave ---------------
-// (node scripts/e2e-sandbox.mjs sets this up: REAL_REPORT=/tmp/report-verified.json)
+// (node scripts/e2e-sandbox.mjs sets this setup: REAL_REPORT=/tmp/report-verified.json)
 // Runs against the DEFAULT Intel anchor — the synthetic root is swapped out so
 // the genuine PCK chain must reach the pinned Intel DCAP root for real.
 if (process.env.REAL_REPORT) {

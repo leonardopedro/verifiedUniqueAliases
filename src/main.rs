@@ -888,6 +888,13 @@ mod tpm {
             marker["tdx_quote_present"] = serde_json::Value::Bool(true);
             marker["tdx_quote_source"] =
                 serde_json::json!(silicon.quote_source.clone().unwrap_or_default());
+            // Security audit 2026-10-19: the default status string
+            // "unavailable_no_guest_device" contradicted the quote we just
+            // acquired — stale epistemic metadata is exactly what an auditor
+            // must be able to trust. "ok" = acquisition succeeded (matches the
+            // auditor fixture convention); verification remains the auditor's
+            // job — acquisition is not proof.
+            marker["tdx_quote_status"] = serde_json::json!("ok");
             marker["auditor_note"] = serde_json::json!(
                 "platform_type is a software probe. This report DOES contain hardware-signed evidence: an Intel TDX TD Quote (Quoting Enclave ECDSA P-256 attestation key, embedded PCK certificate chain) with REPORTDATA bound to this session nonce. Verify the quote signature, the attestation-key -> QE-report -> PCK binding, the PCK -> Intel SGX Root CA chain, and the report_data session binding."
             );
@@ -2607,7 +2614,13 @@ async fn generate_attestation(
     hasher.update(userinfo_compact.as_bytes());
     let paypal_hash = hex::encode(hasher.finalize());
 
-    println!("DEBUG: userinfo_compact: {}", userinfo_compact);
+    // Security audit 2026-10-19: the userinfo_compact / DEBUG PAYLOAD console
+    // prints were removed — both can carry the user's name/email, and PID 1's
+    // stdout lands on the serial console, which is readable account-wide via
+    // ECS DescribeInstanceConsoleOutput (and by the cloud operator). PII stays
+    // inside the TLS session where the report is actually delivered.
+    // (paypal_hash below is kept: it is a non-PII digest already present in
+    // the signed report.)
     println!("DEBUG: paypal_hash: {}", paypal_hash);
 
     // 2.5 Software Hash Check (Self-measure)
@@ -2644,10 +2657,40 @@ async fn generate_attestation(
     let pub_key_hash_bytes = pub_key_hasher.finalize();
     let pub_key_hash_hex = hex::encode(pub_key_hash_bytes);
 
-    // Combine paypal_hash and pub_key_hash into a final nonce
+    // v155/SEC-02 combined nonce — must be byte-identical to verify.html's
+    // reconstruction (v160): nonce = SHA-256 over the 160-byte concatenation
+    //   [0..32]   sha256(compact sorted PayPal userinfo JSON)
+    //   [32..64]  sha256(enclave signing pubkey SPKI DER)
+    //   [64..96]  sha256(custom_info string, "NONE" when absent/empty)
+    //   [96..128] boot_measurements.binary_sha256 (self-measure of /init)
+    //   [128..160] sha256(canonical JSON of sorted [path, sha256] manifest pairs)
+    // The hardware quote's REPORTDATA carries nonce[0..32]; an auditor who
+    // cannot re-derive this exact value sees binding=false. The old 2-component
+    // formula (paypal ∥ pubkey) was pre-SEC-02 and failed the live audit
+    // (2026-10-19: quote bound df4e9af6…, auditor expected 507bd42e…).
+    let custom_info_str = custom_info.clone().unwrap_or_default();
+    let custom_info_str = if custom_info_str.is_empty() {
+        "NONE".to_string()
+    } else {
+        custom_info_str
+    };
+    let custom_info_hash = Sha256::digest(custom_info_str.as_bytes());
+
+    // BTreeMap iteration is key-sorted — byte-identical to verify.html's
+    // Object.keys(diskManifest).sort() for the ASCII manifest paths.
+    let manifest_pairs: Vec<(&String, &String)> = state.boot_manifest.iter().collect();
+    let canonical_manifest_json = serde_json::to_string(&manifest_pairs)
+        .expect("Internal Error: canonical manifest serialization failed");
+    let manifest_hash = Sha256::digest(canonical_manifest_json.as_bytes());
+    let binary_hash_bytes =
+        hex::decode(&binary_self_hash).expect("Internal Error: Invalid binary self-hash hex");
+
     let mut combined_hasher = Sha256::new();
     combined_hasher.update(hex::decode(&paypal_hash).expect("Internal Error: Invalid PayPal Hex"));
     combined_hasher.update(&pub_key_hash_bytes);
+    combined_hasher.update(custom_info_hash);
+    combined_hasher.update(binary_hash_bytes);
+    combined_hasher.update(manifest_hash);
     let final_combined_nonce = hex::encode(combined_hasher.finalize());
 
     info!("Generating hardware attestation with bound public key hash: {}", pub_key_hash_hex);
@@ -2706,7 +2749,8 @@ async fn generate_attestation(
     // v70: We use Compact JSON for the signature to ensure deterministic verification (Canonical-lite)
     let payload_compact = serde_json::to_string(&payload).expect("Failed to serialize compact payload");
     let _ = std::fs::write("/tmp/last_payload.json", &payload_compact);
-    println!("DEBUG PAYLOAD: {}", payload_compact);
+    // Security audit 2026-10-19: DEBUG PAYLOAD print removed — same PII-to-
+    // serial-console leak as the userinfo print above (see note there).
     
     // 6. Sign everything using the enclave-bound asymmetric key
     let signature = if let Some(key) = &state.attestation_signing_key {
@@ -2808,8 +2852,12 @@ async fn get_userinfo(token: &str, api_base: &str) -> Result<PayPalUserInfo, Box
     match serde_json::from_str::<PayPalUserInfo>(&body) {
         Ok(u) => Ok(u),
         Err(e) => {
-            error!("FAIL: Userinfo JSON decoding error: {}. Raw body: {}", e, body);
-            Err(format!("Decoding error: {}. See serial logs for body.", e).into())
+            // Security audit 2026-10-19: never echo the raw body — on schema
+            // drift it can be a well-formed userinfo payload (name/email), and
+            // tracing reaches the serial console (readable account-wide via
+            // DescribeInstanceConsoleOutput). Log the error and size only.
+            error!("FAIL: Userinfo JSON decoding error: {} (body {} bytes)", e, body.len());
+            Err(format!("Decoding error: {} (userinfo body withheld — PII)", e).into())
         }
     }
 }

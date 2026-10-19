@@ -77,6 +77,9 @@ echo "✅ Upload verified (size=$LOCAL_SIZE bytes, etag=${REMOTE_ETAG:-n/a})"
 
 # Step 2: Import as custom UEFI image
 echo "⏳ [2/3] Starting ImportImage (BootMode=UEFI, format=raw)..."
+# NOTE (2026-10-19, live-verified): the aliyun CLI rejects
+# `--DiskDeviceMapping.1.ImageFormat` outright ("is not a valid parameter or
+# flag") — ImportImage takes the FLAT `--DiskDeviceMapping.1.Format` flag.
 IMPORT_OUTPUT=$(aliyun ecs ImportImage \
     --RegionId "$ALI_REGION" \
     --ImageName "$IMAGE_NAME" \
@@ -84,43 +87,59 @@ IMPORT_OUTPUT=$(aliyun ecs ImportImage \
     --BootMode UEFI \
     --DiskDeviceMapping.1.OSSBucket "$ALI_OSS_BUCKET" \
     --DiskDeviceMapping.1.OSSObject "$OSS_OBJECT" \
-    --DiskDeviceMapping.1.ImageFormat raw 2>&1) || true
+    --DiskDeviceMapping.1.Format raw 2>&1) || true
 
 TASK_ID=$(echo "$IMPORT_OUTPUT" | jq -r '.TaskId // empty' 2>/dev/null || true)
-if [[ -z "$TASK_ID" ]]; then
+IMAGE_ID=$(echo "$IMPORT_OUTPUT" | jq -r '.ImageId // empty' 2>/dev/null || true)
+if [[ -z "$TASK_ID" && -z "$IMAGE_ID" ]]; then
     echo "❌ Failed to start image import:"
     echo "$IMPORT_OUTPUT"
     exit 1
 fi
-echo "✅ Import task: $TASK_ID"
+[[ -n "$TASK_ID" ]] && echo "✅ Import task: $TASK_ID"
 
-# Step 3: Poll the task, then resolve the resulting ImageId
+# Step 3: Wait until the image exists and is Available.
+# NOTE (2026-10-19, live-verified): polling DescribeTasks does NOT work with
+# this CLI — `--TaskId` is rejected outright ("Did you mean: TaskIds") and the
+# `--TaskIds '["..."]'` filter returns an empty TaskSet even for a Finished
+# task, so a task-status loop hangs until timeout. Poll the IMAGE instead: it
+# only becomes visible/Available once the import has completed. The current
+# CLI also returns ImageId directly in the ImportImage response, so the
+# name-based lookup below is only a fallback.
 echo "⏳ [3/3] Waiting for import..."
-IMAGE_ID=""
-for i in $(seq 1 120); do
-    TASK_JSON=$(aliyun ecs DescribeTasks --RegionId "$ALI_REGION" --TaskId "[\"$TASK_ID\"]" 2>/dev/null || true)
-    STATUS=$(echo "$TASK_JSON" | jq -r '.Tasks.Task[0].TaskStatus // "Unknown"' 2>/dev/null || echo Unknown)
-    case "$STATUS" in
-        Success|Finished)
-            IMAGE_ID=$(echo "$TASK_JSON" | jq -r '.Tasks.Task[0].ImageId // empty' 2>/dev/null || true)
-            break ;;
-        Failed|Error)
-            echo "❌ Import task failed:"
-            echo "$TASK_JSON" | jq '.Tasks.Task[0]' 2>/dev/null || echo "$TASK_JSON"
-            exit 1 ;;
-    esac
-    sleep 5
-done
-
-# Fallback: find the image by name (DescribeTasks sometimes omits ImageId)
 if [[ -z "$IMAGE_ID" ]]; then
-    IMAGE_ID=$(aliyun ecs DescribeImages --RegionId "$ALI_REGION" --ImageName "$IMAGE_NAME" --Owner self 2>/dev/null \
-        | jq -r '.Images.Image[0].ImageId // empty' 2>/dev/null || true)
+    for i in $(seq 1 30); do
+        IMAGE_ID=$(aliyun ecs DescribeImages --RegionId "$ALI_REGION" --ImageName "$IMAGE_NAME" 2>/dev/null \
+            | jq -r '.Images.Image[0].ImageId // empty' 2>/dev/null || true)
+        [[ -n "$IMAGE_ID" ]] && break
+        sleep 10
+    done
 fi
 
 if [[ -z "$IMAGE_ID" ]]; then
-    echo "⚠️ Timeout waiting for import — check:"
-    echo "   aliyun ecs DescribeTasks --RegionId $ALI_REGION --TaskId \"[\\\"$TASK_ID\\\"]\""
+    echo "⚠️ Timeout waiting for the imported image to appear — check:"
+    echo "   aliyun ecs DescribeTasks --RegionId $ALI_REGION --TaskIds '[\"$TASK_ID\"]'"
+    echo "   aliyun ecs DescribeImages --RegionId $ALI_REGION --ImageName $IMAGE_NAME"
+    exit 1
+fi
+
+# A visible image is not yet a usable one: poll Status until Available.
+STATUS=""
+for i in $(seq 1 60); do
+    STATUS=$(aliyun ecs DescribeImages --RegionId "$ALI_REGION" --ImageId "$IMAGE_ID" 2>/dev/null \
+        | jq -r '.Images.Image[0].Status // "Unknown"' 2>/dev/null || echo Unknown)
+    echo "   image $IMAGE_ID status: $STATUS"
+    [[ "$STATUS" == "Available" ]] && break
+    case "$STATUS" in
+        Failed|Discarded|Expired)
+            echo "❌ Image import failed (status=$STATUS)"
+            exit 1 ;;
+    esac
+    sleep 10
+done
+if [[ "$STATUS" != "Available" ]]; then
+    echo "⚠️ Image $IMAGE_ID not Available (status=$STATUS) — retry later:"
+    echo "   aliyun ecs DescribeImages --RegionId $ALI_REGION --ImageId $IMAGE_ID"
     exit 1
 fi
 
@@ -133,6 +152,6 @@ echo "   Name     : $IMAGE_NAME"
 echo "============================================================"
 echo ""
 echo "Next step:"
-echo "  export ALI_IMAGE_ID=$IMAGE_ID"
-echo "  bash deploy-alibaba.sh"
+echo "   export ALI_IMAGE_ID=$IMAGE_ID"
+echo "   bash deploy-alibaba.sh"
 echo ""

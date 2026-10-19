@@ -1159,6 +1159,18 @@
         if (certInput) certInput.addEventListener('change', (e) => loadFile(e.target, 'certInput'));
     });
 
+    // SECURITY (audit 2026-10-19, VULN follow-up): the report under audit is
+    // UNTRUSTED input. updateStatus() renders `desc` with innerHTML, so every
+    // report-derived fragment interpolated into a description must pass through
+    // esc() first — otherwise a forged report (even one that fails every
+    // cryptographic gate) can inject markup into the auditor's own verdict DOM
+    // and fake green checks or exfiltrate the pre-flight-pinned key.
+    function esc(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+            { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+        ));
+    }
+
     // v163 (audit VULN-04 follow-up): TRI-STATE status. Booleans keep their
     // meaning (true = verified, false = failed); the string 'warning' renders
     // the amber DEGRADED state — a check that could only verify what it had
@@ -1428,8 +1440,16 @@
                     updateStatus('tpmCheck', 'verified',
                         tpmMsgText + ` 📏 All 4/4 golden PCR pins enforced — firmware, bootloader, cmdline, and kernel+initramfs match the CI-captured golden build.`);
                 }
-            } else {
+            } else if (hw.snp_report_b64) {
                 updateStatus('tpmCheck', true, "No TPM evidence in report — expected on AMD SEV-SNP platforms without a vTPM (Oracle Cloud). Session bound by the SNP report_data instead.");
+            } else {
+                // TPM-less AND SNP-less (Alibaba TDX builds with no vTPM and no
+                // guest device): do NOT claim SNP report_data binding this
+                // report does not contain — this row is green because the
+                // ABSENCE of TPM evidence is platform-expected, not because
+                // anything was verified. Hardware trust is decided by the
+                // Silicon Root row below.
+                updateStatus('tpmCheck', true, "No TPM evidence in report — TPM-less platform (no vTPM), and this report carries no SNP report either. Green = absence is expected for this platform, NOT a verified proof; hardware trust is decided by the Silicon Root row below.");
             }
 
             // 4. Software Provenance (Hardware-Anchored PCR 15)
@@ -1484,7 +1504,9 @@
                 atomic ? `✅ Image Atomicity (Run #${[...commonRuns][0]})` : `❌ Image Atomicity — ${atomicFail}`,
                 hasPcr15
                     ? (pcr15Ok ? `✅ PCR 15 hardware binding mathematically verified` : `❌ PCR 15 Software Mismatch`)
-                    : `ℹ️ PCR 15 not applicable (no TPM in this report) — session bound via SNP report_data. OCI scope: the SNP launch digest measures Oracle's OVMF launch firmware, NOT the virtual disk — disk/code integrity rests on the GitHub provenance lines above (self-reported manifest, audited against CI)`
+                    : (hw.snp_report_b64
+                        ? `ℹ️ PCR 15 not applicable (no TPM in this report) — session bound via SNP report_data. OCI scope: the SNP launch digest measures Oracle's OVMF launch firmware, NOT the virtual disk — disk/code integrity rests on the GitHub provenance lines above (self-reported manifest, audited against CI)`
+                        : `ℹ️ PCR 15 not applicable (no TPM in this report) — and no SNP report is present either, so no hardware quote in this report binds the session; disk/code integrity rests on the GitHub provenance lines above (self-reported manifest, audited against CI) and hardware trust is decided by the Silicon Root row below`)
             ];
             const anyApiBlocked = [bin, ker, init, cfg, uki].some(c => (c.reason || '').startsWith('api') || c.reason === 'network');
             updateStatus('githubCheck', bin.success && atomic && pcr15Ok,
@@ -1571,11 +1593,11 @@
                     const subject = akNames.subject;
 
                     siliconMsg = `✅ <b>Silicon Anchor: Google Confidential Hardware Verified</b><br>` +
-                                 `📜 EK Cert Issuer: ${issuer}<br>` +
-                                 `📍 Hardware Identity: ${subject}<br>` +
+                                 `📜 EK Cert Issuer: ${esc(issuer)}<br>` +
+                                 `📍 Hardware Identity: ${esc(subject)}<br>` +
                                  `ℹ️ This certificate is Google-signed proof that the enclave runs on real GCP Confidential VM hardware (AMD SEV-SNP).`;
                 } catch (err) {
-                    siliconMsg = `❌ <b>Silicon Anchor Failed:</b> ${err.message}`;
+                    siliconMsg = `❌ <b>Silicon Anchor Failed:</b> ${esc(err.message)}`;
                     throw err;
                 }
             }
@@ -1587,7 +1609,7 @@
                 // only if it verifies). An absent leaf means NEITHER the
                 // silicon-provisioned certs nor AMD KDS held the report's
                 // real signing key — fail closed with a precise reason.
-                const src = hw.vcek_source ? ` (enclave vcek_source=${hw.vcek_source})` : '';
+                const src = hw.vcek_source ? ` (enclave vcek_source=${esc(hw.vcek_source)})` : '';
                 siliconMsg += `<br>❌ <b>AMD SEV-SNP report present but NO verifiable endorsement key</b>${src}<br>` +
                               `⚠️ The enclave verified every key it could obtain (PSP certificate table and AMD KDS) and none of them signs this report. This is consistent with a host whose endorsement key is only known to the cloud provider's PSP. Do NOT trust this report — the silicon binding cannot be established.`;
             } else if (hw.snp_report_b64 && hw.vcek_der_b64) {
@@ -1669,7 +1691,7 @@
                                       `🔏 ECDSA P-384 signature valid<br>` +
                                       `⛓️ VCEK→ASK→ARK chain pinned (ARK ${arkPinHex.substring(0, 16)}…)<br>` +
                                       `📏 Launch digest pinned: ${measurement.substring(0, 16)}…` +
-                                      (hw.vcek_source ? `<br>🏷️ Endorsement key source: ${hw.vcek_source}` : '');
+                                      (hw.vcek_source ? `<br>🏷️ Endorsement key source: ${esc(hw.vcek_source)}` : '');
                     } else {
                         if (!measurementOk) {
                             siliconMsg += `<br>❌ <b>Launch digest (MEASUREMENT) not pinned:</b> ${measurement}<br>` +
@@ -1680,15 +1702,15 @@
                         }
                         if (!snpBindingOk || !snpSigOk || !chainOk) {
                             siliconMsg += `<br>❌ <b>SEV-SNP verification failed</b> (binding=${snpBindingOk}, sig=${snpSigOk}, chain=${chainOk}, ark=${arkPinHex})` +
-                                          (hw.vcek_source ? `<br>🏷️ Endorsement key source: ${hw.vcek_source}` : '') +
+                                          (hw.vcek_source ? `<br>🏷️ Endorsement key source: ${esc(hw.vcek_source)}` : '') +
                                           (!snpSigOk && hw.vcek_source && hw.vcek_source !== 'psp-table' && !hw.vcek_source.startsWith('psp-table')
-                                              ? `<br>💡 The published key came from <b>${hw.vcek_source}</b> and does not sign this report. On hosts whose PSP uses vendor-loaded (VLEK-style) endorsement, only the silicon-provisioned PSP certificate can verify the report — this report's endorsement could not be obtained.`
+                                              ? `<br>💡 The published key came from <b>${esc(hw.vcek_source)}</b> and does not sign this report. On hosts whose PSP uses vendor-loaded (VLEK-style) endorsement, only the silicon-provisioned PSP certificate can verify the report — this report's endorsement could not be obtained.`
                                               : '');
                         }
                     }
                 } catch (err) {
                     snpVerified = false;
-                    siliconMsg += `<br>❌ <b>SEV-SNP verification error:</b> ${err.message}`;
+                    siliconMsg += `<br>❌ <b>SEV-SNP verification error:</b> ${esc(err.message)}`;
                 }
             }
 
@@ -1719,6 +1741,12 @@
             // A bare TDREPORT (tdx_td_report_b64) is generated INSIDE the
             // guest and is UNSIGNED — it can NEVER satisfy the silicon root.
             const claimsTdx = !!(hw.tdx_quote_b64 || hw.tdx_td_report_b64 || hw.pck_cert_pem
+                || hw.tdx_evidence_marker // TPM-less Alibaba build: the marker is the report's
+                    // only TDX-class claim — route it into the TDX branch below so the
+                    // auditor gets the PRECISE no-hardware-signed-evidence diagnosis
+                    // (incl. the enclave's own probe transcript) instead of the generic
+                    // "no evidence present" message. The marker can never make this pass:
+                    // with no tdx_quote_b64 the branch ends at tdxVerified=false.
                 || (hw.platform_type || '').indexOf('TDX') !== -1);
             if (claimsTdx) {
                 if (hw.tdx_quote_b64) {
@@ -1910,13 +1938,13 @@
                                 `🔏 Quote signature ECDSA P-256/SHA-256 by its attestation key over header+TDREPORT (v${qVersion}${bodyType ? ', body type ' + bodyType : ''}) valid<br>` +
                                 `⛓️ Attestation key bound into the QE report (SHA-256) and the QE report signed by the PCK leaf ✓<br>` +
                                 `⛓️ PCK chain: ${chainLabel}<br>` +
-                                `📜 PCK leaf "${pckSubject}" issued by: ${pckIssuer}<br>` +
+                                `📜 PCK leaf "${esc(pckSubject)}" issued by: ${esc(pckIssuer)}<br>` +
                                 `🔐 report_data[0..32] == this session's combined nonce, [32..64] zero — bound ✓<br>` +
-                                `📏 MRTD: ${qMrtdHex.substring(0, 32)}… (source: ${hw.tdx_evidence_source || 'unknown'})`;
+                                `📏 MRTD: ${qMrtdHex.substring(0, 32)}… (source: ${esc(hw.tdx_evidence_source || 'unknown')})`;
                         } else {
                             siliconMsg = `❌ <b>Intel TDX quote present but verification FAILED</b> ` +
                                 `(binding=${qBindingOk}, quote_sig=${qSigOk}, attkey_bind=${attKeyBound}, qe_report_sig=${qeRepSigOk}, issuer_intel=${issuerIntelOk}, root_chain=${chainOk})<br>` +
-                                `⚠️ PCK issuer was: "${pckIssuer || 'n/a'}" — do NOT trust this report.<br>` +
+                                `⚠️ PCK issuer was: "${esc(pckIssuer || 'n/a')}" — do NOT trust this report.<br>` +
                                 `⛓️ ${chainLabel}` +
                                 (!qBindingOk
                                     ? `<br>ℹ️ quote report_data[0..32] = ${qReportDataHex.slice(0, 32)}…, expected session nonce = ${expectedNonce.slice(0, 32)}…`
@@ -1924,7 +1952,7 @@
                         }
                     } catch (err) {
                         tdxVerified = false;
-                        siliconMsg = `❌ <b>Intel TDX verification error:</b> ${err.message}`;
+                        siliconMsg = `❌ <b>Intel TDX verification error:</b> ${esc(err.message)}`;
                     }
                 } else {
                     // No signed quote. A TDREPORT is generated inside the TD and
@@ -1936,9 +1964,12 @@
                     const probe = hw.tdx_evidence_probe || {};
                     const notes = Array.isArray(probe.notes) ? probe.notes.slice(0, 10) : [];
                     siliconMsg = `❌ <b>No hardware-signed TDX evidence in this report.</b><br>` +
-                        `⚠️ A bare TDREPORT (1024 B) is generated inside the guest and is UNSIGNED; sysfs MRTD/RTMRs are guest-internal self-reports. Neither is a silicon root.<br>` +
-                        `ℹ️ Enclave marker: hardware_signed_tdx_quote=${marker.hardware_signed_tdx_quote ? 'true' : 'false'}, status=${marker.tdx_quote_status || 'n/a'}, source=${hw.tdx_evidence_source || 'none'}${marker.tdx_td_report_present ? ', td_report_present=true' : ''}.` +
-                        (notes.length ? `<br>ℹ️ Probe transcript:<br>ℹ️ ${notes.join('<br>ℹ️ ')}` : '');
+                        ((marker.tdx_td_report_present || hw.tdx_td_report_b64)
+                            ? `⚠️ A bare TDREPORT (1024 B) is generated inside the guest and is UNSIGNED; sysfs MRTD/RTMRs are guest-internal self-reports. Neither is a silicon root.<br>`
+                            : `⚠️ The platform exposed no TDX guest device, so the enclave obtained neither a TD Quote nor a TDREPORT — there is nothing hardware-signed to verify.<br>`) +
+                        `ℹ️ Enclave marker: hardware_signed_tdx_quote=${marker.hardware_signed_tdx_quote ? 'true' : 'false'}, status=${esc(marker.tdx_quote_status || 'n/a')}, source=${esc(hw.tdx_evidence_source || 'none')}${marker.tdx_td_report_present ? ', td_report_present=true' : ''}.` +
+                        (marker.auditor_note ? `<br>ℹ️ Enclave's own note: ${esc(marker.auditor_note)}` : '') +
+                        (notes.length ? `<br>ℹ️ Probe transcript:<br>ℹ️ ${notes.map(esc).join('<br>ℹ️ ')}` : '');
                 }
             }
             // v153 SECURITY (audit SEC-04): platform-enforced silicon root.
