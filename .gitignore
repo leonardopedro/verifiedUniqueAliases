@@ -1,7 +1,7 @@
 # Compiled Rust binaries
 target/
 **/*.rs.bk
-
+paypal-auth-vm
 # Build Artifacts & Disk Images
 .gh_cli/
 .idx/
