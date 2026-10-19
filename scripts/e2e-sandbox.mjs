@@ -44,7 +44,6 @@ async function runFlow(browser, FLOW) {
   let reportJson = null;
   page.on('response', async (r) => {
     try {
-      if (r.request().method() !== 'GET') return;
       const ct = r.headers()['content-type'] || '';
       if (!/json/.test(ct)) return;
       const t = await r.text();
@@ -65,52 +64,130 @@ async function runFlow(browser, FLOW) {
   });
 
   try {
-    // 1. Enclave login → PayPal (auto-follows through authorize)
-    await page.goto(`${BASE}/login?flow=${FLOW}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    log(`  landed: ${page.url().split('?')[0]}`);
-
-    // 2. PayPal signin — split flow: email step then password step. The
-    // hidden pane also exists in the DOM, so decide by VISIBILITY, not count.
-    const emailSel = 'input[type="email"], input[name="login_email"], #email';
-    const passSel = 'input[type="password"], input[name="login_password"], #password';
-    const email = page.locator(emailSel).first();
-    const pw = page.locator(passSel).first();
-    await email.or(pw).first().waitFor({ state: 'visible', timeout: 30000 });
-    if (await pw.isVisible()) {
-      await pw.fill(PASSWORD);
-      log('  password step: filled');
-    } else {
-      await email.fill(EMAIL);
-      await page.locator('button[type="submit"], [data-e2e="btnNext"], button:has-text("Next"), button:has-text("Weiter")').first().click();
-      log('  email step: submitted');
-      await pw.waitFor({ state: 'visible', timeout: 20000 });
-      await pw.fill(PASSWORD);
+    // 1. Enclave login → PayPal (auto-follows through authorize). PayPal
+    // sometimes serves a transient "Sorry about that" error page — retry it.
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await page.goto(`${BASE}/login?flow=${FLOW}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      log(`  landed: ${page.url().split('?')[0]}`);
+      await page.waitForSelector('#email, #password', { timeout: 30000 }).catch(() => {});
+      const body = await page.content();
+      if (!/Sorry about that/.test(body)) break;
+      log(`  PayPal error page (attempt ${attempt}), retrying in 15s…`);
+      await page.waitForTimeout(15000);
     }
-    await page.locator('button[type="submit"], [data-e2e*="Login"], button:has-text("Log In"), button:has-text("Anmelden")').first().click();
-    log('  credentials submitted');
 
-    const onCallback = () => page.url().includes('login.airma.de/callback');
+    // 2. PayPal classic split form: one <form> with #email/#password and two
+    // submit buttons (#btnNext = email step, #btnLogin = password step). The
+    // panes are z-stacked, so Playwright actionability (fill/click) is
+    // unreliable — instead DOM-focus each field and type REAL keystrokes,
+    // which PayPal's keyup/blur validation listeners definitely observe.
+    const domClick = (id) => page.evaluate((b) => { const n = document.getElementById(b); if (n) n.click(); }, id);
+    const valOf = (id) => page.evaluate((b) => (document.getElementById(b) || {}).value || '', id);
+    const typeInto = async (id, text) => {
+      await page.evaluate((b) => {
+        const n = document.getElementById(b);
+        if (n) { n.focus(); n.select?.(); }
+      }, id);
+      await page.keyboard.press('Control+A').catch(() => {});
+      await page.keyboard.type(text, { delay: 15 });
+    };
+    const hasEmail = (await page.locator('#email').count()) > 0;
+    let navigated = false;
+    for (let attempt = 0; attempt < 3 && !navigated; attempt++) {
+      // step A: email → Next
+      if (hasEmail) {
+        await typeInto('email', EMAIL);
+        log(`  email field: "${(await valOf('email')).slice(0, 32)}"`);
+        await domClick('btnNext');
+        await page.waitForTimeout(2500);
+      }
+      // step B: password → Login (btnLogin may share the form with btnNext)
+      await typeInto('password', PASSWORD);
+      log(`  password field: ${(await valOf('password')).length} chars`);
+      await domClick('btnLogin').catch(() => domClick('btnNext'));
+      log(`  credentials submit #${attempt + 1}`);
+      navigated = await page
+        .waitForURL((u) => !/signin|authorize/.test(u.pathname), { timeout: 20000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!navigated) {
+        const body = await page.content().catch(() => '');
+        if (/too many times/i.test(body)) {
+          log('  ⚠️ rate-limited by PayPal, backing off 60s…');
+          await page.waitForTimeout(60000);
+        } else {
+          await page.waitForTimeout(2500);
+        }
+      }
+    }
+    log(`  credentials submitted (navigated=${navigated})`);
+    if (!navigated) throw new Error('login did not navigate after 3 submit attempts');
 
-    // 3. Consent SPA: maybe it auto-redirects; otherwise click the approve button
+    // 3. Consent: auto-redirect if previously granted; otherwise approve via
+    //    the consent UI (cookie banner first), falling back to the /callback
+    //    URL (with a real ?code=) that the consent page embeds — the same hop
+    //    the curl-based driver used successfully.
+    const isCallback = (u) => u.host === 'login.airma.de' && u.pathname === '/callback';
     try {
-      await page.waitForURL((u) => u.host === 'login.airma.de' && u.pathname === '/callback', { timeout: 12000 });
+      await page.waitForURL((u) => isCallback(u), { timeout: 15000 });
       log('  consent auto-completed (previously granted)');
     } catch {
-      await page.waitForSelector('button', { timeout: 20000 });
+      await page.waitForSelector('button', { timeout: 25000 });
+      // dismiss the cookie/overlay banner if it is in the way
+      const banner = page.locator('button.acceptButton, button:has-text("Yes, I accept")').first();
+      if (await banner.count()) {
+        await banner.click({ timeout: 5000 }).catch(() => {});
+        log('  cookie banner dismissed');
+        await page.waitForTimeout(1000);
+      }
       const agree = page.locator('button:not([disabled])').filter({
-        hasText: /zustimmen|agree|contin|autoriz|allow|genehmig|akzept|accept|weiter|next/i,
+        hasText: /zustimmen|agree|contin|autoriz|allow|genehmig|akzept|accept/i,
       }).first();
-      const target = (await agree.count()) ? agree : page.locator('button:not([disabled])').last();
-      const txt = ((await target.textContent().catch(() => '')) || '').trim().slice(0, 60);
-      log(`  consent click → "${txt}"`);
-      await target.click({ timeout: 10000 }).catch((e) => log(`  click failed: ${e.message.slice(0, 120)}`));
-      await page.waitForURL((u) => u.host === 'login.airma.de' && u.pathname === '/callback', { timeout: 30000 });
+      if (await agree.count()) {
+        const txt = ((await agree.textContent().catch(() => '')) || '').trim().slice(0, 60);
+        log(`  consent click → "${txt}"`);
+        await agree.click({ timeout: 10000 }).catch((e) => log(`  click failed: ${e.message.slice(0, 120)}`));
+      }
+      try {
+        await page.waitForURL((u) => isCallback(u), { timeout: 15000 });
+      } catch {
+        // Fallback: the consent page embeds the final callback URL incl. the
+        // authorization code — navigate to it directly.
+        const html2 = await page.content();
+        const m = html2.match(/https:\/\/login\.airma\.de\/callback\?[^"'\s<>\\]+/);
+        const cb = m && m[0].replace(/&amp;/g, '&');
+        if (cb && /[?&]code=/.test(cb)) {
+          log(`  consent fallback: hopping to embedded callback URL`);
+          await page.goto(cb, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        } else {
+          throw new Error('no consent approval and no embedded callback URL');
+        }
+      }
     }
 
     // 4. Enclave callback: code exchange + hardware attestation (can take seconds)
     log(`  callback: ${page.url().slice(0, 140)}`);
     await page.waitForLoadState('networkidle', { timeout: 45000 }).catch(() => { /* attestation may stream */ });
     await page.waitForTimeout(3000);
+    writeFileSync(`/tmp/result-${FLOW}-landing.html`, await page.content());
+
+    // 4b. One-time report generation: the landing page holds a POST /generate
+    // form (session_id + optional custom_info) whose submit triggers the
+    // hardware attestation report. Bind a flow marker as custom data.
+    const genBtn = page.locator('form[action="/generate"] button[type="submit"], button:has-text("Generate Certificate")').first();
+    if (await genBtn.count()) {
+      const custom = page.locator('form[action="/generate"] input[name="custom_info"]').first();
+      if (await custom.count()) await custom.fill(`e2e-${FLOW}-${Date.now()}`).catch(() => {});
+      log('  clicking Generate Certificate…');
+      await Promise.all([
+        page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => {}),
+        genBtn.click({ timeout: 10000 }),
+      ]);
+      await page.waitForTimeout(3000);
+      log(`  generate → ${page.url().slice(0, 140)}`);
+    } else {
+      log('  no generate form found (already generated?)');
+    }
     const html = await page.content();
     const finalUrl = page.url();
     writeFileSync(`/tmp/result-${FLOW}.html`, html);
@@ -128,21 +205,13 @@ async function runFlow(browser, FLOW) {
         } catch { /* not it */ }
       }
     }
-    // 6. Explicit download link on the page
+    // 6. The result page embeds the report verbatim in <pre id="raw_report">
+    //    (the Download button just blobs that innerText) — read it directly.
     if (!reportJson) {
-      const dl = page.locator('a[download], a:has-text("JSON"), a:has-text("Download")').first();
-      if (await dl.count()) {
-        log('  clicking report download link…');
-        const [download] = await Promise.all([
-          page.waitForEvent('download', { timeout: 15000 }).catch(() => null),
-          dl.click().catch(() => null),
-        ]);
-        if (download) {
-          const p = `/tmp/report-${FLOW}.json`;
-          await download.saveAs(p);
-          reportJson = (await import('fs')).readFileSync(p, 'utf8');
-          log(`  report download → ${p}`);
-        }
+      const raw = await page.locator('#raw_report').innerText().catch(() => '');
+      if (raw.trim().startsWith('{')) {
+        reportJson = raw.trim();
+        log(`  report extracted from #raw_report (${reportJson.length} bytes)`);
       }
     }
 
@@ -180,7 +249,16 @@ const browser = await chromium.launch({
   args: ['--disable-blink-features=AutomationControlled'],
 });
 const results = [];
-for (const f of FLOWS) results.push(await runFlow(browser, f));
+for (const f of FLOWS) {
+  if (f !== FLOWS[0]) await new Promise((r) => setTimeout(r, 15000));
+  let r = await runFlow(browser, f);
+  if (!r.ok) {
+    log(`  retrying ${f} once after 20s…`);
+    await new Promise((x) => setTimeout(x, 20000));
+    r = await runFlow(browser, f);
+  }
+  results.push(r);
+}
 await browser.close();
 
 log('\n===== E2E SUMMARY =====');

@@ -529,8 +529,13 @@
     // ========================================================================
     var EXPECTED_APPS = [
         // Sandbox (staging deployment — live-captured 2026-10-14)
-        { flow: 'verified', client_id: 'ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
-        { flow: 'full', client_id: 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address%20profile%20email%20https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
+        // App pairing (2026-10-19): the verified flow uses the REST app that
+        // has NO PII scopes enabled (profile/email/address are rejected at the
+        // app level), so minimal disclosure is structurally enforced by PayPal,
+        // not just by the requested scope. The full flow uses the PII-capable
+        // app. Swapping these back will break the full flow with "invalid scope".
+        { flow: 'verified', client_id: 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
+        { flow: 'full', client_id: 'ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address%20profile%20email%20https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
         // Production entries: add here at cutover (www.paypal.com authorize_base).
     ];
 
