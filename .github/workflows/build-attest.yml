@@ -25,10 +25,18 @@ jobs:
             dockerfile: Dockerfile.repro
             features: ""
             label: "GCP AMD SEV-SNP"
+            # Dockerfile.repro has no assembler stage — image-builder is its
+            # last stage and already exposes the artifacts below.
+            target: image-builder
           - platform: alibabacloud
             dockerfile: Dockerfile.alibaba
             features: "alibabacloud"
             label: "Alibaba Cloud Intel TDX"
+            # The bootable ESP disk is assembled in the `assembler` stage
+            # (Dockerfile.alibaba) and copied to /disk-alibaba.raw — building
+            # only image-builder (the ancestor stage) would never produce it,
+            # so the disk attestation below depends on this target.
+            target: assembler
 
     steps:
       - uses: actions/checkout@v4
@@ -58,7 +66,7 @@ jobs:
           # readable via the check-run annotations API) because raw job
           # logs require repo-admin access.
           for attempt in 1 2; do
-            if docker build --no-cache --load --target image-builder -f ${{ matrix.dockerfile }} -t paypal-auth-vm:${{ matrix.platform }} . 2>&1 | tee /tmp/docker-build.log; then
+            if docker build --no-cache --load --target ${{ matrix.target }} -f ${{ matrix.dockerfile }} -t paypal-auth-vm:${{ matrix.platform }} . 2>&1 | tee /tmp/docker-build.log; then
               break
             fi
             echo "::error title=docker build failed (attempt $attempt)::$(tail -c 1800 /tmp/docker-build.log | tr '\n' '|' )"
@@ -72,6 +80,9 @@ jobs:
           docker cp $CONTAINER_ID:/build/output/grubx64.efi ./grubx64-${{ matrix.platform }}.efi || true
           docker cp $CONTAINER_ID:/grub.cfg ./grub-${{ matrix.platform }}.cfg || true
           docker cp $CONTAINER_ID:/disk.tar.gz ./disk-${{ matrix.platform }}.tar.gz || true
+          # Alibaba ESP disk: produced by Dockerfile.alibaba's assembler stage
+          # at /disk-alibaba.raw (the GCP leg has no such file → || true).
+          docker cp $CONTAINER_ID:/disk-alibaba.raw ./disk-alibaba.raw || true
           docker cp $CONTAINER_ID:/packages.txt ./packages-${{ matrix.platform }}.txt || true
           docker cp $CONTAINER_ID:/build/packages.txt ./packages-${{ matrix.platform }}.txt || true
           docker rm $CONTAINER_ID
@@ -81,7 +92,7 @@ jobs:
           # sha256sum exits 1 on any missing file, and `bash -e` would kill the
           # step after all the real work already succeeded. This missing
           # tolerance was the deterministic CI failure of the alibabacloud leg.
-          sha256sum paypal-auth-vm-${{ matrix.platform }}.bin vmlinuz-${{ matrix.platform }} initramfs-${{ matrix.platform }}.img shimx64-${{ matrix.platform }}.efi grubx64-${{ matrix.platform }}.efi grub-${{ matrix.platform }}.cfg disk-${{ matrix.platform }}.tar.gz 2>/dev/null || true
+          sha256sum paypal-auth-vm-${{ matrix.platform }}.bin vmlinuz-${{ matrix.platform }} initramfs-${{ matrix.platform }}.img shimx64-${{ matrix.platform }}.efi grubx64-${{ matrix.platform }}.efi grub-${{ matrix.platform }}.cfg disk-${{ matrix.platform }}.tar.gz disk-alibaba.raw 2>/dev/null || true
           echo "========================="
 
       - name: Attest Enclave Binary
@@ -122,6 +133,17 @@ jobs:
           subject-name: VM Disk Image (${{ matrix.label }})
           subject-path: disk-${{ matrix.platform }}.tar.gz
 
+      # The Alibaba bootable ESP disk is the object that gets imported into ECS
+      # (import-alibaba-image.sh uploads output-alibaba/disk-alibaba.raw), so it
+      # is the artifact auditors must be able to pin to a CI run — a missing
+      # file fails the step rather than silently skipping the attestation.
+      - name: Attest ESP Disk Image
+        if: matrix.platform == 'alibabacloud'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ESP Disk Image (${{ matrix.label }})
+          subject-path: disk-alibaba.raw
+
       - name: Upload artifacts
         if: matrix.platform != 'gcp' || github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
@@ -132,4 +154,5 @@ jobs:
             initramfs-${{ matrix.platform }}.img
             vmlinuz-${{ matrix.platform }}
             disk-${{ matrix.platform }}.tar.gz
+            disk-alibaba.raw
           retention-days: 7
