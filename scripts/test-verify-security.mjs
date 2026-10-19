@@ -58,11 +58,12 @@ let lastAlert = null;
 globalThis.alert = (msg) => { lastAlert = msg; };
 
 // Provenance lookups (GitHub attestations) — configurable per test.
-let fetchMode = 'ok'; // 'ok' = every hash attested by run #777; '404' = unattested
+let fetchMode = 'ok'; // 'ok' = every hash attested by run #777; '404' = unattested; 'xss' = attested by a hostile run id
 globalThis.fetch = async () => {
-  if (fetchMode === 'ok') {
+  if (fetchMode === 'ok' || fetchMode === 'xss') {
+    const invocationId = fetchMode === 'xss' ? '<img src=x onerror=window.__pwned=1>' : '777';
     const payload = Buffer.from(JSON.stringify({
-      predicate: { runDetails: { metadata: { invocationId: '777' } } },
+      predicate: { runDetails: { metadata: { invocationId } } },
     })).toString('base64');
     return {
       ok: true, status: 200,
@@ -776,6 +777,76 @@ console.log('\nTest 21b: untrusted-report HTML injection neutralized (esc() sink
     !fw.includes('<svg') && fw.includes('&lt;svg'), fw.slice(0, 400));
   check('marker status rendered escaped (no attribute-breakout quote pair)',
     !fw.includes('">' + '<img'), fw.slice(0, 400));
+
+  // 21b cont.: the GitHub provenance row renders runIds from the API payload
+  // and the atomicity run number — both must arrive escaped too.
+  fetchMode = 'xss';
+  await runAuditWith(built.envelope);
+  const ghDesc = row('githubCheck').desc;
+  fetchMode = 'ok';
+  check('github-runId rendered escaped (no raw <img in provenance row)',
+    !ghDesc.includes('<img src=x') && ghDesc.includes('&lt;img src=x'), ghDesc.slice(0, 400));
+}
+
+console.log('\nTest 21c: golden-PCR pcr_values injection neutralized');
+{
+  // Test 20's self-consistent TPM fixture, but with a hostile pcr_0 value.
+  // The quote still verifies internally (composite built over the same
+  // values), so the DEGRADED-TRUST warning renders goldenDetails — which
+  // interpolates the quoted value and MUST escape it.
+  const IMG = '<img src=x onerror="window.__pwned=1">';
+  const ak = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const akPem = ak.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const pcrValues = {};
+      pcrValues['pcr_0'] = IMG + '00'.repeat(16); // hostile, 16-char window keeps the payload prefix
+      for (const p of [4, 8, 9]) pcrValues['pcr_' + p] = sha256(Buffer.from(`pcr${p}`)).toString('hex');
+      pcrValues['pcr_15'] = await calculatePcr15(DISK_MANIFEST);
+      // Use the PAGE's own composite function so the fixture is self-consistent
+      // with how verify.html parses hostile hex (NaN→0 pairs).
+      const composite = Buffer.from(await calculatePcrCompositeDigest(pcrValues), 'hex');
+      const qSigner = Buffer.alloc(32, 0x41);
+      const extra = Buffer.from(nonce, 'hex');
+      const parts = [];
+      const hdrB = Buffer.alloc(8);
+      hdrB.writeUInt32BE(0xFF544347, 0);
+      hdrB.writeUInt16BE(0x8018, 4);
+      hdrB.writeUInt16BE(qSigner.length, 6);
+      parts.push(hdrB, qSigner);
+      const edSz = Buffer.alloc(2); edSz.writeUInt16BE(extra.length, 0);
+      parts.push(edSz, extra, Buffer.alloc(25, 0));
+      const selCount = Buffer.alloc(4); selCount.writeUInt32BE(1, 0);
+      parts.push(selCount, Buffer.from([0x00, 0x0b, 0x03, 0x00, 0x04, 0x0f]));
+      const dgSz = Buffer.alloc(2); dgSz.writeUInt16BE(composite.length, 0);
+      parts.push(dgSz, composite);
+      const quoteMsg = Buffer.concat(parts);
+      const quoteSig = rsaSign('sha256', quoteMsg, ak.privateKey);
+      const gkeys = forge.pki.rsa.generateKeyPair(2048);
+      const gcert = forge.pki.createCertificate();
+      gcert.publicKey = gkeys.publicKey;
+      gcert.serialNumber = '02';
+      gcert.validity.notBefore = new Date(Date.now() - 86400000);
+      gcert.validity.notAfter = new Date(Date.now() + 86400000);
+      const gdn = [{ name: 'commonName', value: 'gcp-instance' }, { name: 'organizationName', value: 'EK/AK CA Intermediate' }];
+      gcert.setSubject(gdn);
+      gcert.setIssuer(gdn);
+      gcert.sign(gkeys.privateKey, forge.md.sha256.create());
+      return {
+        ak_pub_pem: akPem,
+        tpm_quote_msg: quoteMsg.toString('base64'),
+        tpm_quote_sig: quoteSig.toString('base64'),
+        pcr_values: pcrValues,
+        google_ak_cert_pem: forge.pki.certificateToPem(gcert),
+        platform_type: 'GCP',
+      };
+    },
+  });
+  const { ok } = await runAuditWith(built.envelope);
+  const tpmDesc = row('tpmCheck').desc;
+  check('hostile-pcr report still passes its self-consistent checks', ok === true, `ok=${ok}`);
+  check('golden-PCR UNPINNED detail rendered escaped (no raw <img in tpm row)',
+    !tpmDesc.includes('<img src=x') && tpmDesc.includes('&lt;img src=x'), tpmDesc.slice(0, 400));
 }
 
 // ---- Optional: a REAL report captured from the live enclave ---------------

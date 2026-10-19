@@ -2619,9 +2619,11 @@ async fn generate_attestation(
     // stdout lands on the serial console, which is readable account-wide via
     // ECS DescribeInstanceConsoleOutput (and by the cloud operator). PII stays
     // inside the TLS session where the report is actually delivered.
-    // (paypal_hash below is kept: it is a non-PII digest already present in
-    // the signed report.)
-    println!("DEBUG: paypal_hash: {}", paypal_hash);
+    // Round 2: the DEBUG: paypal_hash print was removed as well — the digest is
+    // a STABLE PSEUDONYMOUS USER IDENTIFIER (nonce component [0..32]) and the
+    // console audience is broader than the TLS session that receives the
+    // signed report. The hash itself is still computed and signed into the
+    // report; it is simply no longer echoed to an account-readable channel.
 
     // 2.5 Software Hash Check (Self-measure)
     let bin_path = "/init"; 

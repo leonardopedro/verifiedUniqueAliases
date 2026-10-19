@@ -1396,12 +1396,12 @@
                     const pin = GOLDEN_PCRS[gpcr];
                     const actual = ((hw.pcr_values || {})[gpcr] || '').replace(/^0x/i, '').toLowerCase();
                     if (!pin) {
-                        goldenDetails.push(`⚠️ ${gpcr} (${PCR_DESC[gpcr] || 'boot chain'}): UNPINNED — quoted value ${actual ? actual.substring(0, 16) + '…' : '(absent)'}`);
+                        goldenDetails.push(`⚠️ ${gpcr} (${PCR_DESC[gpcr] || 'boot chain'}): UNPINNED — quoted value ${actual ? esc(actual.substring(0, 16)) + '…' : '(absent)'}`);
                         continue;
                     }
                     goldenPinned++;
                     if (actual !== pin.toLowerCase()) {
-                        goldenFails.push(`${gpcr}: expected ${pin.substring(0, 16)}…, got ${actual ? actual.substring(0, 16) + '…' : '(absent)'}`);
+                        goldenFails.push(`${gpcr}: expected ${pin.substring(0, 16)}…, got ${actual ? esc(actual.substring(0, 16)) + '…' : '(absent)'}`);
                     } else {
                         goldenDetails.push(`✅ ${gpcr} (${PCR_DESC[gpcr] || 'boot chain'}): matches CI golden pin`);
                     }
@@ -1490,9 +1490,11 @@
                 unattested: 'NO GitHub attestation exists for this exact SHA-256 — the artifact was built outside CI or from uncommitted source. Deploy a build produced from a pushed commit (or the CI-built artifact) so the same hash is attested',
                 network: 'GitHub API unreachable (offline auditor or rate limit) — retry',
             };
+            // runIds are strings from the GitHub API payload — treat them as
+            // untrusted for innerHTML (esc), same as report-controlled data.
             const provLine = (c) => c.success
-                ? `✅ ${c.name} (#${c.runIds.join(',')})`
-                : `❌ ${c.name} — ${provReasons[c.reason] || 'not attested'}`;
+                ? `✅ ${c.name} (#${esc(c.runIds.join(','))})`
+                : `❌ ${c.name} — ${esc(provReasons[c.reason] || 'not attested')}`;
             const atomicFail = imageComponents.some(c => c.reason === 'missing')
                 ? provReasons.missing
                 : (commonRuns === null
@@ -1501,7 +1503,7 @@
             const provResults =[
                 provLine(bin),
                 ukiLayout ? provLine(uki) : '',
-                atomic ? `✅ Image Atomicity (Run #${[...commonRuns][0]})` : `❌ Image Atomicity — ${atomicFail}`,
+                atomic ? `✅ Image Atomicity (Run #${esc([...commonRuns][0])})` : `❌ Image Atomicity — ${esc(atomicFail)}`,
                 hasPcr15
                     ? (pcr15Ok ? `✅ PCR 15 hardware binding mathematically verified` : `❌ PCR 15 Software Mismatch`)
                     : (hw.snp_report_b64
