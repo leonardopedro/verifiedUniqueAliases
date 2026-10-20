@@ -140,6 +140,41 @@ made from an OSS object via `ImportImage`.
 - `RunInstances` returns `InstanceIdSets.InstanceIdSet` (capital D) — reading
   `.InstanceidSet` silently yields an empty instance id
 - `DeleteDisk` takes lowercase `--force`; `StopInstance` takes `--ForceStop`
+- **EIP bind/unbind is VPC-side and rejects `InstanceType`**: ECS
+  `DisassociateEipAddress` and `UnassociatePublicIpAddress` do not exist
+  (`InvalidAction.NotFound`). Use `vpc UnassociateEipAddress` /
+  `vpc AssociateEipAddress` with `AllocationId` + `InstanceId` and **no
+  `InstanceType`** — both `Ecs` and `ecs` are rejected
+  (`InvalidInstanceType.ValueNotSupported` /
+  `InvalidParameter.InstanceTypeNotSupport`)
+- **An instance's auto-assigned public IP blocks EIP binding**
+  (`EIP_CAN_NOT_ASSOCIATE_WITH_PUBLIC_IP` — even while Stopped). Release it
+  first: `ecs ReleasePublicIpAddress` (the `PublicIpAddress=<exact ip>`
+  parameter is required); there is no "keep public IP" escape hatch
+- **`/tmp/ali-rpc.mjs` args are `Key=Value`, never `--Key value`** — a
+  bash-style `--RegionId cn-beijing` misparses into a garbage key and the call
+  silently runs in the profile's default region (`cn-hangzhou` → empty
+  result sets that look like "no instances exist")
+- **STS creds expire (~3 h)**: `~/.aliyun/config.json` is OAuth mode. On
+  `InvalidSecurityToken.Expired`, run any harmless `aliyun <product> <Action>`
+  once — the CLI auto-refreshes STS and rewrites the profile, after which the
+  `/tmp/*-rpc.mjs` helpers work again (`sts_expiration` shows remaining life)
+
+### Cloudflare DNS-01 token is IP-pinned to the reserved EIP (proven live 2026-10-20)
+
+The `dns01_secret` Cloudflare API token in the enclave config **only authorizes
+API calls that egress from the reserved EIP** (`eip-2zet05jbat6wr6rp7elrc`,
+101.200.178.251). From any other address — operator host, relay instance, or
+an ECS instance using its auto-assigned public IP — Cloudflare returns
+`Invalid API Token` (codes 1000/9109), which the enclave surfaces at boot as
+`zone 'airma.de' not found for this API token` and then falls back to HTTP-01
+(carrier-intercepted on mainland IPs ⇒ no TLS ever). Operational consequence
+for any instance swap: the EIP must be moved **and** the instance must egress
+through it *before* its first ACME attempt — release the auto public IP, bind
+the EIP (recipes in the API-traps list above), then boot/reboot. The enclave
+only orders ACME at boot, so a reboot after the EIP is in place is required.
+The EIP also pins `login.airma.de` DNS (A record = the EIP), so moving it
+moves all production traffic.
 
 ### Aliyun CLI Workflow (this branch's core tooling)
 
@@ -275,3 +310,23 @@ The system presents a signed **Remote Attestation Report** on the OAuth callback
 - **`tpm2` standalone binary vs wrapper**: In the minimal initramfs filesystem, the unified `tpm2` binary should always be invoked directly — wrapper aliases like `tpm2_getcap` often don't exist, causing silent failures. Use pattern `tpm2 getcap` instead of `tpm2-getcap`.
 - **DHCP timeout**: NATIVE implementation waits up to 30 seconds for DHCPAC before rejecting. If the cloud metadata service is slow responding, increase the socket timeout in PID-1 init (currently set to 30 seconds in the socket setup path).
 - **PCIe slot exhaustion**: Each module loaded via `insmod` occupies PCI space on bare-metal virtualized infrastructures; batch loads where possible in `insmod_all()` function.
+
+---
+
+## Security Audit Status (2026-10-20)
+
+- **Round 1 complete & deployed**: independent audit under the threat model
+  *the cloud provider and the owner of login.airma.de are untrusted and may
+  collude* — fixes in `6a99f0e` (enclave OAuth: CSRF cookie + PKCE binding on
+  `state = <flow>.<nonce>`; verify.html: MRTD/RTMR pins, app pins
+  (full=`ARDDr…` / verified=`AZXkz…`), code/preflight pins, boot-chain
+  provenance for shim/grub; CI: attests shim+grub and gates on the 83-test
+  harness). CI run 283 green; attestations resolve unauthenticated via
+  `api.github.com/repos/<o>/<r>/attestations/sha256:<hex>`; local disk
+  `00963ad5…`, binary `ebe9fa31…`, initrd `ab97b8ed…` are byte-identical to
+  CI's attested digests.
+- **Live deployment**: new TDX instance `i-2ze0sd65q6qhot55aerq` holds the
+  reserved EIP and serves TLS; old `i-2zefwa6bdimeg1rbcfsg` is the rollback
+  (Running, no EIP). Round-1 E2E against live PayPal has NOT run yet.
+- **State of play + remaining task list live in `HANDOVER.md`** (repo root) —
+  read it before continuing the audit cycle.
