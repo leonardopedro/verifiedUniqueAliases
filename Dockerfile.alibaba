@@ -33,7 +33,11 @@ RUN bash -c ". /usr/local/cargo/env && \
           target/x86_64-unknown-linux-gnu/release/paypal_auth_vm* \
           target/x86_64-unknown-linux-gnu/release/deps/paypal-auth-vm*"
 
-# Layer 2: compile our crate
+# Layer 2: compile our crate.
+# NOTE: verify.html is deliberately NOT embedded (no include_str!) — it is
+# shipped as a disk file by the image-builder stage. This keeps the binary's
+# self-measure SHA256(/init) independent of EXPECTED_ENCLAVE_SHA256 (the code
+# pin inside verify.html), so the pin is not self-referential.
 COPY src ./src
 RUN bash -c ". /usr/local/cargo/env && \
     set -euo pipefail && \
@@ -67,6 +71,7 @@ COPY --from=rust-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin
 COPY --from=rust-builder /usr/bin/add-det /usr/bin/add-det
 
 COPY build-initramfs-tools.sh ./
+COPY verify.html ./
 COPY src ./src
 
 RUN chmod +x build-initramfs-tools.sh && \

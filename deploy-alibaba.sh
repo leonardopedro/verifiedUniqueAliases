@@ -40,9 +40,18 @@ ALI_IMAGE_ID="${ALI_IMAGE_ID:-}"
 ALI_VPC_ID="${ALI_VPC_ID:-}"
 ALI_VSWITCH_ID="${ALI_VSWITCH_ID:-}"
 ALI_SECURITY_GROUP_ID="${ALI_SECURITY_GROUP_ID:-}"
-ALI_SYSTEM_DISK_SIZE="${ALI_SYSTEM_DISK_SIZE:-20}"
-# TDX shapes reject cloud_efficiency/cloud_ssd — verified via RunInstances --DryRun
-ALI_SYSTEM_DISK_CATEGORY="${ALI_SYSTEM_DISK_CATEGORY:-cloud_essd}"
+# Minimum-cost system disk, verified via RunInstances --DryRun (2026-10-20):
+#   - cloud_auto @ 1 GiB ACCEPTS TDX+imported image (baseline 3000 IOPS/125 MB/s
+#     included; <=3 GiB cannot burst/预配置 so no performance fees) → ¥1.53/mo
+#   - cloud_essd is hard-floored at 20 GiB on RunInstances (10 GiB rejected:
+#     InvalidSystemDiskSize.ValueNotSupported) → ¥15.33/mo at 20 GiB
+#   - cloud_essd_entry floors at 10 GiB; cloud_efficiency/cloud_ssd/cloud_essd_local
+#     rejected outright (InvalidDisk.*). 1 GiB is the API floor (image=46 MiB
+#     rounds to 1 GiB; disks are GiB-granular — 100 MB is not representable).
+# ReplaceSystemDisk cannot reach this state (shrinking + type change both
+# forbidden) → a fresh instance is required to get the 1 GiB disk.
+ALI_SYSTEM_DISK_SIZE="${ALI_SYSTEM_DISK_SIZE:-1}"
+ALI_SYSTEM_DISK_CATEGORY="${ALI_SYSTEM_DISK_CATEGORY:-cloud_auto}"
 ALI_INTERNET_BW="${ALI_INTERNET_BW:-5}"
 
 # Spot: pay market price, NO protection period (reclaimable immediately)

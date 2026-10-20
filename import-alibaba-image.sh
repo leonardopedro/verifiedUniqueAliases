@@ -17,6 +17,15 @@
 #   export ALI_OSS_BUCKET=your-bucket-name        # required
 #   export ALI_REGION=cn-beijing                  # default
 #   bash import-alibaba-image.sh
+#
+# Relay notes (2026-10-20):
+#   - OSS data-plane calls from outside mainland China are geo-blocked, so the
+#     upload path is: local → HK bucket (paypal-tdx-relay-*) → relay ECS in
+#     cn-beijing → intranet PUT to the Beijing bucket (see the /tmp/relay*
+#     transfer flow; `aliyun oss cp` below only works FROM a mainland host).
+#   - NEXT relay instance: a 1 GiB cloud_auto system disk is enough (the relay
+#     only shuttles the 46 MiB disk image). Start it for the upload, then stop
+#     it economically:  aliyun ecs StopInstance --InstanceId <id> --StoppedMode StopCharging
 # =============================================================================
 set -eo pipefail
 

@@ -528,15 +528,27 @@ fn configfs_evidence(report_data: &[u8; 64], ev: &mut TdxEvidence) {
             .push("configfs: /sys/kernel/config/tsm/report absent (tsm reports module not registered?)".into());
         return;
     }
-    let dir = format!("{}/paypal_{}", base, hex::encode(&report_data[..8]));
-    let _ = std::fs::remove_dir_all(&dir);
+    // Unique per-request entry name. The SEC-02 nonce (and thus report_data) is
+    // DETERMINISTIC per boot, so a name derived from report_data alone repeats
+    // across requests; if a prior entry lingers, create_dir would EEXIST and the
+    // signed quote silently degrades to the unsigned TDREPORT (silicon root lost).
+    // A monotonic counter makes every entry distinct so a lingering entry can
+    // never collide.
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = format!("{}/paypal_{}_{:08x}", base, hex::encode(&report_data[..8]), seq);
+    // configfs entries are removed with rmdir (remove_dir), NEVER remove_dir_all:
+    // the latter recurses into inblob/outblob/provider — configfs attributes that
+    // cannot be unlinked — so it always failed and leaked the entry. That leak is
+    // what caused the fixed-name EEXIST once the nonce became deterministic.
+    let _ = std::fs::remove_dir(&dir);
     if let Err(e) = std::fs::create_dir(&dir) {
         ev.notes.push(format!("configfs: create entry failed: {}", e));
         return;
     }
     if let Err(e) = std::fs::write(format!("{}/inblob", dir), report_data) {
         ev.notes.push(format!("configfs: write inblob failed: {}", e));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir(&dir);
         return;
     }
     match std::fs::read_to_string(format!("{}/provider", dir)) {
@@ -580,7 +592,7 @@ fn configfs_evidence(report_data: &[u8; 64], ev: &mut TdxEvidence) {
             ev.aux_b64 = Some(STANDARD.encode(&aux));
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir(&dir);
 }
 
 const TDX_DEVICES: [&str; 2] = ["/dev/tdx_guest", "/dev/tdx-guest"];
@@ -745,28 +757,40 @@ fn device_quote(report_data: &[u8; 64], ev: &mut TdxEvidence) {
     }
 }
 
-/// Collect whatever TDX silicon evidence this platform actually offers,
-/// binding `nonce_hex` into REPORTDATA (first 32 bytes; matches the SNP
-/// report_data / TPM-nonce convention used by the auditor).
+/// Collect TDX silicon evidence, binding either `report_data_override`
+/// (pre-flight client-bound digest) or `nonce_hex` into REPORTDATA.
 ///
 /// Never panics and never claims evidence it did not obtain — every failure
-/// lands in `notes` for the /debug endpoint.
-pub fn collect_silicon_evidence(nonce_hex: &str) -> TdxEvidence {
+/// lands in `notes`.
+pub fn collect_silicon_evidence(
+    nonce_hex: &str,
+    report_data_override: Option<[u8; 64]>,
+) -> TdxEvidence {
     let mut ev = TdxEvidence::default();
     let mut report_data = [0u8; 64];
-    match hex::decode(nonce_hex.trim()) {
-        Ok(bytes) if bytes.len() >= 32 => {
-            report_data[..32].copy_from_slice(&bytes[..32]);
-            ev.notes.push(format!(
-                "bind NOTE: REPORTDATA[0..32] = session nonce {}",
-                hex::encode(&report_data[..32])
-            ));
+
+    if let Some(rdo) = report_data_override {
+        report_data.copy_from_slice(&rdo);
+        ev.notes.push(format!(
+            "bind NOTE: REPORTDATA explicitly overridden with client-bound pre-flight digest ({})",
+            hex::encode(&report_data[..32])
+        ));
+    } else {
+        match hex::decode(nonce_hex.trim()) {
+            Ok(bytes) if bytes.len() >= 32 => {
+                report_data[..32].copy_from_slice(&bytes[..32]);
+                ev.notes.push(format!(
+                    "bind NOTE: REPORTDATA[0..32] = session nonce {}",
+                    hex::encode(&report_data[..32])
+                ));
+            }
+            _ => ev.notes.push(format!(
+                "bind WARNING: nonce_hex not decodable (len={}) — REPORTDATA zeroed",
+                nonce_hex.len()
+            )),
         }
-        _ => ev.notes.push(format!(
-            "bind WARNING: nonce_hex not decodable (len={}) — REPORTDATA zeroed",
-            nonce_hex.len()
-        )),
     }
+
     configfs_evidence(&report_data, &mut ev);
     if ev.td_report_b64.is_none() && ev.quote_b64.is_none() {
         device_report(&report_data, &mut ev);

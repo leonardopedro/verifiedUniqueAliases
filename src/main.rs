@@ -1,21 +1,16 @@
-//! PaynePal OAuth Confidential VM
+//! PayPal OAuth Confidential Enclave (Intel TDX / Alibaba Cloud)
 //!
-//! Configuration: Single JSON secret in GCP Secret Manager  
-//! TLS: Google Public CA via ACME
-//! Runtime: GCP Confidential VM (AMD SEV-SNP) or Alibaba Cloud Intel TDX depending on build target
+//! Hardened Zero-Trust Implementation against Colluding Owner & Cloud Provider
 
-mod intel_tdx;  // Portable TDX attestation adapter for ECS.r9i.xlarge
+mod intel_tdx;
 
 const GOOGLE_CA_PEM: &[u8] = include_bytes!("google_ca.pem");
 const PAYPAL_CA_PEM: &[u8] = include_bytes!("paypal.pem");
 
-// ============================================================================
-// ENCLAVE INIT — PID 1 responsibilities: mounts, drivers, DHCP
-// Called before the Tokio runtime touches anything.
-// ============================================================================
 mod enclave_init {
     use socket2::{Domain, Protocol, Socket, Type};
     use std::net::Ipv4Addr;
+    use std::os::unix::io::AsRawFd;
 
     pub fn kmsg(msg: &str) {
         if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
@@ -25,95 +20,37 @@ mod enclave_init {
         eprintln!("[INIT] {}", msg);
     }
 
-    /// Mount essential kernel virtual filesystems.
     pub fn load_drivers() {
-        // v128: Final boss mode module loading
         let _ = std::process::Command::new("/bin/mount").args(["-t", "proc", "none", "/proc"]).status();
         let _ = std::process::Command::new("/bin/mount").args(["-t", "sysfs", "none", "/sys"]).status();
         let _ = std::process::Command::new("/bin/mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
-        
+
         insmod_all();
-        
-        // Try to clear existing (possibly broken) attestation state
+
         #[cfg(feature = "alibabacloud")]
         {
             let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "intelpsfw"]).status();
-        }
-        #[cfg(not(feature = "alibabacloud"))]
-        {
-            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "amd_tsm"]).status();
-            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "amd-tsm"]).status();
-            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "tsm"]).status();
-            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "tsm_report"]).status();
-            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "sev_guest"]).status();
-            let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "sev-guest"]).status();
-        }
-
-        modprobe("configfs");
-        let _ = std::process::Command::new("/bin/mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
-        
-        modprobe("virt_anchor");
-        modprobe("coco");
-        
-        #[cfg(feature = "alibabacloud")]
-        {
-            // v131: the TDX evidence interfaces ship as loadable modules
-            // (CONFIG_TDX_GUEST_DRIVER=m, CONFIG_TSM_REPORTS=m) and were never
-            // loaded before — so /dev/tdx_guest and
-            // /sys/kernel/config/tsm/report were absent at runtime even though
-            // the Debian 6.12 cloud kernel supports both.
+            modprobe("configfs");
+            let _ = std::process::Command::new("/bin/mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
+            modprobe("virt_anchor");
+            modprobe("coco");
             modprobe("tsm");
             modprobe("tdx-guest");
             modprobe("tdx_guest");
-            // Subsystems registered by freshly loaded modules appear on the
-            // already-mounted configfs; remount defensively (a duplicate mount
-            // failure is harmless and ignored here).
             let _ = std::process::Command::new("/bin/mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
-            kmsg(&format!(
-                "TDX modules: {}",
-                super::intel_tdx::modules_matching(&["tdx", "report", "tsm"]).join(", ")
-            ));
         }
-        
-        #[cfg(not(feature = "alibabacloud"))]
-        {
-            modprobe("tsm");
-            modprobe("amd_tsm");
-            modprobe("amd-tsm");
-            modprobe("sev-guest");
-            modprobe("sev_guest");
-            modprobe("coco_guest");
-            
-            // v134: Aggressive probe retry only on AMD platforms
-            let _ = std::process::Command::new("/bin/sh").args(["-c", "echo sev-guest > /sys/bus/platform/drivers/sev-guest/bind"]).status();
-        }
-        
-        if !std::path::Path::new("/sys/kernel/config/tsm").exists() || 
-           (cfg!(feature = "alibabacloud") && !std::path::Path::new("/dev/tpmrm0").exists())
-        {
-             let _ = std::process::Command::new("/bin/mkdir").args(["-p", "/sys/kernel/config/tsm"]).status();
-        }
-  
-        modprobe("gve");
+
         modprobe("virtio_net");
         modprobe("virtio_scsi");
         modprobe("virtio_blk");
         modprobe("virtio_pci");
         modprobe("nvme");
         modprobe("nvme_core");
-        
-        // v91: Recursive module hunter for attestation drivers
-        kmsg("Scanning for attestation modules...");
-        let _ = std::process::Command::new("find").args(["/lib/modules", "-name", "*sev*", "-o", "-name", "*tsm*", "-o", "-name", "*coco*"]).status();
-        
         modprobe("tpm_tis");
         modprobe("tpm_crb");
-        
         modprobe("vfat");
         modprobe("nls_cp437");
         modprobe("nls_ascii");
-
-        // v116: Strict Kernel Egress Filtering via nftables
         modprobe("nf_conntrack");
         modprobe("nft_ct");
         modprobe("nf_tables");
@@ -140,22 +77,18 @@ mod enclave_init {
             "add rule inet filter output udp dport 53 accept",
             "add rule inet filter output tcp dport 53 accept",
             "add rule inet filter output ip daddr 169.254.169.254 accept",
-            // Alibaba Cloud's instance metadata service is 100.100.100.200 (GCP/AWS use
-            // 169.254.169.254) and it serves plain HTTP only — without this rule the
-            // enclave can never read user_data and boot-loops on a missing config.
             "add rule inet filter output ip daddr 100.100.100.200 accept",
             "add rule inet filter output tcp dport 443 accept",
-            // Documented egress policy: 53 (DNS), 80 and 443. Port 80 was missing here
-            // even though the policy (and Alibaba IMDS) require it.
             "add rule inet filter output tcp dport 80 accept",
         ];
 
         for cmd in commands {
-            let status = std::process::Command::new("/usr/sbin/nft")
-                .arg(cmd)
-                .status();
-            if let Err(e) = status {
-                kmsg(&format!("Failed to execute nft command '{}': {}", cmd, e));
+            match std::process::Command::new("/usr/sbin/nft").arg(cmd).status() {
+                Ok(s) if s.success() => {}
+                _ => {
+                    kmsg(&format!("FATAL: Failed to execute nft command '{}' — halting", cmd));
+                    poweroff();
+                }
             }
         }
     }
@@ -166,95 +99,63 @@ mod enclave_init {
             let src = std::ffi::CString::new(source).unwrap();
             let tgt = std::ffi::CString::new(target).unwrap();
             let fst = std::ffi::CString::new(fstype).unwrap();
-            let ret = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), 0, std::ptr::null()) };
-            if ret != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EBUSY) {
-                    kmsg(&format!("mount {} -> {}: {:?}", source, target, err));
-                }
-            }
+            let _ = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), 0, std::ptr::null()) };
         }
-        mount_fs("devtmpfs", "/dev",  "devtmpfs"); // Mount /dev first so kmsg works!
+        mount_fs("devtmpfs", "/dev", "devtmpfs");
         kmsg("--- PAYPAL ENCLAVE NATIVE RUST BOOT ---");
-        mount_fs("proc",     "/proc", "proc");
-        mount_fs("sysfs",    "/sys",  "sysfs");
-        mount_fs("tmpfs",    "/tmp",  "tmpfs");
-        mount_fs("tmpfs",    "/run",  "tmpfs");
-        
-        // CRITICAL FIX: load configfs module BEFORE trying to mount it
+        mount_fs("proc", "/proc", "proc");
+        mount_fs("sysfs", "/sys", "sysfs");
+        mount_fs("tmpfs", "/tmp", "tmpfs");
+        mount_fs("tmpfs", "/run", "tmpfs");
         modprobe("configfs");
         mount_fs("configfs", "/sys/kernel/config", "configfs");
         std::fs::create_dir_all("/dev/pts").ok();
-
-        // 9. Mount EFI partition to measure the boot chain
         std::fs::create_dir_all("/boot/efi").ok();
-        // GCP standard is sda1, VirtIO is vda1.
         mount_fs("/dev/sda1", "/boot/efi", "vfat");
         mount_fs("/dev/vda1", "/boot/efi", "vfat");
-
-        kmsg("Filesystems mounted");
     }
 
     pub fn measure_boot_components() -> std::collections::BTreeMap<String, String> {
         use sha2::{Digest, Sha256};
         let mut manifest = std::collections::BTreeMap::new();
-        
         let mount_point = "/tmp/esp";
         let _ = std::fs::create_dir_all(mount_point);
-        
+
         fn mount_device(source: &str, target: &str) -> bool {
             let src = std::ffi::CString::new(source).unwrap();
             let tgt = std::ffi::CString::new(target).unwrap();
             let fst = std::ffi::CString::new("vfat").unwrap();
-            let ret = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), libc::MS_RDONLY, std::ptr::null()) };
-            if ret == 0 {
-                kmsg(&format!("Successfully mounted {} to {}", source, target));
-                true
-            } else {
-                false
-            }
+            unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), libc::MS_RDONLY, std::ptr::null()) == 0 }
         }
 
-        // DYNAMIC DISCOVERY: Scan /sys/class/block for anything that looks like a partition
-        let mut success = false;
         if let Ok(entries) = std::fs::read_dir("/sys/class/block") {
             let mut candidates: Vec<String> = entries.filter_map(|e| e.ok())
                 .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.chars().any(|c| c.is_digit(10))) // Likely a partition
+                .filter(|n| n.chars().any(|c| c.is_ascii_digit()))
                 .collect();
-            candidates.sort(); // Try sda1 before sda2 etc.
-            
+            candidates.sort();
+
             for dev_name in candidates {
                 let dev_path = format!("/dev/{}", dev_name);
                 if mount_device(&dev_path, mount_point) {
-                    success = true;
                     break;
                 }
             }
         }
-        
-        if !success {
-            kmsg("CRITICAL: Failed to mount EFI System Partition after scanning all devices!");
-        }
 
-        fn hash_recursive(dir: &str, mount_point: &str, manifest: &mut std::collections::BTreeMap<String, String>) {
+        fn hash_recursive(dir: &str, root: &str, m: &mut std::collections::BTreeMap<String, String>) {
             if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.filter_map(|e| e.ok()) {
+                for entry in entries.flatten() {
                     let path = entry.path();
                     let path_str = path.to_string_lossy();
                     if path.is_dir() {
-                        hash_recursive(&path_str, mount_point, manifest);
+                        hash_recursive(&path_str, root, m);
                     } else if path.is_file() {
-                        if let Ok(mut file) = std::fs::File::open(&path) {
+                        if let Ok(mut f) = std::fs::File::open(&path) {
                             let mut hasher = Sha256::new();
-                            if std::io::copy(&mut file, &mut hasher).is_ok() {
-                                let h = hex::encode(hasher.finalize());
-                                // Key should be relative to the ESP root (e.g. EFI/BOOT/grub.cfg)
-                                let key = path_str.strip_prefix(mount_point)
-                                    .unwrap_or(&path_str)
-                                    .trim_start_matches('/')
-                                    .to_string();
-                                manifest.insert(key, h);
+                            if std::io::copy(&mut f, &mut hasher).is_ok() {
+                                let key = path_str.strip_prefix(root).unwrap_or(&path_str).trim_start_matches('/').to_string();
+                                m.insert(key, hex::encode(hasher.finalize()));
                             }
                         }
                     }
@@ -262,21 +163,18 @@ mod enclave_init {
             }
         }
         hash_recursive(mount_point, mount_point, &mut manifest);
-        
         let tgt = std::ffi::CString::new(mount_point).unwrap();
         unsafe { libc::umount(tgt.as_ptr()); }
         manifest
     }
 
     fn insmod_all() {
-        kmsg("Aggressively loading all discovered modules via insmod...");
         let paths = ["/sbin/find", "/usr/bin/find", "/bin/find", "find"];
         for path in &paths {
             if let Ok(output) = std::process::Command::new(path).args(["/lib/modules", "-name", "*.ko"]).output() {
                 let s = String::from_utf8_lossy(&output.stdout);
                 for line in s.lines() {
-                    if line.contains("tsm") || line.contains("sev") || line.contains("coco") || line.contains("anchor") || line.contains("virtio") || line.contains("gve") || line.contains("configfs") || line.contains("tdx") || line.contains("report") {
-                        kmsg(&format!("insmod {}", line));
+                    if line.contains("tsm") || line.contains("sev") || line.contains("coco") || line.contains("virtio") || line.contains("tdx") {
                         let _ = std::process::Command::new("/sbin/insmod").arg(line).status();
                     }
                 }
@@ -287,20 +185,10 @@ mod enclave_init {
 
     fn modprobe(module: &str) {
         let paths = ["/sbin/modprobe", "/usr/sbin/modprobe", "/bin/modprobe", "modprobe"];
-        let mut success = false;
         for path in &paths {
-            match std::process::Command::new(path).arg("-q").arg(module).status() {
-                Ok(s) if s.success() => {
-                    kmsg(&format!("modprobe {} (via {}): OK", module, path));
-                    success = true;
-                    break;
-                },
-                Ok(_) => {}, // Try next path if this one failed (maybe not found)
-                Err(_) => {},
+            if let Ok(s) = std::process::Command::new(path).arg("-q").arg(module).status() {
+                if s.success() { break; }
             }
-        }
-        if !success {
-            kmsg(&format!("modprobe {}: ALL PATHS FAILED", module));
         }
     }
 
@@ -312,8 +200,7 @@ mod enclave_init {
     }
 
     fn read_mac(iface: &str) -> [u8; 6] {
-        let s = std::fs::read_to_string(format!("/sys/class/net/{}/address", iface))
-            .unwrap_or_default();
+        let s = std::fs::read_to_string(format!("/sys/class/net/{}/address", iface)).unwrap_or_default();
         let mut mac = [0u8; 6];
         for (i, p) in s.trim().split(':').enumerate().take(6) {
             mac[i] = u8::from_str_radix(p, 16).unwrap_or(0);
@@ -322,18 +209,17 @@ mod enclave_init {
     }
 
     fn build_dhcp(xid: u32, mac: &[u8; 6], msg_type: u8, req_ip: Option<Ipv4Addr>) -> Vec<u8> {
-
         let mut p = vec![0u8; 240];
         p[0] = 1; p[1] = 1; p[2] = 6; p[10] = 0x80;
         p[4..8].copy_from_slice(&xid.to_be_bytes());
         p[28..34].copy_from_slice(mac);
-        p[236] = 99; p[237] = 130; p[238] = 83; p[239] = 99; // magic cookie
+        p[236] = 99; p[237] = 130; p[238] = 83; p[239] = 99;
         p.extend_from_slice(&[53, 1, msg_type]);
         if let Some(ip) = req_ip {
             p.extend_from_slice(&[50, 4]);
             p.extend_from_slice(&ip.octets());
         }
-        p.extend_from_slice(&[55, 3, 1, 3, 6]); // request subnet, router, dns
+        p.extend_from_slice(&[55, 3, 1, 3, 6]);
         p.push(255);
         p
     }
@@ -357,9 +243,9 @@ mod enclave_init {
                     if i + 2 + len > buf.len() { break; }
                     let v = &buf[i+2..i+2+len];
                     match code {
-                        1 if len == 4 => mask = Ipv4Addr::new(v[0],v[1],v[2],v[3]),
-                        3 if len >= 4 => gw = Some(Ipv4Addr::new(v[0],v[1],v[2],v[3])),
-                        6 => for c in v.chunks(4) { if c.len()==4 { dns.push(Ipv4Addr::new(c[0],c[1],c[2],c[3])); } },
+                        1 if len == 4 => mask = Ipv4Addr::new(v[0], v[1], v[2], v[3]),
+                        3 if len >= 4 => gw = Some(Ipv4Addr::new(v[0], v[1], v[2], v[3])),
+                        6 => for c in v.chunks(4) { if c.len() == 4 { dns.push(Ipv4Addr::new(c[0], c[1], c[2], c[3])); } },
                         _ => {}
                     }
                     i += 2 + len;
@@ -370,47 +256,23 @@ mod enclave_init {
         Some(Lease { ip, prefix, gw, dns })
     }
 
-    fn apply_lease(iface: &str, lease: &Lease) {
-        use std::process::Command;
-        let cidr = format!("{}/{}", lease.ip, lease.prefix);
-        let _ = Command::new("/sbin/ip").args(["addr", "flush", "dev", iface]).status();
-        let _ = Command::new("/sbin/ip").args(["addr", "add", &cidr, "dev", iface]).status();
-        let _ = Command::new("/sbin/ip").args(["link", "set", iface, "up"]).status();
-        
-        if let Some(gw) = lease.gw {
-            // CRITICAL GCP FIX: GCP assigns /32 subnet masks. The gateway is technically outside 
-            // our subnet, so the kernel will reject a default route. We must add a direct 
-            // device-bound host route to the gateway first!
-            let _ = Command::new("/sbin/ip")
-                .args(["route", "add", &gw.to_string(), "dev", iface])
-                .status();
+    pub async fn configure_network() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let iface = {
+            let mut found = None;
+            for _ in 0..60 {
+                if let Some(i) = find_interface() { found = Some(i); break; }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            found.ok_or("No network interface after 30s")?
+        };
+        let _ = std::process::Command::new("/sbin/ip").args(["link", "set", &iface, "up"]).status();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            let _ = Command::new("/sbin/ip")
-                .args(["route", "add", "default", "via", &gw.to_string()])
-                .status();
-        }
-        
-        if !lease.dns.is_empty() {
-            std::fs::create_dir_all("/etc").ok();
-            let resolv: String = lease.dns.iter().map(|ip| format!("nameserver {}\n", ip)).collect();
-            std::fs::write("/etc/resolv.conf", resolv).ok();
-        }
-        
-        // CRITICAL GCP FIX: Set MTU to 1460 to avoid fragmentation on ACME/TLS packets
-        let _ = Command::new("/sbin/ip").args(["link", "set", "dev", iface, "mtu", "1460"]).status();
-        
-        kmsg(&format!("Network up: {} gw={:?} mtu=1460", cidr, lease.gw));
-    }
-
-    async fn dhcp(iface: &str) -> Result<Lease, Box<dyn std::error::Error + Send + Sync>> {
         let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         sock.set_reuse_address(true)?;
         sock.set_broadcast(true)?;
-        // CRITICAL FIX: Without an IP address, Linux refuses to route 255.255.255.255 broadcasts 
-        // with `ENETUNREACH` unless we explicitly pin the socket to the raw interface!
-        let ifname = std::ffi::CString::new(iface)?;
+        let ifname = std::ffi::CString::new(iface.as_str())?;
         unsafe {
-            use std::os::unix::io::AsRawFd;
             libc::setsockopt(
                 sock.as_raw_fd(),
                 libc::SOL_SOCKET,
@@ -422,1088 +284,58 @@ mod enclave_init {
         sock.bind(&std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 68).into())?;
         sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
         let bc = std::net::SocketAddrV4::new(Ipv4Addr::BROADCAST, 67);
-        let mac = read_mac(iface);
+        let mac = read_mac(&iface);
         let xid: u32 = 0xC0FFEE42;
 
         sock.send_to(&build_dhcp(xid, &mac, 1, None), &bc.into())?;
-        kmsg("DHCP DISCOVER sent");
-
         let mut buf = [std::mem::MaybeUninit::uninit(); 1024];
         let (n, _) = sock.recv_from(&mut buf)?;
         let mut recv_buf = [0u8; 1024];
         for i in 0..n { recv_buf[i] = unsafe { buf[i].assume_init() }; }
         let offered = Ipv4Addr::new(recv_buf[16], recv_buf[17], recv_buf[18], recv_buf[19]);
-        kmsg(&format!("DHCP OFFER: {}", offered));
 
         sock.send_to(&build_dhcp(xid, &mac, 3, Some(offered)), &bc.into())?;
-        kmsg("DHCP REQUEST sent");
-
         let (n, _) = sock.recv_from(&mut buf)?;
         for i in 0..n { recv_buf[i] = unsafe { buf[i].assume_init() }; }
         let lease = parse_lease(&recv_buf[..n]).ok_or("Bad DHCP ACK")?;
-        kmsg(&format!("DHCP ACK: ip={}", lease.ip));
-        Ok(lease)
-    }
 
-    /// Load drivers, wait for NIC, perform DHCP, apply lease.
-    pub async fn configure_network() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        kmsg("Waiting for network interface...");
-        let iface = {
-            let mut found = None;
-            for _ in 0..60 {
-                if let Some(i) = find_interface() { found = Some(i); break; }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-            found.ok_or("No network interface after 30s")?
-        };
-        kmsg(&format!("Interface found: {}. Bringing interface UP...", iface));
+        let cidr = format!("{}/{}", lease.ip, lease.prefix);
+        let _ = std::process::Command::new("/sbin/ip").args(["addr", "add", &cidr, "dev", &iface]).status();
+        if let Some(gw) = lease.gw {
+            let _ = std::process::Command::new("/sbin/ip").args(["route", "add", "default", "via", &gw.to_string()]).status();
+        }
+        if !lease.dns.is_empty() {
+            let resolv: String = lease.dns.iter().map(|ip| format!("nameserver {}\n", ip)).collect();
+            std::fs::write("/etc/resolv.conf", resolv).ok();
+        }
+        let _ = std::process::Command::new("/bin/date").args(["-s", "@1777000000"]).status();
 
-        // CRITICAL: We must bring the interface UP before we can broadcast UDP!
-        let _ = std::process::Command::new("/sbin/ip").args(["link", "set", &iface, "up"]).status();
-        
-        // Brief wait for PHY link state to stabilize
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        let lease = dhcp(&iface).await?;
-        apply_lease(&iface, &lease);
-
-        // CRITICAL FIX: Prevent Time-Rollback TLS breakage.
-        // Seed the system clock to a realistic 2026 epoch.
-        let _ = std::process::Command::new("/bin/date")
-            .args(["-s", "@1777000000"])
-            .status();
-
-        // SYNC TIME from trusted source over PINNED TLS
-        // Because clock is >= 2026, the TLS handshake will succeed.
-        #[cfg(not(feature = "alibabacloud"))]
-        {
-            // GCP: Use Google as time source
-            if let Ok(resp) = crate::hardened_client().get("https://www.google.com").send().await {
-                if let Some(date_str) = resp.headers().get("Date") {
-                    if let Ok(date) = date_str.to_str() {
+        let time_sources = ["https://www.cloudflare.com", "https://www.aliyun.com"];
+        for src in &time_sources {
+            if let Ok(out) = std::process::Command::new("/usr/bin/curl").args(["-sI", "--max-time", "5", src]).output() {
+                let headers = String::from_utf8_lossy(&out.stdout);
+                for line in headers.lines() {
+                    if line.to_lowercase().starts_with("date:") {
+                        let date = line[5..].trim();
                         let _ = std::process::Command::new("/bin/date").args(["-s", date]).status();
-                        kmsg(&format!("System time cryptographically synced to: {}", date));
+                        break;
                     }
                 }
             }
         }
-        #[cfg(feature = "alibabacloud")]
-        {
-            // Alibaba Cloud: Use curl to fetch Date header (Google may be unreachable from CN regions)
-            let time_sources = ["https://www.cloudflare.com", "https://www.aliyun.com"];
-            for src in &time_sources {
-                let output = std::process::Command::new("/usr/bin/curl")
-                    .args(["-sI", "--max-time", "5", src])
-                    .output();
-                if let Ok(out) = output {
-                    let headers = String::from_utf8_lossy(&out.stdout);
-                    for line in headers.lines() {
-                        if line.to_lowercase().starts_with("date:") {
-                            let date = line[5..].trim();
-                            let _ = std::process::Command::new("/bin/date").args(["-s", date]).status();
-                            kmsg(&format!("System time synced from {}: {}", src, date));
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
         Ok(())
     }
 
     pub fn poweroff() -> ! {
-        kmsg("FATAL: Initialization failed. Halting system to preserve serial logs...");
-        loop { 
-            std::thread::sleep(std::time::Duration::from_secs(60));
-        }
-    }
-
-}
-
-use axum::{
-    extract::{Query, State},
-    http::StatusCode,
-    response::{Html, IntoResponse, Redirect, Response},
-    routing::get,
-    Json, Router,
-};
-use acme2_eab::{
-    gen_rsa_private_key, AccountBuilder, AuthorizationStatus, DirectoryBuilder, OrderBuilder, Csr,
-};
-use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
-use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering, AtomicU64};
-use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
-use tokio::sync::Semaphore;
-use tokio::net::TcpListener;
-use tower::ServiceExt;
-use tower_http::trace::TraceLayer;
-use tracing::{error, info, warn};
-use std::collections::BTreeMap;
-use std::net::IpAddr;
-
-// ============================================================================
-// CONSTANTS
-// ============================================================================
-
-mod tpm {
-    use tokio::process::Command;
-    use tracing::error;
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use serde::{Deserialize, Serialize};
-
-    pub const PCR_SELECTION: &str = "0,4,8,9,15";
-
-    #[derive(Serialize, Deserialize, Clone)]
-    pub struct SealedData {
-        pub pub_blob: String,
-        pub priv_blob: String,
-    }
-
-    #[derive(Serialize, Deserialize, Clone)]
-    #[allow(dead_code)]  // GCP-specific helper, used selectively in code paths
-    pub struct AttestationResult {
-        pub tpm_quote_msg: String,
-        pub tpm_quote_sig: String,
-        pub ak_pub_pem: String,
-        pub ek_cert: Option<String>,
-        pub pcrs: String,
-        pub pcr_values: std::collections::BTreeMap<String, String>,
-        pub nonce_hex: String,
-        pub snp_report_b64: Option<String>,
-        pub auxblob_b64: Option<String>,
-        pub signature_binding_pubkey_hash: String,
-        pub vcek_der_b64: Option<String>,
-        pub amd_chain_b64: Option<String>,
-        pub google_ak_cert_pem: Option<String>,
-        pub ak_der_sha256: String,
-        // Intel TDX fields
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub pck_cert_pem: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub tdx_policy: Option<String>,
-        pub platform_type: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub td_info: Option<serde_json::Value>,
-        /// Honest provenance marker for `platform_type` — see `evidence_marker`.
-        pub tdx_evidence_marker: serde_json::Value,
-        /// v131: TDXMODULE-generated TDREPORT (1024 B, binds REPORTDATA = this
-        /// session nonce). NOT signed — corroborating context only.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub tdx_td_report_b64: Option<String>,
-        /// v131: Intel-QE-signed TD Quote (ECDSA P-384 + PCK chain) when the
-        /// platform's quote path is available — the real silicon root.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub tdx_quote_b64: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub tdx_evidence_source: Option<String>,
-        /// Full probe transcript (sources, ioctl status codes, failures).
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub tdx_evidence_probe: Option<serde_json::Value>,
-    }
-
-    /// Threat-model honesty: `platform_type` is a *software probe result*
-    /// (kernel boot banner read from /dev/kmsg, plus sysfs node existence),
-    /// NOT attestation evidence. No TDX quote (TDCALL/MRTD+RTMR signature by
-    /// the Quote Enclave) is obtainable in this build — Alibaba exposes no
-    /// /dev/tdx-guest — and the sysfs TDINFO values are guest-internal and
-    /// unsigned. An auditor must never mistake the label for hardware proof,
-    /// so the report states its own epistemic status explicitly:
-    ///
-    ///   - `tpm_quote_present` is the ONLY hardware-signed evidence class in
-    ///     the report (PCR 0,4,8,9,15 signed by the session AK).
-    ///   - `hardware_signed_tdx_quote` is always false in this build; flip it
-    ///     only if a real TDCALL quote path is ever wired in.
-    ///   - `mrtd_rtmrs_source: "sysfs_unsigned"` marks MRTD/RTMRs as
-    ///     self-reported guest state, not silicon-signed measurements.
-    pub fn evidence_marker(
-        platform_type: &str,
-        tpm_quote_present: bool,
-        td_info_present: bool,
-        pck_cert_present: bool,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "platform_type": platform_type,
-            "platform_type_basis": "software_probe",
-            "platform_type_detail": "kernel boot banner (Memory Encryption Features active: Intel TDX) via /dev/kmsg + sysfs probe — software evidence only",
-            "hardware_signed_tdx_quote": false,
-            "tdx_quote_status": "unavailable_no_guest_device",
-            "mrtd_rtmrs_source": if td_info_present { "sysfs_unsigned" } else { "absent" },
-            "pck_cert_present": pck_cert_present,
-            "tpm_quote_present": tpm_quote_present,
-            "auditor_note": if tpm_quote_present {
-                "platform_type is a software probe, not attestation. The hardware-signed evidence in this report is the TPM quote (PCR 0,4,8,9,15 under the session AK); verify that first. TDX fields are corroborating context only."
-            } else {
-                "platform_type is a software probe, not attestation, and this report contains NO hardware-signed quote of any kind (TPM-less platform). Treat the entire report as software self-attestation."
-            },
-        })
-    }
-
-    pub mod snp {
-        use std::fs;
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-
-        pub fn get_report(nonce: &[u8; 64]) -> Option<(Vec<u8>, Option<String>)> {
-            // v124: Use the modern unified TSM (Trusted Security Module) ConfigFS interface
-            let tsm_base = "/sys/kernel/config/tsm/report";
-            // v125: Ensure the TSM ConfigFS hierarchy is present
-            if !fs::metadata(tsm_base).is_ok() {
-                let _ = std::process::Command::new("mkdir").args(["-p", tsm_base]).status();
-            }
-
-            // v124: Use a unique directory name per request to avoid race conditions or stale reports
-            let unique_id = hex::encode(&nonce[..16]);
-            let report_dir = format!("{}/paypal_audit_{}", tsm_base, unique_id);
-            
-            // Clean up any stale directory if it exists
-            let _ = fs::remove_dir_all(&report_dir);
-            
-            if let Err(e) = fs::create_dir(&report_dir) {
-                tracing::error!("Failed to create TSM report directory {}: {}", report_dir, e);
-                return None;
-            }
-
-            // 1. Set the nonce/inblob
-            if let Err(e) = fs::write(format!("{}/inblob", report_dir), nonce) {
-                tracing::error!("Failed to write inblob to ConfigFS: {}", e);
-                let _ = fs::remove_dir_all(&report_dir);
-                return None;
-            }
-
-            // 2. Wait for hardware report generation (ConfigFS is asynchronous)
-            // Some vTPMs/CPUs are slow to generate the silicon signature.
-            std::thread::sleep(std::time::Duration::from_millis(1000));
-
-            // 3. Read the report
-            let report_path = format!("{}/outblob", report_dir);
-            let report = match fs::read(&report_path) {
-                Ok(data) => {
-                    tracing::info!("Successfully read SNP report from ConfigFS outblob ({} bytes)", data.len());
-                    Some(data)
-                },
-                Err(e) => {
-                    tracing::error!("Failed to read outblob from ConfigFS at {}: {}", report_path, e);
-                    None
-                }
-            };
-
-            let auxblob = match fs::read(format!("{}/auxblob", report_dir)) {
-                Ok(data) if !data.is_empty() => {
-                    tracing::info!("Successfully read SNP auxblob from ConfigFS ({} bytes)", data.len());
-                    Some(STANDARD.encode(&data))
-                },
-                _ => None,
-            };
-
-            // Cleanup
-            let _ = fs::remove_dir_all(&report_dir);
-            report.map(|r| (r, auxblob))
-        }
-    }
-
-    pub async fn run_cmd(cmd: &str, args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        // Bound every tpm2 invocation: a wedged TPM driver or a tool waiting on
-        // a missing TCTI must not hang the request task forever (previously an
-        // unbounded .output().await — one stuck tool froze the attestation
-        // handler and held a connection-semaphore permit until restart).
-        let fut = Command::new(cmd)
-            .args(args)
-            .env("TCTI", "device:/dev/tpmrm0")
-            .env("TPM2TOOLS_TCTI", "device:/dev/tpmrm0")
-            .kill_on_drop(true)
-            .output();
-        let output = match tokio::time::timeout(std::time::Duration::from_secs(20), fut).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => return Err(format!("{} failed to spawn: {}", cmd, e).into()),
-            Err(_) => return Err(format!("{} timed out after 20s (TPM/TCTI unresponsive)", cmd).into()),
-        };
-        if !output.status.success() {
-            return Err(format!("{} failed: {}", cmd, String::from_utf8_lossy(&output.stderr)).into());
-        }
-        Ok(output.stdout)
-    }
-
-    async fn cleanup(paths: &[&str]) {
-        for p in paths {
-            let _ = tokio::fs::remove_file(p).await;
-        }
-        let _ = run_cmd("tpm2_flushcontext", &["-t"]).await;
-        let _ = run_cmd("tpm2_flushcontext", &["-s"]).await;
-    }
-
-    pub async fn seal_dek(dek: &[u8]) -> Result<SealedData, Box<dyn std::error::Error + Send + Sync>> {
-        let cleanup_paths = [
-            "/tmp/dek.plain", "/tmp/primary_seal.ctx",
-            "/tmp/dek.priv", "/tmp/dek.pub",
-        ];
-        let _ = cleanup(&cleanup_paths).await;
-
-        tokio::fs::write("/tmp/dek.plain", dek).await?;
-        // Use the well-known deterministic owner-hierarchy primary template.
-        // This produces the SAME primary key on every boot of the same physical TPM.
-        run_cmd("tpm2_createprimary", &[
-            "-C", "o",
-            "-g", "sha256",
-            "-G", "rsa2048",
-            "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda|restricted|decrypt",
-            "-c", "/tmp/primary_seal.ctx",
-        ]).await?;
-        // v117: Enforce PCR policy (0,4,8,9,15) to prevent unsealing on a modified image
-        let policy_file = "/tmp/policy.bin";
-        // v118: Explicitly specify --policy-pcr
-        run_cmd("tpm2_createpolicy", &[
-            "--policy-pcr",
-            "-l", &format!("sha256:{}", PCR_SELECTION),
-            "-L", policy_file,
-        ]).await?;
-
-        run_cmd("tpm2_create", &[
-            "-C", "/tmp/primary_seal.ctx",
-            "-r", "/tmp/dek.priv",
-            "-u", "/tmp/dek.pub",
-            "-i", "/tmp/dek.plain",
-            "-L", policy_file,
-        ]).await?;
-        let pub_b = tokio::fs::read("/tmp/dek.pub").await?;
-        let priv_b = tokio::fs::read("/tmp/dek.priv").await?;
-        let _ = cleanup(&cleanup_paths).await;
-        Ok(SealedData {
-            pub_blob: STANDARD.encode(pub_b),
-            priv_blob: STANDARD.encode(priv_b),
-        })
-    }
-
-    pub async fn unseal_dek(sealed: &SealedData) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let paths =["/tmp/dek.pub", "/tmp/dek.priv", "/tmp/primary_seal.ctx", "/tmp/dek.ctx", "/tmp/policy.bin"];
-        cleanup(&paths).await;
-        tokio::fs::write("/tmp/dek.pub", STANDARD.decode(&sealed.pub_blob)?).await?;
-        tokio::fs::write("/tmp/dek.priv", STANDARD.decode(&sealed.priv_blob)?).await?;
-        run_cmd("tpm2_createprimary", &["-C", "o", "-g", "sha256", "-G", "rsa2048", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda|restricted|decrypt", "-c", "/tmp/primary_seal.ctx"]).await?;
-        run_cmd("tpm2_load", &["-C", "/tmp/primary_seal.ctx", "-u", "/tmp/dek.pub", "-r", "/tmp/dek.priv", "-c", "/tmp/dek.ctx"]).await?;
-        run_cmd("tpm2_createpolicy", &["--policy-pcr", "-l", &format!("sha256:{}", PCR_SELECTION), "-L", "/tmp/policy.bin"]).await?;
-        let dek = run_cmd("tpm2_unseal", &["-c", "/tmp/dek.ctx"]).await?;
-        cleanup(&paths).await;
-        Ok(dek)
-    }
-
-    async fn fetch_vcek(chip_id: &str, bl: u8, tee: u8, snp: u8, ucode: u8) -> Option<String> {
-        let client = reqwest::Client::new(); // Standard client for public KDS to avoid pinning errors
-        let url = format!("https://kdsintf.amd.com/vcek/v1/Milan/{}?blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}", chip_id, bl, tee, snp, ucode);
-        tracing::info!("v136: Fetching VCEK from {}", url);
-        match client.get(&url).send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    if let Ok(bytes) = resp.bytes().await { 
-                        tracing::info!("v136: VCEK fetch succeeded ({} bytes)", bytes.len());
-                        return Some(STANDARD.encode(&bytes)); 
-                    }
-                } else {
-                    tracing::warn!("v136: VCEK fetch failed with status {}. Response: {:?}", status, resp.text().await.unwrap_or_default());
-                }
-            },
-            Err(e) => tracing::warn!("v136: VCEK fetch HTTP error: {}", e),
-        }
-        None
-    }
-
-    async fn fetch_amd_chain() -> Option<String> {
-        let client = reqwest::Client::new();
-        match client.get("https://kdsintf.amd.com/vcek/v1/Milan/cert_chain").send().await {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    if let Ok(text) = resp.text().await { 
-                        tracing::info!("v136: AMD chain fetch succeeded");
-                        return Some(STANDARD.encode(text.as_bytes())); 
-                    }
-                } else {
-                    tracing::warn!("v136: AMD chain fetch failed with status {}", resp.status());
-                }
-            },
-            Err(e) => tracing::warn!("v136: AMD chain fetch HTTP error: {}", e),
-        }
-        None
-    }
-
-
-    /// Collect Intel TDX evidence (PCK cert, policy, MRTD/RTMRs). Shared by the
-    /// normal TPM path and the TPM-less path below.
-    fn collect_tdx_fields() -> (Option<String>, Option<String>, String, Option<serde_json::Value>) {
-        if super::intel_tdx::is_intel_tdx_available() {
-            let tdx_base = super::intel_tdx::collect_tdx_report();
-            let pck_pem = tdx_base.as_ref().and_then(|b| {
-                b.pck_cert_from_nvram.as_deref().map(|der| {
-                    super::intel_tdx::der_to_pem("CERTIFICATE", der)
-                })
-            });
-            let policy = tdx_base.as_ref().and_then(|b| b.tdx_policy.clone());
-            let td_info = tdx_base.as_ref().and_then(|b| {
-                b.td_info.as_ref().map(|info| serde_json::json!({
-                    "attributes": info.attributes,
-                    "mrtd": info.mrtd,
-                    "rtmr0": info.rtmr0,
-                    "rtmr1": info.rtmr1,
-                    "rtmr2": info.rtmr2,
-                    "rtmr3": info.rtmr3,
-                }))
-            });
-            tracing::info!("Intel TDX platform detected — PCK hash: {}", 
-                tdx_base.as_ref().and_then(|b| {
-                    b.pck_cert_from_nvram.as_deref().map(|d| super::intel_tdx::hash_cert(d))
-                }).unwrap_or_else(|| "none".to_string()));
-            if td_info.is_some() {
-                tracing::info!("Intel TDX TDINFO measurements available");
-            }
-            (pck_pem, policy, "Intel TDX".to_string(), td_info)
-        } else {
-            (None, None, "AMD SEV-SNP".to_string(), None)
-        }
-    }
-
-    /// v131: shared TDX silicon-evidence collection. Returns
-    /// (tdreport_b64, quote_b64, source, probe-transcript) and upgrades `marker`
-    /// ONLY when the corresponding hardware-signed evidence was really obtained.
-    fn collect_silicon_evidence_into(
-        nonce_hex: &str,
-        marker: &mut serde_json::Value,
-    ) -> (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<serde_json::Value>,
-    ) {
-        if !super::intel_tdx::is_intel_tdx_available() {
-            return (None, None, None, None);
-        }
-        let silicon = super::intel_tdx::collect_silicon_evidence(nonce_hex);
-        for note in silicon.notes.iter() {
-            tracing::info!("TDX silicon probe: {}", note);
-        }
-        let quote_present = silicon.quote_b64.is_some();
-        let report_present = silicon.td_report_b64.is_some();
-        if quote_present {
-            marker["hardware_signed_tdx_quote"] = serde_json::Value::Bool(true);
-            marker["tdx_quote_present"] = serde_json::Value::Bool(true);
-            marker["tdx_quote_source"] =
-                serde_json::json!(silicon.quote_source.clone().unwrap_or_default());
-            // Security audit 2026-10-19: the default status string
-            // "unavailable_no_guest_device" contradicted the quote we just
-            // acquired — stale epistemic metadata is exactly what an auditor
-            // must be able to trust. "ok" = acquisition succeeded (matches the
-            // auditor fixture convention); verification remains the auditor's
-            // job — acquisition is not proof.
-            marker["tdx_quote_status"] = serde_json::json!("ok");
-            marker["auditor_note"] = serde_json::json!(
-                "platform_type is a software probe. This report DOES contain hardware-signed evidence: an Intel TDX TD Quote (Quoting Enclave ECDSA P-256 attestation key, embedded PCK certificate chain) with REPORTDATA bound to this session nonce. Verify the quote signature, the attestation-key -> QE-report -> PCK binding, the PCK -> Intel SGX Root CA chain, and the report_data session binding."
-            );
-        } else if report_present {
-            marker["tdx_td_report_present"] = serde_json::Value::Bool(true);
-            marker["tdx_td_report_source"] =
-                serde_json::json!(silicon.td_report_source.clone().unwrap_or_default());
-            // No quote => evidence_marker's honest TPM-less auditor_note stands
-            // (a bare TDREPORT is UNSIGNED and remote-unverifiable).
-        }
-        let probe = serde_json::to_value(&silicon).unwrap_or_default();
-        let source = silicon
-            .quote_source
-            .clone()
-            .or(silicon.td_report_source.clone());
-        (silicon.td_report_b64, silicon.quote_b64, source, Some(probe))
-    }
-
-    /// TPM-less platform report: Alibaba Cloud Intel TDX provides no
-    /// /dev/tpmrm0, so there is no AK and no TPM quote — the TPM evidence
-    /// fields serialize empty (the auditor's documented "TPM-less platform"
-    /// signal, same discipline as the OCI builds) and the Intel TDX evidence
-    /// carries the hardware claim instead.
-    pub fn tpm_less_tdx_report(nonce_hex: &str) -> AttestationResult {
-        let (pck_cert_pem, tdx_policy, platform_type, td_info) = collect_tdx_fields();
-        let mut marker = evidence_marker(&platform_type, false, td_info.is_some(), pck_cert_pem.is_some());
-        let (tdx_td_report_b64, tdx_quote_b64, tdx_evidence_source, tdx_evidence_probe) =
-            collect_silicon_evidence_into(nonce_hex, &mut marker);
-        AttestationResult {
-            tpm_quote_msg: String::new(),
-            tpm_quote_sig: String::new(),
-            ak_pub_pem: String::new(),
-            ek_cert: None,
-            pcrs: String::new(),
-            pcr_values: std::collections::BTreeMap::new(),
-            nonce_hex: nonce_hex.to_string(),
-            snp_report_b64: None,
-            auxblob_b64: None,
-            signature_binding_pubkey_hash: String::new(),
-            vcek_der_b64: None,
-            amd_chain_b64: None,
-            google_ak_cert_pem: None,
-            ak_der_sha256: String::new(),
-            pck_cert_pem,
-            tdx_policy,
-            platform_type,
-            td_info,
-            tdx_evidence_marker: marker,
-            tdx_td_report_b64,
-            tdx_quote_b64,
-            tdx_evidence_source,
-            tdx_evidence_probe,
-        }
-    }
-
-    pub async fn quote(nonce_hex: &str) -> Result<AttestationResult, Box<dyn std::error::Error + Send + Sync>> {
-        if crate::intel_tdx::is_intel_tdx_available() {
-            tracing::info!("Intel TDX hardware attestation path active"); 
-        }
-
-        // TPM-less platforms (Alibaba Cloud Intel TDX): no TPM device exists, so
-        // AK discovery below can only end in "Could not find or derive a
-        // hardware-bound AK" (live-observed 2026-10-17 during a user test — the
-        // whole attestation payload was replaced by that error string). Return
-        // the TPM-empty TDX report instead of failing.
-        if cfg!(feature = "alibabacloud")
-            && !std::path::Path::new("/dev/tpmrm0").exists()
-            && !std::path::Path::new("/dev/tpm0").exists()
-        {
-            tracing::warn!("No TPM device present — returning TPM-less Intel TDX attestation report");
-            return Ok(tpm_less_tdx_report(nonce_hex));
-        }
-        
-        let work_dir = format!("/tmp/tpm_{}", hex::encode(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos().to_be_bytes()));
-        let _ = std::fs::create_dir_all(&work_dir);
-
-        let _primary_ctx = format!("{}/primary.ctx", work_dir);
-        let _ak_ctx = format!("{}/ak.ctx", work_dir);
-        let _ak_pub = format!("{}/ak.pub", work_dir);
-        let _ak_priv = format!("{}/ak.priv", work_dir);
-        let ak_pem = format!("{}/ak.pem", work_dir);
-        let _ak_der = format!("{}/ak.der", work_dir);
-        let quote_msg = format!("{}/quote.msg", work_dir);
-        let quote_sig = format!("{}/quote.sig", work_dir);
-        // v135: GCP delivers the AMD SEV-SNP report in the TPM quote's auxblob
-        // This is the ONLY way to get AMD hardware-signed data on GCP.
-        let auxblob_path = format!("{}/auxblob.bin", work_dir);
-
-        // 1. Find the persistent AK handle dynamically from the GCP vTPM
-        let mut ak_ctx = String::new();
-        
-        // v143: Aggressive 'Shotgun' AK Discovery with explicit error logging
-        let standard_handles = ["0x81010002", "0x81010001", "0x81000001", "0x81000002"];
-        for h in &standard_handles {
-            // Try both tpm2_readpublic and tpm2 readpublic
-            for cmd in ["tpm2_readpublic", "tpm2"] {
-                let args = if cmd == "tpm2" { vec!["readpublic", "-c", h] } else { vec!["-c", h] };
-                match run_cmd(cmd, &args).await {
-                    Ok(pub_out) => {
-                        let pub_str = String::from_utf8_lossy(&pub_out).to_lowercase();
-                        if pub_str.contains("sign") {
-                            tracing::info!("DEBUG: Successfully anchored to hardware AK handle: {} (via {})", h, cmd);
-                            ak_ctx = h.to_string();
-                            break;
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!("DEBUG: Failed to read handle {} via {}: {}", h, cmd, e);
-                    }
-                }
-            }
-            if !ak_ctx.is_empty() { break; }
-        }
-
-        if ak_ctx.is_empty() {
-            tracing::error!("Standard handles failed. SYSTEMATIC SEARCH of persistent handles...");
-            // Try systemically searching a wider range if the cap list fails
-            for i in 0..10 {
-                let h = format!("0x8101000{:x}", i);
-                if let Ok(pub_out) = run_cmd("tpm2_readpublic", &["-c", &h]).await {
-                    if String::from_utf8_lossy(&pub_out).to_lowercase().contains("sign") {
-                        ak_ctx = h;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if ak_ctx.is_empty() {
-            tracing::warn!("Systematic search failed. Attempting capability discovery...");
-            for cmd in ["tpm2_getcap", "tpm2"] {
-                let args = if cmd == "tpm2" { vec!["getcap", "handles-persistent"] } else { vec!["handles-persistent"] };
-                match run_cmd(cmd, &args).await {
-                    Ok(handles_out) => {
-                        let str_out = String::from_utf8_lossy(&handles_out);
-                        tracing::info!("Discovered persistent handles via {}: {}", cmd, str_out);
-                        for part in str_out.split(|c: char| !c.is_alphanumeric() && c != 'x') {
-                            if part.starts_with("0x81") {
-                                let h_str = part.to_string();
-                                if let Ok(pub_out) = run_cmd("tpm2_readpublic", &["-c", &h_str]).await {
-                                    if String::from_utf8_lossy(&pub_out).to_lowercase().contains("sign") {
-                                        ak_ctx = h_str;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    Err(e) => tracing::error!("Capability discovery failed via {}: {}", cmd, e),
-                }
-                if !ak_ctx.is_empty() { break; }
-            }
-        }
-        
-        // v145: GCP vTPM Architecture — Session AK for Signing
-        // The Google EK Cert (NVRAM) proves hardware identity. The TPM Quote is signed
-        // by a fresh session signing key (session AK), created via tpm2_createprimary.
-        // These are intentionally different keys — EK = silicon proof, session AK = quote signer.
-        if ak_ctx.is_empty() {
-            tracing::info!("Creating session signing AK via tpm2_createprimary...");
-            let ak_ctx_file = format!("{}/ak.ctx", work_dir);
-            for cmd in ["tpm2_createprimary", "tpm2"] {
-                let args = if cmd == "tpm2" {
-                    vec!["createprimary", "-C", "e", "-g", "sha256", "-G", "rsa2048", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign", "-c", &ak_ctx_file]
-                } else {
-                    vec!["-C", "e", "-g", "sha256", "-G", "rsa2048", "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign", "-c", &ak_ctx_file]
-                };
-                match run_cmd(cmd, &args).await {
-                    Ok(_) => {
-                        tracing::info!("Session signing AK created via {}", cmd);
-                        ak_ctx = ak_ctx_file;
-                        break;
-                    },
-                    Err(e) => tracing::error!("createprimary failed via {}: {}", cmd, e),
-                }
-            }
-        }
-
-        
-        // Final fallback: Failure
-        if ak_ctx.is_empty() {
-            return Err("CRITICAL: Could not find or derive a hardware-bound AK. Identity cannot be verified.".into());
-        }
-
-        // Extract AK PEM for the report
-        run_cmd("tpm2_readpublic", &["-c", &ak_ctx, "-f", "pem", "-o", &ak_pem]).await?;
-        let ak_pem_str = tokio::fs::read_to_string(&ak_pem).await?;
-
-        tracing::info!("DEBUG: TPM Quote starting with nonce 0x{}...", nonce_hex);
-        run_cmd("tpm2_quote", &[
-            "-c", &ak_ctx,
-            "-l", &format!("sha256:{}", PCR_SELECTION),
-            "-q", &nonce_hex,
-            "-m", &quote_msg,
-            "-s", &quote_sig,
-            // v135: Request the GCP SNP auxblob — this contains the AMD hardware-signed report
-            "-o", &auxblob_path,
-        ]).await?;
-        tracing::info!("DEBUG: TPM Quote done.");
-
-        // v117: Capture the public key hash that was bound to this nonce (if any)
-        // Note: The nonce_hex passed here is already the combined hash.
-        let msg = tokio::fs::read(&quote_msg).await?;
-        let sig = tokio::fs::read(&quote_sig).await?;
-
-        let pcr_out = match run_cmd("tpm2_pcrread", &[&format!("sha256:{}", PCR_SELECTION)]).await {
-            Ok(out) => out,
-            Err(e) => {
-                error!("TPM tpm2 pcrread FAILED: {}", e);
-                vec![]
-            }
-        };
-        let pcr_str = String::from_utf8_lossy(&pcr_out);
-        tracing::info!("TPM PCRREAD OUT: {}", pcr_str);
-        tracing::info!("TPM PCR SELECTION WAS: {}", PCR_SELECTION);
-        let mut pcr_values = std::collections::BTreeMap::new();
-        for line in pcr_str.lines() {
-            if line.contains(':') && !line.trim().is_empty() {
-                let parts: Vec<&str> = line.split(':').collect();
-                if parts.len() >= 2 {
-                    let idx = parts[0].trim_matches(|c: char| !c.is_numeric()).to_string();
-                    let val = parts[1].trim().to_string();
-                    if !idx.is_empty() && !val.is_empty() {
-                        pcr_values.insert(format!("pcr_{}", idx), val);
-                    }
-                }
-            }
-        }
-
-        let ek_cert = match run_cmd("tpm2_readpublic", &["-c", "0x81010001", "-f", "pem", "-o", &format!("{}/ek.pub", work_dir)]).await {
-            Ok(_) => {
-                match run_cmd("tpm2_getekcertificate", &["-X", "-o", &format!("{}/ek.cert", work_dir)]).await {
-                    Ok(cert_der) => Some(STANDARD.encode(cert_der)),
-                    Err(_) => None,
-                }
-            }
-            Err(_) => None,
-        };
-
-        // 🔴 FIX: Cryptographically bind using raw DER bytes instead of the PEM string.
-        // PEM strings can have varying newlines which silently break the hash.
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-        let ak_b64 = ak_pem_str
-            .lines()
-            .filter(|l| !l.starts_with("-----"))
-            .collect::<String>()
-            .replace(|c: char| c.is_whitespace(), "");
-        let ak_der_bytes = STANDARD.decode(ak_b64).unwrap_or_default();
-
-        // Hardware SNP Report & AMD Certificates
-        use sha2::Digest;
-        let ak_der_sha256 = hex::encode(sha2::Sha256::digest(&ak_der_bytes));
-
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&ak_der_bytes);
-        hasher.update(&hex::decode(nonce_hex).unwrap_or_default());
-        let bound_nonce = hasher.finalize();
-
-        let mut nonce_bytes = [0u8; 64];
-        nonce_bytes[..32].copy_from_slice(&bound_nonce);
-
-        tracing::info!("DEBUG: SNP nonce bytes prepared");
-        // 1. Fetch Google AK Certificate (Mandatory Identity Root)
-        // v137: Directly fetch from TPM NVRAM (primary path) with enlarged buffer (2048 bytes)
-        // to prevent truncation of the hardware-bound AMD SNP extensions.
-        let mut google_ak_cert_pem = None;
-        tracing::info!("Retrieving Google AK Certificate from hardware NVRAM...");
-        let indices = [("0x01c00002", "2048"), ("0x01c00001", "2048")];
-        for (idx, _size_hint) in &indices {
-            if let Ok(data) = run_cmd("tpm2", &["nvread", idx, "-C", "o"]).await {
-                if !data.is_empty() {
-                    tracing::info!("Obtained Google AK Cert from NVRAM index {} ({} bytes)", idx, data.len());
-                    // v125: Manually wrap Base64 in PEM headers to avoid dependency on openssl in initramfs
-                    let b64 = STANDARD.encode(&data);
-                    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
-                    for chunk in b64.as_bytes().chunks(64) {
-                        pem.push_str(std::str::from_utf8(chunk).unwrap());
-                        pem.push('\n');
-                    }
-                    pem.push_str("-----END CERTIFICATE-----\n");
-                    google_ak_cert_pem = Some(pem);
-                    break;
-                }
-            }
-        }
-
-        // v136: AMD SEV-SNP Hardware Report — Three-Path Acquisition Strategy
-        // The AMD hardware root of trust: report signed by VCEK (fused AMD silicon key).
-        // Independently verifiable against AMD's KDS without trusting Google.
-        let mut auxblob_b64 = None;
-        let mut vcek_der_b64 = None;
-        let mut amd_chain_b64 = None;
-        let mut snp_report_b64 = None;
-
-        // Helper closure to try parsing SNP report from a byte slice
-        let try_parse_snp = |data: &[u8]| -> Option<Vec<u8>> {
-            for &offset in &[0usize, 4, 8, 16, 32, 64] {
-                if data.len() >= offset + 1088 {
-                    let v = u32::from_le_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
-                    if v >= 1 && v <= 4 {
-                        let end = (offset + 1184).min(data.len());
-                        if end - offset >= 1088 {
-                            let snp_slice = &data[offset..end];
-                            if snp_slice.len() >= 1088 {
-                                let chip_id = hex::encode(&snp_slice[1024..1088]);
-                                let bl = snp_slice.get(16).copied().unwrap_or(0);
-                                let tee = snp_slice.get(17).copied().unwrap_or(0);
-                                let snp_val = snp_slice.get(22).copied().unwrap_or(0);
-                                let ucode = snp_slice.get(23).copied().unwrap_or(0);
-                                tracing::info!("AMD TCB Info - ChipID: {}, BL: {}, TEE: {}, SNP: {}, UCode: {}", 
-                                    &chip_id[..16], bl, tee, snp_val, ucode);
-                            }
-                            return Some(snp_slice.to_vec());
-                        }
-                    }
-                }
-            }
-            None
-        };
-
-        // PATH 1: GCP vTPM NVRAM — AMD SNP report provisioned by hypervisor at boot
-        // Index 0x01400001 is the well-known GCP location for the hardware SNP report.
-        tracing::info!("v136: PATH 1 — NVRAM discovery and systematic scan");
-        let mut discovered_handles = vec!["0x01400001".to_string(), "0x01400002".to_string(), "0x01c00003".to_string()];
-        if let Ok(output) = run_cmd("tpm2", &["getcap", "handles-nv-indices"]).await {
-             let s = String::from_utf8_lossy(&output);
-             for line in s.lines() {
-                 if let Some(h) = line.split_whitespace().find(|s| s.starts_with("0x")) {
-                     discovered_handles.push(h.to_string());
-                 }
-             }
-        }
-        discovered_handles.sort();
-        discovered_handles.dedup();
-        tracing::info!("v136: Scanning discovered NV handles: {:?}", discovered_handles);
-
-        'nvram: for idx in &discovered_handles {
-            let data = if let Ok(d) = run_cmd("tpm2_nvread", &["-C", "o", idx]).await { d }
-                       else if let Ok(d) = run_cmd("tpm2_nvread", &["-C", "p", idx]).await { d }
-                       else if let Ok(d) = run_cmd("tpm2_nvread", &["-C", "e", idx]).await { d }
-                       else if let Ok(d) = run_cmd("tpm2", &["nvread", idx]).await { d }
-                       else { continue; };
-
-            if data.len() < 32 { continue; }
-            tracing::info!("v136: NVRAM {} returned {} bytes", idx, data.len());
-            
-            // v147: Chip ID Hunter — scan for SNP report header (0x01) at any offset
-            for offset in (0..data.len().saturating_sub(1088)).step_by(8) {
-                if let Some(snp) = try_parse_snp(&data[offset..]) {
-                    tracing::info!("v147: Found SNP report at NVRAM {} offset {}", idx, offset);
-                    let chip_id = hex::encode(&snp[1024..1088]);
-                    tracing::info!("v147: AMD Chip ID: {}", &chip_id[..16]);
-                    vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
-                    amd_chain_b64 = fetch_amd_chain().await;
-                    snp_report_b64 = Some(STANDARD.encode(&snp));
-                    break 'nvram;
-                }
-            }
-            
-            // Fallback for smaller/truncated reports in auxblob
-            if let Some(snp) = try_parse_snp(&data) {
-                tracing::info!("v136: Parsed SNP report ({} bytes) from NVRAM {}", snp.len(), idx);
-                if snp.len() >= 1088 {
-                    let chip_id = hex::encode(&snp[1024..1088]);
-                    vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
-                    amd_chain_b64 = fetch_amd_chain().await;
-                }
-                snp_report_b64 = Some(STANDARD.encode(&snp));
-                break 'nvram;
-            }
-        }
-
-        // PATH 2: TPM quote auxblob (PCR qualification data — may contain SNP embedding)
-        if snp_report_b64.is_none() {
-            tracing::info!("v136: PATH 2 — TPM quote auxblob");
-            if let Ok(raw) = tokio::fs::read(&auxblob_path).await {
-                if !raw.is_empty() {
-                    tracing::info!("v136: auxblob {} bytes", raw.len());
-                    if auxblob_b64.is_none() { auxblob_b64 = Some(STANDARD.encode(&raw)); }
-                    
-                    // v147: Chip ID Hunter in auxblob
-                    for offset in (0..raw.len().saturating_sub(1088)).step_by(8) {
-                        if let Some(snp) = try_parse_snp(&raw[offset..]) {
-                            tracing::info!("v147: Found SNP report in auxblob at offset {}", offset);
-                            let chip_id = hex::encode(&snp[1024..1088]);
-                            vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
-                            amd_chain_b64 = fetch_amd_chain().await;
-                            snp_report_b64 = Some(STANDARD.encode(&snp));
-                            break;
-                        }
-                    }
-
-                    if snp_report_b64.is_none() {
-                        if let Some(snp) = try_parse_snp(&raw) {
-                            if snp.len() >= 1088 {
-                                let chip_id = hex::encode(&snp[1024..1088]);
-                                vcek_der_b64 = fetch_vcek(&chip_id, snp[16], snp[17], snp[22], snp[23]).await;
-                                amd_chain_b64 = fetch_amd_chain().await;
-                            }
-                            snp_report_b64 = Some(STANDARD.encode(&snp));
-                            tracing::info!("v136: Found SNP report in auxblob");
-                        }
-                    }
-                }
-            }
-        }
-
-        // PATH 3: ConfigFS TSM interface (requires sev-guest.ko)
-        if snp_report_b64.is_none() {
-            tracing::info!("v136: PATH 3 — ConfigFS TSM");
-            if let Some((report, aux)) = snp::get_report(&nonce_bytes) {
-                if aux.is_some() { auxblob_b64 = aux; }
-                if report.len() >= 1088 {
-                    let chip_id = hex::encode(&report[1024..1088]);
-                    vcek_der_b64 = fetch_vcek(&chip_id, report[16], report[17], report[22], report[23]).await;
-                    amd_chain_b64 = fetch_amd_chain().await;
-                }
-                snp_report_b64 = Some(STANDARD.encode(&report));
-                tracing::info!("v136: Got SNP report via ConfigFS ({} bytes)", report.len());
-            }
-        }
-
-        if snp_report_b64.is_some() {
-            tracing::info!("v136: AMD hardware root established!");
-        } else {
-            tracing::error!("v136: ALL SNP paths failed — AMD hardware root unavailable");
-        }
-
-        let _ = tokio::fs::remove_dir_all(&work_dir).await;
-
-        // Collect Intel TDX-specific data when available
-        let (pck_cert_pem, tdx_policy, platform_type, td_info_json) = collect_tdx_fields();
-        let mut marker = evidence_marker(
-            &platform_type,
-            true, // this path produced a real TPM quote (hardware-signed)
-            td_info_json.is_some(),
-            pck_cert_pem.is_some(),
-        );
-        let (tdx_td_report_b64, tdx_quote_b64, tdx_evidence_source, tdx_evidence_probe) =
-            collect_silicon_evidence_into(nonce_hex, &mut marker);
-
-        Ok(AttestationResult {
-            tpm_quote_msg: STANDARD.encode(msg),
-            tpm_quote_sig: STANDARD.encode(sig),
-            ak_pub_pem: ak_pem_str,
-            ek_cert,
-            pcrs: PCR_SELECTION.to_string(),
-            pcr_values,
-            nonce_hex: nonce_hex.to_string(),
-            snp_report_b64,
-            auxblob_b64,
-            signature_binding_pubkey_hash: "".to_string(), // Filled by caller
-            vcek_der_b64,
-            amd_chain_b64,
-            google_ak_cert_pem,
-            ak_der_sha256,
-            pck_cert_pem,
-            tdx_policy,
-            platform_type,
-            td_info: td_info_json,
-            tdx_evidence_marker: marker,
-            tdx_td_report_b64,
-            tdx_quote_b64,
-            tdx_evidence_source,
-            tdx_evidence_probe,
-        })
+        loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
     }
 }
 
-mod crypto {
-    use aes_gcm::{
-        aead::{Aead, AeadCore, KeyInit, OsRng},
-        Aes256Gcm, Key, Nonce,
-    };
-    use rand::Rng;
-
-    pub fn generate_dek() -> Vec<u8> {
-        let mut key = vec![0u8; 32];
-        rand::thread_rng().fill(&mut key[..]);
-        key
-    }
-
-    pub fn encrypt(dek: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
-        let key = Key::<Aes256Gcm>::from_slice(dek);
-        let cipher = Aes256Gcm::new(key);
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 96-bits; 12 bytes
-        let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(|e| format!("AesGcm encrypt failed: {:?}", e))?;
-        Ok((nonce.to_vec(), ciphertext))
-    }
-
-    pub fn decrypt(dek: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let key = Key::<Aes256Gcm>::from_slice(dek);
-        let cipher = Aes256Gcm::new(key);
-        let nonce_arr = Nonce::from_slice(nonce);
-        let plaintext = cipher.decrypt(nonce_arr, ciphertext).map_err(|e| format!("AesGcm decrypt failed: {:?}", e))?;
-        Ok(plaintext)
-    }
-}
-
-
-const MAX_TRACKED_IPS: usize = 1000;
-const MAX_CONCURRENT_CONNECTIONS: usize = 50;
-const GLOBAL_EGRESS_BYTES_PER_HOUR: u64 = 512 * 1024 * 1024; // 512 MB
-const IP_EGRESS_BYTES_PER_HOUR: u64 = 25 * 1024 * 1024;     // 25 MB
-const GOOGLE_PUBLIC_CA_DIRECTORY: &str = "https://dv.acme-v02.api.pki.goog/directory";
-const LETSENCRYPT_CA_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
-// ZeroSSL (EAB-enabled) — the Alibaba build's ACME CA. Google Public CA's
-// China coverage and LE's rate limits both burned us; ZeroSSL takes the new
-// EAB creds provisioned in the deploy config.
-const ZEROSSL_CA_DIRECTORY: &str = "https://acme.zerossl.com/v2/DV90";
-
-const PAYPAL_PRODUCTION_API: &str = "https://api-m.paypal.com";
-const PAYPAL_SANDBOX_API: &str = "https://api-m.sandbox.paypal.com";
-const PAYPAL_PRODUCTION_AUTH: &str = "https://www.paypal.com/signin/authorize";
-const PAYPAL_SANDBOX_AUTH: &str = "https://www.sandbox.paypal.com/signin/authorize";
-
-const HTML_TEMPLATE: &str = r#"
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Confidential PayPal Auth</title>
-    <style>
-        body { font-family: monospace; max-width: 800px; margin: 50px auto; padding: 20px; background: #0a0a0a; color: #e0e0e0; }
-        .container { border: 2px solid #0070ba; padding: 30px; border-radius: 10px; background: #1a1a1a; }
-        .btn { background: #0070ba; color: white; padding: 15px 30px; text-decoration: none;
-               border-radius: 5px; display: inline-block; font-size: 16px; border: none; cursor: pointer; }
-        .btn:hover { background: #005a94; }
-        .info { background: #2a2a2a; padding: 15px; margin: 20px 0; border-radius: 5px; border-left: 4px solid #0070ba; }
-        .attestation { background: #1a3a1a; padding: 15px; margin: 20px 0; border-radius: 5px;
-                       word-break: break-all; font-size: 11px; border-left: 4px solid #4caf50; }
-        .error { background: #3a1a1a; padding: 15px; margin: 20px 0; border-radius: 5px; color: #ff6b6b; border-left: 4px solid #c62828; }
-        .cert-status { font-weight: bold; color: #4caf50; }
-        pre { background: #0a0a0a; padding: 10px; border-radius: 3px; overflow-x: auto; font-size: 10px; }
-        h1 { color: #0070ba; }
-        h3 { color: #64b5f6; }
-        ul { list-style: none; padding-left: 0; }
-        li { padding: 5px 0; }
-        .footer { margin-top: 30px; text-align: center; font-size: 12px; color: #888; border-top: 1px solid #333; padding-top: 15px; }
-        .footer a { color: #64b5f6; text-decoration: none; margin: 0 10px; }
-        .document-content h2 { color: #64b5f6; margin-top: 25px; border-bottom: 1px solid #333; padding-bottom: 5px; }
-        .document-content p { line-height: 1.6; }
-        .links-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 40px; }
-        .card { background: rgba(255,255,255,0.02); padding: 24px; border-radius: 8px; border: 1px solid #30363d; text-decoration: none; color: #c9d1d9; display: block; font-family: system-ui, -apple-system, sans-serif; }
-        .card:hover { border-color: #58a6ff; }
-        .card h3 { margin: 0 0 10px 0; color: #58a6ff; }
-        .card p { margin: 0; font-size: 0.9rem; }
-    </style>
-</head>
-<body><div class="container">{{CONTENT}}</div></body></html>
-"#;
-
-// Legal policies migrated to GitHub Pages
-
-/// Run a synchronous subprocess with a hard wall-clock timeout.
-///
-/// `std::process::Child::wait` has no deadline of its own, so a hung child
-/// (wedged TPM device, blocked kernel log, full pipe) would otherwise park the
-/// calling thread forever — in an async handler that stalls a tokio worker.
-/// On timeout the child is SIGKILLed and `None` is returned.
-pub fn cmd_output_timeout(
-    cmd: &str,
-    args: &[&str],
-    envs: &[(String, String)],
-    timeout: std::time::Duration,
-) -> Option<std::process::Output> {
-    use std::io::Read as _;
-    use std::process::{Command, Stdio};
-    let mut command = Command::new(cmd);
-    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    for (k, v) in envs {
-        command.env(k, v);
-    }
-    let mut child = command.spawn().ok()?;
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None; // timed out — never leave a zombie or a stuck thread
-            }
-        }
-    };
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut so) = child.stdout.take() { let _ = so.read_to_end(&mut stdout); }
-    if let Some(mut se) = child.stderr.take() { let _ = se.read_to_end(&mut stderr); }
-    let _ = child.wait();
-    Some(std::process::Output { status, stdout, stderr })
-}
-
 // ============================================================================
-// NON-BLOCKING LOG SINK — tracing must never write to the serial console tty
+// NON-BLOCKING LOG SINK (ported: the plan's info!/warn!/error! calls need a
+// subscriber; tracing must never write to the serial console tty — see the
+// original kmsg_log rationale in git history).
 // ============================================================================
-//
-// tracing_subscriber's default writer is stderr, which on this image is the
-// serial console. A busy/slow UART (or one with flow control stalled) blocks
-// the writing thread — i.e. a runtime worker or PID 1 — and the process stops
-// serving TLS while the kernel console drains. That failure class is exactly
-// "TCP 443 accepts, no TLS". All runtime logging instead goes to /dev/kmsg
-// opened O_NONBLOCK: the kernel ring buffer absorbs it asynchronously (printk
-// echoes to the console via irq-work, not from our write path), and backpressure
-// (ENOSPC/EAGAIN) drops the line instead of stalling the worker.
 mod kmsg_log {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -1590,9 +422,418 @@ mod kmsg_log {
     }
 }
 
-// ============================================================================
-// CONFIG (single JSON secret)
-// ============================================================================
+/// Run a synchronous subprocess with a hard wall-clock timeout.
+///
+/// (Ported: required by src/intel_tdx.rs via `crate::cmd_output_timeout`.)
+/// `std::process::Child::wait` has no deadline of its own, so a hung child
+/// (wedged TPM device, blocked kernel log, full pipe) would otherwise park the
+/// calling thread forever — in an async handler that stalls a tokio worker.
+/// On timeout the child is SIGKILLed and `None` is returned.
+pub fn cmd_output_timeout(
+    cmd: &str,
+    args: &[&str],
+    envs: &[(String, String)],
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    let mut command = Command::new(cmd);
+    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    for (k, v) in envs {
+        command.env(k, v);
+    }
+    let mut child = command.spawn().ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None; // timed out — never leave a zombie or a stuck thread
+            }
+        }
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut so) = child.stdout.take() { let _ = so.read_to_end(&mut stdout); }
+    if let Some(mut se) = child.stderr.take() { let _ = se.read_to_end(&mut stderr); }
+    let _ = child.wait();
+    Some(std::process::Output { status, stdout, stderr })
+}
+
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::{Html, IntoResponse, Redirect, Response},
+    routing::get,
+    Json, Router,
+};
+use openssl::ssl::{SslAcceptor, SslMethod};
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering, AtomicU64};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
+use tokio::sync::Semaphore;
+use tokio::net::TcpListener;
+use tower::ServiceExt;
+use tower_http::trace::TraceLayer;
+use tracing::{error, info, warn};
+use std::collections::BTreeMap;
+use std::net::IpAddr;
+
+// ----------------------------------------------------------------------------
+// Ephemeral Cryptographic Identity in RAM (Never Logged / Never Persisted)
+// ----------------------------------------------------------------------------
+#[derive(Clone)]
+pub struct EphemeralEnclaveIdentity {
+    pub pkey: Arc<openssl::pkey::PKey<openssl::pkey::Private>>,
+    pub pubkey_der: Vec<u8>,
+    pub pubkey_pem: String,
+    pub pubkey_sha256: [u8; 32],
+}
+
+impl EphemeralEnclaveIdentity {
+    pub fn generate() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        use sha2::{Digest, Sha256};
+        let rsa = openssl::rsa::Rsa::generate(4096)?;
+        let pkey = openssl::pkey::PKey::from_rsa(rsa)?;
+        let pubkey_der = pkey.public_key_to_der()?;
+        let pubkey_pem = String::from_utf8(pkey.public_key_to_pem()?)?;
+        let pubkey_sha256 = Sha256::digest(&pubkey_der).into();
+        Ok(Self {
+            pkey: Arc::new(pkey),
+            pubkey_der,
+            pubkey_pem,
+            pubkey_sha256,
+        })
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Ephemeral In-RAM PKCE Session (Client-Bound)
+// ----------------------------------------------------------------------------
+pub struct PkceSession {
+    pub code_verifier: String,
+    pub code_challenge: String,
+    pub client_ecdh_pub: Vec<u8>,
+    pub client_nonce: [u8; 32],
+    pub enclave_ecdh: openssl::pkey::PKey<openssl::pkey::Private>,
+    // The user's custom_info chosen at pre-flight; the login (callback) report
+    // binds it into the SEC-02 nonce so it matches the pre-flight binding.
+    pub custom_info: String,
+    pub created_at: Instant,
+}
+
+impl PkceSession {
+    pub fn new(client_ecdh_pub: Vec<u8>, client_nonce: [u8; 32], custom_info: String) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+        use base64::Engine as _;
+        use openssl::ec::{EcGroup, EcKey};
+        use openssl::nid::Nid;
+        use rand::Rng;
+        use sha2::{Digest, Sha256};
+
+        let mut verifier_bytes = [0u8; 64];
+        rand::thread_rng().fill(&mut verifier_bytes);
+        let code_verifier = B64URL.encode(verifier_bytes);
+
+        let challenge_hash = Sha256::digest(code_verifier.as_bytes());
+        let code_challenge = B64URL.encode(challenge_hash);
+
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+        let ec_key = EcKey::generate(&group)?;
+        let enclave_ecdh = openssl::pkey::PKey::from_ec_key(ec_key)?;
+
+        Ok(Self {
+            code_verifier,
+            code_challenge,
+            client_ecdh_pub,
+            client_nonce,
+            enclave_ecdh,
+            custom_info,
+            created_at: Instant::now(),
+        })
+    }
+}
+
+// ----------------------------------------------------------------------------
+// In-Memory End-to-End Cryptography Engine (Zero Plaintext Leakage)
+// ----------------------------------------------------------------------------
+mod crypto_e2ee {
+    use super::*;
+    use aes_gcm::{aead::{Aead, AeadCore, KeyInit, Payload}, Aes256Gcm, Key, Nonce};
+    use openssl::derive::Deriver;
+    use openssl::pkey::PKey;
+
+    pub fn hkdf_sha256(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) {
+        use openssl::sign::Signer;
+        fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+            let k = PKey::hmac(key).expect("HMAC key");
+            let mut s = Signer::new(openssl::hash::MessageDigest::sha256(), &k).expect("HMAC signer");
+            s.update(data).expect("HMAC update");
+            s.sign_to_vec().expect("HMAC sign")
+        }
+        let prk = hmac(salt, ikm);
+        let mut t: Vec<u8> = Vec::new();
+        let mut okm: Vec<u8> = Vec::new();
+        let mut counter: u8 = 1;
+        while okm.len() < out.len() {
+            let mut msg = t.clone();
+            msg.extend_from_slice(info);
+            msg.push(counter);
+            t = hmac(&prk, &msg);
+            okm.extend_from_slice(&t);
+            counter = counter.wrapping_add(1).max(1);
+        }
+        let n = out.len().min(okm.len());
+        out[..n].copy_from_slice(&okm[..n]);
+    }
+
+    pub fn derive_session_key(
+        enclave_ecdh: &PKey<openssl::pkey::Private>,
+        client_pub_der: &[u8],
+        client_nonce: &[u8; 32],
+    ) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+        let peer = PKey::public_key_from_der(client_pub_der)?;
+        let mut deriver = Deriver::new(enclave_ecdh)?;
+        deriver.set_peer(&peer)?;
+        let mut ikm = deriver.derive_to_vec()?;
+
+        let mut key = [0u8; 32];
+        hkdf_sha256(&ikm, client_nonce, b"paypal-auth-vm/e2ee/v1", &mut key);
+        ikm.iter_mut().for_each(|b| *b = 0);
+        Ok(key)
+    }
+
+    pub fn encrypt_envelope(
+        key_bytes: &[u8; 32],
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+        let key = Key::<Aes256Gcm>::from_slice(key_bytes);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Aes256Gcm::generate_nonce(&mut aes_gcm::aead::OsRng);
+        let ciphertext = cipher
+            .encrypt(&nonce, Payload { msg: plaintext, aad })
+            .map_err(|e| format!("AES-GCM encryption failed: {:?}", e))?;
+        Ok((nonce.to_vec(), ciphertext))
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Client-Bound Hardware Attestation Binding Formula
+// ----------------------------------------------------------------------------
+pub fn compute_preflight_binding(
+    pubkey_der: &[u8],
+    code_challenge: &str,
+    client_pub_der: &[u8],
+    client_nonce: &[u8; 32],
+    custom_info: &str,
+) -> [u8; 64] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(pubkey_der);
+    hasher.update(code_challenge.as_bytes());
+    hasher.update(client_pub_der);
+    hasher.update(client_nonce);
+    hasher.update(custom_info.as_bytes());
+    let digest = hasher.finalize();
+
+    let mut report_data = [0u8; 64];
+    report_data[0..32].copy_from_slice(&digest);
+    report_data
+}
+
+// ----------------------------------------------------------------------------
+// SEC-02 / verify.html v160 — 5-component hardware-bound session nonce
+// ----------------------------------------------------------------------------
+// nonce = SHA-256 over the 160-byte concatenation:
+//   [0..32]    sha256(compact sorted PayPal userinfo JSON)   (pre-login: published placeholder)
+//   [32..64]   sha256(enclave signing pubkey SPKI DER)
+//   [64..96]   sha256(custom_info; "NONE" when absent/empty)
+//   [96..128]  boot_measurements.binary_sha256 (self-measure of /init)
+//   [128..160] sha256(canonical compact JSON of sorted [path, sha256] manifest pairs)
+// The TDX quote's report_data[0..32] (and the TPM quote's extraData) MUST
+// equal this digest or the auditor fails the binding check. Byte-for-byte the
+// same formula verify.html recomputes as `expectedNonce`.
+fn sec02_nonce(
+    paypal_user_raw_hash: &str,
+    pubkey_der: &[u8],
+    custom_info: &str,
+    binary_sha256_hex: &str,
+    manifest: &std::collections::BTreeMap<String, String>,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let paypal = hex::decode(paypal_user_raw_hash.trim()).unwrap_or_default();
+    let pubkey_hash = Sha256::digest(pubkey_der);
+    let ci = if custom_info.trim().is_empty() { "NONE" } else { custom_info };
+    let ci_hash = Sha256::digest(ci.as_bytes());
+    let binary = hex::decode(binary_sha256_hex.trim()).unwrap_or_default();
+    // Canonical manifest: sorted [path, sha256] pairs, compact JSON — must be
+    // byte-identical to verify.html's `JSON.stringify(sorted.map(k=>[k,m[k]]))`.
+    // BTreeMap iterates in sorted key order; serde_json emits compact arrays.
+    let pairs: Vec<(&String, &String)> = manifest.iter().collect();
+    let manifest_json = serde_json::to_string(&pairs).unwrap_or_default();
+    let manifest_hash = Sha256::digest(manifest_json.as_bytes());
+
+    let mut hasher = Sha256::new();
+    hasher.update(&paypal);
+    hasher.update(&pubkey_hash);
+    hasher.update(&ci_hash);
+    hasher.update(&binary);
+    hasher.update(&manifest_hash);
+    hasher.finalize().into()
+}
+
+// Pre-login placeholder for paypal_user_info_raw_hash: there is no PayPal user
+// yet when the standalone /debug/envelope or the pre-flight POST is generated.
+// The auditor recomputes expectedNonce from whatever value we publish here, so
+// any deterministic placeholder keeps the binding self-consistent; the real
+// user hash is bound only at the login (callback) step. Self-documenting marker.
+fn prelogin_paypal_hash() -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(b"PRELOGIN_NO_USER"))
+}
+
+// Sign the canonical (sorted-key) JSON of an attestation_report with the
+// enclave's ephemeral RSA key. serde_json's Map is a BTreeMap (sorted), so
+// to_string() is byte-identical to verify.html's JSON.stringify(reorder(...)).
+fn sign_report(state: &AppState, report: &serde_json::Value) -> String {
+    use base64::engine::general_purpose::STANDARD as B64STD;
+    use base64::Engine as _;
+    use openssl::hash::MessageDigest;
+    use openssl::sign::Signer;
+    let report_str = serde_json::to_string(report).unwrap_or_default();
+    let mut signer = Signer::new(MessageDigest::sha256(), &state.enclave_identity.pkey).unwrap();
+    signer.update(report_str.as_bytes()).unwrap();
+    B64STD.encode(signer.sign_to_vec().unwrap())
+}
+
+// ----------------------------------------------------------------------------
+// TPM & Hardware Silicon Module
+// ----------------------------------------------------------------------------
+mod tpm {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde::{Deserialize, Serialize};
+
+    pub const PCR_SELECTION: &str = "0,4,8,9,15";
+
+    #[derive(Serialize, Deserialize, Clone)]
+    pub struct AttestationResult {
+        pub tpm_quote_msg: String,
+        pub tpm_quote_sig: String,
+        pub ak_pub_pem: String,
+        pub ek_cert: Option<String>,
+        pub pcrs: String,
+        pub pcr_values: std::collections::BTreeMap<String, String>,
+        pub nonce_hex: String,
+        pub snp_report_b64: Option<String>,
+        pub auxblob_b64: Option<String>,
+        pub signature_binding_pubkey_hash: String,
+        pub vcek_der_b64: Option<String>,
+        pub amd_chain_b64: Option<String>,
+        pub google_ak_cert_pem: Option<String>,
+        pub ak_der_sha256: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub pck_cert_pem: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tdx_policy: Option<String>,
+        pub platform_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub td_info: Option<serde_json::Value>,
+        pub tdx_evidence_marker: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tdx_td_report_b64: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tdx_quote_b64: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tdx_evidence_source: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tdx_evidence_probe: Option<serde_json::Value>,
+    }
+
+    pub fn quote(
+        nonce_hex: &str,
+        report_data_override: Option<[u8; 64]>,
+    ) -> AttestationResult {
+        let silicon = super::intel_tdx::collect_silicon_evidence(nonce_hex, report_data_override);
+        let quote_present = silicon.quote_b64.is_some();
+        let report_present = silicon.td_report_b64.is_some();
+
+        let marker = serde_json::json!({
+            "platform_type": "Intel TDX",
+            "hardware_signed_tdx_quote": quote_present,
+            "tdx_quote_status": if quote_present { "ok" } else { "unavailable_no_guest_device" },
+            "tdx_td_report_present": report_present,
+            "tdx_quote_source": silicon.quote_source.clone().unwrap_or_default(),
+            "tdx_td_report_source": silicon.td_report_source.clone().unwrap_or_default(),
+        });
+
+        // Serialize while `silicon` is still fully owned (the struct below
+        // moves individual fields out of it).
+        let silicon_probe = serde_json::to_value(&silicon).unwrap_or_default();
+
+        AttestationResult {
+            tpm_quote_msg: String::new(),
+            tpm_quote_sig: String::new(),
+            ak_pub_pem: String::new(),
+            ek_cert: None,
+            pcrs: String::new(),
+            pcr_values: std::collections::BTreeMap::new(),
+            nonce_hex: nonce_hex.to_string(),
+            snp_report_b64: None,
+            auxblob_b64: None,
+            signature_binding_pubkey_hash: String::new(),
+            vcek_der_b64: None,
+            amd_chain_b64: None,
+            google_ak_cert_pem: None,
+            ak_der_sha256: String::new(),
+            pck_cert_pem: None,
+            tdx_policy: None,
+            platform_type: "Intel TDX".to_string(),
+            td_info: None,
+            tdx_evidence_marker: marker,
+            tdx_td_report_b64: silicon.td_report_b64,
+            tdx_quote_b64: silicon.quote_b64,
+            tdx_evidence_source: silicon.quote_source,
+            tdx_evidence_probe: Some(silicon_probe),
+        }
+    }
+}
+
+const MAX_TRACKED_IPS: usize = 1000;
+const MAX_CONCURRENT_CONNECTIONS: usize = 50;
+const GLOBAL_EGRESS_BYTES_PER_HOUR: u64 = 512 * 1024 * 1024;
+const IP_EGRESS_BYTES_PER_HOUR: u64 = 25 * 1024 * 1024;
+const ZEROSSL_CA_DIRECTORY: &str = "https://acme.zerossl.com/v2/DV90";
+const LETSENCRYPT_CA_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
+
+const PAYPAL_PRODUCTION_API: &str = "https://api-m.paypal.com";
+const PAYPAL_SANDBOX_API: &str = "https://api-m.sandbox.paypal.com";
+const PAYPAL_PRODUCTION_AUTH: &str = "https://www.paypal.com/signin/authorize";
+const PAYPAL_SANDBOX_AUTH: &str = "https://www.sandbox.paypal.com/signin/authorize";
+
+const HTML_TEMPLATE: &str = r#"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Confidential PayPal Auth</title>
+    <style>
+        body { font-family: monospace; max-width: 800px; margin: 50px auto; padding: 20px; background: #0a0a0a; color: #e0e0e0; }
+        .container { border: 2px solid #0070ba; padding: 30px; border-radius: 10px; background: #1a1a1a; }
+        .btn { background: #0070ba; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; display: inline-block; font-size: 16px; border: none; cursor: pointer; }
+        .info { background: #2a2a2a; padding: 15px; margin: 20px 0; border-radius: 5px; border-left: 4px solid #0070ba; }
+        h1 { color: #0070ba; } h3 { color: #64b5f6; }
+    </style>
+</head>
+<body><div class="container">{{CONTENT}}</div></body></html>
+"#;
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -1607,35 +848,11 @@ struct Config {
     eab_hmac_key: Option<String>,
     #[serde(default)]
     staging: bool,
-    /// DNS-01 credentials. When `dns_api_token` is present the enclave proves
-    /// domain control with a DNS TXT record instead of HTTP-01. This is not an
-    /// optional refinement: on a mainland-China IP the carrier intercepts
-    /// port 80 for any domain without an ICP filing, so HTTP-01 challenges can
-    /// never be validated there (proven live on 2026-10-16 — the CA's fetch
-    /// returns a carrier "Non-compliance ICP Filing" 403 page instead of our
-    /// challenge file). DNS-01 touches only port 443, which is unaffected.
-    #[serde(default)]
-    dns_provider: Option<String>,
     #[serde(default, alias = "dns01_secret")]
     dns_api_token: Option<String>,
-    /// Zone holding the challenge record; defaults to the parent of `domain`
-    /// (login.airma.de -> airma.de). Accepts a raw 32-hex Cloudflare zone ID.
-    /// The deploy config ships these as `dns01` (zone) / `dns01_secret`
-    /// (token) — both spellings deserialize, so a config with either name
-    /// still gets DNS-01 (an unrecognized name silently falls back to
-    /// HTTP-01, which the mainland-China carrier intercepts).
     #[serde(default, alias = "dns01")]
     dns_zone: Option<String>,
-    #[allow(dead_code)]  // Used in GCP builds for ACME account persistence
-    acme_account_json: Option<String>,
-    // v69: Asymmetric key for signing the attestation payload
-    #[serde(default)]
-    attestation_signing_key: Option<String>,
 }
-
-// ============================================================================
-// DATA STRUCTURES
-// ============================================================================
 
 #[derive(Clone)]
 struct AppState {
@@ -1644,193 +861,86 @@ struct AppState {
     paypal_verified_client_id: String,
     paypal_verified_client_secret: String,
     redirect_uri: String,
-    #[allow(dead_code)]  // Used for rate limiting / dedup logic in future versions
-    used_paypal_ids: Arc<RwLock<HashSet<String>>>,
     domain: String,
     https_ready: Arc<AtomicBool>,
     staging: bool,
-    // v69: For inclusion in remote attestation
     tls_cert_pem: Arc<RwLock<Option<String>>>,
-    attestation_signing_key: Option<String>,
-    // v70: DDoS Protection for IP tracking
+    enclave_identity: EphemeralEnclaveIdentity,
     ip_stats: Arc<RwLock<std::collections::BTreeMap<IpAddr, u64>>>,
     global_egress_bytes: Arc<AtomicU64>,
     last_limit_reset: Arc<RwLock<Instant>>,
     connection_semaphore: Arc<Semaphore>,
     boot_manifest: BTreeMap<String, String>,
-    pending_attestations: Arc<RwLock<std::collections::HashMap<String, (String, PayPalUserInfo, Instant)>>>,
-    // v165 SECURITY (audit round 1, threat model: untrusted owner+cloud):
-    // one in-flight OAuth attempt per browser, created at /login and consumed
-    // EXACTLY ONCE at /callback. `nonce` (32 alnum) travels in BOTH the
-    // `state=<flow>.<nonce>` parameter and the HttpOnly `pav_oauth` cookie —
-    // a callback URL forged by an attacker cannot know the victim's cookie
-    // value, killing OAuth login CSRF. `code_verifier` implements PKCE so an
-    // authorization code injected out-of-context cannot be exchanged.
-    pending_oauth: Arc<RwLock<std::collections::HashMap<String, PendingOauth>>>,
-}
-
-struct PendingOauth {
-    flow: String,
-    code_verifier: String,
-    created: Instant,
-}
-
-struct PayPalFlowConfig {
-    client_id: String,
-    client_secret: String,
-    scope: String,
-    label: String,
+    pending_oauth: Arc<RwLock<std::collections::HashMap<String, (String, PkceSession)>>>,
+    pending_e2ee_blobs: Arc<RwLock<std::collections::HashMap<String, (serde_json::Value, Instant)>>>,
 }
 
 impl AppState {
-    fn get_flow_config(&self, flow_name: &str) -> PayPalFlowConfig {
+    fn get_flow_config(&self, flow_name: &str) -> (String, String, String, String) {
         if flow_name == "verified" {
-            PayPalFlowConfig {
-                client_id: self.paypal_verified_client_id.clone(),
-                client_secret: self.paypal_verified_client_secret.clone(),
-                scope: "https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes".to_string(),
-                label: "verified".to_string(),
-            }
+            (
+                self.paypal_verified_client_id.clone(),
+                self.paypal_verified_client_secret.clone(),
+                "https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes".to_string(),
+                "verified".to_string(),
+            )
         } else {
-            PayPalFlowConfig {
-                client_id: self.paypal_client_id.clone(),
-                client_secret: self.paypal_client_secret.clone(),
-                scope: "openid%20profile%20email%20address%20profile%20email%20https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes".to_string(),
-                label: "full".to_string(),
-            }
+            (
+                self.paypal_client_id.clone(),
+                self.paypal_client_secret.clone(),
+                "openid%20profile%20email%20address%20profile%20email%20https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes".to_string(),
+                "full".to_string(),
+            )
         }
     }
 
-    fn record_egress_data(&self, ip: IpAddr, bytes: u64) -> Result<(), StatusCode> {
+    fn record_egress(&self, ip: IpAddr, bytes: u64) -> Result<(), StatusCode> {
         let now = Instant::now();
-        
         let mut stats = self.ip_stats.write();
         let mut reset = self.last_limit_reset.write();
-        
-        // Reset counters if hour passed
         if now.duration_since(*reset) > Duration::from_secs(3600) {
-            info!("Egress data counters reset (1 hour interval reached)");
             *reset = now;
             self.global_egress_bytes.store(0, Ordering::Relaxed);
             stats.clear();
         }
-        drop(reset); 
-
-        // 1. Global Data Limit Check
-        let current_global = self.global_egress_bytes.fetch_add(bytes, Ordering::Relaxed);
-        if current_global + bytes >= GLOBAL_EGRESS_BYTES_PER_HOUR {
-            error!("Global data limit reached ({}/{} bytes)", current_global, GLOBAL_EGRESS_BYTES_PER_HOUR);
+        let current = self.global_egress_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if current + bytes >= GLOBAL_EGRESS_BYTES_PER_HOUR {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-
-        // 2. Per-IP Data Limit Check
-        let ip_bytes = if let Some(count) = stats.get_mut(&ip) {
-            *count += bytes;
-            *count
-        } else if stats.len() < MAX_TRACKED_IPS {
-            stats.insert(ip, bytes);
-            bytes
-        } else {
-            0
-        };
-
-        if ip_bytes > IP_EGRESS_BYTES_PER_HOUR && ip_bytes != 0 {
-            error!("IP bandwidth limit reached for {}: ({}/{} bytes)", ip, ip_bytes, IP_EGRESS_BYTES_PER_HOUR);
+        let ip_bytes = stats.entry(ip).and_modify(|e| *e += bytes).or_insert(bytes);
+        if *ip_bytes > IP_EGRESS_BYTES_PER_HOUR {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-
         Ok(())
     }
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct TokenResponse {
     access_token: String,
-    token_type: String,
-    expires_in: u64,
+    #[serde(default)]
     id_token: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct PayPalAddress {
-    street_address: Option<String>,
-    locality: Option<String>,
-    region: Option<String>,
-    postal_code: Option<String>,
-    country: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct PayPalEmail {
-    value: String,
-    primary: Option<bool>,
-    confirmed: Option<bool>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 struct PayPalUserInfo {
+    #[serde(default)]
     user_id: String,
+    #[serde(default)]
     sub: Option<String>,
-    name: Option<String>,
-    given_name: Option<String>,
-    family_name: Option<String>,
-    middle_name: Option<String>,
-    nickname: Option<String>,
-    preferred_username: Option<String>,
-    profile: Option<String>,
-    picture: Option<String>,
-    website: Option<String>,
-    email: Option<String>,
-    emails: Option<Vec<PayPalEmail>>,
-    email_verified: Option<bool>,
-    gender: Option<String>,
-    birthdate: Option<String>,
-    zoneinfo: Option<String>,
-    locale: Option<String>,
-    phone_number: Option<String>,
-    address: Option<PayPalAddress>,
+    #[serde(default)]
     verified_account: Option<String>,
-    verified: Option<String>,
-    account_type: Option<String>,
-    age_range: Option<String>,
+    #[serde(default)]
     payer_id: Option<String>,
 }
 
 impl PayPalUserInfo {
-    /// v130 PRIVACY: Verified-flow projection. The restricted "Verified
-    /// Candidate" login attests ONLY whether the account is PayPal-verified.
-    /// Every personal field (name, email, address, payer_id, picture, …) is
-    /// dropped here — *before* the identity hash of the report is computed —
-    /// so neither the signed payload nor the success page ever sees profile
-    /// data in that flow.
-    fn verified_only(&self) -> Self {
+    fn verified_only(self) -> Self {
         PayPalUserInfo {
-            user_id: String::new(),
-            sub: None,
-            name: None,
-            given_name: None,
-            family_name: None,
-            middle_name: None,
-            nickname: None,
-            preferred_username: None,
-            profile: None,
-            picture: None,
-            website: None,
-            email: None,
-            emails: None,
-            email_verified: None,
-            gender: None,
-            birthdate: None,
-            zoneinfo: None,
-            locale: None,
-            phone_number: None,
-            address: None,
-            verified_account: self.verified_account.clone(),
-            verified: self.verified.clone(),
-            account_type: None,
-            age_range: None,
-            payer_id: None,
+            user_id: self.user_id,
+            sub: self.sub,
+            verified_account: self.verified_account,
+            payer_id: self.payer_id,
         }
     }
 }
@@ -1842,43 +952,71 @@ struct CallbackQuery {
     error: Option<String>,
 }
 
-// ============================================================================
-// GCP SECRET MANAGER (GCP-only; no-op on Alibaba Cloud)
-// ============================================================================
-
-#[cfg(not(feature = "alibabacloud"))]
-#[allow(dead_code)]  // Only used in GCP builds, but required for shared code paths
-async fn fetch_secret_direct(secret_id: &str) -> Option<String> {
-    let client = crate::hardened_client();
-    let token_resp: serde_json::Value = client
-        .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
-        .header("Metadata-Flavor", "Google")
-        .send().await.ok()?.json().await.ok()?;
-    let access_token = token_resp["access_token"].as_str()?;
-
-    let project_id = "REDACTED_GCP_PROJECT";
-    let url = format!("https://secretmanager.googleapis.com/v1/projects/{}/secrets/{}/versions/latest:access", project_id, secret_id);
-    let secret_resp: serde_json::Value = client
-        .get(&url).bearer_auth(access_token).send().await.ok()?.json().await.ok()?;
-    let encoded = secret_resp["payload"]["data"].as_str()?;
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    String::from_utf8(STANDARD.decode(encoded.trim()).ok()?).ok().map(|s| s.trim().trim_matches('\0').to_string())
+fn zeroize_str(s: &mut String) {
+    unsafe {
+        let bytes = s.as_bytes_mut();
+        for b in bytes.iter_mut() {
+            *b = 0;
+        }
+    }
+    s.clear();
 }
 
-#[cfg(feature = "alibabacloud")]
-async fn fetch_secret_direct(_secret_id: &str) -> Option<String> {
-    None
+fn hardened_client() -> reqwest::Client {
+    use reqwest::Certificate;
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .use_rustls_tls()
+        .resolve("api-m.paypal.com", std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(104, 16, 124, 74)), 443))
+        .resolve("api-m.sandbox.paypal.com", std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(146, 75, 123, 1)), 443));
+
+    if let Ok(cert) = Certificate::from_pem(PAYPAL_CA_PEM) {
+        builder = builder.add_root_certificate(cert);
+    }
+    if let Ok(cert) = Certificate::from_pem(GOOGLE_CA_PEM) {
+        builder = builder.add_root_certificate(cert);
+    }
+    builder.build().unwrap()
 }
 
-/// Load config from a local JSON file (Alibaba Cloud / general fallback)
-async fn load_config_from_file(path: &str) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
-    let content = std::fs::read_to_string(path)?;
-    let config: Config = serde_json::from_str(content.trim())?;
+// ----------------------------------------------------------------------------
+// Fail-Closed Credential Ingestion (No Hardcoded Secrets Allowed)
+// ----------------------------------------------------------------------------
+fn require_credentials(config: Config) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
+    fn is_missing(val: &str) -> bool {
+        let t = val.trim();
+        t.is_empty() || t.starts_with("MISSING_") || t.starts_with("YOUR_") || t.contains("***REMOVED***")
+    }
+
+    let mut missing_fields = Vec::new();
+    if is_missing(&config.paypal_client_id) { missing_fields.push("paypal_client_id"); }
+    if is_missing(&config.paypal_client_secret) { missing_fields.push("paypal_client_secret"); }
+
+    if let Some(ref v_id) = config.paypal_verified_client_id {
+        if is_missing(v_id) { missing_fields.push("paypal_verified_client_id"); }
+    } else {
+        missing_fields.push("paypal_verified_client_id");
+    }
+
+    if let Some(ref v_sec) = config.paypal_verified_client_secret {
+        if is_missing(v_sec) { missing_fields.push("paypal_verified_client_secret"); }
+    } else {
+        missing_fields.push("paypal_verified_client_secret");
+    }
+
+    if !missing_fields.is_empty() {
+        return Err(format!(
+            "FAIL-CLOSED: Missing or placeholder PayPal credentials for: {}. \
+            Hardcoded credentials have been completely removed. \
+            Supply real credentials via environment variables or user_data metadata.",
+            missing_fields.join(", ")
+        ).into());
+    }
+
     Ok(config)
 }
 
 async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
-    // Priority 1: Check for environment variables (KeePassXC / Local / Alibaba Cloud)
     if let (Ok(p_id), Ok(p_sec), Ok(pv_id), Ok(pv_sec), Ok(dom)) = (
         std::env::var("PAYPAL_CLIENT_ID"),
         std::env::var("PAYPAL_CLIENT_SECRET"),
@@ -1886,8 +1024,7 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
         std::env::var("PAYPAL_VERIFIED_CLIENT_SECRET"),
         std::env::var("DOMAIN"),
     ) {
-        info!("Using configuration from Environment Variables");
-        return Ok(Config {
+        return require_credentials(Config {
             paypal_client_id: p_id,
             paypal_client_secret: p_sec,
             paypal_verified_client_id: Some(pv_id),
@@ -1896,287 +1033,58 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
             eab_key_id: std::env::var("EAB_KEY_ID").ok(),
             eab_hmac_key: std::env::var("EAB_HMAC_KEY").ok(),
             staging: std::env::var("STAGING").map(|s| s == "true").unwrap_or(false),
-            acme_account_json: std::env::var("ACME_ACCOUNT_JSON").ok(),
-            dns_provider: std::env::var("DNS_PROVIDER").ok(),
             dns_api_token: std::env::var("DNS_API_TOKEN").ok(),
             dns_zone: std::env::var("DNS_ZONE").ok(),
-            attestation_signing_key: std::env::var("ATTESTATION_SIGNING_KEY").ok(),
         });
     }
 
-    // Priority 2: Try local config file (Alibaba Cloud or fallback)
-    let config_file_env = std::env::var("CONFIG_FILE").unwrap_or_else(|_| "/etc/paypal-auth/config.json".to_string());
-    if let Ok(config) = load_config_from_file(&config_file_env).await {
-        info!("Loaded configuration from {}", config_file_env);
-        return apply_config_fallbacks(config);
-    }
-
-    // Priority 3: GCP Secret Manager (only on GCP builds)
-    #[cfg(not(feature = "alibabacloud"))]
-    {
-        info!("Attempting to fetch configuration from GCP Secret Manager...");
-        let gcp_config = fetch_config_from_gcp().await;
-        match gcp_config {
-            Ok(c) => return apply_config_fallbacks(c),
-            Err(e) => {
-                warn!("GCP Secret Manager unavailable: {}. Falling back to file config.", e);
-            }
-        }
-    }
-
-    #[cfg(feature = "alibabacloud")]
-    {
-        // Priority 3: Alibaba Cloud instance user_data (IMDSv1-compatible raw endpoint).
-        // The deploy script injects the config JSON as instance user_data; there is no
-        // cloud-init in the initramfs, so we fetch it ourselves from the metadata service.
-        info!("Alibaba Cloud build: trying instance metadata user_data for config...");
-        if let Ok(client) = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-        {
-            if let Ok(resp) = client
-                .get("http://100.100.100.200/latest/user-data")
-                .send()
-                .await
-            {
-                if resp.status().is_success() {
-                    if let Ok(text) = resp.text().await {
-                        let raw = text.trim().to_string();
-                        // ECS takes user_data base64-encoded on input, and depending on the
-                        // console/CLI path the metadata endpoint may hand it back still
-                        // encoded. Accept both forms — a delivery quirk must never hide a
-                        // valid config and boot-loop the enclave.
-                        let decoded = if raw.starts_with('{') {
-                            None
-                        } else {
-                            use base64::Engine as _;
-                            base64::engine::general_purpose::STANDARD
-                                .decode(raw.trim())
-                                .ok()
-                                .and_then(|bytes| String::from_utf8(bytes).ok())
-                        };
-                        for cand in [&raw, decoded.as_deref().unwrap_or("")] {
-                            if !cand.starts_with('{') {
-                                continue;
-                            }
-                            match serde_json::from_str::<Config>(cand) {
-                                Ok(config) => {
-                                    let _ = std::fs::create_dir_all("/etc/paypal-auth");
-                                    let _ = std::fs::write("/etc/paypal-auth/config.json", cand);
-                                    info!("Loaded configuration from instance user_data");
-                                    return apply_config_fallbacks(config);
-                                }
-                                Err(e) => warn!("user_data candidate is not valid Config JSON: {}", e),
-                            }
-                        }
-                        if raw.starts_with('{') {
-                            warn!("user_data present but is not valid Config JSON — ignoring");
-                        } else {
-                            info!("user_data present but not JSON — skipping metadata config");
-                        }
+    if let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(5)).build() {
+        if let Ok(resp) = client.get("http://100.100.100.200/latest/user-data").send().await {
+            if resp.status().is_success() {
+                if let Ok(text) = resp.text().await {
+                    let raw = text.trim();
+                    let decoded_bytes = if raw.starts_with('{') {
+                        raw.as_bytes().to_vec()
+                    } else {
+                        use base64::Engine as _;
+                        base64::engine::general_purpose::STANDARD.decode(raw).unwrap_or_default()
+                    };
+                    if let Ok(cfg) = serde_json::from_slice::<Config>(&decoded_bytes) {
+                        return require_credentials(cfg);
                     }
                 }
-            } else {
-                warn!("Alibaba metadata user_data endpoint unreachable");
             }
         }
-        info!("Alibaba Cloud build: config provided via environment variables or CONFIG_FILE");
     }
 
-    Err("Configuration not available. Set PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, PAYPAL_VERIFIED_CLIENT_ID, PAYPAL_VERIFIED_CLIENT_SECRET, DOMAIN environment variables, or provide CONFIG_FILE path.".into())
+    Err("Configuration unavailable. Must provide credentials via environment or user_data.".into())
 }
 
-/// Fetch configuration from GCP Secret Manager
-#[cfg(not(feature = "alibabacloud"))]
-async fn fetch_config_from_gcp() -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
-    let mode_secret = "projects/REDACTED_GCP_PROJECT/secrets/PAYPAL_AUTH_MODE/versions/latest";
-    let client = hardened_client();
-
-    let token_resp: serde_json::Value = client
-        .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
-        .header("Metadata-Flavor", "Google")
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    let access_token = token_resp["access_token"]
-        .as_str()
-        .ok_or("No access token from metadata server")?;
-
-    let mode = if let Ok(resp) = client.get(format!("https://secretmanager.googleapis.com/v1/{}:access", mode_secret))
-        .bearer_auth(access_token)
-        .send().await {
-            if let Ok(json) = resp.json::<serde_json::Value>().await {
-                use base64::{engine::general_purpose::STANDARD, Engine as _};
-                if let Some(encoded) = json["payload"]["data"].as_str() {
-                    if let Ok(decoded) = STANDARD.decode(encoded) {
-                        if let Ok(mode_json) = serde_json::from_slice::<serde_json::Value>(&decoded) {
-                            mode_json["active_mode"].as_str().unwrap_or("production").to_string()
-                        } else { "production".to_string() }
-                    } else { "production".to_string() }
-                } else { "production".to_string() }
-            } else { "production".to_string() }
-        } else {
-            info!("PAYPAL_AUTH_MODE secret not found, defaulting to production");
-            "production".to_string()
-        };
-
-    std::env::set_var("ACTIVE_MODE", &mode);
-    info!("Active mode from Vault: {}", mode);
-
-    let base_secret_name = if mode == "staging" { "PAYPAL_AUTH_STAGING" } else { "PAYPAL_AUTH_PRODUCTION" };
-
-    let secret_name = std::env::var("SECRET_NAME").unwrap_or_else(|_| {
-        format!("projects/REDACTED_GCP_PROJECT/secrets/{}/versions/latest", base_secret_name)
-    });
-
-    info!("Fetching main config from: {}", secret_name);
-    let secret_resp: serde_json::Value = client
-        .get(format!("https://secretmanager.googleapis.com/v1/{}:access", secret_name))
-        .bearer_auth(access_token)
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    let encoded = secret_resp["payload"]["data"]
-        .as_str()
-        .ok_or_else(|| format!("No payload in Secret Manager response for {}", secret_name))?;
-
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let decoded = STANDARD.decode(encoded.trim())?;
-    let clean_json = String::from_utf8(decoded)?.trim().trim_matches('\0').to_string();
-
-    let _ = std::fs::write("/tmp/bootstrap_config.json", &clean_json);
-    let _ = std::fs::write("/tmp/bootstrap_secret_id.txt", base_secret_name);
-
-    let mut config: Config = serde_json::from_str(&clean_json)?;
-
-    let eab_key_id_secret = fetch_secret_direct("EAB_KEY_ID").await;
-    let eab_hmac_secret = fetch_secret_direct("EAB_HMAC_KEY").await;
-    if let (Some(kid), Some(hmac)) = (eab_key_id_secret, eab_hmac_secret) {
-        config.eab_key_id = Some(kid);
-        config.eab_hmac_key = Some(hmac);
-    }
-    if let Some(id) = fetch_secret_direct("PAYPAL_CLIENT_ID").await { config.paypal_client_id = id; }
-    if let Some(sec) = fetch_secret_direct("PAYPAL_CLIENT_SECRET").await { config.paypal_client_secret = sec; }
-    if let Some(id) = fetch_secret_direct("PAYPAL_VERIFIED_CLIENT_ID").await { config.paypal_verified_client_id = Some(id); }
-    if let Some(sec) = fetch_secret_direct("PAYPAL_VERIFIED_CLIENT_SECRET").await { config.paypal_verified_client_secret = Some(sec); }
-    if let Some(staging_env) = fetch_secret_direct("PAYPAL_STAGING").await {
-        config.staging = staging_env == "true";
-    }
-
-    Ok(config)
-}
-
-/// Apply hardcoded fallback credentials when values are empty/missing
-fn apply_config_fallbacks(mut config: Config) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
-    config.paypal_client_id = if config.paypal_client_id.is_empty() || config.paypal_client_id == "MISSING_CLIENT_ID" {
-        "***REMOVED***".to_string()
-    } else { config.paypal_client_id };
-    config.paypal_client_secret = if config.paypal_client_secret.is_empty() || config.paypal_client_secret == "MISSING_CLIENT_SECRET" {
-        "EFdUSE2qjgZy5Ok5f4Cy0SBuodWTj30TzO-7b8W8VAQOoNDwu-Feecb7va89C0jS5BZuclqiJSt4I20s".to_string()
-    } else { config.paypal_client_secret };
-    config.paypal_verified_client_id = Some(config.paypal_verified_client_id.unwrap_or_else(|| {
-        "***REMOVED***".to_string()
-    }));
-    config.paypal_verified_client_secret = Some(config.paypal_verified_client_secret.unwrap_or_else(|| {
-        "***REMOVED***".to_string()
-    }));
-    Ok(config)
-}
-
-// ============================================================================
-// ACME CERTIFICATE MANAGER (Google Public CA on GCP, Let's Encrypt on Alibaba)
-// ============================================================================
-
-struct GooglePublicCaManager {
+// ----------------------------------------------------------------------------
+// In-RAM Ephemeral ACME Certificate Manager (Zero Disk Writes)
+// ----------------------------------------------------------------------------
+struct InRamAcmeManager {
     domain: String,
     eab_key_id: Option<String>,
     eab_hmac_key: Option<String>,
-    // NOTE: `staging` is intentionally absent here.
-    // The `staging` flag in the Vault secret controls PayPal Sandbox mode only.
-    // ACME/TLS certificates always use the production CA endpoint.
-    acme_account_json: Option<String>,
-    dns_provider: Option<String>,
     dns_api_token: Option<String>,
     dns_zone: Option<String>,
 }
 
-impl GooglePublicCaManager {
+impl InRamAcmeManager {
     fn new(config: &Config) -> Self {
         Self {
             domain: config.domain.clone(),
             eab_key_id: config.eab_key_id.clone(),
             eab_hmac_key: config.eab_hmac_key.clone(),
-            acme_account_json: config.acme_account_json.clone(),
-            dns_provider: config.dns_provider.clone(),
             dns_api_token: config.dns_api_token.clone(),
             dns_zone: config.dns_zone.clone(),
         }
     }
 
-    /// Whether External Account Binding credentials are present and usable
-    #[cfg(feature = "alibabacloud")]
-    fn has_eab(&self) -> bool {
-        self.eab_key_id.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
-            && self.eab_hmac_key.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
-    }
-
-    /// Select the appropriate ACME directory based on platform and EAB availability
-    fn acme_directory(&self) -> &str {
-        #[cfg(feature = "alibabacloud")]
-        {
-            // ZeroSSL whenever EAB credentials are provisioned: the instance
-            // config's EAB pair is ZeroSSL's (Google Public CA EAB is only used
-            // by the GCP fleet), and ZeroSSL doesn't sit on Let's Encrypt's
-            // 5-certificates-per-exact-set-per-week budget that the boot-time
-            // re-issuance cycle burns through on a spot instance. Absent EAB,
-            // fall back to Let's Encrypt (no EAB required).
-            if self.has_eab() { ZEROSSL_CA_DIRECTORY } else { LETSENCRYPT_CA_DIRECTORY }
-        }
-        #[cfg(not(feature = "alibabacloud"))]
-        {
-            // GCP: Use Google Public CA (requires EAB)
-            GOOGLE_PUBLIC_CA_DIRECTORY
-        }
-    }
-
-    /// Whether this CA requires External Account Binding (EAB) credentials
-    fn requires_eab(&self) -> bool {
-        #[cfg(feature = "alibabacloud")]
-        { self.has_eab() }
-        #[cfg(not(feature = "alibabacloud"))]
-        { true }
-    }
-
-    // ---------------------------------------------------------------------
-    // DNS-01 support
-    //
-    // The bundled ACME client (acme2-eab 0.5) understands the dns-01
-    // challenge type but has no provider integration, so the enclave performs
-    // the TXT record dance itself against the DNS provider's API. Everything
-    // here travels over port 443, which is why this works from a
-    // mainland-China IP where port 80 is carrier-intercepted.
-    // ---------------------------------------------------------------------
-
-    fn dns01_enabled(&self) -> bool {
-        self.dns_api_token.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
-    }
-
-    fn dns01_provider(&self) -> &str {
-        match self.dns_provider.as_deref().map(str::trim) {
-            Some(p) if !p.is_empty() => p,
-            _ => "cloudflare",
-        }
-    }
-
-    /// Zone the challenge record belongs to: explicit config, else the parent
-    /// of the served name (login.airma.de -> airma.de).
     fn dns01_zone(&self) -> String {
-        if let Some(z) = self.dns_zone.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            return z.to_string();
+        if let Some(ref z) = self.dns_zone {
+            if !z.is_empty() { return z.clone(); }
         }
         match self.domain.split_once('.') {
             Some((_, rest)) if !rest.is_empty() => rest.to_string(),
@@ -2184,1903 +1092,737 @@ impl GooglePublicCaManager {
         }
     }
 
-    fn dns01_client() -> reqwest::Client {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
-    }
-
-    /// The digest the CA looks for in the TXT record:
-    /// BASE64URL-NO-PAD(SHA-256(key_authorization))
-    fn dns01_txt_value(key_auth: &str) -> String {
-        use base64::Engine as _;
-        use sha2::Digest as _;
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(sha2::Sha256::digest(key_auth.as_bytes()))
-    }
-
-    /// Publish the challenge TXT record and wait until the provider reports it
-    /// as live. Returns (zone_id, record_id) so the caller can clean up.
-    /// Deterministic (stateless) rotating second order identifier, e.g.
-    /// `rate-limit-3-login.airma.de`. Rotation is by UTC hour over K=6 slots so
-    /// consecutive boots rarely share an exact-set bucket, and nothing has to be
-    /// persisted across boots (the enclave is RAM-only by threat model).
-    fn rotation_extra_identifier(domain: &str) -> Option<String> {
-        const K: i64 = 6;
-        let hours = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs() as i64
-            / 3600;
-        let idx = (hours % K + K) % K;
-        Some(format!("rate-limit-{}-{}", idx, domain))
-    }
-
-    async fn dns01_publish(
-        &self,
-        fqdn: &str,
-        value: &str,
-    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-        if self.dns01_provider() != "cloudflare" {
-            return Err(format!(
-                "DNS-01 provider '{}' is not implemented (only 'cloudflare')",
-                self.dns01_provider()
-            )
-            .into());
-        }
-        let token = self.dns_api_token.as_deref().unwrap_or_default();
-        let client = Self::dns01_client();
+    async fn dns01_publish(&self, fqdn: &str, value: &str) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+        let token = self.dns_api_token.as_deref().ok_or("Missing DNS API Token")?;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(15)).build()?;
         let base = "https://api.cloudflare.com/client/v4";
-        let auth = |req: reqwest::RequestBuilder| req.bearer_auth(token);
-
         let zone = self.dns01_zone();
-        // A 32-char hex string is a Cloudflare zone ID — use it directly and
-        // skip the zone-list lookup, so the token needs only DNS Edit (the
-        // "Edit zone DNS" template) and not Zone Read.
+
         let zone_id = if zone.len() == 32 && zone.chars().all(|c| c.is_ascii_hexdigit()) {
             zone
         } else {
-            let zones: serde_json::Value = auth(client.get(format!("{}/zones?name={}", base, zone)))
-                .send().await?
-                .json().await?;
-            zones["result"][0]["id"].as_str()
-                .ok_or_else(|| format!("Cloudflare: zone '{}' not found for this API token", zone))?
-                .to_string()
+            let z_resp: serde_json::Value = client.get(format!("{}/zones?name={}", base, zone))
+                .bearer_auth(token).send().await?.json().await?;
+            z_resp["result"][0]["id"].as_str().ok_or("Cloudflare zone not found")?.to_string()
         };
 
-        // Remove leftovers from an interrupted run: two TXT values at the same
-        // name make the CA validate against the wrong one.
-        let existing: serde_json::Value = auth(client.get(format!(
-            "{}/zones/{}/dns_records?type=TXT&name={}", base, zone_id, fqdn
-        )))
-        .send().await?
-        .json().await?;
-        if let Some(records) = existing["result"].as_array() {
-            for rec in records {
-                if let Some(rid) = rec["id"].as_str() {
-                    warn!("DNS-01: removing stale challenge record {}", rid);
-                    let _ = auth(client.delete(format!("{}/zones/{}/dns_records/{}", base, zone_id, rid)))
-                        .send().await;
-                }
-            }
-        }
-
         let body = serde_json::json!({ "type": "TXT", "name": fqdn, "content": value, "ttl": 60 });
-        let created: serde_json::Value = auth(client.post(format!("{}/zones/{}/dns_records", base, zone_id)))
-            .json(&body)
-            .send().await?
-            .json().await?;
-        let record_id = created["result"]["id"].as_str()
-            .ok_or_else(|| format!("Cloudflare: TXT create failed: {}", created))?
-            .to_string();
-        info!("DNS-01: published challenge TXT at {} (record {})", fqdn, record_id);
+        let create_resp: serde_json::Value = client.post(format!("{}/zones/{}/dns_records", base, zone_id))
+            .bearer_auth(token).json(&body).send().await?.json().await?;
+        let record_id = create_resp["result"]["id"].as_str().ok_or("Failed to create TXT record")?.to_string();
 
-        // The authoritative zone is Cloudflare itself, so polling this API IS
-        // the propagation check — no DNS query needed, which matters because
-        // public resolvers are unreliable from mainland China. A short grace
-        // period follows for the CA's own recursive lookups.
-        for attempt in 0..12 {
-            let check: serde_json::Value = auth(client.get(format!(
-                "{}/zones/{}/dns_records?type=TXT&name={}", base, zone_id, fqdn
-            )))
-            .send().await?
-            .json().await?;
-            let live = check["result"].as_array()
-                .map(|rs| rs.iter().any(|r| r["content"].as_str() == Some(value)))
-                .unwrap_or(false);
-            if live {
-                info!("DNS-01: challenge TXT live in zone after {} attempt(s)", attempt + 1);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-
+        tokio::time::sleep(Duration::from_secs(15)).await;
         Ok((zone_id, record_id))
     }
 
     async fn dns01_cleanup(&self, zone_id: &str, record_id: &str) {
-        let token = self.dns_api_token.as_deref().unwrap_or_default();
-        let client = Self::dns01_client();
-        let url = format!("https://api.cloudflare.com/client/v4/zones/{}/dns_records/{}", zone_id, record_id);
-        match client.delete(&url).bearer_auth(token).send().await {
-            Ok(r) if r.status().is_success() => info!("DNS-01: challenge TXT removed"),
-            Ok(r) => warn!("DNS-01: could not remove challenge TXT (HTTP {})", r.status()),
-            Err(e) => warn!("DNS-01: could not remove challenge TXT: {}", e),
+        if let Some(ref token) = self.dns_api_token {
+            let client = reqwest::Client::new();
+            let _ = client.delete(format!("https://api.cloudflare.com/client/v4/zones/{}/dns_records/{}", zone_id, record_id))
+                .bearer_auth(token).send().await;
         }
     }
 
-    async fn ensure_certificate(&self) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
-        info!("Checking for cached TLS credentials in Vault...");
-        if let Some((cert, key, acme_key)) = Self::fetch_cached_tls().await {
-            // Restore ACME account key to tmpfs for the current session
-            if let Some(ak) = acme_key {
-                let _ = tokio::fs::write("/tmp/acme-account.json", ak).await;
-            }
-            return Ok((cert, key));
-        }
+    /// Obtains an ACME certificate in RAM without saving private keys to disk
+    async fn obtain_certificate_in_ram(
+        &self,
+        ephemeral_tls_key: &openssl::pkey::PKey<openssl::pkey::Private>,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        use acme2_eab::{AccountBuilder, AuthorizationStatus, Csr, DirectoryBuilder, OrderBuilder};
+        use base64::Engine as _;
+        use sha2::Digest as _;
 
-        info!("Obtaining TLS certificate via ACME...");
-        let acme_url = self.acme_directory();
-        info!("ACME directory: {} (EAB required: {})", acme_url, self.requires_eab());
-        let account_path = "/tmp/acme-account.json";
-        
-        // ... (rest of account logic)
-        let account = if let Ok(data) = tokio::fs::read_to_string(account_path).await {
-            info!("Restoring ACME account from tmpfs...");
-            let dir = DirectoryBuilder::new(acme_url.to_string()).build().await?;
-            let priv_key_pem = data.trim();
-            let priv_pem = openssl::pkey::PKey::private_key_from_pem(priv_key_pem.as_bytes())?;
-            let mut builder = AccountBuilder::new(dir);
-            builder.private_key(priv_pem);
-            builder.build().await?
-        } else if self.requires_eab() {
-            let kid = self.eab_key_id.as_ref().ok_or("Missing EAB key ID")?;
-            info!("Creating new ACME account with EAB Key ID: {}...", &kid[..8.min(kid.len())]);
-            let hmac_str = self.eab_hmac_key.as_ref().ok_or("Missing EAB HMAC key")?;
-
-            use base64::{
-                engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
-                Engine as _,
-            };
-            // Try every common base64 flavor rather than sniffing '-'/ '_' —
-            // a ZeroSSL/Google EAB HMAC can be padded or unpadded, url-safe or
-            // standard, and guessing by character class fails on keys that
-            // happen to contain a '-' in the standard alphabet's view.
-            let trimmed = hmac_str.trim();
-            let hmac_bytes = [URL_SAFE_NO_PAD, URL_SAFE, STANDARD, STANDARD_NO_PAD]
-                .iter()
-                .find_map(|eng| eng.decode(trimmed).ok())
-                .ok_or_else(|| {
-                    format!(
-                        "EAB HMAC decode failed: not valid in url-safe (pad/no-pad) or standard (pad/no-pad) base64"
-                    )
-                })?;
-            let hmac_pkey = openssl::pkey::PKey::hmac(&hmac_bytes)?;
-
-            let dir = DirectoryBuilder::new(acme_url.to_string()).build().await?;
-            let mut builder = AccountBuilder::new(dir);
-            builder.contact(vec![format!("mailto:admin@{}", self.domain)]);
-            builder.terms_of_service_agreed(true);
-            builder.external_account_binding(kid.clone(), hmac_pkey);
-            let account = builder.build().await?;
-
-            if let Ok(priv_pem) = account.private_key().private_key_to_pem_pkcs8() {
-                let _ = tokio::fs::write(account_path, priv_pem).await;
-            }
-            account
+        let acme_url = if self.eab_key_id.is_some() && self.eab_hmac_key.is_some() {
+            ZEROSSL_CA_DIRECTORY
         } else {
-            // No EAB required (Let's Encrypt / Alibaba Cloud)
-            info!("Creating new ACME account (no EAB)...");
-            let dir = DirectoryBuilder::new(acme_url.to_string()).build().await?;
-            let mut builder = AccountBuilder::new(dir);
-            builder.contact(vec![format!("mailto:admin@{}", self.domain)]);
-            builder.terms_of_service_agreed(true);
-            let account = builder.build().await?;
-            if let Ok(priv_pem) = account.private_key().private_key_to_pem_pkcs8() {
-                let _ = tokio::fs::write(account_path, priv_pem).await;
-            }
-            account
+            LETSENCRYPT_CA_DIRECTORY
         };
 
-        // ... (rest of certificate logic)
-        info!("Creating ACME order for domain: {}", self.domain);
+        let dir = DirectoryBuilder::new(acme_url.to_string()).build().await?;
+        let mut builder = AccountBuilder::new(dir);
+        builder.contact(vec![format!("mailto:admin@{}", self.domain)]);
+        builder.terms_of_service_agreed(true);
+
+        if let (Some(ref kid), Some(ref hmac)) = (&self.eab_key_id, &self.eab_hmac_key) {
+            let hmac_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(hmac.trim())
+                .or_else(|_| base64::engine::general_purpose::STANDARD.decode(hmac.trim()))?;
+            builder.external_account_binding(kid.clone(), openssl::pkey::PKey::hmac(&hmac_bytes)?);
+        }
+
+        let account = builder.build().await?;
         let mut order_builder = OrderBuilder::new(account.clone());
         order_builder.add_dns_identifier(self.domain.clone());
-        // Rate-limit rotation (Alibaba/spot): Let's Encrypt caps certificates per
-        // EXACT SET of identifiers at 5 per 7 days (refill 1/34h) — a per-boot
-        // re-issuance of the same single name exhausts that bucket in two days on
-        // a spot instance. Adding a time-rotated second identifier makes each
-        // hour's order a different exact set (LE's documented workaround),
-        // multiplying the budget K× while DNS-01 still proves the same zone.
-        if cfg!(feature = "alibabacloud") {
-            if let Some(extra) = Self::rotation_extra_identifier(&self.domain) {
-                info!("Rate-limit rotation: ordering identifiers [{}] + [{}]", self.domain, extra);
-                order_builder.add_dns_identifier(extra);
-            }
-        }
         let mut order = order_builder.build().await?;
 
-        // ... (authorizations)
-        let authorizations = order.authorizations().await?;
-        for auth in authorizations {
+        for auth in order.authorizations().await? {
             if matches!(auth.status, AuthorizationStatus::Valid) { continue; }
+            let challenge = auth.challenges.iter().find(|c| c.r#type == "dns-01")
+                .ok_or("CA did not offer DNS-01 challenge")?.clone();
+            let key_auth = challenge.key_authorization()?.ok_or("Missing key authorization")?;
+            let txt_val = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(sha2::Sha256::digest(key_auth.as_bytes()));
+            let fqdn = format!("_acme-challenge.{}", auth.identifier.value);
 
-            if self.dns01_enabled() {
-                // DNS-01: prove control with a TXT record. The only viable
-                // challenge type from a mainland-China IP, where port 80 is
-                // carrier-intercepted for unfiled domains.
-                let challenge = auth.challenges.iter().find(|c| c.r#type == "dns-01")
-                    .ok_or("CA offered no DNS-01 challenge")?.clone();
-                let key_auth = challenge.key_authorization()?.ok_or("Missing key authorization")?;
-                // The TXT record name follows THIS authorization's identifier —
-                // with the rotated second identifier the two authz differ.
-                let fqdn = format!("_acme-challenge.{}", auth.identifier.value);
-                let txt = Self::dns01_txt_value(&key_auth);
-
-                let (zone_id, record_id) = self.dns01_publish(&fqdn, &txt).await?;
-                let outcome = match challenge.validate().await {
-                    Err(e) => Err(format!("dns-01 validate: {:?}", e)),
-                    Ok(_) => match challenge.wait_done(Duration::from_secs(5), 72).await {
-                        Err(e) => Err(format!("dns-01 wait: {:?}", e)),
-                        Ok(_) => Ok(()),
-                    },
-                };
-                // Always remove the record, even on failure: a leftover
-                // challenge TXT breaks the next attempt at the same name.
-                self.dns01_cleanup(&zone_id, &record_id).await;
-                if let Err(msg) = outcome { return Err(msg.into()); }
-            } else {
-                let challenge = auth.challenges.iter().find(|c| c.r#type == "http-01")
-                    .ok_or("No HTTP-01 challenge found")?.clone();
-
-                let challenge_dir = "/tmp/acme-challenge";
-                tokio::fs::create_dir_all(challenge_dir).await?;
-                let token = challenge.token.as_ref().ok_or("Missing token")?;
-                let key_auth = challenge.key_authorization()?.ok_or("Missing key authorization")?;
-                tokio::fs::write(format!("{}/{}", challenge_dir, token.replace("/", "_")), key_auth.as_bytes()).await?;
-
-                challenge.validate().await?;
-                challenge.wait_done(Duration::from_secs(5), 72).await?;
+            let (zone_id, record_id) = self.dns01_publish(&fqdn, &txt_val).await?;
+            let res = challenge.validate().await;
+            if res.is_ok() {
+                let _ = challenge.wait_done(Duration::from_secs(5), 60).await;
             }
+            self.dns01_cleanup(&zone_id, &record_id).await;
         }
 
-        order = order.wait_ready(Duration::from_secs(5), 72).await?;
-        let pkey = gen_rsa_private_key(4096)?;
-        let key_pem = pkey.private_key_to_pem_pkcs8()?;
-        let order = order.finalize(Csr::Automatic(pkey)).await?;
-        let order = order.wait_done(Duration::from_secs(5), 144).await?;
+        order = order.wait_ready(Duration::from_secs(5), 60).await?;
+        order = order.finalize(Csr::Automatic(ephemeral_tls_key.clone())).await?.wait_done(Duration::from_secs(5), 120).await?;
 
-        match order.certificate().await? {
-            Some(cert) => {
-                let mut cert_chain_str = String::new();
-                for c in cert {
-                    if let Ok(pem) = c.to_pem() {
-                        cert_chain_str.push_str(std::str::from_utf8(&pem).unwrap_or(""));
-                        cert_chain_str.push('\n');
-                    }
-                }
-                
-                let acme_account_key = tokio::fs::read(account_path).await.ok();
-                Self::store_cached_tls(cert_chain_str.as_bytes(), &key_pem, acme_account_key.as_deref()).await;
-                Ok((cert_chain_str.into_bytes(), key_pem))
-            }
-            None => Err("Certificate not available".into()),
+        let certs = order.certificate().await?.ok_or("No certificate returned from CA")?;
+        let mut chain_pem = Vec::new();
+        for c in certs {
+            chain_pem.extend_from_slice(&c.to_pem()?);
+            chain_pem.push(b'\n');
         }
-    }
-
-    async fn fetch_cached_tls() -> Option<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
-        // TLS caching relies on cloud KMS — only available on GCP builds
-        #[cfg(feature = "alibabacloud")]
-        {
-            info!("TLS cache via GCP Secret Manager not available on Alibaba Cloud builds");
-            return None;
-        }
-        #[cfg(not(feature = "alibabacloud"))]
-        {
-        let secret_name = std::env::var("TLS_CACHE_SECRET").ok()?;
-        info!("Attempting to restore TLS from cache: {}", secret_name);
-        let client = reqwest::Client::new();
-        // ... (fetch secret logic from standard metadata)
-        let token_resp: serde_json::Value = client
-            .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
-            .header("Metadata-Flavor", "Google")
-            .send().await.ok()?.json().await.ok()?;
-        let access_token = token_resp["access_token"].as_str()?;
-        let url = format!("https://secretmanager.googleapis.com/v1/{}/versions/latest:access", secret_name);
-        
-        let secret_resp: serde_json::Value = client.get(&url).bearer_auth(access_token).send().await.ok()?.json().await.ok()?;
-        let encoded = secret_resp["payload"]["data"].as_str()?;
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-        let wrapper_bytes = STANDARD.decode(encoded).ok()?;
-        let wrapper: serde_json::Value = serde_json::from_slice(&wrapper_bytes).ok()?;
-        
-        info!("Fetched cached envelope, attempting to unseal DEK...");
-        let sealed_dek: tpm::SealedData = serde_json::from_value(wrapper["sealed_dek"].clone()).ok()?;
-        let dek = match tpm::unseal_dek(&sealed_dek).await {
-            Ok(d) => d,
-            Err(e) => {
-                error!("TPM Unseal failed for TLS cache DEK: {}", e);
-                return None;
-            }
-        };
-
-        info!("DEK unsealed, decrypting TLS private key...");
-
-        let nonce = STANDARD.decode(wrapper["nonce"].as_str()?).ok()?;
-        let ciphertext = STANDARD.decode(wrapper["ciphertext"].as_str()?).ok()?;
-        let plaintext = crypto::decrypt(&dek, &nonce, &ciphertext).ok()?;
-
-        let inner_json: serde_json::Value = serde_json::from_slice(&plaintext).ok()?;
-        let key = STANDARD.decode(inner_json["key"].as_str()?).ok()?;
-        
-        // v118: cert and acme_key are now in the outer wrapper (clear base64)
-        let cert = STANDARD.decode(wrapper["cert"].as_str()?).ok()?;
-        let acme_key = wrapper["acme_key"].as_str().and_then(|ak| STANDARD.decode(ak).ok());
-        
-        info!("Successfully restored and unsealed TLS private key from cache (cert and ACME account unsealed)");
-        Some((cert, key, acme_key))
-        } // end cfg(not(alibabacloud))
-    }
-
-    async fn store_cached_tls(cert: &[u8], key: &[u8], acme_key: Option<&[u8]>) {
-        // TLS cache store only works on GCP builds (uses GCP Secret Manager)
-        #[cfg(feature = "alibabacloud")]
-        {
-            let _ = (cert, key, acme_key);
-            info!("TLS cache storage skipped on Alibaba Cloud build");
-            return;
-        }
-        #[cfg(not(feature = "alibabacloud"))]
-        {
-        if let Ok(secret_name) = std::env::var("TLS_CACHE_SECRET") {
-            use base64::{engine::general_purpose::STANDARD, Engine as _};
-            let dek = crypto::generate_dek();
-            let sealed_dek = match tpm::seal_dek(&dek).await {
-                Ok(s) => s,
-                Err(e) => { error!("Failed to seal DEK: {}", e); return; }
-            };
-
-            // v118: Only protect the TLS private key with TPM/measurement
-            // cert and acme_key are stored in the clear (base64) in the envelope
-            let mut inner_map = serde_json::Map::new();
-            inner_map.insert("key".to_string(), serde_json::Value::String(STANDARD.encode(key)));
-            let inner_json = serde_json::Value::Object(inner_map).to_string();
-
-            let (nonce, ciphertext) = match crypto::encrypt(&dek, inner_json.as_bytes()) {
-                Ok(c) => c,
-                Err(e) => { error!("Failed to encrypt: {}", e); return; }
-            };
-            
-            let mut payload_map = serde_json::Map::new();
-            payload_map.insert("sealed_dek".to_string(), serde_json::to_value(sealed_dek).unwrap());
-            payload_map.insert("nonce".to_string(), serde_json::Value::String(STANDARD.encode(nonce)));
-            payload_map.insert("ciphertext".to_string(), serde_json::Value::String(STANDARD.encode(ciphertext)));
-            payload_map.insert("cert".to_string(), serde_json::Value::String(STANDARD.encode(cert)));
-            if let Some(ak) = acme_key {
-                payload_map.insert("acme_key".to_string(), serde_json::Value::String(STANDARD.encode(ak)));
-            }
-            let payload = serde_json::Value::Object(payload_map);
-            let payload_b64 = STANDARD.encode(payload.to_string());
-            
-            let client = reqwest::Client::new();
-            if let Ok(token_resp) = client
-                .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform")
-                .header("Metadata-Flavor", "Google").send().await {
-                if let Ok(json) = token_resp.json::<serde_json::Value>().await {
-                    if let Some(access_token) = json["access_token"].as_str() {
-                        let url = format!("https://secretmanager.googleapis.com/v1/{}:addVersion", secret_name);
-                        let _ = client.post(&url).bearer_auth(access_token).json(&serde_json::json!({ "payload": { "data": payload_b64 } })).send().await;
-                    }
-                }
-            }
-        }
-        } // end cfg(not(alibabacloud))
+        Ok(chain_pem)
     }
 }
 
-// ============================================================================
-// ATTESTATION
-// ============================================================================
-
-fn sign_payload(payload: &str, private_key_pem: &str) -> Option<String> {
-    use openssl::pkey::PKey;
-    use openssl::sign::Signer;
-    use openssl::hash::MessageDigest;
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine as _;
-
-    // Never panic on the request path: an invalid/garbage key from config
-    // previously hit `.expect()` here, and with panic = "abort" that took
-    // down PID 1 (the whole enclave) in the middle of a user's /generate.
-    let pkey = PKey::private_key_from_pem(private_key_pem.as_bytes()).ok()?;
-    let mut signer = Signer::new(MessageDigest::sha256(), &pkey).ok()?;
-    signer.update(payload.as_bytes()).ok()?;
-    let signature = signer.sign_to_vec().ok()?;
-    Some(STANDARD.encode(signature))
-}
-
-fn extract_pub_key(private_key_pem: &str) -> String {
-    use openssl::pkey::PKey;
-    let pkey = PKey::private_key_from_pem(private_key_pem.as_bytes()).ok();
-    pkey.and_then(|k| k.public_key_to_pem().ok())
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_else(|| "N/A".to_string())
-}
-
-async fn generate_attestation(
-    state: &AppState,
-    clicked_button_label: String,
-    userinfo: PayPalUserInfo,
-    custom_info: Option<String>,
-) -> String {
-    use sha2::{Digest, Sha256};
-    
-    // 1. Get current time with ms precision
-    let now = chrono::Utc::now();
-    let timestamp_ms = now.timestamp_millis() as u64;
-
-    // 2. Convert userinfo to a sorted Value and hash its alphabetical representation
-    let userinfo_val = serde_json::to_value(&userinfo).expect("Failed to value-ize userinfo");
-    let userinfo_compact = serde_json::to_string(&userinfo_val).expect("Failed to serialize userinfo");
-    let mut hasher = Sha256::new();
-    hasher.update(userinfo_compact.as_bytes());
-    let paypal_hash = hex::encode(hasher.finalize());
-
-    // Security audit 2026-10-19: the userinfo_compact / DEBUG PAYLOAD console
-    // prints were removed — both can carry the user's name/email, and PID 1's
-    // stdout lands on the serial console, which is readable account-wide via
-    // ECS DescribeInstanceConsoleOutput (and by the cloud operator). PII stays
-    // inside the TLS session where the report is actually delivered.
-    // Round 2: the DEBUG: paypal_hash print was removed as well — the digest is
-    // a STABLE PSEUDONYMOUS USER IDENTIFIER (nonce component [0..32]) and the
-    // console audience is broader than the TLS session that receives the
-    // signed report. The hash itself is still computed and signed into the
-    // report; it is simply no longer echoed to an account-readable channel.
-
-    // 2.5 Software Hash Check (Self-measure)
-    let bin_path = "/init"; 
-    let mut bin_hasher = Sha256::new();
-    if let Ok(data) = std::fs::read(bin_path) {
-        bin_hasher.update(&data);
-    }
-    let binary_self_hash = hex::encode(bin_hasher.finalize());
-
-    // 3. Obtain hardware attestation quote (PCR 15 base)
-    // v117 Hardening: Bind the Enclave Signing Public Key to the Hardware Attestation
-    // This prevents "Key Substitution" attacks where an attacker replaces the public key
-    // in the JSON report with their own.
-    let pub_key_pem = if let Some(key) = &state.attestation_signing_key {
-        extract_pub_key(key)
-    } else {
-        "N/A".to_string()
-    };
-    
-    // CRITICAL: Hash the raw DER bytes of the public key, NOT the PEM string.
-    // verify.html does: strip PEM headers → atob() → SHA256 of raw DER bytes.
-    // Previously this was hashing the full PEM string (with headers + newlines),
-    // which produced a completely different hash, causing the nonce mismatch.
-    let mut pub_key_hasher = Sha256::new();
-    if let Some(key) = &state.attestation_signing_key {
-        use openssl::pkey::PKey;
-        if let Ok(pkey) = PKey::private_key_from_pem(key.as_bytes()) {
-            if let Ok(der_bytes) = pkey.public_key_to_der() {
-                pub_key_hasher.update(&der_bytes);
-            }
-        }
-    }
-    let pub_key_hash_bytes = pub_key_hasher.finalize();
-    let pub_key_hash_hex = hex::encode(pub_key_hash_bytes);
-
-    // v155/SEC-02 combined nonce — must be byte-identical to verify.html's
-    // reconstruction (v160): nonce = SHA-256 over the 160-byte concatenation
-    //   [0..32]   sha256(compact sorted PayPal userinfo JSON)
-    //   [32..64]  sha256(enclave signing pubkey SPKI DER)
-    //   [64..96]  sha256(custom_info string, "NONE" when absent/empty)
-    //   [96..128] boot_measurements.binary_sha256 (self-measure of /init)
-    //   [128..160] sha256(canonical JSON of sorted [path, sha256] manifest pairs)
-    // The hardware quote's REPORTDATA carries nonce[0..32]; an auditor who
-    // cannot re-derive this exact value sees binding=false. The old 2-component
-    // formula (paypal ∥ pubkey) was pre-SEC-02 and failed the live audit
-    // (2026-10-19: quote bound df4e9af6…, auditor expected 507bd42e…).
-    let custom_info_str = custom_info.clone().unwrap_or_default();
-    let custom_info_str = if custom_info_str.is_empty() {
-        "NONE".to_string()
-    } else {
-        custom_info_str
-    };
-    let custom_info_hash = Sha256::digest(custom_info_str.as_bytes());
-
-    // BTreeMap iteration is key-sorted — byte-identical to verify.html's
-    // Object.keys(diskManifest).sort() for the ASCII manifest paths.
-    let manifest_pairs: Vec<(&String, &String)> = state.boot_manifest.iter().collect();
-    let canonical_manifest_json = serde_json::to_string(&manifest_pairs)
-        .expect("Internal Error: canonical manifest serialization failed");
-    let manifest_hash = Sha256::digest(canonical_manifest_json.as_bytes());
-    let binary_hash_bytes =
-        hex::decode(&binary_self_hash).expect("Internal Error: Invalid binary self-hash hex");
-
-    let mut combined_hasher = Sha256::new();
-    combined_hasher.update(hex::decode(&paypal_hash).expect("Internal Error: Invalid PayPal Hex"));
-    combined_hasher.update(&pub_key_hash_bytes);
-    combined_hasher.update(custom_info_hash);
-    combined_hasher.update(binary_hash_bytes);
-    combined_hasher.update(manifest_hash);
-    let final_combined_nonce = hex::encode(combined_hasher.finalize());
-
-    info!("Generating hardware attestation with bound public key hash: {}", pub_key_hash_hex);
-    let mut tpm_report = match tpm::quote(&final_combined_nonce).await {
-        Ok(r) => r,
-        Err(e) => {
-            #[cfg(feature = "alibabacloud")]
-            {
-                // A TPM failure must never blank the attestation on a TPM-less
-                // TDX platform — serve the TPM-empty TDX report instead of an
-                // error string as the whole payload.
-                error!("TPM quote failed: {}; continuing with TPM-less TDX report", e);
-                tpm::tpm_less_tdx_report(&final_combined_nonce)
-            }
-            #[cfg(not(feature = "alibabacloud"))]
-            {
-                return format!("ERROR: Failed to generate TPM Quote: {}", e);
-            }
-        }
-    };
-    tpm_report.signature_binding_pubkey_hash = pub_key_hash_hex;
-    
-    let tpm_val = serde_json::to_value(&tpm_report).expect("Failed to value-ize tpm_report");
-
-    // 4. Resolve current TLS certificate
-    let cert_pem = state.tls_cert_pem.read().clone().unwrap_or_else(|| "UNSET_DURING_STARTUP".to_string());
-    
-    // 5. Construct the full signed payload
-    // All components are converted to Values (which use BTreeMap/sorted order)
-    let payload = serde_json::json!({
-        "paypal_user_info": userinfo_val,
-        "paypal_user_info_raw_hash": paypal_hash,
-        "timestamp_ms": timestamp_ms,
-        "enclave_config": {
-            "version": "v119-STABLE",
-            "paypal_client_id_full": &state.paypal_client_id,
-            "paypal_client_id_verified": &state.paypal_verified_client_id,
-            "staging_mode": if state.staging { "sandbox" } else { "production" },
-            "domain": &state.domain,
-            "boot_measurements": {
-                "binary_sha256": &binary_self_hash,
-                "disk_manifest": &state.boot_manifest,
-            },
-            "enclave_debug": {
-                "manifest_size": state.boot_manifest.len(),
-            }
-        },
-        "session_context": {
-            "clicked_button_label": clicked_button_label,
-            "tls_certificate_pem": &cert_pem,
-        },
-        "custom_info": custom_info.unwrap_or_else(|| "NONE".to_string()),
-        "hardware_level_attestation": tpm_val,
-    });
-
-    // v70: We use Compact JSON for the signature to ensure deterministic verification (Canonical-lite)
-    let payload_compact = serde_json::to_string(&payload).expect("Failed to serialize compact payload");
-    let _ = std::fs::write("/tmp/last_payload.json", &payload_compact);
-    // Security audit 2026-10-19: DEBUG PAYLOAD print removed — same PII-to-
-    // serial-console leak as the userinfo print above (see note there).
-    
-    // 6. Sign everything using the enclave-bound asymmetric key
-    let signature = if let Some(key) = &state.attestation_signing_key {
-        match sign_payload(&payload_compact, key) {
-            Some(sig) => sig,
-            None => {
-                error!("Attestation signing key is unusable — refusing to emit an unsigned report");
-                return "ERROR: enclave signing key rejected by OpenSSL; report NOT issued".to_string();
-            }
-        }
-    } else {
-        "UNSIGNED_KEY_MISSING".to_string()
-    };
-
-    let full_report = serde_json::json!({
-        "attestation_report": payload,
-        "enclave_signature_b64": signature,
-        "enclave_signing_public_key": if let Some(_) = &state.attestation_signing_key {
-            pub_key_pem
-        } else {
-            "N/A".to_string()
-        }
-    });
-
-    serde_json::to_string_pretty(&full_report).unwrap()
-}
-
-// ============================================================================
-// OAUTH
-// ============================================================================
-
-// ============================================================================
-// HARDENED HTTP CLIENT
-// ============================================================================
-
-fn hardened_client() -> reqwest::Client {
-    use reqwest::Certificate;
-    let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .use_rustls_tls()
-        // v151: DNS Egress Hardening (Prevent DNS Hijacking)
-        // Hardcode PayPal API production IP to bypass OS resolver.
-        .resolve("api-m.paypal.com", std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(104, 16, 124, 74)), 443))
-        .resolve("api-m.sandbox.paypal.com", std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(146, 75, 123, 1)), 443));
-    
-    // Pin PayPal Root CA (Embedded)
-    if let Ok(cert) = Certificate::from_pem(PAYPAL_CA_PEM) {
-        builder = builder.add_root_certificate(cert);
-        info!("Pinned PayPal Root CA (Embedded)");
-    }
-    
-    // Pin Google Public CA Root (Embedded)
-    if let Ok(cert) = Certificate::from_pem(GOOGLE_CA_PEM) {
-        builder = builder.add_root_certificate(cert);
-        info!("Pinned Google Root CA (Embedded)");
-    }
-
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
-}
-
-async fn exchange_code_for_token(
-    code: &str,
-    client_id: &str,
-    client_secret: &str,
-    redirect_uri: &str,
-    api_base: &str,
-    code_verifier: Option<&str>,
-) -> Result<TokenResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/v1/oauth2/token", api_base);
-    let mut form_params = vec![
-        ("grant_type", "authorization_code".to_string()),
-        ("code", code.to_string()),
-        ("redirect_uri", redirect_uri.to_string()),
-    ];
-    // PKCE: sent only when the caller completed a v165 login attempt.
-    if let Some(v) = code_verifier {
-        form_params.push(("code_verifier", v.to_string()));
-    }
-    let resp = hardened_client()
-        .post(&url)
-        .basic_auth(client_id, Some(client_secret))
-        .form(&form_params)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Token exchange failed: {}", resp.text().await?).into());
-    }
-    Ok(resp.json().await?)
-}
-
-async fn get_userinfo(token: &str, api_base: &str) -> Result<PayPalUserInfo, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/v1/identity/oauth2/userinfo?schema=paypalv1.1", api_base);
-    let resp = hardened_client()
-        .get(&url)
-        .bearer_auth(token)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Userinfo API returned {}: {}", resp.status(), resp.text().await?).into());
-    }
-    
-    let body = resp.text().await?;
-    match serde_json::from_str::<PayPalUserInfo>(&body) {
-        Ok(u) => Ok(u),
-        Err(e) => {
-            // Security audit 2026-10-19: never echo the raw body — on schema
-            // drift it can be a well-formed userinfo payload (name/email), and
-            // tracing reaches the serial console (readable account-wide via
-            // DescribeInstanceConsoleOutput). Log the error and size only.
-            error!("FAIL: Userinfo JSON decoding error: {} (body {} bytes)", e, body.len());
-            Err(format!("Decoding error: {} (userinfo body withheld — PII)", e).into())
-        }
-    }
-}
-
-
-
-// ============================================================================
-// HTTP HANDLERS
-// ============================================================================
-
-#[cfg(not(feature = "alibabacloud"))]
-const PLATFORM_LABEL: &str = "AMD SEV-SNP / Google Cloud";
-#[cfg(feature = "alibabacloud")]
-const PLATFORM_LABEL: &str = "Intel TDX / Alibaba Cloud";
-
-async fn index(
-    State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
-) -> Response {
-    let content = format!(
-        r#"
-        <h1>Confidential PayPal Authentication</h1>
-        <div class="info">
-            <p><strong>Domain:</strong> {}</p>
-            <p><strong>Platform:</strong> <span class="cert-status">Hardened ({})</span></p>
-            <p><strong>Certificate:</strong> RAM ONLY (Google Public CA)</p>
-        </div>
-        <div class="info">
-            <p><strong>Verified Candidate Login (Recommended First):</strong></p>
-            <p>This button uses a restricted PayPal App to only verify your "PayPal Verified" status and perform hardware attestation. No profile or email data is shared yet.</p>
-            <a href="/login?flow=verified" class="btn" style="background:#4caf50;">Check Attestation & PayPal Verification</a>
-        </div>
-        <div class="info">
-            <p><strong>Full Data Login:</strong></p>
-            <p>Asks for standard profile and email data for full application functionality.</p>
-            <a href="/login?flow=full" class="btn">Login with PayPal (Full Data)</a>
-        </div>
-        <div class="footer">
-            <a href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html">Privacy Policy</a> |
-            <a href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html">User Agreement</a> |
-            <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">Official Auditor</a>
-        </div>
-        "#,
-        state.domain, PLATFORM_LABEL
-    );
-    let html = HTML_TEMPLATE.replace("{{CONTENT}}", &content);
-    if let Err(status) = state.record_egress_data(addr.ip(), html.len() as u64) {
-        return status.into_response();
-    }
-    Html(html).into_response()
-}
-
-async fn privacy() -> Response {
-    Redirect::to("https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html").into_response()
-}
-
-async fn terms() -> Response {
-    Redirect::to("https://leonardopedro.github.io/verifiedUniqueAliases/terms.html").into_response()
-}
-
-#[derive(Deserialize)]
-struct LoginParams {
-    flow: Option<String>,
-}
-
-async fn login(
-    Query(params): Query<LoginParams>,
-    State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
-) -> Response {
-    if let Err(status) = state.record_egress_data(addr.ip(), 500 /* Estimated redir size */) {
-        return status.into_response();
-    }
-    let flow = params.flow.as_deref().unwrap_or("full");
-    let config = state.get_flow_config(flow);
-    
-    let auth_base = if state.staging { PAYPAL_SANDBOX_AUTH } else { PAYPAL_PRODUCTION_AUTH };
-
-    // v165 SECURITY (audit round 1):
-    //  * CSRF: `state` used to be the STATIC flow label (`&state=full`) with a
-    //    lenient default, so an attacker-authored authorization code could be
-    //    replayed into a victim's browser and /callback would happily exchange
-    //    it (classic OAuth login CSRF). `state` is now `<flow>.<nonce>` and the
-    //    same nonce is set as an HttpOnly/Secure/SameSite=Lax cookie; /callback
-    //    requires BOTH copies to agree and a matching pending_oauth entry.
-    //  * PKCE (RFC 7636, S256): the verifier stays server-side here; only the
-    //    challenge rides in the authorize URL, the verifier in the token
-    //    exchange — a code captured out-of-context cannot be redeemed.
-    use base64::Engine as _;
-    use rand::Rng;
-    use sha2::{Digest as _, Sha256};
-    let nonce: String = rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect();
-    let mut verifier_raw = [0u8; 32];
-    rand::thread_rng().fill(&mut verifier_raw);
-    let code_verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_raw);
-    let challenge = {
-        let mut h = Sha256::new();
-        h.update(code_verifier.as_bytes());
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h.finalize())
-    };
-    {
-        let mut pending = state.pending_oauth.write();
-        pending.retain(|_, p| p.created.elapsed() < Duration::from_secs(900));
-        pending.insert(
-            nonce.clone(),
-            PendingOauth { flow: config.label.clone(), code_verifier, created: Instant::now() },
-        );
-    }
-    let state_param = format!("{}.{}", config.label, nonce);
-    let cookie = format!(
-        "pav_oauth={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=900",
-        nonce
-    );
-
-    // v164 (live E2E fix): `config.scope` is stored ALREADY percent-encoded
-    // (see FlowConfig construction — the same strings are compared verbatim
-    // against verify.html's EXPECTED_APPS and inserted as-is by the browser
-    // pre-flight). Re-encoding here turned every %20/%3A into %2520/%253A:
-    // the verified flow survived (single token, PayPal decodes tokens
-    // individually) but the full flow collapsed into ONE invalid scope token
-    // and PayPal rejected the authorize request with "(invalid scope)".
-    let url = format!(
-        "{}?client_id={}&response_type=code&scope={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
-        auth_base,
-        config.client_id,
-        config.scope, // already query-encoded — do NOT encode again
-        urlencoding::encode(&state.redirect_uri),
-        urlencoding::encode(&state_param),
-        challenge
-    );
-    (
-        [(axum::http::header::SET_COOKIE, cookie)],
-        Redirect::temporary(&url),
-    )
-        .into_response()
-}
-
-async fn debug_attestation() -> impl IntoResponse {
-    let mut results = serde_json::Map::new();
-    
-    // Check TPM Quote
-    let nonce = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
-    match tpm::quote(nonce).await {
-        Ok(r) => { 
-            results.insert("tpm_quote_status".to_string(), serde_json::Value::String("SUCCESS".to_string())); 
-            results.insert("report".to_string(), serde_json::to_value(r).unwrap()); 
-        },
-        Err(e) => { 
-            results.insert("tpm_quote_status".to_string(), serde_json::Value::String(format!("FAILED: {}", e))); 
-        }
-    }
-    
-    // Check ConfigFS status
-    let _configfs_path = "/sys/kernel/config/tsm/report";
-    results.insert("tsm_loaded".to_string(), serde_json::Value::Bool(std::path::Path::new("/sys/kernel/config/tsm").exists()));
-    results.insert("amd_tsm_loaded".to_string(), serde_json::Value::Bool(std::path::Path::new("/sys/bus/platform/drivers/amd_tsm").exists() || std::path::Path::new("/sys/bus/platform/drivers/amd-tsm").exists()));
-    results.insert("sev_guest_device".to_string(), serde_json::Value::Bool(std::path::Path::new("/dev/sev-guest").exists()));
-    results.insert("tsm_report_dir".to_string(), serde_json::Value::Bool(std::path::Path::new("/sys/kernel/config/tsm/report").exists()));
-    results.insert("tdx_guest_dev".to_string(), serde_json::Value::Bool(crate::intel_tdx::has_tdx_guest_device()));
-    results.insert("tdx_modules".to_string(), serde_json::json!(crate::intel_tdx::modules_matching(&["tdx", "report", "tsm"])));
-    results.insert("virtio_ports".to_string(), serde_json::json!(
-        std::fs::read_dir("/dev/virtio-ports")
-            .map(|rd| rd.flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect::<Vec<_>>())
-            .unwrap_or_default()
-    ));
-    let silicon_probe = crate::intel_tdx::collect_silicon_evidence(
-        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
-    );
-    results.insert("tdx_silicon_evidence".to_string(), serde_json::to_value(&silicon_probe).unwrap_or_default());
-    
-    if let Some(output) = crate::cmd_output_timeout("dmesg", &[], &[], std::time::Duration::from_secs(5)) {
-        let s = String::from_utf8_lossy(&output.stdout);
-        let sev_logs: Vec<String> = s.lines()
-            .filter(|l| l.contains("SEV") || l.contains("SNP") || l.contains("tsm") || l.contains("coco") || l.contains("guest"))
-            .map(|s| s.to_string())
-            .collect();
-        results.insert("dmesg_sev".to_string(), serde_json::Value::from(sev_logs));
-    }
-
-    Json(results)
-}
-
-async fn callback(
-    Query(query): Query<CallbackQuery>,
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
-) -> Response {
-    if let Some(_error) = query.error {
-        return (StatusCode::BAD_REQUEST, "Error from PayPal").into_response();
-    }
-    let code = query.code.clone().unwrap_or_default();
-    // v165 SECURITY (audit round 1): OAuth login-CSRF + PKCE validation.
-    // `state` must be `<flow>.<nonce>` (32 alnum), the SAME nonce must be in
-    // the HttpOnly pav_oauth cookie this browser received when the flow
-    // STARTED, and a matching one-time pending_oauth entry must exist (it
-    // carries the flow and the PKCE verifier). An attacker-crafted
-    // /callback?code=… link cannot satisfy all three in a victim's browser.
-    // (The nonce is a per-flow CSRF secret, not a long-term credential, so a
-    // plain string compare over TLS is fine — no early-exit oracle worth
-    // having at HTTP round-trip cost.)
-    let state_param = query.state.clone().unwrap_or_default();
-    let (state_flow, nonce) = match state_param.split_once('.') {
-        Some((f, n)) if !f.is_empty() && n.len() == 32 && n.chars().all(|c| c.is_ascii_alphanumeric()) => {
-            (f.to_string(), n.to_string())
-        }
-        _ => {
-            return (
-                StatusCode::FORBIDDEN,
-                "OAuth state missing or malformed — restart the login from this site (do not open hand-crafted callback links).",
-            )
-                .into_response();
-        }
-    };
-    let cookie_nonce = headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.split(';')
-                .map(|kv| kv.trim())
-                .find_map(|kv| kv.strip_prefix("pav_oauth=").map(|s| s.to_string()))
-        });
-    if cookie_nonce.as_deref() != Some(nonce.as_str()) {
-        return (
-            StatusCode::FORBIDDEN,
-            "OAuth session cookie missing or mismatched (login CSRF guard) — restart the login from this site.",
-        )
-            .into_response();
-    }
-    // One-time consumption: the pending entry is removed even if the exchange
-    // later fails, so a nonce can never redeem two codes (replay window = 0).
-    let pending_entry = state.pending_oauth.write().remove(&nonce);
-    let (flow, code_verifier) = match pending_entry {
-        Some(p) if p.flow == state_flow => (p.flow, p.code_verifier),
-        _ => {
-            return (
-                StatusCode::FORBIDDEN,
-                "OAuth attempt unknown or already used — restart the login from this site.",
-            )
-                .into_response();
-        }
-    };
-    let config = state.get_flow_config(&flow);
-    
-    let redirect_uri = state.redirect_uri.clone();
-
-    let api_base = if state.staging { PAYPAL_SANDBOX_API } else { PAYPAL_PRODUCTION_API };
-
-    let token = match exchange_code_for_token(&code, &config.client_id, &config.client_secret, &redirect_uri, api_base, Some(&code_verifier)).await {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Token exchange failed: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Token exchange failed: {}", e)).into_response();
-        }
-    };
-
-    let userinfo = match get_userinfo(&token.access_token, api_base).await {
-        Ok(u) => u,
-        Err(e) => {
-            error!("Userinfo failed: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Userinfo failed: {}", e)).into_response();
-        }
-    };
-
-    // v74-PROD: Strict verified_account check to prevent resource spend on unverified profiles
-    if userinfo.verified_account.as_deref() != Some("true") {
-        // v130: no payer_id in the log either — the verified flow must not
-        // retain account identifiers at all.
-        warn!("Blocked attestation for unverified PayPal account (flow={})", config.label);
-        return (
-            StatusCode::FORBIDDEN,
-            "Verification Failed: Your PayPal account must be fully verified to obtain a hardware-attested report."
-        ).into_response();
-    }
-
-    // v130 PRIVACY: the Verified flow attests only the verification verdict.
-    // The full profile is projected down before it is hashed, stored, or
-    // rendered; the Full Data flow keeps the complete userinfo unchanged.
-    let userinfo = if config.label == "verified" {
-        userinfo.verified_only()
-    } else {
-        userinfo
-    };
-
-    // v116-PROD: Multi-step attestation feature mapping PayPal profile to custom nonce before generation.
-    use rand::Rng;
-    let session_id: String = rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect();
-
-    state.pending_attestations.write().insert(session_id.clone(), (config.label.clone(), userinfo.clone(), Instant::now()));
-
-    // v130 PRIVACY: honest copy per flow — the verified flow never asked for
-    // profile data, so it must not claim that a "profile" was secured.
-    let (intro_heading, intro_body) = if config.label == "verified" {
-        (
-            "PayPal Verification Confirmed".to_string(),
-            "Your account is <strong>PayPal-verified</strong>. No name, email or other personal data was requested in this flow — only the verification verdict will be attested. You may now generate your one-time Hardware Attestation Certificate.".to_string(),
-        )
-    } else {
-        (
-            "Verified PayPal Profile Linked".to_string(),
-            "Your PayPal identity has been successfully secured in RAM. You may now generate your one-time Hardware Attestation Certificate.".to_string(),
-        )
-    };
-
-    let html = HTML_TEMPLATE.replace(
-        "{{CONTENT}}",
-        &format!(
-            r#"
-        <h1>Authentication Successful</h1>
-        <div class="info">
-            <h3>{}</h3>
-            <p>{}</p>
-        </div>
-        <div class="info" style="border-color: #2196f3;">
-            <h3>Optional: Attach Custom Data</h3>
-            <p>You may optionally attach a custom string (e.g. a Wallet Address, a nonce, or a public key) strictly bound to this attestation report.</p>
-            <form action="/generate" method="POST">
-                <input type="hidden" name="session_id" value="{}">
-                <input type="text" name="custom_info" placeholder="Enter custom data here..." style="width: 100%; padding: 12px; margin-bottom: 20px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;" maxlength="512">
-                <button type="submit" class="btn" style="background:#4caf50; width: 100%;">Generate Certificate (One-Time)</button>
-            </form>
-        </div>
-        "#,
-            intro_heading,
-            intro_body,
-            session_id
-        ),
-    );
-    
-    if let Err(status) = state.record_egress_data(addr.ip(), html.len() as u64) {
-        return status.into_response();
-    }
-
-    Html(html).into_response()
-}
-
-#[derive(serde::Deserialize)]
-struct GenerateCertForm {
-    session_id: String,
-    custom_info: String,
-}
-
-async fn generate_cert(
-    State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
-    axum::extract::Form(form): axum::extract::Form<GenerateCertForm>,
-) -> Response {
-    let pending = state.pending_attestations.write().remove(&form.session_id);
-    let (label, userinfo, _timestamp) = match pending {
-        Some(p) => p,
-        None => {
-            return (
-                StatusCode::FORBIDDEN,
-                "Invalid Session ID or Certificate already generated. You may only generate the certificate once per PayPal authentication.",
-            ).into_response();
-        }
-    };
-
-    let custom_info = if form.custom_info.trim().is_empty() {
-        None
-    } else {
-        // v166 SECURITY (audit round 2): cap the auditor-supplied marker. It is
-        // hashed into the SEC-02 nonce binding and echoed into the report page;
-        // unbounded it was a free ~2 MB per-request memory/egress amplifier
-        // (axum's default 2 MB form limit). The clamp is applied BEFORE the
-        // value enters the report, so enclave hash and auditor recomputation
-        // always see the same string.
-        Some(form.custom_info.trim().chars().take(256).collect::<String>())
-    };
-
-    let attestation = generate_attestation(&state, label.clone(), userinfo.clone(), custom_info).await;
-    let userinfo_full_json = serde_json::to_string_pretty(&userinfo).unwrap();
-
-    // v130 PRIVACY: only the Full Data flow may print profile fields. The
-    // verified flow renders the verdict — nothing else was ever stored.
-    let (profile_heading, profile_body) = if label == "verified" {
-        (
-            "PayPal Verification Status".to_string(),
-            "verified_account: true\n\nNo name, email, payer_id or any other personal data was requested, stored, or attested in this flow — only the verification verdict is bound into the report below.".to_string(),
-        )
-    } else {
-        (
-            "Verified PayPal User Profile".to_string(),
-            userinfo_full_json,
-        )
-    };
-
-    let html = HTML_TEMPLATE.replace(
-        "{{CONTENT}}",
-        &format!(
-            r#"
-        <h1>Attestation Complete</h1>
-        <div class="info">
-            <h3>{}</h3>
-            <pre>{}</pre>
-        </div>
-        <div class="attestation">
-            <h3>Hardware-Attested Enclave Report</h3>
-            <p><strong>Certificate Authority:</strong> Google Public CA</p>
-            <p><strong>Enclave Mode:</strong> {}</p>
-            <p><strong>Hashed & Signed Evidence:</strong></p>
-            <pre id="raw_report">{}</pre>
-        </div>
-        <div class="links-grid">
-            <div class="card" style="grid-column: 1 / -1; border-color: #4caf50;">
-                <h3 style="color: #4caf50;">✅ Download Attestation & Auditor (Recommended)</h3>
-                <p>For maximum security, download both your generated report and the auditor file, then verify locally.</p>
-                <div style="margin-top: 15px;">
-                    <button onclick="downloadReport()" class="btn" style="background:#4caf50; margin-right: 10px; font-family: inherit;">Download Report (.json)</button>
-                    <a href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/refs/heads/main/verify.html" class="btn" target="_blank" style="background:#238636; margin-right: 10px; font-family: inherit;">Download Auditor (.html)</a>
-                    <span style="font-size: 0.85rem; color: #888;">(Right-click the second link and choose "Save Link As...")</span>
-                </div>
-            </div>
-
-            <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" target="_blank" class="card" style="border-color: #d29922;">
-                <h3 style="color: #d29922;">⚠️ Web Auditor (Less Safe)</h3>
-                <p>Verify your generated JSON directly on the hosted GitHub Pages domain.</p>
-            </a>
-            
-            <a href="/" class="card" style="border-color: #30363d; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center;">
-                <h3 style="color: #c9d1d9;">Return Home</h3>
-            </a>
-        </div>
-
-        <script>
-            function downloadReport() {{
-                const data = document.getElementById('raw_report').innerText;
-                const blob = new Blob([data], {{ type: 'application/json' }});
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.style.display = 'none';
-                a.href = url;
-                a.download = 'attestation_report.json';
-                document.body.appendChild(a);
-                a.click();
-                window.URL.revokeObjectURL(url);
-            }}
-        </script>
-        "#,
-            html_escape::encode_text(&profile_heading),
-            html_escape::encode_text(&profile_body),
-            if state.staging { "Confidential Sandbox" } else { "Confidential Production" },
-            html_escape::encode_text(&attestation),
-        ),
-    );
-    
-    if let Err(status) = state.record_egress_data(addr.ip(), html.len() as u64) {
-        return status.into_response();
-    }
-
-    Html(html).into_response()
-}
-
-async fn acme_challenge(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(token): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    if state.https_ready.load(Ordering::Relaxed) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    match tokio::fs::read_to_string(format!("/tmp/acme-challenge/{}", token)).await {
-        Ok(c) => c.into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
-#[allow(dead_code)]
-async fn http_to_https_redirect() -> impl IntoResponse {
-    Redirect::permanent("https://")
-}
-
-// ============================================================================
-// TLS
-// ============================================================================
-
-async fn load_tls_config(
-    cert_pem: &[u8],
-    key_pem: &[u8],
+// Builds the OpenSSL SslAcceptor strictly in memory (Zero Disk Storage)
+fn build_in_memory_ssl_acceptor(
+    cert_chain_pem: &[u8],
+    private_key: &openssl::pkey::PKey<openssl::pkey::Private>,
 ) -> Result<Arc<SslAcceptor>, Box<dyn std::error::Error + Send + Sync>> {
-    tokio::fs::write("/tmp/tls-cert.pem", cert_pem).await?;
-    tokio::fs::write("/tmp/tls-key.pem", key_pem).await?;
+    let certs = openssl::x509::X509::stack_from_pem(cert_chain_pem)?;
+    if certs.is_empty() {
+        return Err("No certificates parsed from memory".into());
+    }
 
     let mut builder = SslAcceptor::mozilla_modern_v5(SslMethod::tls_server())?;
-    // Chain file, not certificate file: ACME returns leaf + intermediate, and
-    // set_certificate_file() (SSL_CTX_use_certificate_file) loads ONLY the first
-    // PEM block — serving a bare leaf makes every client that lacks the CA's
-    // intermediate (LE YR2) fail verification (live-proven 2026-10-17:
-    // `openssl s_client` showed 1 cert, verify error 21).
-    builder.set_certificate_chain_file("/tmp/tls-cert.pem")?;
-    builder.set_private_key_file("/tmp/tls-key.pem", SslFiletype::PEM)?;
+    builder.set_certificate(&certs[0])?;
+    for intermediate in certs.iter().skip(1) {
+        builder.add_extra_chain_cert(intermediate.clone())?;
+    }
+    builder.set_private_key(private_key)?;
     builder.check_private_key()?;
-
     Ok(Arc::new(builder.build()))
 }
 
-/// Generate a self-signed TLS certificate using rcgen (fallback for Alibaba Cloud
-/// when ACME is unreachable due to DNS/network constraints)
-#[cfg(feature = "alibabacloud")]
-fn generate_self_signed_cert(domain: &str) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
-    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
-
-    info!("Generating self-signed TLS certificate for domain: {}", domain);
-    let mut params = CertificateParams::default();
-    let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, domain);
-    dn.push(DnType::OrganizationName, "PayPal Auth Confidential VM");
-    params.distinguished_name = dn;
-    params.subject_alt_names = vec![
-        SanType::DnsName(domain.to_string().try_into()?),
-    ];
-    // 90-day validity
-    params.not_before = rcgen::date_time_ymd(2026, 1, 1);
-    params.not_after = rcgen::date_time_ymd(2027, 1, 1);
-
-    let key_pair = KeyPair::generate()?;
-    let cert = params.self_signed(&key_pair)?;
-    let cert_pem = cert.pem().into_bytes();
-    let key_pem = key_pair.serialize_pem().into_bytes();
-
-    info!("Self-signed certificate generated ({} bytes cert, {} bytes key)", cert_pem.len(), key_pem.len());
-    Ok((cert_pem, key_pem))
+// ----------------------------------------------------------------------------
+// Pre-Flight Protocol & E2EE Endpoints
+// ----------------------------------------------------------------------------
+#[derive(Deserialize)]
+pub struct PreflightRequest {
+    pub client_ecdh_pub_b64: String,
+    pub client_nonce_hex: String,
+    pub flow: Option<String>,
+    pub custom_info: Option<String>,
 }
 
-// ============================================================================
-// MAIN
-// ============================================================================
+async fn serve_verify_html() -> impl IntoResponse {
+    // Served from the initramfs on disk, NOT embedded via include_str!. This
+    // is deliberate: EXPECTED_ENCLAVE_SHA256 (the code-pin gate) lives in this
+    // file and must equal the running binary's self-measure SHA256(/init).
+    // Embedding the auditor would make that self-referential (pin ==
+    // SHA256(binary containing pin)), an unsatisfiable fixed point. See
+    // build-initramfs-tools.sh where verify.html is copied to /verify.html.
+    match std::fs::read("/verify.html") {
+        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], bytes).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "verify.html not present in initramfs",
+        )
+            .into_response(),
+    }
+}
 
+async fn preflight_cors() -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            (axum::http::header::ACCESS_CONTROL_ALLOW_METHODS, "POST, OPTIONS"),
+            (axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS, "content-type"),
+        ],
+        StatusCode::NO_CONTENT,
+    )
+}
+
+async fn attest_preflight(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+    Json(payload): Json<PreflightRequest>,
+) -> Response {
+    use base64::engine::general_purpose::STANDARD as B64STD;
+    use base64::Engine as _;
+    use sha2::Digest;
+
+    if let Err(status) = state.record_egress(addr.ip(), 8192) {
+        return status.into_response();
+    }
+
+    let client_pub = match B64STD.decode(payload.client_ecdh_pub_b64.trim()) {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid client_ecdh_pub_b64").into_response(),
+    };
+    // Panic-safe validation: reject a non-DER/unsupported key NOW, so the
+    // callback's ECDH cannot fail later (panic = abort would kill the enclave).
+    if openssl::pkey::PKey::public_key_from_der(&client_pub).is_err() {
+        return (StatusCode::BAD_REQUEST, "client_ecdh_pub_b64 is not a valid DER public key").into_response();
+    }
+    let nonce_vec = match hex::decode(payload.client_nonce_hex.trim()) {
+        Ok(v) if v.len() == 32 => v,
+        _ => return (StatusCode::BAD_REQUEST, "client_nonce_hex must be exactly 32 bytes").into_response(),
+    };
+    let mut client_nonce = [0u8; 32];
+    client_nonce.copy_from_slice(&nonce_vec);
+
+    let flow = payload.flow.as_deref().unwrap_or("verified");
+    let (cid, _csec, scope, label) = state.get_flow_config(flow);
+
+    let custom_info = payload.custom_info.as_deref().unwrap_or("NONE").trim();
+    let custom_info_str = if custom_info.is_empty() { "NONE" } else { custom_info };
+
+    let pkce = match PkceSession::new(client_pub.clone(), client_nonce, custom_info_str.to_string()) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("PKCE generation failed: {}", e)).into_response(),
+    };
+    let code_challenge = pkce.code_challenge.clone();
+
+    // Hardware binding calculated strictly in RAM
+    let report_data = compute_preflight_binding(
+        &state.enclave_identity.pubkey_der,
+        &code_challenge,
+        &client_pub,
+        &client_nonce,
+        custom_info_str,
+    );
+
+    let quote_res = tpm::quote(&hex::encode(&report_data[..32]), Some(report_data));
+
+    use rand::Rng;
+    let state_token = hex::encode(rand::thread_rng().gen::<[u8; 32]>());
+    let auth_base = if state.staging { PAYPAL_SANDBOX_AUTH } else { PAYPAL_PRODUCTION_AUTH };
+    let ecdh_pub_der = pkce.enclave_ecdh.public_key_to_der().unwrap_or_default();
+
+    let signed_fields = serde_json::json!({
+        "binding": "v161",
+        "code_challenge": code_challenge,
+        "state": state_token,
+        "flow": label,
+        "paypal_client_id": cid,
+        "redirect_uri": state.redirect_uri,
+        "authorize_base": auth_base,
+        "scope": scope,
+        "enclave_ecdh_public_key_b64": B64STD.encode(&ecdh_pub_der),
+        "custom_info": custom_info_str,
+    });
+
+    let signed_fields_str = serde_json::to_string(&signed_fields).unwrap();
+    let signature = {
+        use openssl::hash::MessageDigest;
+        use openssl::sign::Signer;
+        let mut signer = Signer::new(MessageDigest::sha256(), &state.enclave_identity.pkey).unwrap();
+        signer.update(signed_fields_str.as_bytes()).unwrap();
+        B64STD.encode(signer.sign_to_vec().unwrap())
+    };
+
+    state.pending_oauth.write().insert(state_token.clone(), (label, pkce));
+
+    let binary_sha256 = hex::encode(sha2::Sha256::digest(&std::fs::read("/init").unwrap_or_default()));
+    // Pre-flight is pre-login: paypal_user_info_raw_hash carries the documented
+    // placeholder (real user hash is bound only at the login/callback step).
+    let attestation_report = serde_json::json!({
+        "custom_info": custom_info_str,
+        "paypal_user_info_raw_hash": prelogin_paypal_hash(),
+        "enclave_config": {
+            "boot_measurements": {
+                "binary_sha256": binary_sha256,
+                "disk_manifest": &state.boot_manifest,
+            }
+        },
+        "session_context": {
+            "preflight": {
+                "binding": "v161",
+                "code_challenge": code_challenge,
+                "client_pub_b64": B64STD.encode(&client_pub),
+                "client_nonce_hex": payload.client_nonce_hex,
+                "custom_info": custom_info_str,
+            }
+        },
+        "hardware_level_attestation": quote_res,
+        "timestamp_ms": chrono::Utc::now().timestamp_millis() as u64,
+    });
+    let report_sig = sign_report(&state, &attestation_report);
+
+    let body = serde_json::json!({
+        "attestation_envelope": {
+            "attestation_report": attestation_report,
+            "enclave_signing_public_key": state.enclave_identity.pubkey_pem,
+            "enclave_signature_b64": report_sig,
+        },
+        "enclave_signing_public_key": state.enclave_identity.pubkey_pem,
+        "signed_fields": signed_fields,
+        "preflight_signature_b64": signature,
+    });
+
+    let mut resp = ([(axum::http::header::CONTENT_TYPE, "application/json")], Json(body)).into_response();
+    resp.headers_mut().insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, axum::http::HeaderValue::from_static("*"));
+    resp
+}
+
+// ----------------------------------------------------------------------------
+// Standalone Auditor Envelope (GET /debug/envelope)
+// ----------------------------------------------------------------------------
+// verify.html's pre-flight button (runPreflight) fetches this path and runs
+// the full audit on a LIVE report before the user starts a login. The body
+// mirrors attest_preflight's `attestation_envelope` exactly — the same shape
+// executePreflightAndLogin audits — with an SEC-02 (v160)5-component nonce
+// bound into the TDX quote's report_data and NO client session bound (session
+// binding belongs to the login flow's POST). Pre-login there is no PayPal user,
+// so paypal_user_info_raw_hash carries a documented placeholder and the nonce
+// is self-consistent with it; the real user hash is bound only at login.
+async fn debug_envelope(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+) -> Response {
+    use sha2::Digest;
+    if let Err(status) = state.record_egress(addr.ip(), 8192) {
+        return status.into_response();
+    }
+
+    let binary_sha256 = hex::encode(sha2::Sha256::digest(&std::fs::read("/init").unwrap_or_default()));
+    let custom_info = "NONE";
+    let paypal_hash = prelogin_paypal_hash();
+
+    // SEC-02 nonce = SHA-256(paypal_hash ∥ pubkey_hash ∥ custom_info_hash ∥
+    // binary_sha256 ∥ manifest_hash). Bind the TDX quote's report_data[0..32]
+    // to it ([32..64] zero) so the auditor's recomputed expectedNonce matches.
+    let nonce = sec02_nonce(
+        &paypal_hash,
+        &state.enclave_identity.pubkey_der,
+        custom_info,
+        &binary_sha256,
+        &state.boot_manifest,
+    );
+    let mut report_data = [0u8; 64];
+    report_data[0..32].copy_from_slice(&nonce);
+    let quote_res = tpm::quote(&hex::encode(nonce), Some(report_data));
+
+    let attestation_report = serde_json::json!({
+        "custom_info": custom_info,
+        "paypal_user_info_raw_hash": paypal_hash,
+        "enclave_config": {
+            "boot_measurements": {
+                "binary_sha256": binary_sha256,
+                "disk_manifest": &state.boot_manifest,
+            }
+        },
+        "session_context": {},
+        "hardware_level_attestation": quote_res,
+        "timestamp_ms": chrono::Utc::now().timestamp_millis() as u64,
+    });
+    let signature = sign_report(&state, &attestation_report);
+
+    let body = serde_json::json!({
+        "attestation_report": attestation_report,
+        "enclave_signing_public_key": state.enclave_identity.pubkey_pem,
+        "enclave_signature_b64": signature,
+    });
+
+    let mut resp = ([(axum::http::header::CONTENT_TYPE, "application/json")], Json(body)).into_response();
+    resp.headers_mut().insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, axum::http::HeaderValue::from_static("*"));
+    resp
+}
+
+// ----------------------------------------------------------------------------
+// Local Auditor Out-of-Band Claim Route (Zero WebPKI MITM)
+// ----------------------------------------------------------------------------
+#[derive(Deserialize)]
+struct ClaimQuery {
+    state: Option<String>,
+}
+
+async fn get_e2ee_blob(
+    Query(query): Query<ClaimQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let state_token = match query.state {
+        Some(s) => s,
+        None => return (StatusCode::BAD_REQUEST, "Missing state").into_response(),
+    };
+
+    let blob = state.pending_e2ee_blobs.write().remove(&state_token);
+    match blob {
+        Some((payload, _)) => {
+            let mut resp = Json(payload).into_response();
+            resp.headers_mut().insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, axum::http::HeaderValue::from_static("*"));
+            resp
+        }
+        None => (StatusCode::NOT_FOUND, "No E2EE payload for session or already claimed").into_response(),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Safe Callback Handler: E2EE Encrypted Output Only
+// ----------------------------------------------------------------------------
+async fn callback(
+    Query(query): Query<CallbackQuery>,
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+) -> Response {
+    use base64::engine::general_purpose::STANDARD as B64STD;
+    use base64::Engine as _;
+    use sha2::Digest;
+
+    let code = query.code.clone().unwrap_or_default();
+    let state_param = query.state.clone().unwrap_or_default();
+
+    let pending_entry = state.pending_oauth.write().remove(&state_param);
+    let (flow, pkce) = match pending_entry {
+        Some((f, p)) if p.created_at.elapsed() < Duration::from_secs(600) => (f, p),
+        _ => return (StatusCode::FORBIDDEN, "Invalid or expired session. Start from /verify.html").into_response(),
+    };
+
+    let (cid, csec, _, _) = state.get_flow_config(&flow);
+    let api_base = if state.staging { PAYPAL_SANDBOX_API } else { PAYPAL_PRODUCTION_API };
+
+    let token_resp = hardened_client().post(format!("{}/v1/oauth2/token", api_base))
+        .basic_auth(&cid, Some(&csec))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", &state.redirect_uri),
+            ("code_verifier", &pkce.code_verifier),
+        ])
+        .send().await;
+
+    let mut token_obj: TokenResponse = match token_resp {
+        Ok(r) if r.status().is_success() => r.json().await.unwrap_or(TokenResponse { access_token: String::new(), id_token: None }),
+        _ => return (StatusCode::INTERNAL_SERVER_ERROR, "Token exchange failed with PayPal").into_response(),
+    };
+
+    let mut userinfo: PayPalUserInfo = match hardened_client()
+        .get(format!("{}/v1/identity/oauth2/userinfo?schema=paypalv1.1", api_base))
+        .bearer_auth(&token_obj.access_token)
+        .send()
+        .await
+    {
+        Ok(r) => r.json().await.unwrap_or_default(),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "PayPal userinfo fetch failed").into_response(),
+    };
+
+    // Zeroize sensitive token memory immediately
+    zeroize_str(&mut token_obj.access_token);
+    if let Some(ref mut idt) = token_obj.id_token { zeroize_str(idt); }
+
+    let minimized = userinfo.verified_only();
+    if minimized.verified_account.as_deref() != Some("true") {
+        return (StatusCode::FORBIDDEN, "PayPal account must be verified").into_response();
+    }
+
+    // Build the final attestation report. The login report binds the REAL PayPal
+    // user hash into the SEC-02 nonce and a fresh hardware quote, so the
+    // post-login audit's recomputed expectedNonce matches the quote's report_data.
+    let binary_sha256 = hex::encode(sha2::Sha256::digest(&std::fs::read("/init").unwrap_or_default()));
+    let paypal_user_raw_hash = hex::encode(sha2::Sha256::digest(
+        serde_json::to_string(&minimized).unwrap_or_default().as_bytes(),
+    ));
+    let custom_info = pkce.custom_info.clone();
+
+    let nonce = sec02_nonce(
+        &paypal_user_raw_hash,
+        &state.enclave_identity.pubkey_der,
+        &custom_info,
+        &binary_sha256,
+        &state.boot_manifest,
+    );
+    let mut report_data = [0u8; 64];
+    report_data[0..32].copy_from_slice(&nonce);
+    let quote_res = tpm::quote(&hex::encode(nonce), Some(report_data));
+
+    let report_payload = serde_json::json!({
+        "paypal_user_info": minimized,
+        "paypal_user_info_raw_hash": paypal_user_raw_hash,
+        "custom_info": custom_info,
+        "timestamp_ms": chrono::Utc::now().timestamp_millis() as u64,
+        "enclave_config": {
+            "boot_measurements": {
+                "binary_sha256": binary_sha256,
+                "disk_manifest": &state.boot_manifest,
+            }
+        },
+        "session_context": {
+            "tls_certificate_pem": state.tls_cert_pem.read().clone().unwrap_or_default(),
+        },
+        "hardware_level_attestation": quote_res,
+    });
+    let sig = sign_report(&state, &report_payload);
+
+    let full_envelope = serde_json::json!({
+        "attestation_report": report_payload,
+        "enclave_signature_b64": sig,
+        "enclave_signing_public_key": state.enclave_identity.pubkey_pem,
+    });
+
+    // Derive session key in RAM and encrypt using AES-256-GCM (AAD: client_nonce)
+    let mut session_key = match crypto_e2ee::derive_session_key(
+        &pkce.enclave_ecdh,
+        &pkce.client_ecdh_pub,
+        &pkce.client_nonce,
+    ) {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "E2EE key derivation failed").into_response(),
+    };
+    let report_json = match serde_json::to_string(&full_envelope) {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Envelope serialization failed").into_response(),
+    };
+    let (iv, ct) = match crypto_e2ee::encrypt_envelope(&session_key, report_json.as_bytes(), &pkce.client_nonce) {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "E2EE encryption failed").into_response(),
+    };
+    // Zeroize the derived session key immediately after use (plan requirement).
+    session_key.iter_mut().for_each(|b| *b = 0);
+
+    let ecdh_pub_der = pkce.enclave_ecdh.public_key_to_der().unwrap_or_default();
+    let e2ee_blob = serde_json::json!({
+        "alg": "AES-256-GCM+HKDF-SHA256+ECDH-P256",
+        "aad": "client_nonce",
+        "iv_b64": B64STD.encode(&iv),
+        "ct_b64": B64STD.encode(&ct),
+        "enclave_ecdh_public_key_b64": B64STD.encode(&ecdh_pub_der),
+        "enclave_signing_public_key": state.enclave_identity.pubkey_pem,
+        "state": state_param,
+        "flow": flow,
+    });
+
+    // Save for local claim
+    state.pending_e2ee_blobs.write().insert(state_param.clone(), (e2ee_blob.clone(), Instant::now()));
+
+    // Never render plaintext user info: only return the encrypted blob container
+    let html = HTML_TEMPLATE.replace(
+        "{{CONTENT}}",
+        &format!(
+            r#"<h1>Authentication Succeeded</h1>
+            <div class="info">
+                <h3>Hardware-Attested Delivery (Encrypted)</h3>
+                <p>Your verified PayPal status has been sealed in RAM and encrypted to your local client key.</p>
+                <a class="btn" href="/verify.html">Open Local Auditor</a>
+            </div>
+            <script type="application/json" id="e2ee-blob">{}</script>"#,
+            e2ee_blob.to_string().replace("</", "<\\/")
+        ),
+    );
+
+    let _ = state.record_egress(addr.ip(), html.len() as u64);
+    Html(html).into_response()
+}
+
+// ----------------------------------------------------------------------------
+// Runtime Main Loop
+// ----------------------------------------------------------------------------
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    eprintln!("====================================================");
-    eprintln!("PAYPAL AUTH VM STARTING AT {}", chrono::Utc::now());
-    eprintln!("====================================================");
-    
-    // 1. PID 1 RESPONSIBILITIES: Mount filesystems FIRST!
     enclave_init::mount_filesystems();
-    // 2. Now load drivers (requires /sys, /proc)
     enclave_init::load_drivers();
-    // 3. Finally measure boot components
     let boot_manifest = enclave_init::measure_boot_components();
-    
-    // 4. Anchor manifest in PCR 15 for the auditor
-    {
-        use sha2::{Digest, Sha256};
-        let mut sorted_manifest: Vec<_> = boot_manifest.iter().collect();
-        sorted_manifest.sort_by_key(|(k, _)| *k);
-        let manifest_json = serde_json::to_string(&sorted_manifest).unwrap_or_default();
-        let manifest_hash = Sha256::digest(manifest_json.as_bytes());
-        let hash_hex = hex::encode(manifest_hash);
-        
-        enclave_init::kmsg(&format!("Anchoring manifest ({} files) in PCR 15: {}", boot_manifest.len(), hash_hex));
-        
-        let _ = std::process::Command::new("tpm2")
-            .args(["pcrextend", &format!("15:sha256={}", hash_hex)])
-            .status();
-    }
-
-    // Platform-specific hardware interface check
-    #[cfg(not(feature = "alibabacloud"))]
-    {
-        if std::path::Path::new("/dev/sev-guest").exists() {
-            enclave_init::kmsg("Hardware interface /dev/sev-guest is PRESENT (likely built-in)");
-        } else {
-            enclave_init::kmsg("Hardware interface /dev/sev-guest is MISSING");
-        }
-    }
-    #[cfg(feature = "alibabacloud")]
-    {
-        if std::path::Path::new("/dev/tpmrm0").exists() {
-            enclave_init::kmsg("TPM device /dev/tpmrm0 is PRESENT (Intel TDX standard TPM)");
-        } else {
-            enclave_init::kmsg("WARNING: /dev/tpmrm0 is MISSING — TPM attestation unavailable");
-        }
-        if std::path::Path::new("/sys/bus/platform/drivers/tdx").exists() {
-            enclave_init::kmsg("Intel TDX driver is loaded");
-        }
-    }
-
-    // 2. Initialize the Tokio runtime now that the environment is sane
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-
-    // 3. Configure network (DHCP) from within the async runtime
     enclave_init::setup_firewall();
+
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async {
-        if let Err(e) = enclave_init::configure_network().await {
-            eprintln!("[FATAL] Network config failed: {}", e);
+        // Initialize tracing to /dev/kmsg (O_NONBLOCK): the plan's info!/warn!
+        // statements need a subscriber, and stderr (the serial console tty) can
+        // wedge runtime workers on a stalled UART.
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with_writer(kmsg_log::KmsgMakeWriter)
+            .with_ansi(false)
+            .init();
+
+        if let Err(_) = enclave_init::configure_network().await {
             enclave_init::poweroff();
         }
 
-        async_main(boot_manifest).await
-    })
-}
+        let config = fetch_config().await.unwrap_or_else(|e| {
+            error!("FATAL: {}", e);
+            enclave_init::poweroff();
+        });
 
-#[allow(dead_code)]  // Debug endpoint, not used in production
-async fn test_quote(axum::extract::State(_state): axum::extract::State<Arc<AppState>>) -> impl axum::response::IntoResponse {
-    match tpm::quote("1234").await {
-        Ok(tpm_data) => axum::response::Json(tpm_data).into_response(),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("TPM Quote Failed: {}", e)).into_response(),
-    }
-}
+        // 1. Generate Ephemeral Enclave Identity (RAM ONLY, Never Logged)
+        let enclave_identity = EphemeralEnclaveIdentity::generate()?;
+        info!("--- EPHEMERAL ENCLAVE RSA KEY GENERATED (RAM ONLY, {} bytes) ---", enclave_identity.pubkey_der.len());
 
-async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    
-    // Attempt to force immediate flush
-    use std::io::Write;
-    std::io::stderr().flush()?;
-    std::io::stdout().flush()?;
+        let state = Arc::new(AppState {
+            paypal_client_id: config.paypal_client_id.clone(),
+            paypal_client_secret: config.paypal_client_secret.clone(),
+            paypal_verified_client_id: config.paypal_verified_client_id.clone().unwrap_or_default(),
+            paypal_verified_client_secret: config.paypal_verified_client_secret.clone().unwrap_or_default(),
+            redirect_uri: format!("https://{}/callback", config.domain),
+            domain: config.domain.clone(),
+            https_ready: Arc::new(AtomicBool::new(false)),
+            staging: config.staging,
+            tls_cert_pem: Arc::new(RwLock::new(None)),
+            enclave_identity,
+            ip_stats: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+            global_egress_bytes: Arc::new(AtomicU64::new(0)),
+            last_limit_reset: Arc::new(RwLock::new(Instant::now())),
+            connection_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
+            boot_manifest,
+            pending_oauth: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            pending_e2ee_blobs: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        });
 
-    // Log to /dev/kmsg (O_NONBLOCK), never the serial console tty: a stalled
-    // UART write used to park runtime workers mid-request ("TCP 443 accepts,
-    // no TLS"). See mod kmsg_log.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(kmsg_log::KmsgMakeWriter)
-        .with_ansi(false)
-        .init();
-
-    eprintln!("[DEBUG] tracing initialized");
-    info!("Starting PayPal Auth on {} (v151 Hardened)", PLATFORM_LABEL);
-    info!("SECRET_NAME={:?}", std::env::var("SECRET_NAME"));
-
-    eprintln!("[DEBUG] about to fetch config");
-    
-    // --- MEASURED BOOT ---
-    // Note: PCR 15 was anchored with the disk manifest in PID 1 phase.
-    // BIN_HASH is included in the report JSON and verified via SLSA.
-    
-    // Log current PCR 15 state for diagnostics
-    if let Ok(pcr_out) = tpm::run_cmd("tpm2", &["pcrread", "sha256:15"]).await {
-        info!("Current PCR 15 State:\n{}", String::from_utf8_lossy(&pcr_out).trim());
-    }
-
-    // DIAGNOSTIC: Check TPM device presence
-    let tpm_exists = std::path::Path::new("/dev/tpmrm0").exists() || std::path::Path::new("/dev/tpm0").exists();
-    info!("TPM Device present: {}", tpm_exists);
-
-    // DIAGNOSTIC: Dump all NV indices to find the SEV-SNP report
-    match tpm::run_cmd("/usr/bin/tpm2_getcap", &["handles-nv-index"]).await {
-        Ok(nv_out) => info!("Available TPM NV Indices:\n{}", String::from_utf8_lossy(&nv_out).trim()),
-        Err(e) => warn!("Failed to get TPM NV indices (full path): {}", e),
-    }
-
-    #[cfg(not(feature = "alibabacloud"))]
-    {
-        let _client = hardened_client();
-        // Try the instance-level identity token (GCP Attestation Token)
-        match _client.get("http://metadata.google.internal/computeMetadata/v1/instance/identity?audience=paypal-auditor&format=full")
-            .header("Metadata-Flavor", "Google")
-            .send().await {
-            Ok(resp) => {
-                match resp.text().await {
-                    Ok(jwt) => info!("ATTESTATION TOKEN: {}", jwt),
-                    Err(e) => warn!("Failed to read attestation token text: {}", e),
-                }
-            },
-            Err(e) => warn!("Failed to fetch attestation token: {}", e),
-        }
-    }
-
-    #[cfg(feature = "alibabacloud")]
-    {
-        // Alibaba Cloud: Fetch instance identity document from metadata service
-        let meta_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build().unwrap_or_else(|_| reqwest::Client::new());
-        match meta_client.get("http://100.100.100.200/latest/dynamic/instance-identity/document")
-            .send().await {
-            Ok(resp) => {
-                match resp.text().await {
-                    Ok(identity_doc) => info!("Alibaba Cloud Instance Identity: {}", &identity_doc[..identity_doc.len().min(200)]),
-                    Err(e) => warn!("Failed to read Alibaba instance identity: {}", e),
-                }
-            },
-            Err(e) => warn!("Alibaba Cloud metadata service unavailable: {}", e),
-        }
-        // Check Intel TDX availability (log every probe so the serial console shows
-        // exactly which signal is present on this instance type)
-        let tdx_probes = [
-            "/dev/tdx-guest",
-            "/dev/tdx_guest",
-            "/sys/bus/platform/drivers/tdx",
-            "/sys/module/tdx_guest",
-            "/dev/tpmrm0",
-        ];
-        let probe_state = tdx_probes
-            .iter()
-            .map(|p| format!("{}={}", p, std::path::Path::new(p).exists()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        info!("TDX probe: {}", probe_state);
-        if crate::intel_tdx::is_intel_tdx_available() {
-            info!("Intel TDX hardware attestation available on this Alibaba Cloud instance");
-        } else {
-            warn!("Intel TDX not detected — falling back to standard TPM attestation");
-        }
-    }
-
-    info!("About to fetch config...");
-    let config = match fetch_config().await {
-        Ok(c) => {
-            info!("Config loaded successfully");
-            c
-        }
-        Err(e) => {
-            error!("Failed to fetch config: {}", e);
-            return Err(e);
-        }
-    };
-    eprintln!("[DEBUG] config loaded, domain={}", config.domain);
-    info!("Config: domain={}", config.domain);
-
-    let redirect_uri = format!("https://{}/callback", config.domain);
-    info!("Redirect URI: {}", redirect_uri);
-
-    let https_ready = Arc::new(AtomicBool::new(false));
-    let https_ready_clone = https_ready.clone();
-
-    // v69: Attestation Signing Key handling (cloned to avoid partial move of config)
-    let attestation_signing_key = if let Some(key) = config.attestation_signing_key.clone() {
-        info!("Attestation signing key loaded from Vault");
-        Some(key)
-    } else {
-        info!("Attestation signing key missing in Vault, generating ephemeral RAM-ONLY RSA 4096 key...");
-        acme2_eab::gen_rsa_private_key(4096).ok().map(|k| {
-            let pem = String::from_utf8(k.private_key_to_pem_pkcs8().expect("Failed to convert key to PEM")).unwrap();
-            info!("--- EPHEMERAL RSA KEY GENERATED (RAM ONLY) ---");
-            info!("{}", pem);
-            info!("----------------------------------------------");
-            pem
-        })
-    };
-
-    // Initialize app state
-    eprintln!("[DEBUG] building app state");
-    let state = Arc::new(AppState {
-        paypal_client_id: config.paypal_client_id.clone(),
-        paypal_client_secret: config.paypal_client_secret.clone(),
-        paypal_verified_client_id: config.paypal_verified_client_id.clone().unwrap_or_default(),
-        paypal_verified_client_secret: config.paypal_verified_client_secret.clone().unwrap_or_default(),
-        redirect_uri,
-        used_paypal_ids: Arc::new(RwLock::new(HashSet::new())),
-        domain: config.domain.clone(),
-        https_ready: https_ready_clone,
-        staging: config.staging,
-        tls_cert_pem: Arc::new(RwLock::new(None)),
-        attestation_signing_key,
-        ip_stats: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
-        global_egress_bytes: Arc::new(AtomicU64::new(0)),
-        last_limit_reset: Arc::new(RwLock::new(Instant::now())),
-        connection_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
-        boot_manifest,
-        pending_attestations: Arc::new(RwLock::new(std::collections::HashMap::new())),
-        pending_oauth: Arc::new(RwLock::new(std::collections::HashMap::new())),
-    });
-
-    // v117: Background task for cleaning up expired pending attestations (DoS mitigation)
-    let state_for_cleanup = state.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            let now = Instant::now();
-            let mut pending = state_for_cleanup.pending_attestations.write();
-            let before = pending.len();
-            pending.retain(|_, (_, _, timestamp)| {
-                now.duration_since(*timestamp) < Duration::from_secs(600) // 10 minute TTL
-            });
-            let after = pending.len();
-            if before != after {
-                info!("Cleaned up {} expired pending attestations ({} remaining)", before - after, after);
+        // Periodic cleanup of expired volatile sessions
+        let cleanup_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                cleanup_state.pending_oauth.write().retain(|_, (_, p)| p.created_at.elapsed() < Duration::from_secs(600));
+                cleanup_state.pending_e2ee_blobs.write().retain(|_, (_, t)| t.elapsed() < Duration::from_secs(600));
             }
-            drop(pending);
-            // v165: same hygiene for in-flight OAuth attempts (verifiers +
-            // CSRF nonces) — /login also prunes on insert; belt and braces.
-            let mut oauth = state_for_cleanup.pending_oauth.write();
-            oauth.retain(|_, p| p.created.elapsed() < Duration::from_secs(900));
-        }
-    });
+        });
 
-    // Build the main app router
-    eprintln!("[DEBUG] building router");
-    let mut app = Router::new()
-        .route("/", get(index))
-        .route("/login", get(login))
-        .route("/callback", get(callback))
-        .route("/generate", axum::routing::post(generate_cert))
-        .route("/privacy", get(privacy))
-        .route("/terms", get(terms))
-        .route("/report", get(|| async { Redirect::to("/") }))
-        .route("/.well-known/acme-challenge/{token}", get(acme_challenge));
-    // v166 SECURITY (audit round 2, threat model: untrusted owner+cloud):
-    // `/debug/attestation` runs REAL TPM/TDX hardware quotes and echoes dmesg
-    // SEV/SNP lines plus silicon evidence. It stays mounted on the sandbox
-    // (staging) for bring-up, but production must not expose it: any internet
-    // client could burn quote capacity (each call = a hardware quote that
-    // competes with real attestations) and harvest boot-log/silicon detail.
-    // Production gets a plain 404 (route absent).
-    if state.staging {
-        info!("Staging environment: mounting /debug/attestation");
-        app = app.route("/debug/attestation", get(debug_attestation));
-    }
-    let app = app
-        .layer(TraceLayer::new_for_http())
-        .with_state(state.clone());
-    eprintln!("[DEBUG] router built");
-    info!("Router built");
+        let app = Router::new()
+            .route("/", get(serve_verify_html))
+            .route("/verify.html", get(serve_verify_html))
+            .route("/attest/preflight", axum::routing::options(preflight_cors).post(attest_preflight))
+            .route("/debug/envelope", get(debug_envelope))
+            .route("/callback", get(callback))
+            .route("/e2ee-blob", get(get_e2ee_blob))
+            .layer(TraceLayer::new_for_http())
+            .with_state(state.clone());
 
-    let http_addr = SocketAddr::from(([0, 0, 0, 0], 80));
-    let http_listener = TcpListener::bind(http_addr).await?;
-    info!("HTTP server listening on {}...", http_addr);
-
-    let ready_for_fallback = https_ready.clone();
-    let domain_for_fallback = config.domain.clone();
-
-    let http_router = Router::new()
-        .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
-        .fallback(move |uri: axum::http::Uri| {
-            let ready = ready_for_fallback.clone();
-            let domain = domain_for_fallback.clone();
-            async move {
-                if ready.load(Ordering::Relaxed) {
-                    let https_url = format!("https://{}{}", domain, uri.path());
-                    (
-                        axum::http::StatusCode::PERMANENT_REDIRECT,
-                        [("Location", https_url)],
-                    )
-                        .into_response()
-                } else {
-                    (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "Service starting up (obtaining TLS certificate)...",
-                    )
-                        .into_response()
+        let http_listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 80))).await?;
+        let http_app = app.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, addr)) = http_listener.accept().await {
+                    let svc_app = http_app.clone();
+                    tokio::spawn(async move {
+                        let io = hyper_util::rt::TokioIo::new(stream);
+                        let svc = hyper::service::service_fn(move |mut req| {
+                            let a = svc_app.clone();
+                            req.extensions_mut().insert(axum::extract::ConnectInfo(addr));
+                            async move { Ok::<_, std::convert::Infallible>(a.oneshot(req).await.unwrap_or_else(|n| match n {})) }
+                        });
+                        let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                            .serve_connection(io, svc).await;
+                    });
                 }
             }
-        })
-        .with_state(state.clone());
+        });
 
-    let state_for_http = state.clone();
-    let http_handle = tokio::spawn(async move {
-        loop {
-            let (stream, addr) = match http_listener.accept().await {
-                Ok(s) => s,
+        // 2. Ephemeral In-RAM TLS Key Generation (Every Boot, Never Written to Disk)
+        info!("Generating fresh in-memory ephemeral TLS keypair (RAM ONLY)...");
+        let ephemeral_tls_key = openssl::pkey::PKey::from_rsa(openssl::rsa::Rsa::generate(4096)?)?;
+
+        let acme_mgr = InRamAcmeManager::new(&config);
+        let mut retry_delay = Duration::from_secs(15);
+        let cert_chain_pem = loop {
+            match acme_mgr.obtain_certificate_in_ram(&ephemeral_tls_key).await {
+                Ok(chain) => {
+                    info!("ACME certificate obtained in RAM successfully.");
+                    break chain;
+                }
                 Err(e) => {
-                    error!("Failed to accept HTTP connection: {}", e);
-                    continue;
+                    warn!("ACME certificate failed: {}. Retrying in {:?} (no self-signed fallback)...", e, retry_delay);
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
                 }
-            };
-            let router = http_router.clone();
-            let semaphore = state_for_http.connection_semaphore.clone();
+            }
+        };
+
+        *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&cert_chain_pem).to_string());
+        let ssl_acceptor = build_in_memory_ssl_acceptor(&cert_chain_pem, &ephemeral_tls_key)?;
+        state.https_ready.store(true, Ordering::Relaxed);
+
+        let https_listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 443))).await?;
+        info!("HTTPS server listening on port 443 with in-RAM TLS configuration.");
+
+        loop {
+            let (stream, addr) = https_listener.accept().await?;
+            let acceptor = ssl_acceptor.clone();
+            let app_clone = app.clone();
+            let sem = state.connection_semaphore.clone();
 
             tokio::spawn(async move {
-                let _permit = match semaphore.try_acquire_owned() {
+                let _permit = match sem.try_acquire_owned() {
                     Ok(p) => p,
-                    Err(_) => {
-                        error!("Concurrency limit reached (HTTP)");
-                        return;
-                    }
+                    Err(_) => return,
                 };
-                let io = hyper_util::rt::TokioIo::new(stream);
-                let svc = hyper::service::service_fn(move |mut req| {
-                    let router = router.clone();
-                    req.extensions_mut().insert(axum::extract::ConnectInfo(addr));
-                    async move {
-                        // Infallible error type: unwrap can never fire, but the
-                        // explicit match documents the contract and guarantees
-                        // the closure itself holds no panic path.
-                        Ok::<_, std::convert::Infallible>(
-                            router.oneshot(req).await.unwrap_or_else(|never| match never {}),
-                        )
-                    }
-                });
-                let _ = hyper_util::server::conn::auto::Builder::new(
-                    hyper_util::rt::TokioExecutor::new(),
-                )
-                .serve_connection(io, svc)
-                .await;
-            });
-        }
-    });
-
-    // Obtain TLS certificate (HTTP-01 challenge served by the running HTTP server)
-    eprintln!("[DEBUG] starting ACME cert obtain");
-    info!("Obtaining TLS certificate via ACME...");
-    let ca = GooglePublicCaManager::new(&config);
-    let (cert_pem, key_pem) = {
-        let mut attempt: u32 = 0;
-        loop {
-            attempt += 1;
-            match ca.ensure_certificate().await {
-                Ok(r) => {
-                    info!("Certificate obtained via ACME (attempt {})", attempt);
-                    https_ready.store(true, Ordering::Relaxed);
-                    *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&r.0).to_string());
-                    break r;
-                }
-                Err(e) => {
-                    // Transient transport failures to the ACME CA are common from
-                    // mainland-China egress (live-observed 2026-10-17: one boot got
-                    // a real LE certificate, the next died on a 36s timeout fetching
-                    // the directory, the one after failed post-validation) — retry
-                    // with backoff before falling back, never give up on first error.
-                    const MAX_ATTEMPTS: u32 = 5;
-                    if attempt < MAX_ATTEMPTS {
-                        let backoff = [15u64, 30, 45, 60][(attempt - 1) as usize];
-                        warn!(
-                            "ACME attempt {}/{} failed: {}. Retrying in {}s...",
-                            attempt, MAX_ATTEMPTS, e, backoff
-                        );
-                        tokio::time::sleep(Duration::from_secs(backoff)).await;
-                        continue;
-                    }
-                    #[cfg(feature = "alibabacloud")]
-                    {
-                        error!("ACME certificate failed: {}. Generating self-signed certificate as fallback...", e);
-                        match generate_self_signed_cert(&config.domain) {
-                            Ok(r) => {
-                                warn!("Using SELF-SIGNED certificate — not suitable for production without a reverse proxy");
-                                https_ready.store(true, Ordering::Relaxed);
-                                *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&r.0).to_string());
-                                break r;
-                            }
-                            Err(e2) => {
-                                error!("Self-signed cert also failed: {}. Keeping process alive for debugging...", e2);
-                                loop { tokio::time::sleep(Duration::from_secs(3600)).await; }
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "alibabacloud"))]
-                    {
-                        error!(
-                            "Failed to get certificate: {}. Keeping process alive for debugging...",
-                            e
-                        );
-                        loop {
-                            tokio::time::sleep(Duration::from_secs(3600)).await;
-                        }
-                    }
-                }
-            }
-        }
-    };
-    eprintln!("[DEBUG] cert obtained, loading TLS");
-
-    // Start HTTPS server on port 8443
-    eprintln!("[DEBUG] loading TLS config");
-    info!("Loading TLS config...");
-    let tls_config = load_tls_config(&cert_pem, &key_pem).await?;
-    eprintln!("[DEBUG] TLS config loaded");
-    // Shared holder: the renewal loop swaps in a fresh acceptor live, no restart.
-    let tls_holder: Arc<std::sync::RwLock<Option<Arc<SslAcceptor>>>> =
-        Arc::new(std::sync::RwLock::new(Some(tls_config)));
-    let https_addr = SocketAddr::from(([0, 0, 0, 0], 443));
-    info!("HTTPS listening on {}", https_addr);
-
-    let https_listener = TcpListener::bind(https_addr).await?;
-    let https_tls_holder = tls_holder.clone();
-
-    let state_for_https = state.clone();
-    let https_handle = tokio::spawn(async move {
-        loop {
-            let (stream, addr) = match https_listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("Failed to accept HTTPS connection: {}", e);
-                    continue;
-                }
-            };
-            let ssl_config = match https_tls_holder.read().expect("tls holder lock").clone() {
-                Some(cfg) => cfg,
-                None => continue,
-            };
-            let app = app.clone();
-            let semaphore = state_for_https.connection_semaphore.clone();
-
-            tokio::spawn(async move {
-                let _permit = match semaphore.try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        error!("Concurrency limit reached (HTTPS)");
-                        return;
-                    }
-                };
-                let ssl = match openssl::ssl::Ssl::new(ssl_config.context()) {
+                let ssl = match openssl::ssl::Ssl::new(acceptor.context()) {
                     Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to create SSL: {}", e);
-                        return;
-                    }
+                    Err(_) => return,
                 };
                 let mut tls_stream = match tokio_openssl::SslStream::new(ssl, stream) {
                     Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to create SslStream: {}", e);
-                        return;
-                    }
+                    Err(_) => return,
                 };
-                // Handshake deadline: a slowloris client that opens TCP and
-                // trickles (or stops sending) ClientHello bytes would hold this
-                // task and its semaphore permit forever — 50 such connections
-                // permanently wedge TLS for everyone (the "TCP 443 accepts, no
-                // TLS" failure mode). 10s is generous; a real handshake on the
-                // same continent finishes in <1s.
-                match tokio::time::timeout(
-                    Duration::from_secs(10),
-                    std::pin::Pin::new(&mut tls_stream).accept(),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        error!("TLS handshake failed: {}", e);
-                        return;
-                    }
-                    Err(_) => {
-                        warn!("TLS handshake timed out after 10s — dropping slow client");
-                        return;
-                    }
+                if tokio::time::timeout(Duration::from_secs(10), std::pin::Pin::new(&mut tls_stream).accept()).await.is_err() {
+                    return;
                 }
                 let io = hyper_util::rt::TokioIo::new(tls_stream);
                 let svc = hyper::service::service_fn(move |mut req| {
-                    let app = app.clone();
+                    let a = app_clone.clone();
                     req.extensions_mut().insert(axum::extract::ConnectInfo(addr));
-                    async move {
-                        // Infallible error type: unwrap can never fire, but the
-                        // explicit match documents the contract and guarantees
-                        // the closure itself holds no panic path.
-                        Ok::<_, std::convert::Infallible>(
-                            app.oneshot(req).await.unwrap_or_else(|never| match never {}),
-                        )
-                    }
+                    async move { Ok::<_, std::convert::Infallible>(a.oneshot(req).await.unwrap_or_else(|n| match n {})) }
                 });
-                // Whole-connection deadline so a stuck keep-alive or mid-body
-                // stall can never pin a semaphore permit; permits are the
-                // enclave's only backpressure valve.
-                if let Err(e) = tokio::time::timeout(
-                    Duration::from_secs(120),
-                    hyper_util::server::conn::auto::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    )
-                    .serve_connection(io, svc),
-                )
-                .await
-                {
-                    // Only the Elapsed arm reaches here; the inner
-                    // serve_connection result is handled by hyper itself.
-                    warn!("HTTPS connection hit 120s cap ({}); closing", e);
-                }
+                let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(io, svc).await;
             });
         }
-    });
-    eprintln!("[DEBUG] HTTPS server spawned");
-
-    // ------------------------------------------------------------------
-    // WATCHDOG: self-heal the two failure classes that require a human today
-    //   (a) semaphore exhaustion (permits pinned by stuck connections),
-    //   (b) TLS acceptor lost/corrupt (accept loop serves nothing).
-    // Runs entirely off /dev/kmsg, so its diagnostics are visible on the
-    // serial console even though the logging path itself never blocks on it.
-    // ------------------------------------------------------------------
-    {
-        let state_wd = state.clone();
-        let tls_holder_wd = tls_holder.clone();
-        let https_ready_wd = https_ready.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(30));
-            let mut exhausted_streak: u32 = 0;
-            loop {
-                tick.tick().await;
-
-                // (b) TLS acceptor self-heal: if we are past certificate
-                // acquisition but the holder is empty (lock poison or a bug
-                // swapped in None), rebuild from the on-disk PEMs that
-                // load_tls_config() already wrote — no ACME round-trip, no
-                // restart, seconds of downtime instead of a redeploy.
-                if https_ready_wd.load(Ordering::Relaxed)
-                    && tls_holder_wd.read().map(|g| g.is_none()).unwrap_or(true)
-                {
-                    kmsg_log::critical("watchdog: TLS acceptor missing while serving — rebuilding from disk");
-                    match (std::fs::read("/tmp/tls-cert.pem"), std::fs::read("/tmp/tls-key.pem")) {
-                        (Ok(cert), Ok(key)) => match load_tls_config(&cert, &key).await {
-                            Ok(cfg) => {
-                                if let Ok(mut g) = tls_holder_wd.write() {
-                                    *g = Some(cfg);
-                                }
-                                kmsg_log::critical("watchdog: TLS acceptor RESTORED from disk");
-                            }
-                            Err(e) => kmsg_log::critical(&format!("watchdog: TLS rebuild failed: {}", e)),
-                        },
-                        _ => kmsg_log::critical("watchdog: no on-disk PEMs to rebuild TLS from"),
-                    }
-                }
-
-                // (a) Semaphore starvation detection + slow drain. We cannot
-                // force-drop foreign tasks, but a sustained zero-permit state
-                // with the server "ready" means clients are being refused at
-                // accept; log it loudly and lower the blast radius by logging
-                // the live connection count for the operator.
-                let available = state_wd.connection_semaphore.available_permits();
-                if https_ready_wd.load(Ordering::Relaxed) && available == 0 {
-                    exhausted_streak += 1;
-                    kmsg_log::critical(&format!(
-                        "watchdog: 0/{} connection permits available (streak {}s) — server may be refusing connections",
-                        MAX_CONCURRENT_CONNECTIONS,
-                        exhausted_streak * 30
-                    ));
-                } else {
-                    if exhausted_streak > 0 {
-                        kmsg_log::line(&format!(
-                            "watchdog: connection pool recovered ({}/{} available)",
-                            available, MAX_CONCURRENT_CONNECTIONS
-                        ));
-                    }
-                    exhausted_streak = 0;
-                }
-
-                // Liveness heartbeat: presence in kmsg proves the runtime is
-                // scheduling; absence of this line in the next 30s of console
-                // output is itself the diagnosis (frozen runtime / blocked
-                // worker pool — the old serial-tty logging bug).
-                kmsg_log::line(&format!(
-                    "watchdog: ok, {} permits free, https_ready={}",
-                    available,
-                    https_ready_wd.load(Ordering::Relaxed)
-                ));
-            }
-        });
-    }
-
-    // Certificate renewal: only re-issuance when the served certificate is close
-    // to expiry, and apply it live. The old loop re-issued every 12h unconditionally
-    // — on Alibaba (no cert cache) every tick burned one Let's Encrypt
-    // "exact set of identifiers" quota unit (5 per 7 days, refill 1/34h) for a cert
-    // that was never even applied ("restart needed", no restart).
-    let ca = GooglePublicCaManager::new(&config);
-    let state_for_renewal = state.clone();
-    let tls_holder_for_renewal = tls_holder.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(12 * 3600));
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            let days_left = state_for_renewal
-                .tls_cert_pem
-                .read()
-                .clone()
-                .and_then(|pem| {
-                    let cert = openssl::x509::X509::from_pem(pem.as_bytes()).ok()?;
-                    let now = openssl::asn1::Asn1Time::days_from_now(0).ok()?;
-                    // diff(from=now, to=not_after) → positive = time remaining
-                    let remaining = now.diff(cert.not_after()).ok()?;
-                    Some(remaining.days as i64)
-                });
-            match days_left {
-                Some(d) if d > 21 => {
-                    info!("Certificate still valid for ~{} days — skipping renewal (ACME rate limits)", d);
-                    continue;
-                }
-                Some(d) => info!("Certificate expires in ~{} days — attempting renewal...", d),
-                None => warn!("Could not parse the current certificate — attempting renewal..."),
-            }
-            match ca.ensure_certificate().await {
-                Ok((cert, key)) => match load_tls_config(&cert, &key).await {
-                    Ok(new_cfg) => {
-                        *state_for_renewal.tls_cert_pem.write() =
-                            Some(String::from_utf8_lossy(&cert).to_string());
-                        *tls_holder_for_renewal.write().expect("tls holder lock") = Some(new_cfg);
-                        info!("Certificate renewed and applied live");
-                    }
-                    Err(e) => error!("Certificate renewed but could not be loaded: {}", e),
-                },
-                Err(e) => error!("Certificate renewal failed: {}", e),
-            }
-        }
-    });
-    eprintln!("[DEBUG] all servers running, entering select");
-
-    // Wait for any server to finish (they shouldn't)
-    tokio::select! {
-        result = https_handle => {
-            error!("HTTPS server exited: {:?}", result);
-        }
-        result = http_handle => {
-            error!("HTTP server exited: {:?}", result);
-        }
-    }
-
-    Ok(())
+    })
 }
 
-// PROD: Debug handlers removed
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn require_credentials_rejects_empty_or_placeholders() {
+        let bad = Config {
+            paypal_client_id: String::new(),
+            paypal_client_secret: "secret".into(),
+            paypal_verified_client_id: Some("id".into()),
+            paypal_verified_client_secret: Some("sec".into()),
+            domain: "example.com".into(),
+            eab_key_id: None,
+            eab_hmac_key: None,
+            staging: false,
+            dns_api_token: None,
+            dns_zone: None,
+        };
+        assert!(require_credentials(bad).is_err());
+    }
+
+    #[test]
+    fn test_in_memory_ssl_acceptor_creation() {
+        use openssl::asn1::Asn1Time;
+        use openssl::hash::MessageDigest;
+        use openssl::nid::Nid;
+        use openssl::rsa::Rsa;
+        use openssl::x509::{X509NameBuilder, X509};
+        let rsa = Rsa::generate(2048).unwrap();
+        let pkey = openssl::pkey::PKey::from_rsa(rsa).unwrap();
+
+        // A structurally complete self-signed certificate: without validity,
+        // subject/issuer and a signature the DER encoding fails ("illegal zero
+        // content"), which would test nothing about the acceptor path.
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid(Nid::COMMONNAME, "paypal-auth-vm-test").unwrap();
+        let name = name.build();
+
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap();
+        builder.set_not_after(&Asn1Time::days_from_now(1).unwrap()).unwrap();
+        builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+        let cert = builder.build();
+        let cert_pem = cert.to_pem().unwrap();
+
+        let acceptor = build_in_memory_ssl_acceptor(&cert_pem, &pkey);
+        assert!(acceptor.is_ok());
+    }
+}
