@@ -116,7 +116,12 @@ echo "GPT GUIDs pinned: disk=$READ_DISK_ID part1=$READ_PART_ID"
 dd if="$ESP_IMAGE" of="$RAW_IMAGE" bs=512 seek=2048 conv=notrunc status=none
 touch -d "@$SOURCE_DATE_EPOCH" "$RAW_IMAGE"
 
-rm -f "$OUTPUT_DIR/.mtoolsrc" "$OUTPUT_DIR/grub.cfg" "$ESP_IMAGE"
+# NOTE: keep $OUTPUT_DIR/grub.cfg — Dockerfile.alibaba ships it to /grub.cfg so
+# the CI workflow can attest its digest. verify.html's "Boot Config (grub.cfg)"
+# provenance row looks that digest up in the GitHub attestation ledger; deleting
+# the file here left the alibabacloud leg with nothing to extract (`docker cp
+# /grub.cfg … || true` silently skipped) and every TDX audit failed the row.
+rm -f "$OUTPUT_DIR/.mtoolsrc" "$ESP_IMAGE"
 
 # --- Report ----------------------------------------------------------------
 SHA=$(sha256sum "$RAW_IMAGE" | cut -d' ' -f1)

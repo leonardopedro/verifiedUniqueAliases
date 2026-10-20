@@ -163,6 +163,7 @@ jobs:
           subject-path: |
             shimx64-${{ matrix.platform }}.efi
             grubx64-${{ matrix.platform }}.efi
+            grub-${{ matrix.platform }}.cfg
 
       - name: Upload artifacts
         if: matrix.platform != 'gcp' || github.ref == 'refs/heads/main'

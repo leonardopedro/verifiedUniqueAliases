@@ -122,6 +122,7 @@ COPY build-alibaba-image.sh ./
 
 RUN chmod +x build-alibaba-image.sh && ./build-alibaba-image.sh && \
     cp /build/output-alibaba/disk-alibaba.raw /disk-alibaba.raw && \
+    cp /build/output-alibaba/grub.cfg /grub.cfg && \
     cp /build/output/initramfs-paypal-auth.img /initramfs-paypal-auth.img && \
     cp /build/paypal-auth-vm-bin /paypal-auth-vm-bin && \
     cp /build/packages.txt /packages.txt && \

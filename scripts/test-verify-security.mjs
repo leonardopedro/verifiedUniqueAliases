@@ -290,7 +290,7 @@ const DISK_MANIFEST = {
 // EXPECTED_ENCLAVE_SHA256 in verify.html) — the code-pin gate rejects
 // anything else, by design.
 const BINARY_SHA = EXPECTED_ENCLAVE_SHA256;
-async function buildEnvelope({ hw, customInfo = 'wallet_test_1', corruptEnclaveSig = false, hwBuilder, binarySha = BINARY_SHA }) {
+async function buildEnvelope({ hw, customInfo = 'wallet_test_1', corruptEnclaveSig = false, hwBuilder, binarySha = BINARY_SHA, sessionContext = {} }) {
   const enc = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const encPem = enc.publicKey.export({ type: 'spki', format: 'pem' }).toString();
   const report = {
@@ -300,7 +300,7 @@ async function buildEnvelope({ hw, customInfo = 'wallet_test_1', corruptEnclaveS
       domain: 'login.airma.de',
     },
     paypal_user_info_raw_hash: '11'.repeat(32),
-    session_context: {},
+    session_context: sessionContext,
     timestamp_ms: Date.now(),
     hardware_level_attestation: hw || null,
   };
@@ -309,7 +309,9 @@ async function buildEnvelope({ hw, customInfo = 'wallet_test_1', corruptEnclaveS
     new Uint8Array(sha256(pemToDer(encPem))),
     customInfo, binarySha, DISK_MANIFEST,
   );
-  if (hwBuilder) report.hardware_level_attestation = await hwBuilder(nonce);
+  // hwBuilder(nonce, pEncDer): the second arg lets pre-flight fixtures build
+  // the v161 client-binding hash over THIS envelope's real P_enc.
+  if (hwBuilder) report.hardware_level_attestation = await hwBuilder(nonce, pemToDer(encPem));
   const payload = JSON.stringify(reorder(report));
   let sig = rsaSign('sha256', Buffer.from(payload), enc.privateKey);
   if (corruptEnclaveSig) { const b = Buffer.from(sig); b[5] ^= 0xff; sig = b; }
@@ -490,6 +492,71 @@ console.log('\nTest 6b: quote signed by the PCK key (old-bug shape) → must FAI
   check('audit fails', ok === false, `ok=${ok}`);
   check('quote_sig=false while attkey_bind=true (key roles enforced)',
     fw.includes('quote_sig=false') && fw.includes('attkey_bind=true'), fw.slice(0, 900));
+}
+
+console.log('\nTest 6c: TDX pre-flight v161 client binding (regression 2026-10-21)');
+{
+  // The TDX branch must honour session_context.preflight exactly like the SNP
+  // branch: a pre-flight envelope's report_data carries
+  //   SHA-256(P_enc ∥ code_challenge ∥ P_client ∥ client_nonce ∥ custom_info),
+  // [32..64] zero — NOT the SEC-02 session nonce (no PayPal user yet).
+  // The TDX path lacked this branch until 2026-10-21 and failed EVERY live
+  // pre-flight envelope with binding=false.
+  const clientEnc = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const clientPubDer = clientEnc.publicKey.export({ type: 'spki', format: 'der' });
+  const clientNonceHex = '7f'.repeat(32);
+  const codeChallenge = 'E9xrX1s2qO0hAaBcDeFgHiJkLmNoPqRsTuVwXyZ012345';
+  const pfCustom = 'wallet_pref_1';
+  const v161ReportData = (pEncDer) => {
+    const pre = Buffer.concat([
+      pEncDer, Buffer.from(codeChallenge, 'utf8'), clientPubDer,
+      Buffer.from(clientNonceHex, 'hex'), Buffer.from(pfCustom, 'utf8'),
+    ]);
+    return concat(new Uint8Array(sha256(pre)), new Uint8Array(32)); // digest ‖ zeros
+  };
+  const pfCtx = {
+    binding: 'v161', code_challenge: codeChallenge,
+    client_pub_b64: clientPubDer.toString('base64'),
+    client_nonce_hex: clientNonceHex, custom_info: pfCustom,
+  };
+
+  // (a) quote binds the v161 client inputs → binding=true, silicon verified
+  const good = await buildEnvelope({
+    sessionContext: { preflight: pfCtx },
+    hwBuilder: async (_nonce, pEncDer) => tdxHw({
+      quoteB64: (await buildTdxQuote({
+        version: 4, reportData: v161ReportData(pEncDer),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      })).b64,
+    }),
+  });
+  const g = await runAuditWith(good.envelope);
+  const gfw = fwDesc();
+  check('audit returns true (v161 binding honoured on TDX)', g.ok === true, `alert=${g.alert}`);
+  check('silicon root verified with v161 binding', gfw.includes('Intel TDX Silicon Root Verified'), gfw.slice(0, 900));
+  check('silicon row green (verified)', row('firmwareCheck').cls === 'check-item verified', row('firmwareCheck').cls);
+  check('success message names the v161.2 client binding',
+    gfw.includes('report_data == v161.2 client binding'), gfw.match(/report_data[^<]*/)?.[0]);
+
+  // (b) envelope claims v161 pre-flight but the quote carries SEC-02-shaped
+  //     data → binding=false (substituted/foreign quote fails closed)
+  const bad = await buildEnvelope({
+    sessionContext: { preflight: pfCtx },
+    hwBuilder: async (nonce) => tdxHw({
+      quoteB64: (await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      })).b64,
+    }),
+  });
+  const b = await runAuditWith(bad.envelope);
+  const bfw = fwDesc();
+  check('audit fails on foreign quote data', b.ok === false, `ok=${b.ok}`);
+  check('binding=false in verdict', bfw.includes('binding=false'), bfw.slice(0, 900));
+  check('failure names the expected v161.2 client binding',
+    bfw.includes('expected v161.2 client binding'), bfw.slice(0, 900));
 }
 
 console.log('\nTest 7: QE-report binding corrupted → attkey_bind=false');

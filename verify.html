@@ -1836,8 +1836,28 @@
                         // ---- session binding: TDREPORT10.report_data @520..584 ----
                         if (qBody.length < 584) throw new Error(`TDREPORT body ${qBody.length} bytes < 584`);
                         const qReportDataHex = hx(qBody.subarray(520, 584));
-                        const qBindingOk = qReportDataHex.slice(0, 64) === expectedNonce
-                            && qReportDataHex.slice(64) === '0'.repeat(64);
+                        // v161 (Pillars 2–5) — same branch as the SNP path:
+                        // pre-flight (client-bound) envelopes bind the BROWSER's
+                        // own inputs into the quote — SHA-256(P_enc ∥ code_challenge
+                        // ∥ P_client ∥ client_nonce ∥ custom_info), [32..64] zero —
+                        // NOT the SEC-02 session nonce (there is no PayPal user yet
+                        // at pre-flight). Login/callback envelopes keep SEC-02.
+                        // Without this branch every TDX pre-flight envelope failed
+                        // binding=false by construction (2026-10-21).
+                        const pfCtxTdx = report.session_context && report.session_context.preflight;
+                        let expectedTdxBindingHex, tdxBindingLabel;
+                        if (pfCtxTdx && pfCtxTdx.binding === 'v161') {
+                            expectedTdxBindingHex = (await preflightBindingHex(
+                                pubKeyBuffer, pfCtxTdx.code_challenge, b64ToDer(pfCtxTdx.client_pub_b64), pfCtxTdx.client_nonce_hex,
+                                pfCtxTdx.custom_info || 'NONE'
+                            )).padEnd(128, '0');
+                            tdxBindingLabel = 'v161.2 client binding (P_enc ∥ code_challenge ∥ P_client ∥ client_nonce ∥ custom_info)';
+                        } else {
+                            expectedTdxBindingHex = expectedNonce.padEnd(128, '0');
+                            // wording pinned by the offline harness (Test 2/5)
+                            tdxBindingLabel = 'session nonce';
+                        }
+                        const qBindingOk = qReportDataHex === expectedTdxBindingHex;
                         // MRTD (mr_td): after tee_tcb_svn16 + mr_seam48 + mr_signer_seam48
                         // + seam_attributes8 + td_attributes8 + xfam8 = offset 136.
                         const qMrtdHex = hx(qBody.subarray(136, 184));
@@ -1995,7 +2015,9 @@
                                 `⛓️ Attestation key bound into the QE report (SHA-256) and the QE report signed by the PCK leaf ✓<br>` +
                                 `⛓️ PCK chain: ${chainLabel}<br>` +
                                 `📜 PCK leaf "${esc(pckSubject)}" issued by: ${esc(pckIssuer)}<br>` +
-                                `🔐 report_data[0..32] == this session's combined nonce, [32..64] zero — bound ✓<br>` +
+                                `🔐 ${pfCtxTdx && pfCtxTdx.binding === 'v161'
+                                    ? 'report_data == v161.2 client binding (P_enc ∥ code_challenge ∥ P_client ∥ client_nonce ∥ custom_info), [32..64] zero — bound ✓'
+                                    : "report_data[0..32] == this session's combined nonce, [32..64] zero — bound ✓"}<br>` +
                                 `📏 MRTD: ${qMrtdHex.substring(0, 32)}… pinned ✓ (launch-chain ghost guard; source: ${esc(hw.tdx_evidence_source || 'unknown')})`;
                         } else {
                             siliconMsg = `❌ <b>Intel TDX quote present but verification FAILED</b> ` +
@@ -2004,7 +2026,7 @@
                                 `⚠️ PCK issuer was: "${esc(pckIssuer || 'n/a')}" — do NOT trust this report.<br>` +
                                 `⛓️ ${chainLabel}` +
                                 (!qBindingOk
-                                    ? `<br>ℹ️ quote report_data[0..32] = ${qReportDataHex.slice(0, 32)}…, expected session nonce = ${expectedNonce.slice(0, 32)}…`
+                                    ? `<br>ℹ️ quote report_data[0..32] = ${qReportDataHex.slice(0, 32)}…, expected ${tdxBindingLabel} = ${expectedTdxBindingHex.slice(0, 32)}…`
                                     : '');
                         }
                     } catch (err) {
