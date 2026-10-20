@@ -98,8 +98,12 @@ ENV LC_ALL=C.UTF-8
 
 RUN echo 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/20260406T000000Z\nSuites: trixie trixie-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/20260406T000000Z\nSuites: trixie-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.pgp' > /etc/apt/sources.list.d/debian.sources
 
+# `fdisk` (NOT util-linux) ships sfdisk on Debian — without it the GUID-pinning
+# calls in build-alibaba-image.sh silently failed and every disk build got
+# random parted GUIDs (2026-10-20: the reason CI's attested disk digest never
+# matched a locally built one).
 RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --no-install-recommends \
-    mtools parted dosfstools util-linux coreutils \
+    mtools parted dosfstools util-linux fdisk coreutils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build

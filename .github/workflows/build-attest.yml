@@ -94,6 +94,13 @@ jobs:
           # tolerance was the deterministic CI failure of the alibabacloud leg.
           sha256sum paypal-auth-vm-${{ matrix.platform }}.bin vmlinuz-${{ matrix.platform }} initramfs-${{ matrix.platform }}.img shimx64-${{ matrix.platform }}.efi grubx64-${{ matrix.platform }}.efi grub-${{ matrix.platform }}.cfg disk-${{ matrix.platform }}.tar.gz disk-alibaba.raw 2>/dev/null || true
           echo "========================="
+          # Publish the attested disk digest as a check-run annotation — job
+          # logs are repo-admin-only, but annotations are publicly readable via
+          # the check-runs API, so auditors can look the digest up against the
+          # "Attest ESP Disk Image" attestation without repo access.
+          if [ -f disk-alibaba.raw ]; then
+            echo "::notice title=disk-alibaba.raw sha256::$(sha256sum disk-alibaba.raw | cut -d' ' -f1)"
+          fi
 
       - name: Attest Enclave Binary
         if: matrix.platform != 'gcp' || github.ref == 'refs/heads/main'

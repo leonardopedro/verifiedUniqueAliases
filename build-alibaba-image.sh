@@ -90,9 +90,28 @@ PART_END_SECTOR=$(( 2048 + ESP_SECTORS - 1 ))
 parted -s "$RAW_IMAGE" mklabel gpt
 parted -s "$RAW_IMAGE" mkpart ESP fat32 2048s "${PART_END_SECTOR}s"
 parted -s "$RAW_IMAGE" set 1 esp on
-# Fixed, reproducible GUIDs (overwrites the random ones parted assigns)
-sfdisk --part-uuid "$RAW_IMAGE" 1 00000000-0000-0000-0000-000000000002 2>/dev/null || true
-sfdisk --disk-id "$RAW_IMAGE" 00000000-0000-0000-0000-000000000001 2>/dev/null || true
+# Fixed, reproducible GUIDs (overwrites the random ones parted assigns).
+# FAIL CLOSED (audit 2026-10-20): these used to be `2>/dev/null || true`, and
+# sfdisk was missing from the assembler image (Debian ships it in the `fdisk`
+# package, not util-linux) — so every build silently kept parted's RANDOM
+# GUIDs and no two builds (operator host vs CI) were byte-identical, which is
+# why no GitHub attestation ever existed for a locally built disk.
+sfdisk --part-uuid "$RAW_IMAGE" 1 00000000-0000-0000-0000-000000000002
+sfdisk --disk-id "$RAW_IMAGE" 00000000-0000-0000-0000-000000000001
+# Read back and verify the pins actually landed (byte-level reproducibility
+# gate — a silently-random GUID produces an unattestable disk image).
+READ_DISK_ID=$(sfdisk --disk-id "$RAW_IMAGE")
+READ_PART_ID=$(sfdisk --part-uuid "$RAW_IMAGE" 1)
+case "$READ_DISK_ID" in
+    *[!0-9A-Fa-f-]*|'') echo "FAIL: cannot read disk GUID"; exit 1 ;;
+esac
+if [[ "${READ_DISK_ID,,}" != "00000000-0000-0000-0000-000000000001" ]]; then
+    echo "FAIL: disk GUID not pinned (got $READ_DISK_ID)"; exit 1
+fi
+if [[ "${READ_PART_ID,,}" != "00000000-0000-0000-0000-000000000002" ]]; then
+    echo "FAIL: partition GUID not pinned (got $READ_PART_ID)"; exit 1
+fi
+echo "GPT GUIDs pinned: disk=$READ_DISK_ID part1=$READ_PART_ID"
 
 dd if="$ESP_IMAGE" of="$RAW_IMAGE" bs=512 seek=2048 conv=notrunc status=none
 touch -d "@$SOURCE_DATE_EPOCH" "$RAW_IMAGE"
