@@ -159,6 +159,11 @@ made from an OSS object via `ImportImage`.
   `InvalidSecurityToken.Expired`, run any harmless `aliyun <product> <Action>`
   once — the CLI auto-refreshes STS and rewrites the profile, after which the
   `/tmp/*-rpc.mjs` helpers work again (`sts_expiration` shows remaining life)
+- **`DescribeInstances` ignores a singular `InstanceId` param** — it silently
+  returns every instance in the region (bit me: polled the WRONG instance
+  after an EIP swap, watching "Running" on the new box while the old one had
+  already stopped). List all + filter client-side, or pass the plural
+  `InstanceIds` form
 
 ### Cloudflare DNS-01 token is IP-pinned to the reserved EIP (proven live 2026-10-20)
 
@@ -327,6 +332,9 @@ The system presents a signed **Remote Attestation Report** on the OAuth callback
   CI's attested digests.
 - **Live deployment**: new TDX instance `i-2ze0sd65q6qhot55aerq` holds the
   reserved EIP and serves TLS; old `i-2zefwa6bdimeg1rbcfsg` is the rollback
-  (Running, no EIP). Round-1 E2E against live PayPal has NOT run yet.
+  (**Stopped** once live E2E went green; restart + re-attach EIP to roll
+  back). Round-1 **E2E passed live** on both flows (CSRF cookie + PKCE
+  against real PayPal), live harness 90/90, console-PII 0 — details in
+  HANDOVER.md §3.
 - **State of play + remaining task list live in `HANDOVER.md`** (repo root) —
   read it before continuing the audit cycle.
