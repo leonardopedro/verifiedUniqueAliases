@@ -3251,7 +3251,13 @@ async fn generate_cert(
     let custom_info = if form.custom_info.trim().is_empty() {
         None
     } else {
-        Some(form.custom_info.clone())
+        // v166 SECURITY (audit round 2): cap the auditor-supplied marker. It is
+        // hashed into the SEC-02 nonce binding and echoed into the report page;
+        // unbounded it was a free ~2 MB per-request memory/egress amplifier
+        // (axum's default 2 MB form limit). The clamp is applied BEFORE the
+        // value enters the report, so enclave hash and auditor recomputation
+        // always see the same string.
+        Some(form.custom_info.trim().chars().take(256).collect::<String>())
     };
 
     let attestation = generate_attestation(&state, label.clone(), userinfo.clone(), custom_info).await;
@@ -3668,16 +3674,27 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
 
     // Build the main app router
     eprintln!("[DEBUG] building router");
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/", get(index))
         .route("/login", get(login))
         .route("/callback", get(callback))
         .route("/generate", axum::routing::post(generate_cert))
-        .route("/debug/attestation", get(debug_attestation))
         .route("/privacy", get(privacy))
         .route("/terms", get(terms))
         .route("/report", get(|| async { Redirect::to("/") }))
-        .route("/.well-known/acme-challenge/{token}", get(acme_challenge))
+        .route("/.well-known/acme-challenge/{token}", get(acme_challenge));
+    // v166 SECURITY (audit round 2, threat model: untrusted owner+cloud):
+    // `/debug/attestation` runs REAL TPM/TDX hardware quotes and echoes dmesg
+    // SEV/SNP lines plus silicon evidence. It stays mounted on the sandbox
+    // (staging) for bring-up, but production must not expose it: any internet
+    // client could burn quote capacity (each call = a hardware quote that
+    // competes with real attestations) and harvest boot-log/silicon detail.
+    // Production gets a plain 404 (route absent).
+    if state.staging {
+        info!("Staging environment: mounting /debug/attestation");
+        app = app.route("/debug/attestation", get(debug_attestation));
+    }
+    let app = app
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
     eprintln!("[DEBUG] router built");
