@@ -151,6 +151,19 @@ jobs:
           subject-name: ESP Disk Image (${{ matrix.label }})
           subject-path: disk-alibaba.raw
 
+      # v165 audit: verify.html's provenance row now gates the ENTIRE boot
+      # chain — shim/BOOTX64.EFI and grubx64.efi actually execute the kernel,
+      # so a loader swapped onto the disk by the cloud provider must surface
+      # as "not attested by CI" instead of passing unchecked.
+      - name: Attest ESP Boot Chain
+        if: matrix.platform == 'alibabacloud'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ESP Boot Chain (${{ matrix.label }})
+          subject-path: |
+            shimx64-${{ matrix.platform }}.efi
+            grubx64-${{ matrix.platform }}.efi
+
       - name: Upload artifacts
         if: matrix.platform != 'gcp' || github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4

@@ -469,7 +469,7 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ client_ecdh_pub_b64: pubB64, client_nonce_hex: nonceHex, flow: flow || 'verified', custom_info: customInfo === 'NONE' ? '' : customInfo })
             });
-            if (!resp.ok) throw new Error('pre-flight request rejected (HTTP ' + resp.status + ')');
+            if (!resp.ok) throw new Error('pre-flight request rejected (HTTP ' + resp.status + ')' + (resp.status === 404 ? ' — this deployment does not expose /attest/preflight; use the enclave\u2019s own Login page instead (hardware session binding via the quote\u2019s report_data is enforced either way)' : ''));
             const pf = await resp.json();
 
             say('🔏 Verifying enclave signature over the pre-flight fields…');
@@ -538,6 +538,32 @@
         { flow: 'full', client_id: 'ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address%20profile%20email%20https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
         // Production entries: add here at cutover (www.paypal.com authorize_base).
     ];
+
+    // ========================================================================
+    // v165 AUDIT (threat model: cloud provider + webservice owner COLUDE):
+    // MRTD PIN — the TDX launch measurement (quote body mr_td @136..184),
+    // byte-identical across two independent live quotes. Ghost-enclave guard:
+    // a valid Intel-signed quote proves silicon; this pin proves the silicon
+    // launched the AUDITED boot chain. SCOPE (honest): on this platform no
+    // hardware measurement covers the running image (RTMR[0] is all zeros,
+    // no vTPM) — MRTD covers the launch chain only, so running-code identity
+    // is enforced by EXPECTED_ENCLAVE_SHA256 + the CI attestation rows.
+    // Rotate DELIBERATELY, in a reviewed commit, when the boot chain changes.
+    // ========================================================================
+    var EXPECTED_MRTD = 'e0199499baacb2e4f4bc73046f25bedf674d42defbe4e854242bd6554a9d155edf7f3bff8e6202e63ed230e59ab2568a';
+
+    // ========================================================================
+    // v165 AUDIT: ENCLAVE CODE PIN — the ONE gate that stops colluding
+    // owner+cloud from green-lighting arbitrary code: CI provenance alone
+    // cannot, because the owner controls the repo (a malicious push is still
+    // "attested by CI"). The audited build's SHA-256 is pinned HERE; a swapped
+    // enclave fails this gate even if every signature/quote checks out, and a
+    // colluding owner must ALSO edit this file — a tamper visible in the
+    // audited commit history and to any user holding an independent copy of
+    // this page. Rotate ONLY together with the enclave source change, in the
+    // same reviewed commit (CI-harness fixtures read this value).
+    // ========================================================================
+    var EXPECTED_ENCLAVE_SHA256 = 'ebe9fa31465c314f8ed25f86171ab45f4fb343cd821e5da2296ef0d235822226';
 
     // ========================================================================
     // v162 (audit VULN-04): GOLDEN PCR PINS — CI-captured constants for the
@@ -660,7 +686,7 @@
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ client_ecdh_pub_b64: pubB64, client_nonce_hex: nonceHex, flow: 'verified', custom_info: customInfo === 'NONE' ? '' : customInfo })
             });
-            if (!resp.ok) throw new Error('pre-flight rejected (HTTP ' + resp.status + ')');
+            if (!resp.ok) throw new Error('pre-flight rejected (HTTP ' + resp.status + ')' + (resp.status === 404 ? ' — this deployment does not expose /attest/preflight; use the enclave\u2019s own Login page instead (hardware session binding via the quote\u2019s report_data is enforced either way)' : ''));
             const pf = await resp.json();
 
             say('🔏 Verifying S_enc signature + app pin + hardware binding…');
@@ -1452,6 +1478,16 @@
                 updateStatus('tpmCheck', true, "No TPM evidence in report — TPM-less platform (no vTPM), and this report carries no SNP report either. Green = absence is expected for this platform, NOT a verified proof; hardware trust is decided by the Silicon Root row below.");
             }
 
+            // v165 CODE PIN GATE (fail-closed, runs before any provenance
+            // lookup): see EXPECTED_ENCLAVE_SHA256 for rationale/rotation.
+            const CODE_PIN = (typeof EXPECTED_ENCLAVE_SHA256 === 'string') ? EXPECTED_ENCLAVE_SHA256 : '';
+            if (!/^[0-9a-f]{64}$/.test(CODE_PIN)) {
+                throw new Error('AUDITOR INTEGRITY FAILURE: EXPECTED_ENCLAVE_SHA256 is not a valid pinned digest — this copy of the auditor is incomplete or tampered. Aborting.');
+            }
+            if (boot.binary_sha256 !== CODE_PIN) {
+                throw new Error('ENCLAVE CODE PIN VIOLATION: this report was produced by binary sha256 ' + String(boot.binary_sha256 || 'absent').slice(0, 20) + '… but the audited build is pinned to ' + CODE_PIN.slice(0, 20) + '… — the deployed code is NOT the audited build (or this auditor copy is stale). Do NOT trust. Rotate the pin ONLY in the same reviewed commit that changes the enclave source.');
+            }
+
             // 4. Software Provenance (Hardware-Anchored PCR 15)
             // v161 (plan Pillar 1): the OCI ESP ships the MONOLITHIC UKI as
             // EFI/BOOT/BOOTX64.EFI (no shim/GRUB loose files) — its hash is
@@ -1460,14 +1496,24 @@
             // when present (GCP image / pre-v161 OCI images).
             const ukiLayout = !(diskManifest["EFI/BOOT/vmlinuz"] || diskManifest["vmlinuz"])
                 && !!(diskManifest["EFI/BOOT/BOOTX64.EFI"] || diskManifest["BOOTX64.EFI"]);
-            const [bin, ker, init, cfg, uki] = await Promise.all([
+            // v165 AUDIT (threat model: owner+cloud collusion): the ENTIRE
+            // loaded boot chain must be CI-attested, not just kernel/initrd/
+            // cmdline. BOOTX64.EFI (shim/UKI) and grubx64.efi are what actually
+            // execute the kernel — previously a backdoored shim/grub swapped
+            // onto the disk by the cloud provider yielded a self-consistent
+            // manifest that NOTHING compared to CI. NvVars is deliberately
+            // NEVER looked up: the firmware rewrites it at runtime (observed:
+            // a different hash on every boot), so it cannot be pinned.
+            const [bin, ker, init, cfg, uki, grubBin] = await Promise.all([
                 getProvenance(boot.binary_sha256, "Enclave Binary"),
                 getProvenance(boot.disk_manifest["EFI/BOOT/vmlinuz"] || boot.disk_manifest["vmlinuz"], "Linux Kernel"),
                 getProvenance(boot.disk_manifest["EFI/BOOT/initrd.img"] || boot.disk_manifest["initrd.img"], "Initramfs"),
-                getProvenance(boot.disk_manifest["EFI/BOOT/grub.cfg"] || boot.disk_manifest["grub.cfg"], "EFI Bootloader"),
-                getProvenance(boot.disk_manifest["EFI/BOOT/BOOTX64.EFI"] || diskManifest["BOOTX64.EFI"], "Enclave UKI (monolithic, direct boot)")
+                getProvenance(boot.disk_manifest["EFI/BOOT/grub.cfg"] || boot.disk_manifest["grub.cfg"], "Boot Config (grub.cfg)"),
+                getProvenance(boot.disk_manifest["EFI/BOOT/BOOTX64.EFI"] || diskManifest["BOOTX64.EFI"], "EFI Boot Chain (BOOTX64.EFI: shim/UKI)"),
+                getProvenance(boot.disk_manifest["EFI/BOOT/grubx64.efi"] || boot.disk_manifest["grubx64.efi"], "EFI Bootloader (grubx64.efi)")
             ]);
-            const imageComponents = ukiLayout ? [bin, uki] : [ker, init, cfg];
+            const imageComponents = ukiLayout ? [bin, uki] : [ker, init, cfg, uki, grubBin];
+            const provenanceComponents = ukiLayout ? [uki] : [ker, init, cfg, uki, grubBin];
             
             const expectedPcr15 = await calculatePcr15(boot.disk_manifest);
             const hasPcr15 = !!(hw.pcr_values && hw.pcr_values["pcr_15"]);
@@ -1502,15 +1548,17 @@
                     : 'component hashes were attested by DIFFERENT CI runs — not one atomic image build');
             const provResults =[
                 provLine(bin),
-                ukiLayout ? provLine(uki) : '',
+                ...provenanceComponents.map(provLine),
                 atomic ? `✅ Image Atomicity (Run #${esc([...commonRuns][0])})` : `❌ Image Atomicity — ${esc(atomicFail)}`,
                 hasPcr15
                     ? (pcr15Ok ? `✅ PCR 15 hardware binding mathematically verified` : `❌ PCR 15 Software Mismatch`)
                     : (hw.snp_report_b64
                         ? `ℹ️ PCR 15 not applicable (no TPM in this report) — session bound via SNP report_data. OCI scope: the SNP launch digest measures Oracle's OVMF launch firmware, NOT the virtual disk — disk/code integrity rests on the GitHub provenance lines above (self-reported manifest, audited against CI)`
-                        : `ℹ️ PCR 15 not applicable (no TPM in this report) — and no SNP report is present either, so no hardware quote in this report binds the session; disk/code integrity rests on the GitHub provenance lines above (self-reported manifest, audited against CI) and hardware trust is decided by the Silicon Root row below`)
+                        : (hw.tdx_quote_b64
+                            ? `ℹ️ PCR 15 not applicable (no TPM) — but a hardware-signed TDX quote IS present: report_data binds THIS session (verified in the Silicon Root row below). Disk/boot-chain integrity rests on the CI attestation lines above; code identity on the ENCLAVE CODE PIN gate at the top of this audit`
+                            : `ℹ️ PCR 15 not applicable (no TPM in this report) — and no SNP report is present either, so no hardware quote in this report binds the session; disk/code integrity rests on the GitHub provenance lines above (self-reported manifest, audited against CI) and hardware trust is decided by the Silicon Root row below`))
             ];
-            const anyApiBlocked = [bin, ker, init, cfg, uki].some(c => (c.reason || '').startsWith('api') || c.reason === 'network');
+            const anyApiBlocked = [bin, ker, init, cfg, uki, grubBin].some(c => (c.reason || '').startsWith('api') || c.reason === 'network');
             updateStatus('githubCheck', bin.success && atomic && pcr15Ok,
                 provResults.join('<br>') + (anyApiBlocked ? '<br>⚠️ GitHub API problems detected (rate limit is 60 req/h unauthenticated) — results above may be incomplete.' : ''));
 
@@ -1934,7 +1982,13 @@
                         const qeHash = new Uint8Array(await crypto.subtle.digest('SHA-256', qePreimage));
                         const qeReportData = qeReport.subarray(320, 384); // EnclaveReport.report_data @320
                         const attKeyBound = hx(qeHash) === hx(qeReportData.subarray(0, 32));
-                        tdxVerified = qBindingOk && qSigOk && attKeyBound && qeRepSigOk && issuerIntelOk && chainOk;
+                        // v165 MRTD PIN (ghost-enclave guard): an Intel-signed
+                        // quote proves silicon; the pin proves the audited
+                        // launch chain booted it. Fail-closed if EXPECTED_MRTD
+                        // is unset. Scope/rotation: see the EXPECTED_MRTD block.
+                        const mrtdPin = (typeof EXPECTED_MRTD === 'string' && EXPECTED_MRTD) ? EXPECTED_MRTD : '';
+                        const mrtdOk = !!mrtdPin && qMrtdHex === mrtdPin;
+                        tdxVerified = qBindingOk && qSigOk && attKeyBound && qeRepSigOk && issuerIntelOk && chainOk && mrtdOk;
                         if (tdxVerified) {
                             siliconMsg = `✅ <b>Intel TDX Silicon Root Verified</b><br>` +
                                 `🔏 Quote signature ECDSA P-256/SHA-256 by its attestation key over header+TDREPORT (v${qVersion}${bodyType ? ', body type ' + bodyType : ''}) valid<br>` +
@@ -1942,10 +1996,11 @@
                                 `⛓️ PCK chain: ${chainLabel}<br>` +
                                 `📜 PCK leaf "${esc(pckSubject)}" issued by: ${esc(pckIssuer)}<br>` +
                                 `🔐 report_data[0..32] == this session's combined nonce, [32..64] zero — bound ✓<br>` +
-                                `📏 MRTD: ${qMrtdHex.substring(0, 32)}… (source: ${esc(hw.tdx_evidence_source || 'unknown')})`;
+                                `📏 MRTD: ${qMrtdHex.substring(0, 32)}… pinned ✓ (launch-chain ghost guard; source: ${esc(hw.tdx_evidence_source || 'unknown')})`;
                         } else {
                             siliconMsg = `❌ <b>Intel TDX quote present but verification FAILED</b> ` +
-                                `(binding=${qBindingOk}, quote_sig=${qSigOk}, attkey_bind=${attKeyBound}, qe_report_sig=${qeRepSigOk}, issuer_intel=${issuerIntelOk}, root_chain=${chainOk})<br>` +
+                                `(binding=${qBindingOk}, quote_sig=${qSigOk}, attkey_bind=${attKeyBound}, qe_report_sig=${qeRepSigOk}, issuer_intel=${issuerIntelOk}, root_chain=${chainOk}, mrtd_pin=${mrtdOk})<br>` +
+                                (!mrtdOk ? `⚠️ MRTD pin mismatch: quoted launch measurement ${esc(qMrtdHex.slice(0, 32))}… ≠ the pinned audited chain — a DIFFERENT launch image (ghost enclave). Do NOT trust.<br>` : '') +
                                 `⚠️ PCK issuer was: "${esc(pckIssuer || 'n/a')}" — do NOT trust this report.<br>` +
                                 `⛓️ ${chainLabel}` +
                                 (!qBindingOk

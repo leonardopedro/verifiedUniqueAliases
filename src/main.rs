@@ -1659,6 +1659,20 @@ struct AppState {
     connection_semaphore: Arc<Semaphore>,
     boot_manifest: BTreeMap<String, String>,
     pending_attestations: Arc<RwLock<std::collections::HashMap<String, (String, PayPalUserInfo, Instant)>>>,
+    // v165 SECURITY (audit round 1, threat model: untrusted owner+cloud):
+    // one in-flight OAuth attempt per browser, created at /login and consumed
+    // EXACTLY ONCE at /callback. `nonce` (32 alnum) travels in BOTH the
+    // `state=<flow>.<nonce>` parameter and the HttpOnly `pav_oauth` cookie —
+    // a callback URL forged by an attacker cannot know the victim's cookie
+    // value, killing OAuth login CSRF. `code_verifier` implements PKCE so an
+    // authorization code injected out-of-context cannot be exchanged.
+    pending_oauth: Arc<RwLock<std::collections::HashMap<String, PendingOauth>>>,
+}
+
+struct PendingOauth {
+    flow: String,
+    code_verifier: String,
+    created: Instant,
 }
 
 struct PayPalFlowConfig {
@@ -2819,16 +2833,22 @@ async fn exchange_code_for_token(
     client_secret: &str,
     redirect_uri: &str,
     api_base: &str,
+    code_verifier: Option<&str>,
 ) -> Result<TokenResponse, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{}/v1/oauth2/token", api_base);
+    let mut form_params = vec![
+        ("grant_type", "authorization_code".to_string()),
+        ("code", code.to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+    ];
+    // PKCE: sent only when the caller completed a v165 login attempt.
+    if let Some(v) = code_verifier {
+        form_params.push(("code_verifier", v.to_string()));
+    }
     let resp = hardened_client()
         .post(&url)
         .basic_auth(client_id, Some(client_secret))
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", redirect_uri),
-        ])
+        .form(&form_params)
         .send()
         .await?;
 
@@ -2938,6 +2958,46 @@ async fn login(
     
     let auth_base = if state.staging { PAYPAL_SANDBOX_AUTH } else { PAYPAL_PRODUCTION_AUTH };
 
+    // v165 SECURITY (audit round 1):
+    //  * CSRF: `state` used to be the STATIC flow label (`&state=full`) with a
+    //    lenient default, so an attacker-authored authorization code could be
+    //    replayed into a victim's browser and /callback would happily exchange
+    //    it (classic OAuth login CSRF). `state` is now `<flow>.<nonce>` and the
+    //    same nonce is set as an HttpOnly/Secure/SameSite=Lax cookie; /callback
+    //    requires BOTH copies to agree and a matching pending_oauth entry.
+    //  * PKCE (RFC 7636, S256): the verifier stays server-side here; only the
+    //    challenge rides in the authorize URL, the verifier in the token
+    //    exchange — a code captured out-of-context cannot be redeemed.
+    use base64::Engine as _;
+    use rand::Rng;
+    use sha2::{Digest as _, Sha256};
+    let nonce: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+    let mut verifier_raw = [0u8; 32];
+    rand::thread_rng().fill(&mut verifier_raw);
+    let code_verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_raw);
+    let challenge = {
+        let mut h = Sha256::new();
+        h.update(code_verifier.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h.finalize())
+    };
+    {
+        let mut pending = state.pending_oauth.write();
+        pending.retain(|_, p| p.created.elapsed() < Duration::from_secs(900));
+        pending.insert(
+            nonce.clone(),
+            PendingOauth { flow: config.label.clone(), code_verifier, created: Instant::now() },
+        );
+    }
+    let state_param = format!("{}.{}", config.label, nonce);
+    let cookie = format!(
+        "pav_oauth={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=900",
+        nonce
+    );
+
     // v164 (live E2E fix): `config.scope` is stored ALREADY percent-encoded
     // (see FlowConfig construction — the same strings are compared verbatim
     // against verify.html's EXPECTED_APPS and inserted as-is by the browser
@@ -2946,14 +3006,19 @@ async fn login(
     // individually) but the full flow collapsed into ONE invalid scope token
     // and PayPal rejected the authorize request with "(invalid scope)".
     let url = format!(
-        "{}?client_id={}&response_type=code&scope={}&redirect_uri={}&state={}",
+        "{}?client_id={}&response_type=code&scope={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
         auth_base,
         config.client_id,
         config.scope, // already query-encoded — do NOT encode again
         urlencoding::encode(&state.redirect_uri),
-        config.label
+        urlencoding::encode(&state_param),
+        challenge
     );
-    Redirect::temporary(&url).into_response()
+    (
+        [(axum::http::header::SET_COOKIE, cookie)],
+        Redirect::temporary(&url),
+    )
+        .into_response()
 }
 
 async fn debug_attestation() -> impl IntoResponse {
@@ -3005,6 +3070,7 @@ async fn debug_attestation() -> impl IntoResponse {
 
 async fn callback(
     Query(query): Query<CallbackQuery>,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
 ) -> Response {
@@ -3012,14 +3078,63 @@ async fn callback(
         return (StatusCode::BAD_REQUEST, "Error from PayPal").into_response();
     }
     let code = query.code.clone().unwrap_or_default();
-    let flow = query.state.as_deref().unwrap_or("full");
-    let config = state.get_flow_config(flow);
+    // v165 SECURITY (audit round 1): OAuth login-CSRF + PKCE validation.
+    // `state` must be `<flow>.<nonce>` (32 alnum), the SAME nonce must be in
+    // the HttpOnly pav_oauth cookie this browser received when the flow
+    // STARTED, and a matching one-time pending_oauth entry must exist (it
+    // carries the flow and the PKCE verifier). An attacker-crafted
+    // /callback?code=… link cannot satisfy all three in a victim's browser.
+    // (The nonce is a per-flow CSRF secret, not a long-term credential, so a
+    // plain string compare over TLS is fine — no early-exit oracle worth
+    // having at HTTP round-trip cost.)
+    let state_param = query.state.clone().unwrap_or_default();
+    let (state_flow, nonce) = match state_param.split_once('.') {
+        Some((f, n)) if !f.is_empty() && n.len() == 32 && n.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            (f.to_string(), n.to_string())
+        }
+        _ => {
+            return (
+                StatusCode::FORBIDDEN,
+                "OAuth state missing or malformed — restart the login from this site (do not open hand-crafted callback links).",
+            )
+                .into_response();
+        }
+    };
+    let cookie_nonce = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.split(';')
+                .map(|kv| kv.trim())
+                .find_map(|kv| kv.strip_prefix("pav_oauth=").map(|s| s.to_string()))
+        });
+    if cookie_nonce.as_deref() != Some(nonce.as_str()) {
+        return (
+            StatusCode::FORBIDDEN,
+            "OAuth session cookie missing or mismatched (login CSRF guard) — restart the login from this site.",
+        )
+            .into_response();
+    }
+    // One-time consumption: the pending entry is removed even if the exchange
+    // later fails, so a nonce can never redeem two codes (replay window = 0).
+    let pending_entry = state.pending_oauth.write().remove(&nonce);
+    let (flow, code_verifier) = match pending_entry {
+        Some(p) if p.flow == state_flow => (p.flow, p.code_verifier),
+        _ => {
+            return (
+                StatusCode::FORBIDDEN,
+                "OAuth attempt unknown or already used — restart the login from this site.",
+            )
+                .into_response();
+        }
+    };
+    let config = state.get_flow_config(&flow);
     
     let redirect_uri = state.redirect_uri.clone();
 
     let api_base = if state.staging { PAYPAL_SANDBOX_API } else { PAYPAL_PRODUCTION_API };
 
-    let token = match exchange_code_for_token(&code, &config.client_id, &config.client_secret, &redirect_uri, api_base).await {
+    let token = match exchange_code_for_token(&code, &config.client_id, &config.client_secret, &redirect_uri, api_base, Some(&code_verifier)).await {
         Ok(t) => t,
         Err(e) => {
             error!("Token exchange failed: {}", e);
@@ -3524,6 +3639,7 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
         connection_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
         boot_manifest,
         pending_attestations: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        pending_oauth: Arc::new(RwLock::new(std::collections::HashMap::new())),
     });
 
     // v117: Background task for cleaning up expired pending attestations (DoS mitigation)
@@ -3542,6 +3658,11 @@ async fn async_main(boot_manifest: BTreeMap<String, String>) -> Result<(), Box<d
             if before != after {
                 info!("Cleaned up {} expired pending attestations ({} remaining)", before - after, after);
             }
+            drop(pending);
+            // v165: same hygiene for in-flight OAuth attempts (verifiers +
+            // CSRF nonces) — /login also prunes on insert; belt and braces.
+            let mut oauth = state_for_cleanup.pending_oauth.write();
+            oauth.retain(|_, p| p.created.elapsed() < Duration::from_secs(900));
         }
     });
 

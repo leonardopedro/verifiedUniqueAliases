@@ -204,7 +204,7 @@ async function buildTdxQuote(o) {
     version = 4, bodyType = 2, reportData, innerChainPems, leafKey,
     tamperQuoteSig = false, corruptQeReportData = false, quoteSigByPckKey = false,
     vendorId = INTEL_VENDOR, teeType = 0x81, attKeyType = 2,
-    outerCertType = 6, forceBodySize = null, mrtdFill = 0x42,
+    outerCertType = 6, forceBodySize = null, mrtdFill = null,
   } = o;
   if (!reportData || reportData.length !== 64) throw new Error('reportData must be 64 bytes');
   const bodyLen = bodyType === 3 ? 648 : 584;
@@ -229,7 +229,16 @@ async function buildTdxQuote(o) {
   fillAt(body, 112, 8, 0x44);   // seam_attributes
   fillAt(body, 120, 8, 0x55);   // td_attributes
   fillAt(body, 128, 8, 0x66);   // xfam
-  fillAt(body, 136, 48, mrtdFill); // mr_td (MRTD) @136
+  // mr_td (MRTD) @136 — default fixture = the PINNED audited MRTD
+  // (EXPECTED_MRTD gate rejects anything else); pass mrtdFill as a byte to
+  // exercise the mismatch path. Empty/absent pin → zeros → never matches
+  // (fail-closed, same as verify.html).
+  if (mrtdFill === null) {
+    const pin = (typeof EXPECTED_MRTD === 'string' && /^[0-9a-f]{96}$/.test(EXPECTED_MRTD)) ? EXPECTED_MRTD : '';
+    body.set(Uint8Array.from(Buffer.from(pin, 'hex')), 136);
+  } else {
+    fillAt(body, 136, 48, mrtdFill);
+  }
   fillAt(body, 184, 48, 0x77);  // mr_config_id
   fillAt(body, 232, 48, 0x88);  // mr_owner
   fillAt(body, 280, 48, 0x99);  // mr_owner_config
@@ -273,15 +282,21 @@ const DISK_MANIFEST = {
   'EFI/BOOT/vmlinuz': 'cc'.repeat(32),
   'EFI/BOOT/initrd.img': 'dd'.repeat(32),
   'EFI/BOOT/grub.cfg': 'ee'.repeat(32),
+  // v165: full boot chain — shim/UKI + grub are now inside the atomicity gate
+  'EFI/BOOT/BOOTX64.EFI': 'aa'.repeat(32),
+  'EFI/BOOT/grubx64.efi': '99'.repeat(32),
 };
-const BINARY_SHA = 'bb'.repeat(32);
-async function buildEnvelope({ hw, customInfo = 'wallet_test_1', corruptEnclaveSig = false, hwBuilder }) {
+// v165: fixtures must produce the PINNED audited binary (see
+// EXPECTED_ENCLAVE_SHA256 in verify.html) — the code-pin gate rejects
+// anything else, by design.
+const BINARY_SHA = EXPECTED_ENCLAVE_SHA256;
+async function buildEnvelope({ hw, customInfo = 'wallet_test_1', corruptEnclaveSig = false, hwBuilder, binarySha = BINARY_SHA }) {
   const enc = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const encPem = enc.publicKey.export({ type: 'spki', format: 'pem' }).toString();
   const report = {
     custom_info: customInfo,
     enclave_config: {
-      boot_measurements: { binary_sha256: BINARY_SHA, disk_manifest: DISK_MANIFEST },
+      boot_measurements: { binary_sha256: binarySha, disk_manifest: DISK_MANIFEST },
       domain: 'login.airma.de',
     },
     paypal_user_info_raw_hash: '11'.repeat(32),
@@ -292,7 +307,7 @@ async function buildEnvelope({ hw, customInfo = 'wallet_test_1', corruptEnclaveS
   const nonce = await nonce160Hex(
     fromHex(report.paypal_user_info_raw_hash),
     new Uint8Array(sha256(pemToDer(encPem))),
-    customInfo, BINARY_SHA, DISK_MANIFEST,
+    customInfo, binarySha, DISK_MANIFEST,
   );
   if (hwBuilder) report.hardware_level_attestation = await hwBuilder(nonce);
   const payload = JSON.stringify(reorder(report));
@@ -373,7 +388,7 @@ let v4Envelope;
   check('firmwareCheck verified', row('firmwareCheck').cls === 'check-item verified', `cls=${row('firmwareCheck').cls}`);
   check('TDX silicon root message', fw.includes('Intel TDX Silicon Root Verified'), fw.slice(0, 900));
   check('chain pinned (leaf → Intel root)', /leaf → Intel SGX Root CA pinned/.test(fw), fw.slice(0, 900));
-  check('MRTD read at mr_td @136 (0x42 fill)', fw.includes('42'.repeat(16)) && !fw.includes('22'.repeat(16)), fw.match(/MRTD: [0-9a-f]+…/)?.[0]);
+  check('MRTD read at mr_td @136 equals pinned EXPECTED_MRTD', fw.includes(EXPECTED_MRTD.slice(0, 32)) && !fw.includes('22'.repeat(16)), fw.match(/MRTD: [0-9a-f]+…/)?.[0]);
   check('session binding stated', fw.includes("report_data[0..32] == this session's combined nonce"));
   check('tpmCheck green (TPM-less platform)', row('tpmCheck').cls === 'check-item verified', row('tpmCheck').cls);
   check('githubCheck green (attested provenance)', row('githubCheck').cls === 'check-item verified', row('githubCheck').cls);
@@ -396,7 +411,9 @@ console.log('\nTest 3: valid quote v5 body_type=2 (TDREPORT10) — chain incl. r
   const fw = fwDesc();
   check('audit returns true', ok === true, `alert=${alert}`);
   check('v5 accepted with pinned chain', fw.includes('Intel TDX Silicon Root Verified') && fw.includes('leaf → Intel SGX Root CA pinned'), fw.slice(0, 900));
-  check('MRTD correct', fw.includes('42'.repeat(16)) && !fw.includes('22'.repeat(16)), fw.match(/MRTD: [0-9a-f]+…/)?.[0]);
+  // v165: fixture MRTD now defaults to EXPECTED_MRTD (the pin gate rejects
+  // anything else), so assert the displayed value equals the pin prefix.
+  check('MRTD correct (pinned EXPECTED_MRTD)', fw.includes(EXPECTED_MRTD.slice(0, 32)) && !fw.includes('22'.repeat(16)), fw.match(/MRTD: [0-9a-f]+…/)?.[0]);
 }
 
 console.log('\nTest 4: valid quote v5 body_type=3 (TDREPORT15, 648 B) — report_data NOT last 64');
@@ -847,6 +864,65 @@ console.log('\nTest 21c: golden-PCR pcr_values injection neutralized');
   check('hostile-pcr report still passes its self-consistent checks', ok === true, `ok=${ok}`);
   check('golden-PCR UNPINNED detail rendered escaped (no raw <img in tpm row)',
     !tpmDesc.includes('<img src=x') && tpmDesc.includes('&lt;img src=x'), tpmDesc.slice(0, 400));
+}
+
+console.log('\nTest 21d: ENCLAVE CODE PIN gate rejects non-audited binary');
+{
+  // v165: the pin is what stops colluding owner+cloud from green-lighting
+  // arbitrary code — CI provenance alone cannot (the owner controls the repo).
+  // The report is correctly S_ENC-signed for the wrong binary: only the pin
+  // can catch it. (hw must be present: step 3 rejects evidence-less reports
+  // before the pin gate runs; marker-only evidence suffices.)
+  const built = await buildEnvelope({ binarySha: 'ff'.repeat(32), hw: {} });
+  const { ok, alert } = await runAuditWith(built.envelope);
+  check('audit fails closed', ok === false, `ok=${ok}`);
+  check('failure names the CODE PIN violation', /ENCLAVE CODE PIN VIOLATION/.test(alert || ''), (alert || '').slice(0, 200));
+}
+
+console.log('\nTest 21e: MRTD pin gate rejects a different launch chain');
+{
+  // A fully valid Intel-signed quote + valid binding/chain, but MRTD from a
+  // different (ghost) launch image → silicon root must FAIL (mrtd_pin=false).
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+        mrtdFill: 0x42, // ghost launch chain
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  const { ok, alert } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('audit fails closed despite valid quote', ok === false, `ok=${ok}`);
+  check('silicon row shows mrtd_pin=false', /mrtd_pin=false/.test(fw), fw.slice(0, 400));
+  check('ghost-launch wording surfaced', /MRTD pin mismatch/.test(fw), fw.slice(0, 400));
+}
+
+console.log('\nTest 21f: unattested boot-chain files (shim/grub) fail the provenance row');
+{
+  // v165: BOOTX64.EFI (shim/UKI) and grubx64.efi must be IN the row — a
+  // backdoored loader swapped by the cloud provider shows up here.
+  fetchMode = '404';
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  await runAuditWith(built.envelope);
+  const gh = row('githubCheck');
+  fetchMode = 'ok';
+  check('provenance row failed without CI attestations', gh.cls === 'check-item failed', gh.cls);
+  check('row names the unattested shim/BOOTX64 component',
+    gh.desc.includes('EFI Boot Chain (BOOTX64.EFI') && gh.desc.includes('NO GitHub attestation'), gh.desc.slice(0, 700));
+  check('row names the unattested grubx64 component', gh.desc.includes('EFI Bootloader (grubx64.efi)'), gh.desc.slice(0, 700));
 }
 
 // ---- Optional: a REAL report captured from the live enclave ---------------
