@@ -79,8 +79,8 @@ Git: **HEAD = `6494e92` ("m" — user's concurrent commit containing this
 session's `AGENTS.md` updates, pushed; sits on top of `0e15b7a` ("m") which
 contains the rebuilt disk `output-alibaba/disk-alibaba.raw`, sha `00963ad5…`
 = CI's attested digest, rebuilt 03:27). Branch in sync with
-`origin/alibabacloud`. Working tree: **only `HANDOVER.md` untracked** (task
-T8). (Heads-up: the repo sees concurrent human commits — re-check `git log`
+`origin/alibabacloud`; `6e1f71e` (this file + the AGENTS.md status refresh)
+pushed too — working tree clean. (Heads-up: the repo sees concurrent human commits — re-check `git log`
 before acting on git state from this file.)
 
 ### 2.3 How the redeploy happened (compressed timeline, for reproduction)
@@ -155,9 +155,9 @@ node /tmp/ali-rpc.mjs ecs RebootInstance RegionId=cn-beijing InstanceId=<new>
 - [ ] **T7 · Close the loop**: when done, summarize for the user; update
   AGENTS.md/HANDOVER.md state sections; consider `gravity_index` reporting is
   N/A here (no new third-party integration was added).
-- [ ] **T8 · Commit this file**: `AGENTS.md` was committed by the user as
-  `6494e92`; **`HANDOVER.md` is still untracked** — commit it (no secrets in
-  it; verified 0 matches for token/key patterns) when convenient.
+- [x] **T8 · Commit the state docs** — ✅ `HANDOVER.md` + AGENTS.md status
+  refresh committed as **`6e1f71e`** and pushed (secrets-free: 0 matches for
+  token/key patterns).
 
 Definition of done for the whole mission: **no unfixed findings without a
 written justification, CI green, live deployment running the audited build,
