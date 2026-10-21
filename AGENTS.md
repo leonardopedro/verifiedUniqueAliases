@@ -93,6 +93,41 @@ GCP Confidential VMs (n2d with AMD SEV-SNP) **do not pre-provision persistent At
 
 ## Alibaba Cloud Platform Notes
 
+### 🖥️ Instance & Disk Policy (user-mandated 2026-10-21 — apply on every deploy)
+
+1. **Confidential VM: 1 GiB system disk, in-place disk rewrites only.**
+   - The prod enclave instance keeps a **1 GiB `cloud_auto` system disk**.
+   - Redeploying = **rewrite the disk of the SAME instance**
+     (`ReplaceSystemDisk` with the new image id) — **never** stop/release/
+     create a replacement Confidential VM as long as its disk is 1 GiB.
+     The old instance may be kept stopped as a rollback, but new deploys
+     never spin up new Confidential VMs.
+   - Trap: the `aliyun` CLI's `ReplaceSystemDisk` exposes neither size
+     nor category flags and silently defaults to **20 GiB** (the `DiskSize`
+     RPC name is also wrong — the real API parameter is **`SystemDisk.Size`**
+     in GiB, sent flat via the hand-signed `/tmp/ecs-call.mjs` RPC together
+     with `SystemDisk.Category=cloud_auto`). Always verify
+     `DescribeDisks … Size==1GiB` before starting the box.
+   - **Overshoot is IRREVERSIBLE**: once a disk is >1 GiB, both
+     `ReplaceSystemDisk` (`InvalidSystemDiskSize.ValueNotSupported`) and
+     `ResizeDisk` (`InvalidDiskSize.TooSmall`, param name `NewSize`) refuse
+     any smaller size. The only recovery is role-swapping to another
+     instance that still has a 1 GiB disk (EIP move — proven 2026-10-21).
+   - Trap: always `RebootInstance --ForceStop true` — the enclave PID 1
+     does not ACK graceful ACPI shutdown, so a default (graceful) reboot
+     hangs in `Stopping` for minutes and applies late.
+2. **Relay VM: minimal hardware, 1 GiB disk, economy-stopped when idle.**
+   - The relay must use the **smallest/cheapest instance type** that can
+     shuttle the ~46 MiB image and a **1 GiB system disk**.
+   - It must be **stopped in Economy mode immediately after each
+     transfer** (`StopInstance --StoppedMode StopCharging`) — it must
+     never idle in the running state.
+3. **Relay VM: spot / preemptible.**
+   - Create it with `InstanceChargeType=PostPaid` +
+     `SpotStrategy=SpotAsPriceGo` (spot pricing, no protection period).
+   - A pre-existing non-spot relay may only be replaced by creating the
+     spot one, verifying it with a real transfer, then releasing the old.
+
 ### Target Instance Type: ecs.c9i.xlarge (4 vCPU / 8 GiB, Intel TDX) in cn-beijing-i
 - Live-proven 2026-10-16: spot `ecs.c9i.xlarge` (SpotAsPriceGo, no protection period) boots the ESP image end-to-end — DHCP, IMDS, `user_data` config load, NVMe ESP measurement (6 files), HTTP:80 + HTTPS:443, all green
 - Cheapest TDX shape available: Beijing quotes **$0.024/h** spot vs $0.040/h for Hangzhou's minimum (Hangzhou only offers TDX on `r9i.xlarge` and up, i.e. 32 GiB). Everything (bucket, image, instance) must live in one region
