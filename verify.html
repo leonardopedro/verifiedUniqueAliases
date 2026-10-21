@@ -186,32 +186,37 @@
 
 <div class="container">
     <header>
-        <a href="index.html" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Back to Hub</a>
-        <h1>Secure Enclave Auditor</h1>
-        <p class="subtitle">Hardware-Rooted Attestation Verification v140</p>
+        <a href="https://leonardopedro.github.io/verifiedUniqueAliases/" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Project Hub (source code, privacy, terms)</a>
+        <h1>Hardware-Attested PayPal Login</h1>
+        <p class="subtitle">Prove the machine handling your PayPal login is genuine confidential-computing hardware — then log in.</p>
     </header>
 
     <div class="grid">
-        <div class="input-card">
-            <label>Attestation JSON Report</label>
-            <div style="margin-bottom: 15px;">
-                <input type="file" id="reportFile" accept=".json" class="file-input">
-            </div>
-            <textarea id="attestationInput" placeholder="Paste report or use file upload above..."></textarea>
+        <div class="input-card" style="grid-column: span 2; border-color: #4caf50; background: rgba(76, 175, 80, 0.05);">
+            <label style="color: #4caf50;">⭐ Most visitors only need this: click “Log in with PayPal” in Step 1</label>
+            <p style="color: var(--text-dim); font-size: 0.95rem; margin: 0;">Before you are sent to PayPal, this page downloads the enclave's live hardware proof (an Intel TDX quote) and audits it here, in your browser. If any check fails, the login does not start. The later steps are optional tools for auditing manually.</p>
         </div>
-        <div class="input-card">
-            <label>Browser TLS Certificate (Optional)</label>
-            <div style="margin-bottom: 15px;">
-                <input type="file" id="certFile" class="file-input">
+    </div>
+
+    <div class="grid" style="margin-top: -10px;">
+        <div class="input-card" style="grid-column: span 2; border-color: #4caf50;">
+            <label>Step 1 — Log in with PayPal (recommended)</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">Your browser generates a throwaway encryption key that never leaves this page. It is baked into the enclave's hardware quote together with the login challenge, so the proof audited below is proof about <i>this</i> login. Your PayPal identity comes back encrypted to that key — neither the site owner (who holds the PayPal client secret and can issue TLS certificates for this domain) nor the cloud provider (who sees all traffic leaving the machine) can read it. After the hardware audit passes, <b>this page</b> builds the PayPal link; the enclave never redirects you.</p>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                <button onclick="executePreflightAndLogin('verified')" style="background:#4caf50;">🔒 Log in with PayPal (Verified account only)</button>
+                <button onclick="executePreflightAndLogin('full')">🔒 Log in with PayPal (Share full profile)</button>
             </div>
-            <textarea id="certInput" placeholder="Paste .pem or use file upload above..."></textarea>
+            <input type="text" id="customInfoInput" maxlength="512"
+                placeholder="Optional: your public key / wallet / nonce — bound into the hardware quote and the report"
+                style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
+            <p id="secureLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
         </div>
-        <button onclick="runAudit()">Perform Cryptographic Audit</button>
     </div>
 
     <div class="grid" style="margin-top: -10px;">
         <div class="input-card" style="grid-column: span 2;">
-            <label>Step 1 — Pre-Flight: verify the LIVE enclave BEFORE logging in</label>
+            <label>Step 2 — Optional: audit the enclave before logging in</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">Want to inspect the hardware proof <i>before</i> starting a login? Paste the enclave's address (the same page you are on) and run the pre-flight check: it fetches <code>/debug/envelope</code>, audits it in full, and pins the enclave's one-time key. Step 1 then fails if that key changes — so you log into the exact machine you audited.</p>
             <div style="display: flex; gap: 10px;">
                 <input type="text" id="preflightUrl" placeholder="https://login.example-domain" style="flex: 1; background: #0d1117; border: 1px solid #30363d; border-radius: 8px; color: #58a6ff; padding: 10px; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; outline: none;">
                 <button onclick="runPreflight()" style="grid-column: auto; margin: 0; padding: 10px 18px; font-size: 0.95rem; border-radius: 8px; white-space: nowrap;">Pre-Flight Check</button>
@@ -221,22 +226,9 @@
     </div>
 
     <div class="grid" style="margin-top: -10px;">
-        <div class="input-card" style="grid-column: span 2; border-color: #4caf50;">
-            <label>Step 0 — Secure Login (Pillars 2–5): hardware-bound, client-encrypted</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem;">Generates YOUR ephemeral session keypair in this browser and binds it — together with the PKCE challenge — into the AMD SEV-SNP hardware quote. After the live hardware audit passes, THIS page builds the PayPal authorize URL (the enclave never redirects). Your identity comes back encrypted to your key: neither the domain owner (who holds the PayPal client secret and can mint genuine TLS certs) nor the cloud provider (who sees all RAM-exit traffic) can read it.</p>
-            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                <button onclick="executePreflightAndLogin('verified')" style="background:#4caf50;">🔒 Secure Login (Verified only)</button>
-                <button onclick="executePreflightAndLogin('full')">🔒 Secure Login (Full Data)</button>
-            </div>
-            <input type="text" id="customInfoInput" maxlength="512"
-                placeholder="Optional: your public key / wallet / nonce — bound into the AMD hardware quote and the report"
-                style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
-            <p id="secureLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
-        </div>
-
-        <div class="info">
-            <label>Step 0-L — Local Auditor (strongest): keys never touch the enclave origin</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem;">Audit VULN-02: a TLS-terminating owner can inject script into any page served from the enclave origin. This flow closes it — run THIS page from a trusted local copy (right-click → Save As from the GitHub raw URL, then open as a <code>file://</code> page): your keys are generated here and the encrypted report is claimed from <code>/e2ee-blob</code> over your own channel. Anything injected on the enclave origin sees ciphertext only.</p>
+        <div class="input-card" style="grid-column: span 2;">
+            <label>Step 3 — Advanced: run this page from your own copy (strongest)</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">A server owner with a TLS certificate for this domain can inject script into any page it serves — including this one. To remove that trust entirely: save this page from the project's GitHub (<code>verify.html</code>), open the saved file locally (<code>file://</code>), and use the two buttons below in order. Your keys are then created on <i>your</i> machine and the encrypted report is fetched over your own channel — anything injected on the enclave's origin only ever sees ciphertext.</p>
             <input type="text" id="localEnclaveHost" placeholder="https://login.airma.de"
                 style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
             <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px;">
@@ -248,8 +240,37 @@
         </div>
     </div>
 
+    <div class="grid" style="margin-top: -10px;">
+        <div class="input-card" style="grid-column: span 2;">
+            <label>Step 4 — Manual audit: verify a report you already have</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">Have a saved report JSON (💾 offered on the login success page, or the Download button that appears after any passing audit)? Upload or paste it below to audit it offline — the saved file works with <b>any</b> copy of the auditor, including the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color: #64b5f6;">GitHub Pages copy</a> or your own saved <code>verify.html</code>. The optional certificate field additionally binds a saved TLS certificate to the report.</p>
+            <label style="margin-top: 8px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Attestation JSON report</label>
+            <div style="margin-bottom: 15px;">
+                <input type="file" id="reportFile" accept=".json" class="file-input">
+            </div>
+            <textarea id="attestationInput" placeholder="Paste report or use file upload above..."></textarea>
+            <label style="margin-top: 12px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Browser TLS certificate (optional)</label>
+            <div style="margin-bottom: 15px;">
+                <input type="file" id="certFile" class="file-input">
+            </div>
+            <textarea id="certInput" placeholder="Paste .pem or use file upload above..."></textarea>
+            <button onclick="runAudit()" style="margin-top: 15px;">Perform Cryptographic Audit</button>
+        </div>
+    </div>
+
+    <div class="grid" style="margin-top: -10px;">
+        <div class="input-card" style="grid-column: span 2;">
+            <label>Seeing “No valid Silicon Root of Trust”?</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem; margin: 0;">The audit is fail-closed: that alert means the hardware evidence in the report did not verify. The two common benign causes are (1) <b>this auditor page is out of date</b> — always take the latest <code>verify.html</code> from the project's GitHub rather than a cached copy — and (2) the report came from an older enclave build. Only trust a report that passes every check here.</p>
+        </div>
+    </div>
+
     <div id="resultsArea" class="results">
         <div class="status-card">
+            <!-- v164: unlocked only by a fully green audit — the saved JSON is
+                 the user's portable evidence, auditable OFFLINE in any copy of
+                 the auditor (external GitHub Pages copy / saved local copy). -->
+            <button id="reportDownloadBtn" onclick="downloadReportFile()" style="display:none; width:100%; margin-bottom:18px;">💾 Download Attestation Report (JSON)</button>
             <div class="timestamp-box">
                 Account Security Bound at:<br>
                 <span id="signTime">Not verified</span>
@@ -282,8 +303,8 @@
             <div id="firmwareCheck" class="check-item">
                 <div class="check-icon">💎</div>
                 <div class="check-text">
-                    <h4>AMD Silicon Root of Trust</h4>
-                    <p id="firmwareDesc">Proves the platform is a genuine AMD SEV-SNP processor with untampered firmware.</p>
+                    <h4>Silicon Root of Trust (AMD SEV-SNP / Intel TDX)</h4>
+                    <p id="firmwareDesc">Proves the platform is genuine confidential-compute silicon (AMD SEV-SNP or Intel TDX) with untampered measurements.</p>
                 </div>
             </div>
 
@@ -469,7 +490,7 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ client_ecdh_pub_b64: pubB64, client_nonce_hex: nonceHex, flow: flow || 'verified', custom_info: customInfo === 'NONE' ? '' : customInfo })
             });
-            if (!resp.ok) throw new Error('pre-flight request rejected (HTTP ' + resp.status + ')');
+            if (!resp.ok) throw new Error('pre-flight request rejected (HTTP ' + resp.status + ')' + (resp.status === 404 ? ' — this deployment does not expose /attest/preflight; use the enclave\u2019s own Login page instead (hardware session binding via the quote\u2019s report_data is enforced either way)' : ''));
             const pf = await resp.json();
 
             say('🔏 Verifying enclave signature over the pre-flight fields…');
@@ -529,10 +550,41 @@
     // ========================================================================
     var EXPECTED_APPS = [
         // Sandbox (staging deployment — live-captured 2026-10-14)
-        { flow: 'verified', client_id: 'ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
-        { flow: 'full', client_id: 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address%20profile%20email%20https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
+        // App pairing (2026-10-19): the verified flow uses the REST app that
+        // has NO PII scopes enabled (profile/email/address are rejected at the
+        // app level), so minimal disclosure is structurally enforced by PayPal,
+        // not just by the requested scope. The full flow uses the PII-capable
+        // app. Swapping these back will break the full flow with "invalid scope".
+        { flow: 'verified', client_id: 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
+        { flow: 'full', client_id: 'ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address%20profile%20email%20https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
         // Production entries: add here at cutover (www.paypal.com authorize_base).
     ];
+
+    // ========================================================================
+    // v165 AUDIT (threat model: cloud provider + webservice owner COLUDE):
+    // MRTD PIN — the TDX launch measurement (quote body mr_td @136..184),
+    // byte-identical across two independent live quotes. Ghost-enclave guard:
+    // a valid Intel-signed quote proves silicon; this pin proves the silicon
+    // launched the AUDITED boot chain. SCOPE (honest): on this platform no
+    // hardware measurement covers the running image (RTMR[0] is all zeros,
+    // no vTPM) — MRTD covers the launch chain only, so running-code identity
+    // is enforced by EXPECTED_ENCLAVE_SHA256 + the CI attestation rows.
+    // Rotate DELIBERATELY, in a reviewed commit, when the boot chain changes.
+    // ========================================================================
+    var EXPECTED_MRTD = 'e0199499baacb2e4f4bc73046f25bedf674d42defbe4e854242bd6554a9d155edf7f3bff8e6202e63ed230e59ab2568a';
+
+    // ========================================================================
+    // v165 AUDIT: ENCLAVE CODE PIN — the ONE gate that stops colluding
+    // owner+cloud from green-lighting arbitrary code: CI provenance alone
+    // cannot, because the owner controls the repo (a malicious push is still
+    // "attested by CI"). The audited build's SHA-256 is pinned HERE; a swapped
+    // enclave fails this gate even if every signature/quote checks out, and a
+    // colluding owner must ALSO edit this file — a tamper visible in the
+    // audited commit history and to any user holding an independent copy of
+    // this page. Rotate ONLY together with the enclave source change, in the
+    // same reviewed commit (CI-harness fixtures read this value).
+    // ========================================================================
+    var EXPECTED_ENCLAVE_SHA256 = 'cbd680c892634c85e4ffe7d9072b165ce6c36a3f934fd8a07f203c7c15c49ac3';
 
     // ========================================================================
     // v162 (audit VULN-04): GOLDEN PCR PINS — CI-captured constants for the
@@ -553,6 +605,42 @@
         pcr_8: null, // kernel cmdline
         pcr_9: null, // kernel + initramfs payload
     };
+    // ========================================================================
+    // Intel SGX trust anchors for the TDX path (Alibaba ECS). Same discipline
+    // as GOLDEN_PCRS and TRUSTED_AMD_ARKS: a PCK issuer *regex* is spoofable
+    // (anyone can mint a CA called "Intel SGX PCK …"), so the chain MUST
+    // terminate in a root whose DER sha256 is pinned here AND whose PEM (the
+    // cert the walk appends when the quote's chain stops short) is the very
+    // same certificate:
+    //   https://certificates.trustedservices.intel.com/Intel_SGX_Provisioning_Certification_RootCA.cer
+    // SHA-256 corroborated against Intel's dcap-qvl reference crate (which
+    // bundles the same DER) and independent published verifiers.
+    // `var` — like GOLDEN_PCRS — so the offline harness can substitute its
+    // synthetic root for positive-path fixtures; scripts/test-verify-security.mjs
+    // asserts the DEFAULT entry (pem sha256 == pinned sha256 == Intel root)
+    // and must fail if it ever drifts.
+    // ========================================================================
+    var TRUSTED_INTEL_ROOTS = [{
+        sha256: '44a0196b2b99f889b8e149e95b807a350e7424964399e885a7cbb8ccfab674d3',
+        pem: [
+            '-----BEGIN CERTIFICATE-----',
+            'MIICjzCCAjSgAwIBAgIUImUM1lqdNInzg7SVUr9QGzknBqwwCgYIKoZIzj0EAwIw',
+            'aDEaMBgGA1UEAwwRSW50ZWwgU0dYIFJvb3QgQ0ExGjAYBgNVBAoMEUludGVsIENv',
+            'cnBvcmF0aW9uMRQwEgYDVQQHDAtTYW50YSBDbGFyYTELMAkGA1UECAwCQ0ExCzAJ',
+            'BgNVBAYTAlVTMB4XDTE4MDUyMTEwNDUxMFoXDTQ5MTIzMTIzNTk1OVowaDEaMBgG',
+            'A1UEAwwRSW50ZWwgU0dYIFJvb3QgQ0ExGjAYBgNVBAoMEUludGVsIENvcnBvcmF0',
+            'aW9uMRQwEgYDVQQHDAtTYW50YSBDbGFyYTELMAkGA1UECAwCQ0ExCzAJBgNVBAYT',
+            'AlVTMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEC6nEwMDIYZOj/iPWsCzaEKi7',
+            '1OiOSLRFhWGjbnBVJfVnkY4u3IjkDYYL0MxO4mqsyYjlBalTVYxFP2sJBK5zlKOB',
+            'uzCBuDAfBgNVHSMEGDAWgBQiZQzWWp00ifODtJVSv1AbOScGrDBSBgNVHR8ESzBJ',
+            'MEegRaBDhkFodHRwczovL2NlcnRpZmljYXRlcy50cnVzdGVkc2VydmljZXMuaW50',
+            'ZWwuY29tL0ludGVsU0dYUm9vdENBLmRlcjAdBgNVHQ4EFgQUImUM1lqdNInzg7SV',
+            'Ur9QGzknBqwwDgYDVR0PAQH/BAQDAgEGMBIGA1UdEwEB/wQIMAYBAf8CAQEwCgYI',
+            'KoZIzj0EAwIDSQAwRgIhAOW/5QkR+S9CiSDcNoowLuPRLsWGf/Yi7GSX94BgwTwg',
+            'AiEA4J0lrHoMs+Xo5o/sX6O9QWxHRAvZUGOdRQ7cvqRXaqI=',
+            '-----END CERTIFICATE-----'
+        ].join('\n'),
+    }];
     function checkExpectedApp(sf) {
         const hit = EXPECTED_APPS.find(a => a.flow === sf.flow && a.client_id === sf.paypal_client_id
             && a.authorize_base === sf.authorize_base && a.scope === sf.scope);
@@ -619,7 +707,7 @@
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ client_ecdh_pub_b64: pubB64, client_nonce_hex: nonceHex, flow: 'verified', custom_info: customInfo === 'NONE' ? '' : customInfo })
             });
-            if (!resp.ok) throw new Error('pre-flight rejected (HTTP ' + resp.status + ')');
+            if (!resp.ok) throw new Error('pre-flight rejected (HTTP ' + resp.status + ')' + (resp.status === 404 ? ' — this deployment does not expose /attest/preflight; use the enclave\u2019s own Login page instead (hardware session binding via the quote\u2019s report_data is enforced either way)' : ''));
             const pf = await resp.json();
 
             say('🔏 Verifying S_enc signature + app pin + hardware binding…');
@@ -683,13 +771,73 @@
 
     // On load: restore a decrypted E2EE report handed over by /callback
     // (same origin) and auto-start the secure login from the homepage links.
+    // v164 — the /callback handoff: the enclave's success page performs NO
+    // crypto of its own; it only stashes the LOGIN-BOUND ciphertext blob in
+    // this origin's sessionStorage (`pav_e2ee_blob`). The decrypt + S_enc
+    // signature check + pre-flight P_enc pin + full audit ALL happen here, so
+    // a tampered blob or a swapped enclave fails closed and nothing is ever
+    // downloaded. After a login the report is auto-downloaded (?afterlogin=1)
+    // so the user holds a portable JSON they can audit OFFLINE in ANY copy of
+    // the auditor (GitHub Pages copy / saved local copy) — the copy served by
+    // the webservice is a convenience, never the only auditor.
     // (typeof guard: the node security harness evals this script headless.)
-    if (typeof window !== 'undefined') window.addEventListener('DOMContentLoaded', () => {
+    if (typeof window !== 'undefined') window.addEventListener('DOMContentLoaded', async () => {
+        const say = m => { try { const el = document.getElementById('secureLoginStatus'); if (el) el.innerText = m; } catch (e) {} };
+        // Restore the pre-flight-pinned P_enc (survives the PayPal round-trip
+        // via sessionStorage) so the post-login audit still enforces the pin.
+        try {
+            const pin = sessionStorage.getItem('pav_p_enc');
+            if (pin && !preFlightPubKeyPem) preFlightPubKeyPem = pin;
+        } catch (e) { /* no sessionStorage (harness) — skip */ }
         const saved = sessionStorage.getItem('pav_e2ee_report');
         if (saved) {
             const el = document.getElementById('attestationInput');
             if (el && !el.value) el.value = saved;
         }
+        // Login handoff: decrypt the blob stashed by /callback in THIS tab.
+        try {
+            const raw = sessionStorage.getItem('pav_e2ee_blob');
+            if (raw) {
+                const jwk = sessionStorage.getItem('pav_client_jwk');
+                const nonceHex = sessionStorage.getItem('pav_client_nonce');
+                if (!jwk || !nonceHex) {
+                    say('❌ This tab has no session keys — the encrypted report can only be opened in the tab that created the key. Start the login again from this page.');
+                } else {
+                    const pinned = sessionStorage.getItem('pav_p_enc');
+                    // Fail closed: never decrypt a login report without the
+                    // pre-flight-pinned P_enc to check it against.
+                    if (!pinned) throw new Error('No pre-flight pin in this tab — refusing to decrypt an unpinned report. Start the login again from this page.');
+                    say('⏳ Decrypting your attestation report…');
+                    const env = await localDecryptAndVerify(JSON.parse(raw), jwk, nonceHex, pinned);
+                    try { const b = JSON.parse(raw); if (b && b.flow) sessionStorage.setItem('pav_e2ee_flow', String(b.flow)); } catch (e) { /* keep default tag */ }
+                    const pretty = JSON.stringify(env, null, 2);
+                    sessionStorage.setItem('pav_e2ee_report', pretty);
+                    const el = document.getElementById('attestationInput');
+                    if (el) el.value = pretty;
+                    if (await runAudit()) {
+                        if (location.search.indexOf('afterlogin=1') !== -1 && downloadReportFile()) {
+                            say('✅ Report decrypted, audited, and saved as a JSON file. You can audit it offline in ANY copy of the auditor (GitHub Pages copy or your own saved verify.html) — this site is only a convenience.');
+                        } else {
+                            say('✅ Report decrypted and fully audited — use the 💾 Download button in the results below to save the JSON.');
+                        }
+                    } else {
+                        say('❌ Audit FAILED — nothing was downloaded. See the results below.');
+                    }
+                }
+            }
+        } catch (e) {
+            say('❌ ' + e.message);
+        }
+        // UX: when the enclave itself serves this page (https origin), pre-fill
+        // the enclave-address fields so the visitor never has to retype the URL.
+        try {
+            if (location.protocol === 'https:' && location.host) {
+                const pf = document.getElementById('preflightUrl');
+                if (pf && !pf.value) pf.value = location.origin;
+                const lh = document.getElementById('localEnclaveHost');
+                if (lh && !lh.value) lh.value = location.origin;
+            }
+        } catch (e) { /* no location (harness) — skip */ }
         if (location.hash === '#login-verified') executePreflightAndLogin('verified');
         if (location.hash === '#login-full') executePreflightAndLogin('full');
     });
@@ -807,6 +955,51 @@
         } catch (e) {
             throw new Error(`Failed to parse ${name} Certificate: ` + e.message);
         }
+    }
+    // ---- EC-safe X.509 DN extraction ---------------------------------------
+    // forge's pki.certificateFrom* is RSA-only (it throws "OID is not RSA" on
+    // EC certificates like the Intel PCK and AMD VCEK leaves), and its
+    // attribute API needs a fully parsed cert. These helpers work straight on
+    // the ASN.1 nodes, so issuer/subject extraction works for RSA and EC alike.
+    const DN_ATTR_NAMES = {
+        '2.5.4.3': 'CN', '2.5.4.6': 'C', '2.5.4.7': 'L', '2.5.4.8': 'ST',
+        '2.5.4.10': 'O', '2.5.4.11': 'OU', '2.5.4.5': 'serialNumber',
+        '2.5.4.4': 'SN', '2.5.4.9': 'street', '1.2.840.113549.1.9.1': 'email',
+    };
+    function dnFromNode(seqNode) {
+        const parts = [];
+        for (const setNode of (seqNode && seqNode.value) || []) {
+            const attr = (setNode && Array.isArray(setNode.value)) ? setNode.value[0] : null;
+            if (!attr || !Array.isArray(attr.value) || attr.value.length < 2) continue;
+            const oid = oidBytesToDotted(attr.value[0].value);
+            let v = attr.value[1].value;
+            if (v instanceof Uint8Array) v = String.fromCharCode.apply(null, Array.from(v));
+            else if (Array.isArray(v)) v = String(v);
+            parts.push((DN_ATTR_NAMES[oid] || oid) + '=' + v);
+        }
+        return parts.join(', ');
+    }
+    function x509NamesFromTbs(tbs) {
+        const kids = (tbs && tbs.value) || [];
+        let i = 0;
+        while (i < kids.length && kids[i].tagClass !== forge.asn1.Class.UNIVERSAL) i++; // skip [0] version
+        i += 2; // serialNumber + signatureAlgorithm
+        return {
+            issuer: dnFromNode(kids[i]),      // issuer  Name
+            subject: dnFromNode(kids[i + 2]), // subject Name (validity sits between)
+        };
+    }
+    function x509Names(parsedCert) { return x509NamesFromTbs(parsedCert.nodes.tbs); }
+    // Raw SEC1 P-256 point (X||Y, 64 bytes) → SubjectPublicKeyInfo DER so
+    // WebCrypto can import Intel quote attestation keys (raw points, no SPKI).
+    function p256SpkiFromRaw(rawXY) {
+        if (!rawXY || rawXY.length !== 64) throw new Error('attestation key is not a raw P-256 point (64 bytes)');
+        const der = new Uint8Array(26 + 65);
+        der.set([0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+                 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00], 0);
+        der[26] = 0x04; // uncompressed point
+        der.set(rawXY, 27);
+        return der;
     }
     // ECDSA AlgorithmIdentifier → WebCrypto curve params (AMD uses P-384).
     function ecCurveParams(spkiDer) {
@@ -980,9 +1173,12 @@
             const tbsDer = binaryToBytes(forge.asn1.toDer(child.nodes.tbs).getBytes());
             const sigAlgOid = child.nodes.sigAlgOid;
 
-            // BIT STRING: [unused-bits byte] || raw RSA signature
-            const rsaSigContent = (sigBin.length > 0 && sigBin.charCodeAt(0) === 0) ? sigBin.slice(1) : sigBin;
-            const rsaSigBytes = binaryToBytes(rsaSigContent);
+            // BIT STRING: [unused-bits byte] || raw signature. forge 1.3.x
+            // (the CDN-pinned build) returns this as a binary string; forge
+            // 1.4.x returns a parsed node array — forgeValueToBytes accepts
+            // both, so chain links keep verifying across either representation.
+            const sigRawBytes = forgeValueToBytes(sigBin);
+            const rsaSigBytes = (sigRawBytes.length > 0 && sigRawBytes[0] === 0) ? sigRawBytes.slice(1) : sigRawBytes;
 
             // RSASSA-PSS (AMD ASK/ARK chain): hash/MGF1/salt parsed from the
             // AlgorithmIdentifier params. Defaults: SHA-256, saltLen = hLen.
@@ -1012,10 +1208,9 @@
                 return await rsaVerifyPkcs1(parent.spkiDer, hash, tbsDer, rsaSigBytes);
             }
 
-            // ECDSA path (VCEK leaf, P-384): BIT STRING = DER SEQUENCE { r, s }
-            const sigBytes2 = binaryToBytes(sigBin);
-            const content = (sigBin.length > 0 && sigBin.charCodeAt(0) === 0) ? sigBin.slice(1) : sigBin;
-            const seq = forge.asn1.fromDer(content);
+            // ECDSA path (VCEK/PCK leaves): BIT STRING = DER SEQUENCE { r, s }
+            const content = (sigRawBytes.length > 0 && sigRawBytes[0] === 0) ? sigRawBytes.slice(1) : sigRawBytes;
+            const seq = forge.asn1.fromDer(derBytesToBinary(content));
             const toInt = (n) => {
                 let b = binaryToBytes(n.value);
                 let i = 0;
@@ -1070,6 +1265,18 @@
         if (reportInput) reportInput.addEventListener('change', (e) => loadFile(e.target, 'attestationInput'));
         if (certInput) certInput.addEventListener('change', (e) => loadFile(e.target, 'certInput'));
     });
+
+    // SECURITY (audit 2026-10-19, VULN follow-up): the report under audit is
+    // UNTRUSTED input. updateStatus() renders `desc` with innerHTML, so every
+    // report-derived fragment interpolated into a description must pass through
+    // esc() first — otherwise a forged report (even one that fails every
+    // cryptographic gate) can inject markup into the auditor's own verdict DOM
+    // and fake green checks or exfiltrate the pre-flight-pinned key.
+    function esc(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+            { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+        ));
+    }
 
     // v163 (audit VULN-04 follow-up): TRI-STATE status. Booleans keep their
     // meaning (true = verified, false = failed); the string 'warning' renders
@@ -1254,6 +1461,10 @@
             const payload = new TextEncoder().encode(JSON.stringify(reorder(report)));
             const sigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, enclaveKey, sig, payload);
             updateStatus('enclaveCheck', sigOk, sigOk ? "Report mathematically verified." : "Signature invalid!");
+            // v164: fail closed. A report whose enclave signature does not
+            // verify is UNAUTHENTICATED — continuing to green sub-checks would
+            // let a fabricated report render mostly-verified rows.
+            if (!sigOk) throw new Error("CRITICAL: the enclave signature over this report is INVALID — the report content is unauthenticated (tampered or fabricated). Failing closed.");
 
             // 3. TPM Hardware Audit (Strict Binary Parsing)
             // GCP reports always carry TPM evidence and are checked strictly.
@@ -1292,12 +1503,12 @@
                     const pin = GOLDEN_PCRS[gpcr];
                     const actual = ((hw.pcr_values || {})[gpcr] || '').replace(/^0x/i, '').toLowerCase();
                     if (!pin) {
-                        goldenDetails.push(`⚠️ ${gpcr} (${PCR_DESC[gpcr] || 'boot chain'}): UNPINNED — quoted value ${actual ? actual.substring(0, 16) + '…' : '(absent)'}`);
+                        goldenDetails.push(`⚠️ ${gpcr} (${PCR_DESC[gpcr] || 'boot chain'}): UNPINNED — quoted value ${actual ? esc(actual.substring(0, 16)) + '…' : '(absent)'}`);
                         continue;
                     }
                     goldenPinned++;
                     if (actual !== pin.toLowerCase()) {
-                        goldenFails.push(`${gpcr}: expected ${pin.substring(0, 16)}…, got ${actual ? actual.substring(0, 16) + '…' : '(absent)'}`);
+                        goldenFails.push(`${gpcr}: expected ${pin.substring(0, 16)}…, got ${actual ? esc(actual.substring(0, 16)) + '…' : '(absent)'}`);
                     } else {
                         goldenDetails.push(`✅ ${gpcr} (${PCR_DESC[gpcr] || 'boot chain'}): matches CI golden pin`);
                     }
@@ -1336,8 +1547,26 @@
                     updateStatus('tpmCheck', 'verified',
                         tpmMsgText + ` 📏 All 4/4 golden PCR pins enforced — firmware, bootloader, cmdline, and kernel+initramfs match the CI-captured golden build.`);
                 }
-            } else {
+            } else if (hw.snp_report_b64) {
                 updateStatus('tpmCheck', true, "No TPM evidence in report — expected on AMD SEV-SNP platforms without a vTPM (Oracle Cloud). Session bound by the SNP report_data instead.");
+            } else {
+                // TPM-less AND SNP-less (Alibaba TDX builds with no vTPM and no
+                // guest device): do NOT claim SNP report_data binding this
+                // report does not contain — this row is green because the
+                // ABSENCE of TPM evidence is platform-expected, not because
+                // anything was verified. Hardware trust is decided by the
+                // Silicon Root row below.
+                updateStatus('tpmCheck', true, "No TPM evidence in report — TPM-less platform (no vTPM), and this report carries no SNP report either. Green = absence is expected for this platform, NOT a verified proof; hardware trust is decided by the Silicon Root row below.");
+            }
+
+            // v165 CODE PIN GATE (fail-closed, runs before any provenance
+            // lookup): see EXPECTED_ENCLAVE_SHA256 for rationale/rotation.
+            const CODE_PIN = (typeof EXPECTED_ENCLAVE_SHA256 === 'string') ? EXPECTED_ENCLAVE_SHA256 : '';
+            if (!/^[0-9a-f]{64}$/.test(CODE_PIN)) {
+                throw new Error('AUDITOR INTEGRITY FAILURE: EXPECTED_ENCLAVE_SHA256 is not a valid pinned digest — this copy of the auditor is incomplete or tampered. Aborting.');
+            }
+            if (boot.binary_sha256 !== CODE_PIN) {
+                throw new Error('ENCLAVE CODE PIN VIOLATION: this report was produced by binary sha256 ' + String(boot.binary_sha256 || 'absent').slice(0, 20) + '… but the audited build is pinned to ' + CODE_PIN.slice(0, 20) + '… — the deployed code is NOT the audited build (or this auditor copy is stale). Do NOT trust. Rotate the pin ONLY in the same reviewed commit that changes the enclave source.');
             }
 
             // 4. Software Provenance (Hardware-Anchored PCR 15)
@@ -1348,14 +1577,24 @@
             // when present (GCP image / pre-v161 OCI images).
             const ukiLayout = !(diskManifest["EFI/BOOT/vmlinuz"] || diskManifest["vmlinuz"])
                 && !!(diskManifest["EFI/BOOT/BOOTX64.EFI"] || diskManifest["BOOTX64.EFI"]);
-            const [bin, ker, init, cfg, uki] = await Promise.all([
+            // v165 AUDIT (threat model: owner+cloud collusion): the ENTIRE
+            // loaded boot chain must be CI-attested, not just kernel/initrd/
+            // cmdline. BOOTX64.EFI (shim/UKI) and grubx64.efi are what actually
+            // execute the kernel — previously a backdoored shim/grub swapped
+            // onto the disk by the cloud provider yielded a self-consistent
+            // manifest that NOTHING compared to CI. NvVars is deliberately
+            // NEVER looked up: the firmware rewrites it at runtime (observed:
+            // a different hash on every boot), so it cannot be pinned.
+            const [bin, ker, init, cfg, uki, grubBin] = await Promise.all([
                 getProvenance(boot.binary_sha256, "Enclave Binary"),
                 getProvenance(boot.disk_manifest["EFI/BOOT/vmlinuz"] || boot.disk_manifest["vmlinuz"], "Linux Kernel"),
                 getProvenance(boot.disk_manifest["EFI/BOOT/initrd.img"] || boot.disk_manifest["initrd.img"], "Initramfs"),
-                getProvenance(boot.disk_manifest["EFI/BOOT/grub.cfg"] || boot.disk_manifest["grub.cfg"], "EFI Bootloader"),
-                getProvenance(boot.disk_manifest["EFI/BOOT/BOOTX64.EFI"] || diskManifest["BOOTX64.EFI"], "Enclave UKI (monolithic, direct boot)")
+                getProvenance(boot.disk_manifest["EFI/BOOT/grub.cfg"] || boot.disk_manifest["grub.cfg"], "Boot Config (grub.cfg)"),
+                getProvenance(boot.disk_manifest["EFI/BOOT/BOOTX64.EFI"] || diskManifest["BOOTX64.EFI"], "EFI Boot Chain (BOOTX64.EFI: shim/UKI)"),
+                getProvenance(boot.disk_manifest["EFI/BOOT/grubx64.efi"] || boot.disk_manifest["grubx64.efi"], "EFI Bootloader (grubx64.efi)")
             ]);
-            const imageComponents = ukiLayout ? [bin, uki] : [ker, init, cfg];
+            const imageComponents = ukiLayout ? [bin, uki] : [ker, init, cfg, uki, grubBin];
+            const provenanceComponents = ukiLayout ? [uki] : [ker, init, cfg, uki, grubBin];
             
             const expectedPcr15 = await calculatePcr15(boot.disk_manifest);
             const hasPcr15 = !!(hw.pcr_values && hw.pcr_values["pcr_15"]);
@@ -1378,9 +1617,11 @@
                 unattested: 'NO GitHub attestation exists for this exact SHA-256 — the artifact was built outside CI or from uncommitted source. Deploy a build produced from a pushed commit (or the CI-built artifact) so the same hash is attested',
                 network: 'GitHub API unreachable (offline auditor or rate limit) — retry',
             };
+            // runIds are strings from the GitHub API payload — treat them as
+            // untrusted for innerHTML (esc), same as report-controlled data.
             const provLine = (c) => c.success
-                ? `✅ ${c.name} (#${c.runIds.join(',')})`
-                : `❌ ${c.name} — ${provReasons[c.reason] || 'not attested'}`;
+                ? `✅ ${c.name} (#${esc(c.runIds.join(','))})`
+                : `❌ ${c.name} — ${esc(provReasons[c.reason] || 'not attested')}`;
             const atomicFail = imageComponents.some(c => c.reason === 'missing')
                 ? provReasons.missing
                 : (commonRuns === null
@@ -1388,13 +1629,17 @@
                     : 'component hashes were attested by DIFFERENT CI runs — not one atomic image build');
             const provResults =[
                 provLine(bin),
-                ukiLayout ? provLine(uki) : '',
-                atomic ? `✅ Image Atomicity (Run #${[...commonRuns][0]})` : `❌ Image Atomicity — ${atomicFail}`,
+                ...provenanceComponents.map(provLine),
+                atomic ? `✅ Image Atomicity (Run #${esc([...commonRuns][0])})` : `❌ Image Atomicity — ${esc(atomicFail)}`,
                 hasPcr15
                     ? (pcr15Ok ? `✅ PCR 15 hardware binding mathematically verified` : `❌ PCR 15 Software Mismatch`)
-                    : `ℹ️ PCR 15 not applicable (no TPM in this report) — session bound via SNP report_data. OCI scope: the SNP launch digest measures Oracle's OVMF launch firmware, NOT the virtual disk — disk/code integrity rests on the GitHub provenance lines above (self-reported manifest, audited against CI)`
+                    : (hw.snp_report_b64
+                        ? `ℹ️ PCR 15 not applicable (no TPM in this report) — session bound via SNP report_data. OCI scope: the SNP launch digest measures Oracle's OVMF launch firmware, NOT the virtual disk — disk/code integrity rests on the GitHub provenance lines above (self-reported manifest, audited against CI)`
+                        : (hw.tdx_quote_b64
+                            ? `ℹ️ PCR 15 not applicable (no TPM) — but a hardware-signed TDX quote IS present: report_data binds THIS session (verified in the Silicon Root row below). Disk/boot-chain integrity rests on the CI attestation lines above; code identity on the ENCLAVE CODE PIN gate at the top of this audit`
+                            : `ℹ️ PCR 15 not applicable (no TPM in this report) — and no SNP report is present either, so no hardware quote in this report binds the session; disk/code integrity rests on the GitHub provenance lines above (self-reported manifest, audited against CI) and hardware trust is decided by the Silicon Root row below`))
             ];
-            const anyApiBlocked = [bin, ker, init, cfg, uki].some(c => (c.reason || '').startsWith('api') || c.reason === 'network');
+            const anyApiBlocked = [bin, ker, init, cfg, uki, grubBin].some(c => (c.reason || '').startsWith('api') || c.reason === 'network');
             updateStatus('githubCheck', bin.success && atomic && pcr15Ok,
                 provResults.join('<br>') + (anyApiBlocked ? '<br>⚠️ GitHub API problems detected (rate limit is 60 req/h unauthenticated) — results above may be incomplete.' : ''));
 
@@ -1402,6 +1647,7 @@
             let siliconOk = false;
             let snpVerified = false;
             let googleVerified = false;
+            let tdxVerified = false;
             let siliconMsg = "";
 
             // Pinned AMD SEV-SNP LAUNCH_DIGEST values (MEASUREMENT field,
@@ -1435,10 +1681,14 @@
 
             if (akCertPem) {
                 try {
-                    const akCert = parseAnyCertToForge(akCertPem, "Google AK");
+                    // EC-safe parse + DN extraction: forge's certificateFrom*
+                    // throws "OID is not RSA" on an EC EK cert — issuer/subject
+                    // are read straight from the ASN.1 nodes instead.
+                    const akCert = x509ParseAny(akCertPem, "Google AK");
+                    const akNames = x509NamesFromTbs(akCert.nodes.tbs);
                     
                     // 1. IDENTITY INTEGRITY: Verify Issuer
-                    const issuer = akCert.issuer.attributes.map(a => a.value).join(', ');
+                    const issuer = akNames.issuer;
                     const validIssuers = [
                         'Google Cloud Confidential Computing OS Root CA',
                         'EK/AK CA Intermediate'
@@ -1471,14 +1721,14 @@
                     googleVerified = true;
                     
                     // 3. EXTRACT GCP IDENTITY
-                    const subject = akCert.subject.attributes.map(a => `${a.shortName || a.name}: ${a.value}`).join(', ');
+                    const subject = akNames.subject;
 
                     siliconMsg = `✅ <b>Silicon Anchor: Google Confidential Hardware Verified</b><br>` +
-                                 `📜 EK Cert Issuer: ${issuer}<br>` +
-                                 `📍 Hardware Identity: ${subject}<br>` +
+                                 `📜 EK Cert Issuer: ${esc(issuer)}<br>` +
+                                 `📍 Hardware Identity: ${esc(subject)}<br>` +
                                  `ℹ️ This certificate is Google-signed proof that the enclave runs on real GCP Confidential VM hardware (AMD SEV-SNP).`;
                 } catch (err) {
-                    siliconMsg = `❌ <b>Silicon Anchor Failed:</b> ${err.message}`;
+                    siliconMsg = `❌ <b>Silicon Anchor Failed:</b> ${esc(err.message)}`;
                     throw err;
                 }
             }
@@ -1490,7 +1740,7 @@
                 // only if it verifies). An absent leaf means NEITHER the
                 // silicon-provisioned certs nor AMD KDS held the report's
                 // real signing key — fail closed with a precise reason.
-                const src = hw.vcek_source ? ` (enclave vcek_source=${hw.vcek_source})` : '';
+                const src = hw.vcek_source ? ` (enclave vcek_source=${esc(hw.vcek_source)})` : '';
                 siliconMsg += `<br>❌ <b>AMD SEV-SNP report present but NO verifiable endorsement key</b>${src}<br>` +
                               `⚠️ The enclave verified every key it could obtain (PSP certificate table and AMD KDS) and none of them signs this report. This is consistent with a host whose endorsement key is only known to the cloud provider's PSP. Do NOT trust this report — the silicon binding cannot be established.`;
             } else if (hw.snp_report_b64 && hw.vcek_der_b64) {
@@ -1572,7 +1822,7 @@
                                       `🔏 ECDSA P-384 signature valid<br>` +
                                       `⛓️ VCEK→ASK→ARK chain pinned (ARK ${arkPinHex.substring(0, 16)}…)<br>` +
                                       `📏 Launch digest pinned: ${measurement.substring(0, 16)}…` +
-                                      (hw.vcek_source ? `<br>🏷️ Endorsement key source: ${hw.vcek_source}` : '');
+                                      (hw.vcek_source ? `<br>🏷️ Endorsement key source: ${esc(hw.vcek_source)}` : '');
                     } else {
                         if (!measurementOk) {
                             siliconMsg += `<br>❌ <b>Launch digest (MEASUREMENT) not pinned:</b> ${measurement}<br>` +
@@ -1583,18 +1833,305 @@
                         }
                         if (!snpBindingOk || !snpSigOk || !chainOk) {
                             siliconMsg += `<br>❌ <b>SEV-SNP verification failed</b> (binding=${snpBindingOk}, sig=${snpSigOk}, chain=${chainOk}, ark=${arkPinHex})` +
-                                          (hw.vcek_source ? `<br>🏷️ Endorsement key source: ${hw.vcek_source}` : '') +
+                                          (hw.vcek_source ? `<br>🏷️ Endorsement key source: ${esc(hw.vcek_source)}` : '') +
                                           (!snpSigOk && hw.vcek_source && hw.vcek_source !== 'psp-table' && !hw.vcek_source.startsWith('psp-table')
-                                              ? `<br>💡 The published key came from <b>${hw.vcek_source}</b> and does not sign this report. On hosts whose PSP uses vendor-loaded (VLEK-style) endorsement, only the silicon-provisioned PSP certificate can verify the report — this report's endorsement could not be obtained.`
+                                              ? `<br>💡 The published key came from <b>${esc(hw.vcek_source)}</b> and does not sign this report. On hosts whose PSP uses vendor-loaded (VLEK-style) endorsement, only the silicon-provisioned PSP certificate can verify the report — this report's endorsement could not be obtained.`
                                               : '');
                         }
                     }
                 } catch (err) {
                     snpVerified = false;
-                    siliconMsg += `<br>❌ <b>SEV-SNP verification error:</b> ${err.message}`;
+                    siliconMsg += `<br>❌ <b>SEV-SNP verification error:</b> ${esc(err.message)}`;
                 }
             }
 
+            // 5c. Intel TDX Root (Alibaba Cloud ECS confidential instances).
+            //
+            // The enclave publishes `tdx_quote_b64` ONLY when the platform
+            // actually produced a hardware-signed TD Quote (Intel quote ABI
+            // v4/v5, ECDSA P-256 by the Quoting Enclave). The auditor follows
+            // Intel's reference DCAP verification order (dcap-qvl verify.rs):
+            //   1. header: version 4|5, tee_type 0x81, Intel QE vendor id,
+            //      att_key_type 2 (ECDSA P-256). Signed scope =
+            //      header (+v5 6-byte body preamble) || TDREPORT body —
+            //      dcap-qvl Quote::signed_length().
+            //   2. session binding: TDREPORT10.report_data @520..584 holds
+            //      [nonce || zeros] (TDREPORT15 appends its two extra fields
+            //      AFTER report_data, so "last 64 bytes" would be wrong).
+            //   3. QUOTE signature: raw r||s (64 B) ECDSA P-256/SHA-256 over
+            //      the signed scope, verified with the quote's OWN attestation
+            //      key (raw X||Y) — NOT with the PCK key.
+            //   4. attestation-key binding: SHA-256(attkey || qe_auth_data)
+            //      == QE-report.report_data[0..32], and the QE report (384 B)
+            //      is itself signed by the PCK leaf — this is what anchors the
+            //      ephemeral attestation key to Intel's provisioning chain.
+            //   5. PCK leaf → … → Intel SGX Root CA, whose DER sha256 is
+            //      pinned below (an issuer regex alone is spoofable — same
+            //      class of bug as the unpinned AMD ARK).
+            //   6. MRTD (mr_td @136..184 of the body) surfaced for display.
+            // A bare TDREPORT (tdx_td_report_b64) is generated INSIDE the
+            // guest and is UNSIGNED — it can NEVER satisfy the silicon root.
+            const claimsTdx = !!(hw.tdx_quote_b64 || hw.tdx_td_report_b64 || hw.pck_cert_pem
+                || hw.tdx_evidence_marker // TPM-less Alibaba build: the marker is the report's
+                    // only TDX-class claim — route it into the TDX branch below so the
+                    // auditor gets the PRECISE no-hardware-signed-evidence diagnosis
+                    // (incl. the enclave's own probe transcript) instead of the generic
+                    // "no evidence present" message. The marker can never make this pass:
+                    // with no tdx_quote_b64 the branch ends at tdxVerified=false.
+                || (hw.platform_type || '').indexOf('TDX') !== -1);
+            if (claimsTdx) {
+                if (hw.tdx_quote_b64) {
+                    try {
+                        const quote = Uint8Array.from(atob(hw.tdx_quote_b64), c => c.charCodeAt(0));
+                        const hx = (u8) => Array.from(u8).map(b => b.toString(16).padStart(2, '0')).join('');
+                        const le16 = (a, o) => a[o] | (a[o + 1] << 8);
+                        const le32u = (a, o) => a[o] + a[o + 1] * 256 + a[o + 2] * 65536 + a[o + 3] * 16777216;
+                        if (quote.length < 48 + 584 + 4 + 64 + 64 + 6) throw new Error(`quote truncated (${quote.length} bytes)`);
+                        // ---- header (48 B): version u16@0, att_key_type u16@2,
+                        // tee_type u32@4, qe_svn@8, pce_svn@10, vendor id@12 ----
+                        const qVersion = le16(quote, 0);
+                        const qAttKeyType = le16(quote, 2);
+                        const qTeeType = le32u(quote, 4);
+                        const qVendorHex = hx(quote.subarray(12, 28));
+                        if (qTeeType !== 0x81) throw new Error(`tee_type 0x${qTeeType.toString(16)} is not TDX (expected 0x81)`);
+                        if (qVersion !== 4 && qVersion !== 5) throw new Error(`unsupported quote version ${qVersion} — TDX quotes are v4 or v5`);
+                        if (qVendorHex !== '939a7233f79c4ca9940a0db3957f0607') {
+                            throw new Error(`unknown QE vendor id ${qVendorHex} — quote not produced by Intel's Quoting Enclave`);
+                        }
+                        if (qAttKeyType !== 2) throw new Error(`attestation key type ${qAttKeyType} unsupported — Intel TDX quotes use ECDSA P-256 (type 2)`);
+                        // ---- body: v4 carries TDREPORT10 inline (fixed 584 B);
+                        // v5 adds a 6-byte preamble (body_type u16 + body_size u32 LE) ----
+                        let bodyOff = 48, bodyLen = 584, bodyType = null;
+                        if (qVersion === 5) {
+                            bodyType = le16(quote, 48);
+                            bodyLen = le32u(quote, 50);
+                            const expectLen = bodyType === 2 ? 584 : bodyType === 3 ? 648 : null;
+                            if (expectLen === null) throw new Error(`unsupported v5 body type ${bodyType} (2 = TDREPORT10, 3 = TDREPORT15)`);
+                            if (bodyLen !== expectLen) throw new Error(`v5 body_type ${bodyType} implies ${expectLen} bytes, size field says ${bodyLen}`);
+                            bodyOff = 54;
+                        }
+                        const signedLen = bodyOff + bodyLen; // == dcap-qvl Quote::signed_length()
+                        if (quote.length < signedLen + 4 + 64 + 64 + 6) throw new Error('quote truncated before auth data');
+                        const signedRegion = quote.subarray(0, signedLen);
+                        const qBody = quote.subarray(bodyOff, signedLen);
+                        // ---- session binding: TDREPORT10.report_data @520..584 ----
+                        if (qBody.length < 584) throw new Error(`TDREPORT body ${qBody.length} bytes < 584`);
+                        const qReportDataHex = hx(qBody.subarray(520, 584));
+                        // v161 (Pillars 2–5) — same branch as the SNP path:
+                        // pre-flight (client-bound) envelopes bind the BROWSER's
+                        // own inputs into the quote — SHA-256(P_enc ∥ code_challenge
+                        // ∥ P_client ∥ client_nonce ∥ custom_info), [32..64] zero —
+                        // NOT the SEC-02 session nonce (there is no PayPal user yet
+                        // at pre-flight). Login/callback envelopes keep SEC-02.
+                        // Without this branch every TDX pre-flight envelope failed
+                        // binding=false by construction (2026-10-21).
+                        const pfCtxTdx = report.session_context && report.session_context.preflight;
+                        let expectedTdxBindingHex, tdxBindingLabel;
+                        if (pfCtxTdx && pfCtxTdx.binding === 'v161') {
+                            expectedTdxBindingHex = (await preflightBindingHex(
+                                pubKeyBuffer, pfCtxTdx.code_challenge, b64ToDer(pfCtxTdx.client_pub_b64), pfCtxTdx.client_nonce_hex,
+                                pfCtxTdx.custom_info || 'NONE'
+                            )).padEnd(128, '0');
+                            tdxBindingLabel = 'v161.2 client binding (P_enc ∥ code_challenge ∥ P_client ∥ client_nonce ∥ custom_info)';
+                        } else {
+                            expectedTdxBindingHex = expectedNonce.padEnd(128, '0');
+                            // wording pinned by the offline harness (Test 2/5)
+                            tdxBindingLabel = 'session nonce';
+                        }
+                        const qBindingOk = qReportDataHex === expectedTdxBindingHex;
+                        // MRTD (mr_td): after tee_tcb_svn16 + mr_seam48 + mr_signer_seam48
+                        // + seam_attributes8 + td_attributes8 + xfam8 = offset 136.
+                        const qMrtdHex = hx(qBody.subarray(136, 184));
+                        // ---- auth data (v4/v5 AuthDataV4):
+                        //   u32 LE len | sig64 (raw r||s) | attkey64 (raw X||Y)
+                        //   | cert_type u16 | cert_len u32 | cert body ----
+                        const authLen = le32u(quote, signedLen);
+                        if (signedLen + 4 + authLen > quote.length) throw new Error('auth data length exceeds quote size');
+                        const auth = quote.subarray(signedLen + 4, signedLen + 4 + authLen);
+                        if (auth.length < 64 + 64 + 6) throw new Error('auth data truncated');
+                        const qSigRaw = auth.subarray(0, 64);      // ECDSA P-256 raw r||s
+                        const attKeyRaw = auth.subarray(64, 128);  // attestation key raw X||Y
+                        const certType = le16(auth, 128);
+                        const certLen = le32u(auth, 130);
+                        const certBody = auth.subarray(134, 134 + certLen);
+                        if (certBody.length !== certLen) throw new Error('certification data truncated');
+                        // cert_type 6 = QE-report certification data:
+                        //   qe_report384 | qe_report_sig64 | auth_len u16 | auth32
+                        //   | inner cert_type u16 | inner_len u32 | PCK chain (PEM)
+                        if (certType !== 6) {
+                            throw new Error(`certification data type ${certType} unsupported — type 6 (QE-report cert) is required to bind the attestation key to the PCK chain`);
+                        }
+                        if (certBody.length < 384 + 64 + 2 + 32 + 6) throw new Error('QE report certification data truncated');
+                        const qeReport = certBody.subarray(0, 384);
+                        const qeReportSig = certBody.subarray(384, 448);
+                        const qeAuthLen = le16(certBody, 448);
+                        if (qeAuthLen !== 32) throw new Error(`QE auth data length ${qeAuthLen}, expected 32`);
+                        const qeAuthData = certBody.subarray(450, 482);
+                        const innerType = le16(certBody, 482);
+                        const innerLen = le32u(certBody, 484);
+                        const innerBody = certBody.subarray(488, 488 + innerLen);
+                        if (innerBody.length !== innerLen) throw new Error('inner certification data truncated');
+                        if (innerType !== 5 && innerType !== 4) {
+                            throw new Error(`inner certification type ${innerType} unsupported (5 = PCK cert chain, 4 = PCK leaf)`);
+                        }
+                        // ---- certificate material: quote-carried chain first,
+                        // then the enclave-published hw.pck_cert_pem ----
+                        let innerText = '';
+                        for (let i = 0; i < innerBody.length; i += 0x8000) {
+                            innerText += String.fromCharCode.apply(null, innerBody.subarray(i, i + 0x8000));
+                        }
+                        if (innerText.indexOf('-----BEGIN') === -1) {
+                            // type-4 style raw DER blob → wrap as one PEM block
+                            innerText = '-----BEGIN CERTIFICATE-----\n' + btoa(innerText).replace(/(.{64})/g, '$1\n') + '\n-----END CERTIFICATE-----';
+                        }
+                        const pemRe = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
+                        const parseAll = async (text, label) => {
+                            const pems = (text || '').match(pemRe) || [];
+                            const out = [];
+                            for (let i = 0; i < pems.length; i++) {
+                                const o = x509ParseAny(pems[i], label + '[' + i + ']');
+                                const m = pems[i].match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);
+                                o.pem = pems[i];
+                                o.derBytes = Uint8Array.from(atob(m[1].replace(/\s+/g, '')), c => c.charCodeAt(0));
+                                o.derHex = hx(o.derBytes); // identity (dedupe)
+                                o.derSha256 = hx(new Uint8Array(await crypto.subtle.digest('SHA-256', o.derBytes))); // pin compare
+                                out.push(o);
+                            }
+                            return out;
+                        };
+                        const parsedQuote = await parseAll(innerText, 'quote PCK');
+                        const parsedPub = await parseAll(hw.pck_cert_pem, 'published PCK');
+                        if (!parsedQuote.length && !parsedPub.length) {
+                            throw new Error('no PCK certificate in the quote or the report — chain cannot be verified');
+                        }
+                        // Candidate chains, hardware-quoted first. Same-leaf
+                        // published certs complete a leaf-only quote chain.
+                        const groups = [];
+                        if (parsedQuote.length) {
+                            let g = parsedQuote;
+                            if (parsedPub.length && parsedPub[0].derHex === parsedQuote[0].derHex && parsedPub.length > 1) {
+                                // same leaf: extend with published intermediates (deduped —
+                                // a cert must never follow itself in the walk)
+                                const have = new Set(parsedQuote.map(c => c.derHex));
+                                g = parsedQuote.concat(parsedPub.slice(1).filter(c => !have.has(c.derHex)));
+                            }
+                            groups.push(g);
+                        }
+                        if (parsedPub.length && (!parsedQuote.length || parsedPub[0].derHex !== parsedQuote[0].derHex)) {
+                            groups.push(parsedPub);
+                        }
+                        // ---- 4a. QE report signature: signed by the PCK LEAF
+                        // (Intel: PCK cert signs the QE report; the QE report
+                        // then binds the attestation key) ----
+                        let qeRepSigOk = false, usedGroup = null;
+                        for (const g of groups) {
+                            try {
+                                const leafKey = await crypto.subtle.importKey('spki', g[0].spkiDer, ecCurveParams(g[0].spkiDer), false, ['verify']);
+                                if (await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, leafKey, qeReportSig, qeReport)) {
+                                    qeRepSigOk = true; usedGroup = g; break;
+                                }
+                            } catch (e) { /* try next candidate */ }
+                        }
+                        const pckLeafParsed = usedGroup ? usedGroup[0] : (groups[0] && groups[0][0]) || null;
+                        let pckIssuer = '', pckSubject = '';
+                        if (pckLeafParsed) {
+                            const names = x509Names(pckLeafParsed);
+                            pckIssuer = names.issuer; pckSubject = names.subject;
+                        }
+                        const issuerIntelOk = /Intel/i.test(pckIssuer) && /PCK/i.test(pckIssuer);
+                        // ---- 4b. Chain walk to the PINNED roots (root PEMs
+                        // travel with the code, never with the quote) ----
+                        let chainOk = false, chainLabel = 'no usable PCK chain in this report';
+                        if (qeRepSigOk && usedGroup) {
+                            const roots = (Array.isArray(TRUSTED_INTEL_ROOTS) ? TRUSTED_INTEL_ROOTS : [])
+                                .map(r => ({ sha256: String((r && r.sha256) || '').toLowerCase(), pem: (r && r.pem) || '' }))
+                                .filter(r => /^[0-9a-f]{64}$/.test(r.sha256) && r.pem.indexOf('-----BEGIN CERTIFICATE-----') !== -1);
+                            const pins = roots.map(r => r.sha256);
+                            const chain = usedGroup.slice();
+                            // append every pinned root the chain doesn't already carry
+                            for (const rt of roots) {
+                                const m = rt.pem.match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);
+                                if (!m) continue;
+                                const rp = x509ParseAny(rt.pem, 'pinned Intel root');
+                                rp.pem = rt.pem;
+                                rp.derBytes = Uint8Array.from(atob(m[1].replace(/\s+/g, '')), c => c.charCodeAt(0));
+                                rp.derSha256 = hx(new Uint8Array(await crypto.subtle.digest('SHA-256', rp.derBytes)));
+                                if (chain.some(c => c.derSha256 === rp.derSha256)) continue;
+                                chain.push(rp);
+                            }
+                            let links = 0;
+                            for (let i = 0; i < chain.length; i++) {
+                                const cur = chain[i];
+                                if (i > 0 && pins.includes(cur.derSha256)) { chainOk = true; break; }
+                                if (i + 1 >= chain.length) break;
+                                if (!(await x509SignedBy(cur, chain[i + 1]))) break;
+                                links++;
+                            }
+                            chainLabel = chainOk
+                                ? `${links + 1} certs, leaf → Intel SGX Root CA pinned (${pins[0] ? pins[0].substring(0, 16) : '?'}…)`
+                                : `chain does NOT reach a pinned Intel root (walked ${links} link(s))`;
+                        }
+                        // ---- 3. QUOTE signature: attestation key over header+body ----
+                        const attKey = await crypto.subtle.importKey('spki', p256SpkiFromRaw(attKeyRaw),
+                            { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+                        const qSigOk = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, attKey, qSigRaw, signedRegion);
+                        // ---- 4c. attestation key bound into the QE report:
+                        // SHA-256(attkey || qe_auth_data) == report_data[0..32] ----
+                        const qePreimage = new Uint8Array(64 + 32);
+                        qePreimage.set(attKeyRaw, 0);
+                        qePreimage.set(qeAuthData, 64);
+                        const qeHash = new Uint8Array(await crypto.subtle.digest('SHA-256', qePreimage));
+                        const qeReportData = qeReport.subarray(320, 384); // EnclaveReport.report_data @320
+                        const attKeyBound = hx(qeHash) === hx(qeReportData.subarray(0, 32));
+                        // v165 MRTD PIN (ghost-enclave guard): an Intel-signed
+                        // quote proves silicon; the pin proves the audited
+                        // launch chain booted it. Fail-closed if EXPECTED_MRTD
+                        // is unset. Scope/rotation: see the EXPECTED_MRTD block.
+                        const mrtdPin = (typeof EXPECTED_MRTD === 'string' && EXPECTED_MRTD) ? EXPECTED_MRTD : '';
+                        const mrtdOk = !!mrtdPin && qMrtdHex === mrtdPin;
+                        tdxVerified = qBindingOk && qSigOk && attKeyBound && qeRepSigOk && issuerIntelOk && chainOk && mrtdOk;
+                        if (tdxVerified) {
+                            siliconMsg = `✅ <b>Intel TDX Silicon Root Verified</b><br>` +
+                                `🔏 Quote signature ECDSA P-256/SHA-256 by its attestation key over header+TDREPORT (v${qVersion}${bodyType ? ', body type ' + bodyType : ''}) valid<br>` +
+                                `⛓️ Attestation key bound into the QE report (SHA-256) and the QE report signed by the PCK leaf ✓<br>` +
+                                `⛓️ PCK chain: ${chainLabel}<br>` +
+                                `📜 PCK leaf "${esc(pckSubject)}" issued by: ${esc(pckIssuer)}<br>` +
+                                `🔐 ${pfCtxTdx && pfCtxTdx.binding === 'v161'
+                                    ? 'report_data == v161.2 client binding (P_enc ∥ code_challenge ∥ P_client ∥ client_nonce ∥ custom_info), [32..64] zero — bound ✓'
+                                    : "report_data[0..32] == this session's combined nonce, [32..64] zero — bound ✓"}<br>` +
+                                `📏 MRTD: ${qMrtdHex.substring(0, 32)}… pinned ✓ (launch-chain ghost guard; source: ${esc(hw.tdx_evidence_source || 'unknown')})`;
+                        } else {
+                            siliconMsg = `❌ <b>Intel TDX quote present but verification FAILED</b> ` +
+                                `(binding=${qBindingOk}, quote_sig=${qSigOk}, attkey_bind=${attKeyBound}, qe_report_sig=${qeRepSigOk}, issuer_intel=${issuerIntelOk}, root_chain=${chainOk}, mrtd_pin=${mrtdOk})<br>` +
+                                (!mrtdOk ? `⚠️ MRTD pin mismatch: quoted launch measurement ${esc(qMrtdHex.slice(0, 32))}… ≠ the pinned audited chain — a DIFFERENT launch image (ghost enclave). Do NOT trust.<br>` : '') +
+                                `⚠️ PCK issuer was: "${esc(pckIssuer || 'n/a')}" — do NOT trust this report.<br>` +
+                                `⛓️ ${chainLabel}` +
+                                (!qBindingOk
+                                    ? `<br>ℹ️ quote report_data[0..32] = ${qReportDataHex.slice(0, 32)}…, expected ${tdxBindingLabel} = ${expectedTdxBindingHex.slice(0, 32)}…`
+                                    : '');
+                        }
+                    } catch (err) {
+                        tdxVerified = false;
+                        siliconMsg = `❌ <b>Intel TDX verification error:</b> ${esc(err.message)}`;
+                    }
+                } else {
+                    // No signed quote. A TDREPORT is generated inside the TD and
+                    // is UNSIGNED; MRTD/RTMRs from sysfs are guest-internal.
+                    // Neither can anchor a silicon root — say so precisely
+                    // (honest verdict, no generic abort) and surface the
+                    // enclave's own probe transcript for diagnosis.
+                    const marker = hw.tdx_evidence_marker || {};
+                    const probe = hw.tdx_evidence_probe || {};
+                    const notes = Array.isArray(probe.notes) ? probe.notes.slice(0, 10) : [];
+                    siliconMsg = `❌ <b>No hardware-signed TDX evidence in this report.</b><br>` +
+                        ((marker.tdx_td_report_present || hw.tdx_td_report_b64)
+                            ? `⚠️ A bare TDREPORT (1024 B) is generated inside the guest and is UNSIGNED; sysfs MRTD/RTMRs are guest-internal self-reports. Neither is a silicon root.<br>`
+                            : `⚠️ The platform exposed no TDX guest device, so the enclave obtained neither a TD Quote nor a TDREPORT — there is nothing hardware-signed to verify.<br>`) +
+                        `ℹ️ Enclave marker: hardware_signed_tdx_quote=${marker.hardware_signed_tdx_quote ? 'true' : 'false'}, status=${esc(marker.tdx_quote_status || 'n/a')}, source=${esc(hw.tdx_evidence_source || 'none')}${marker.tdx_td_report_present ? ', td_report_present=true' : ''}.` +
+                        (marker.auditor_note ? `<br>ℹ️ Enclave's own note: ${esc(marker.auditor_note)}` : '') +
+                        (notes.length ? `<br>ℹ️ Probe transcript:<br>ℹ️ ${notes.map(esc).join('<br>ℹ️ ')}` : '');
+                }
+            }
             // v153 SECURITY (audit SEC-04): platform-enforced silicon root.
             // The old `googleVerified || snpVerified` OR allowed a report
             // CLAIMING OCI to satisfy the silicon check with a locally-made
@@ -1623,6 +2160,12 @@
                 }
             } else if (claimsGcp) {
                 siliconOk = googleVerified;
+            } else if (claimsTdx) {
+                // Intel TDX reports are ONLY trusted through the quote path.
+                siliconOk = tdxVerified;
+                if (!tdxVerified && siliconMsg.indexOf('❌') === -1) {
+                    siliconMsg += `<br>❌ <b>Intel TDX evidence did not verify</b> — a TDX report is only trusted when the Quoting Enclave's ECDSA signature, the PCK issuer chain, and the session-nonce binding all verify.`;
+                }
             } else {
                 siliconOk = false;
             }
@@ -1631,10 +2174,12 @@
             // shows WHICH sub-check failed (binding / sig / chain / ark pin).
             updateStatus('firmwareCheck', siliconOk, siliconMsg || (siliconOk
                 ? "✅ Silicon root verified"
-                : "❌ No AMD SNP or Google AK evidence present in report"));
+                : "❌ No AMD SNP, Google AK, or Intel TDX evidence present in report"));
 
             if (!siliconOk) {
-                throw new Error("CRITICAL: No valid Silicon Root of Trust (AMD or Google) found in report.");
+                // Harness pins /No valid Silicon Root/ (Test 8/14/15) — the
+                // appended hint keeps that substring intact.
+                throw new Error("CRITICAL: No valid Silicon Root of Trust (AMD, Google, or Intel TDX) found in report. If you believe this enclave is genuine, this copy of the auditor may be out of date — download the latest verify.html from the project's GitHub and re-run.");
             }
 
             // 6. TLS Binding
@@ -1644,12 +2189,49 @@
                 const reportLeaf = getLeafCert(report.session_context.tls_certificate_pem);
                 updateStatus('tlsCheck', userLeaf === reportLeaf, userLeaf === reportLeaf ? "TLS channel bound." : "TLS mismatch!");
             }
+
+            // v164: a fully green audit unlocks the report download — the
+            // saved JSON is what the user audits offline in ANY external
+            // auditor copy; this page is only a convenience.
+            try { document.getElementById('reportDownloadBtn').style.display = 'block'; } catch (e) { /* stub-safe */ }
             return true;
         } catch (e) { 
             console.error(e); 
             alert("Audit Failed: " + e.message);
             return false; 
         }
+    }
+
+    // v164: download the DECRYPTED report currently under audit. Triggered by
+    // the unlocked results button or the post-login handoff (?afterlogin=1).
+    // The file is the user's portable evidence — auditable offline in any
+    // external auditor copy. The filename's flow tag is sanitized (report
+    // content is untrusted until the audit above has passed).
+    function downloadReportFile() {
+        let env = null;
+        try {
+            const ta = document.getElementById('attestationInput');
+            env = JSON.parse((ta && ta.value) ? ta.value : 'null');
+        } catch (e) { env = null; }
+        if (!env || !env.attestation_report) {
+            alert('No decrypted report to download yet — complete the login (Step 1/3) or paste a report (Step 4) first.');
+            return false;
+        }
+        let flowTag = 'report';
+        try {
+            flowTag = String(env.flow || sessionStorage.getItem('pav_e2ee_flow') || 'report')
+                .replace(/[^a-z0-9_-]/gi, '').slice(0, 24) || 'report';
+        } catch (e) { /* no sessionStorage (harness) — keep default */ }
+        const blob = new Blob([JSON.stringify(env, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'attestation-report-' + flowTag + '-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 5000);
+        return true;
     }
 </script>
 
