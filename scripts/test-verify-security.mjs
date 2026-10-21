@@ -1,15 +1,29 @@
-// Functional security regression tests for verify.html.
-// Loads the ACTUAL <script> from verify.html, stubs the DOM, and drives
-// runAudit() against: (1) the genuine captured OCI SNP report (optional,
-// GENUINE_REPORT), (2) a spoofed report that pastes a Google AK cert with
-// no TPM evidence, (3) a report with a tampered (unpinned) SEV-SNP launch
-// digest, (4) nonce-formula parity with the Rust enclave, (5) a legitimate
-// GCP report (must still pass — no regression).
+// Functional security regression tests for verify.html — the REAL <script>
+// is evaluated (indirect eval) and runAudit() is driven end-to-end with
+// synthetic, spec-exact fixtures. No mocked verification logic: every check
+// the page performs is executed for real.
+//
+// Covered (TDX path — Intel quote ABI v4/v5 per Intel's DCAP reference
+// implementation, dcap-qvl 0.6.3):
+//   * positive audits for v4, v5/TDREPORT10, v5/TDREPORT15 quotes
+//   * session binding (report_data @520..584 — NOT "last 64 bytes")
+//   * MRTD display offset (mr_td @136..184 — NOT @16)
+//   * quote signed by the ATTESTATION KEY (not the PCK key)
+//   * attestation key bound into the QE report; QE report signed by PCK leaf
+//   * PCK chain walk to the SHA-256-pinned Intel SGX Root CA
+//   * negative paths: wrong nonce, tampered sigs, unpinned attacker root,
+//     bad header fields, wrong cert types, unsigned TDREPORT, no evidence
+//   * regression guards: Google-cert spoof, legit GCP report (port of the
+//     oraclecloud harness), pre-flight pin, enclave-signature hard fail,
+//     provenance fail-closed, static source pins (no old bogus offsets)
 //
 // Usage:  npm install --no-save node-forge && node scripts/test-verify-security.mjs
-//         (or NODE_PATH=/path/to/node_modules node scripts/test-verify-security.mjs)
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
+import { execFileSync, spawnSync } from 'child_process';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { createRequire } from 'module';
+import { generateKeyPairSync, sign as rsaSign, createHash } from 'crypto';
 
 const require = createRequire(import.meta.url);
 let forge;
@@ -22,7 +36,8 @@ try {
 }
 globalThis.forge = forge;
 
-const html = readFileSync(new URL('../verify.html', import.meta.url), 'utf8');
+const repoRoot = new URL('..', import.meta.url).pathname;
+const html = readFileSync(join(repoRoot, 'verify.html'), 'utf8');
 const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
 
 // ---- DOM stubs -------------------------------------------------------------
@@ -41,26 +56,42 @@ globalThis.document = {
 };
 let lastAlert = null;
 globalThis.alert = (msg) => { lastAlert = msg; };
-// Provenance lookups: fail closed (offline auditor must not crash on this)
-const nativeFetch = globalThis.fetch; // kept for the optional live test (Test 12)
-globalThis.fetch = async () => ({ ok: false, json: async () => ({}) });
 
-// Evaluate the page script in this global scope
+// Provenance lookups (GitHub attestations) — configurable per test.
+let fetchMode = 'ok'; // 'ok' = every hash attested by run #777; '404' = unattested; 'xss' = attested by a hostile run id
+globalThis.fetch = async () => {
+  if (fetchMode === 'ok' || fetchMode === 'xss') {
+    const invocationId = fetchMode === 'xss' ? '<img src=x onerror=window.__pwned=1>' : '777';
+    const payload = Buffer.from(JSON.stringify({
+      predicate: { runDetails: { metadata: { invocationId } } },
+    })).toString('base64');
+    return {
+      ok: true, status: 200,
+      json: async () => ({ attestations: [{ bundle: { payload } }] }),
+    };
+  }
+  return { ok: false, status: 404, json: async () => ({}) };
+};
+
+// Evaluate the page script in this global scope (function decls + var leak
+// to globalThis; const/let stay in the eval's lexical scope).
 (0, eval)(script);
 
-async function runAuditWith(reportJson) {
+async function runAuditWith(envelope) {
   lastAlert = null;
-  elements['attestationInput'] = makeEl();
-  elements['attestationInput'].value = JSON.stringify(reportJson);
-  elements['certInput'] = makeEl();
-  elements['certInput'].value = '';
-  await runAudit();
-  return lastAlert;
+  document.getElementById('attestationInput').value = JSON.stringify(envelope);
+  document.getElementById('certInput').value = '';
+  const ok = await runAudit();
+  return { ok, alert: lastAlert };
 }
-
-function fwStatus() {
-  return elements['firmwareCheck'];
-}
+const fwDesc = () => {
+  const el = elements['firmwareCheck'];
+  return el ? (el.querySelector().innerHTML || el.innerHTML || '') : '';
+};
+const row = (id) => {
+  const el = elements[id];
+  return el ? { cls: el.className, desc: el.querySelector().innerHTML || '' } : { cls: '', desc: '' };
+};
 
 let pass = 0, fail = 0;
 function check(name, cond, detail) {
@@ -68,9 +99,23 @@ function check(name, cond, detail) {
   else { fail++; console.log(`  ❌ ${name}${detail ? ' — ' + detail : ''}`); }
 }
 
-// SEC-02: the hardware nonce commits to code identity too. Mirror of the
-// enclave's compute_session_nonce over the 160-byte (5-element) pre-image:
-// paypal ∥ pubkey ∥ SHA256(custom_info) ∥ binary_sha256 ∥ SHA256(canonical manifest).
+// ---- shared crypto/serialization helpers -----------------------------------
+const sha256 = (b) => createHash('sha256').update(b).digest();
+const pemToDer = (pem) => Buffer.from(pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
+const concat = (...arrs) => {
+  const t = new Uint8Array(arrs.reduce((s, a) => s + a.length, 0));
+  let o = 0;
+  for (const a of arrs) { t.set(a, o); o += a.length; }
+  return t;
+};
+const u16le = (n) => Uint8Array.of(n & 0xff, (n >> 8) & 0xff);
+const u32le = (n) => Uint8Array.of(n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >>> 24) & 0xff);
+const hex = (u8) => Buffer.from(u8).toString('hex');
+const fromHex = (h) => Uint8Array.from(Buffer.from(h, 'hex'));
+const fillAt = (a, off, len, v) => a.fill(v, off, off + len);
+
+// SEC-02 nonce mirror: SHA-256(paypal ∥ pubkey ∥ SHA256(custom_info) ∥
+// binary_sha256 ∥ SHA256(canonical manifest)) over the 160-byte pre-image.
 async function nonce160Hex(paypalHash, pubkeyHash, customInfoStr, binaryShaHex, diskManifest) {
   const ciHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(customInfoStr)));
   const sorted = Object.keys(diskManifest || {}).sort().map(k => [k, diskManifest[k]]);
@@ -79,892 +124,1000 @@ async function nonce160Hex(paypalHash, pubkeyHash, customInfoStr, binaryShaHex, 
   combined.set(paypalHash, 0);
   combined.set(pubkeyHash, 32);
   combined.set(ciHash, 64);
-  combined.set(new Uint8Array((binaryShaHex.match(/.{1,2}/g) || []).map(b => parseInt(b, 16))), 96);
+  combined.set(fromHex(binaryShaHex), 96);
   combined.set(manHash, 128);
-  return Buffer.from(await crypto.subtle.digest('SHA-256', combined)).toString('hex');
+  return hex(new Uint8Array(await crypto.subtle.digest('SHA-256', combined)));
 }
 
-// v160: a fully self-consistent LEGITIMATE GCP report (Google cert with
-// allowlisted issuer + TPM quote whose nonce/PCR digest verify + enclave
-// signature). Shared by Test 5 (regression) and Test 8 (pre-flight happy
-// path) — construction extracted verbatim from Test 5.
-async function buildLegitGcpReport() {
-  const { generateKeyPairSync, sign: rsaSign, createHash } = await import('crypto');
-  const sha256 = (b) => createHash('sha256').update(b).digest();
+const INTEL_VENDOR = Uint8Array.from([0x93, 0x9a, 0x72, 0x33, 0xf7, 0x9c, 0x4c, 0xa9, 0x94, 0x0a, 0x0d, 0xb3, 0x95, 0x7f, 0x06, 0x07]);
+const REAL_INTEL_PIN = '44a0196b2b99f889b8e149e95b807a350e7424964399e885a7cbb8ccfab674d3';
 
-  // Enclave signing key (attacker-independent; just needs to self-consistently sign)
+// ---- synthetic PCK-style certificate chains (openssl, EC P-256) ------------
+// Structurally identical to Intel's hierarchy (root → PCK CA → PCK leaf) so
+// only the root SHA-256 pin separates a real chain from an attacker's.
+const dir = mkdtempSync(join(tmpdir(), 'verify-harness-'));
+function openssl(args) {
+  try {
+    return execFileSync('openssl', args, { stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+  } catch (e) {
+    console.error('openssl failed:', args.join(' '), '\n', (e.stderr || '') + '');
+    process.exit(3);
+  }
+}
+async function makeCertChain({ rootSubject, intSubject, leafSubject }) {
+  const extCa = join(dir, 'ca.ext');
+  const extLeaf = join(dir, 'leaf.ext');
+  writeFileSync(extCa, '[v3_ca]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n');
+  writeFileSync(extLeaf, '[v3_leaf]\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n');
+  const out = {};
+  // keys: WebCrypto (needed for signing qe_report/quote) ⇄ openssl (certs)
+  for (const who of ['root', 'int', 'leaf']) {
+    const kp = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+    const pk8 = Buffer.from(await crypto.subtle.exportKey('pkcs8', kp.privateKey));
+    const derPath = join(dir, `${who}.pk8.der`);
+    const pemPath = join(dir, `${who}.key.pem`);
+    writeFileSync(derPath, pk8);
+    openssl(['pkcs8', '-topk8', '-nocrypt', '-inform', 'DER', '-in', derPath, '-out', pemPath]);
+    out[who] = { key: kp.privateKey, pemPath };
+  }
+  const subjects = { root: rootSubject, int: intSubject, leaf: leafSubject };
+  for (const who of ['root', 'int', 'leaf']) {
+    const csr = join(dir, `${who}.csr`);
+    openssl(['req', '-new', '-key', out[who].pemPath, '-sha256', '-subj', subjects[who], '-out', csr]);
+    const cert = join(dir, `${who}.pem`);
+    if (who === 'root') {
+      openssl(['x509', '-req', '-in', csr, '-signkey', out[who].pemPath, '-sha256', '-days', '3650',
+               '-extfile', extCa, '-extensions', 'v3_ca', '-out', cert]);
+    } else if (who === 'int') {
+      openssl(['x509', '-req', '-in', csr, '-CA', join(dir, 'root.pem'), '-CAkey', out.root.pemPath,
+               '-CAcreateserial', '-sha256', '-days', '3650',
+               '-extfile', extCa, '-extensions', 'v3_ca', '-out', cert]);
+    } else {
+      openssl(['x509', '-req', '-in', csr, '-CA', join(dir, 'int.pem'), '-CAkey', out.int.pemPath,
+               '-CAcreateserial', '-sha256', '-days', '3650',
+               '-extfile', extLeaf, '-extensions', 'v3_leaf', '-out', cert]);
+    }
+    out[who].pem = readFileSync(cert, 'utf8');
+    out[who].derHex = pemToDer(out[who].pem).toString('hex');
+    out[who].sha256 = sha256(pemToDer(out[who].pem)).toString('hex');
+  }
+  return out;
+}
+
+// The audited (positive) chain: structurally Intel-shaped, self-made key.
+const goodChain = await makeCertChain({
+  rootSubject: '/C=US/ST=CA/L=Santa Clara/O=Intel Corporation/CN=Intel SGX Root CA',
+  intSubject: '/C=US/ST=CA/L=Santa Clara/O=Intel Corporation/CN=Intel SGX PCK Platform CA',
+  leafSubject: '/C=US/O=Intel Corporation/CN=PCK CntrTest-00aa11bb22cc33dd',
+});
+// The attacker chain: same DNs (issuer regex cannot tell them apart), fresh keys.
+const evilChain = await makeCertChain({
+  rootSubject: '/C=US/ST=CA/L=Santa Clara/O=Intel Corporation/CN=Intel SGX Root CA',
+  intSubject: '/C=US/ST=CA/L=Santa Clara/O=Intel Corporation/CN=Intel SGX PCK Platform CA',
+  leafSubject: '/C=US/O=Intel Corporation/CN=PCK CntrTest-evil99ee88dd77cc',
+});
+const goodRootSha = goodChain.root.sha256;
+
+// ---- synthetic TD Quote builder (Intel ABI, offsets from dcap-qvl) ---------
+async function buildTdxQuote(o) {
+  const {
+    version = 4, bodyType = 2, reportData, innerChainPems, leafKey,
+    tamperQuoteSig = false, corruptQeReportData = false, quoteSigByPckKey = false,
+    vendorId = INTEL_VENDOR, teeType = 0x81, attKeyType = 2,
+    outerCertType = 6, forceBodySize = null, mrtdFill = null,
+  } = o;
+  if (!reportData || reportData.length !== 64) throw new Error('reportData must be 64 bytes');
+  const bodyLen = bodyType === 3 ? 648 : 584;
+  const hdr = new Uint8Array(48 + (version === 5 ? 6 : 0) + bodyLen);
+  // header: version u16@0, att_key_type u16@2, tee_type u32@4, svn@8/10, vendor@12, user_data@28
+  hdr.set(u16le(version), 0);
+  hdr.set(u16le(attKeyType), 2);
+  hdr.set(u32le(teeType), 4);
+  hdr[8] = 1; hdr[10] = 1;
+  hdr.set(vendorId, 12);
+  let bodyOff = 48;
+  if (version === 5) {
+    hdr.set(u16le(bodyType), 48);
+    hdr.set(u32le(forceBodySize ?? bodyLen), 50);
+    bodyOff = 54;
+  }
+  const body = hdr.subarray(bodyOff);
+  // TDREPORT10 body layout (584 B)
+  fillAt(body, 0, 16, 0x11);    // tee_tcb_svn
+  fillAt(body, 16, 48, 0x22);   // mr_seam
+  fillAt(body, 64, 48, 0x33);   // mr_signer_seam
+  fillAt(body, 112, 8, 0x44);   // seam_attributes
+  fillAt(body, 120, 8, 0x55);   // td_attributes
+  fillAt(body, 128, 8, 0x66);   // xfam
+  // mr_td (MRTD) @136 — default fixture = the PINNED audited MRTD
+  // (EXPECTED_MRTD gate rejects anything else); pass mrtdFill as a byte to
+  // exercise the mismatch path. Empty/absent pin → zeros → never matches
+  // (fail-closed, same as verify.html).
+  if (mrtdFill === null) {
+    const pin = (typeof EXPECTED_MRTD === 'string' && /^[0-9a-f]{96}$/.test(EXPECTED_MRTD)) ? EXPECTED_MRTD : '';
+    body.set(Uint8Array.from(Buffer.from(pin, 'hex')), 136);
+  } else {
+    fillAt(body, 136, 48, mrtdFill);
+  }
+  fillAt(body, 184, 48, 0x77);  // mr_config_id
+  fillAt(body, 232, 48, 0x88);  // mr_owner
+  fillAt(body, 280, 48, 0x99);  // mr_owner_config
+  for (let k = 0; k < 4; k++) fillAt(body, 328 + k * 48, 48, 0xa0 + k); // rt_mr0..3
+  body.set(reportData, 520);    // report_data @520..584 (TD15 appends AFTER it)
+  if (bodyLen === 648) { fillAt(body, 584, 16, 0xbb); fillAt(body, 600, 48, 0xcc); } // tee_tcb_svn2 + mr_service_td
+  // attestation key (raw X||Y) + quote signature over header(+preamble)||body
+  const att = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const attRaw = new Uint8Array(await crypto.subtle.exportKey('raw', att.publicKey)).subarray(1); // strip 0x04
+  const signed = hdr.subarray(0, bodyOff + bodyLen);
+  let qsig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' },
+    quoteSigByPckKey ? leafKey : att.privateKey, signed));
+  if (tamperQuoteSig) qsig[10] ^= 0xff;
+  // QE report certification data (cert_type 6)
+  const qeAuth = new Uint8Array(32).fill(0x5a);
+  const qeReport = new Uint8Array(384);
+  fillAt(qeReport, 0, 16, 0x10);  // cpu_svn
+  fillAt(qeReport, 48, 16, 0x07); // attributes
+  fillAt(qeReport, 64, 32, 0x3d); // mr_enclave
+  fillAt(qeReport, 128, 32, 0x4e);// mr_signer
+  const pre = concat(attRaw, qeAuth);
+  let qhash = new Uint8Array(await crypto.subtle.digest('SHA-256', pre));
+  if (corruptQeReportData) qhash[0] ^= 0xff;
+  qeReport.set(qhash, 320); // report_data[0..32]; [32..64] stays zero
+  const qeSig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, leafKey, qeReport));
+  const innerText = innerChainPems.join('\n') + '\n';
+  const innerBytes = Uint8Array.from(Buffer.from(innerText, 'utf8'));
+  let certBody;
+  if (outerCertType === 6) {
+    certBody = concat(qeReport, qeSig, u16le(32), qeAuth, u16le(5), u32le(innerBytes.length), innerBytes);
+  } else {
+    certBody = innerBytes; // raw chain as cert body (rejected: no QE binding possible)
+  }
+  const auth = concat(qsig, attRaw, u16le(outerCertType), u32le(certBody.length), certBody);
+  const quote = concat(signed, u32le(auth.length), auth);
+  return { b64: Buffer.from(quote).toString('base64') };
+}
+
+// ---- report/envelope builder ----------------------------------------------
+const DISK_MANIFEST = {
+  'EFI/BOOT/vmlinuz': 'cc'.repeat(32),
+  'EFI/BOOT/initrd.img': 'dd'.repeat(32),
+  'EFI/BOOT/grub.cfg': 'ee'.repeat(32),
+  // v165: full boot chain — shim/UKI + grub are now inside the atomicity gate
+  'EFI/BOOT/BOOTX64.EFI': 'aa'.repeat(32),
+  'EFI/BOOT/grubx64.efi': '99'.repeat(32),
+};
+// v165: fixtures must produce the PINNED audited binary (see
+// EXPECTED_ENCLAVE_SHA256 in verify.html) — the code-pin gate rejects
+// anything else, by design.
+const BINARY_SHA = EXPECTED_ENCLAVE_SHA256;
+async function buildEnvelope({ hw, customInfo = 'wallet_test_1', corruptEnclaveSig = false, hwBuilder, binarySha = BINARY_SHA, sessionContext = {} }) {
   const enc = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const encPem = enc.publicKey.export({ type: 'spki', format: 'pem' }).toString();
-
-  // Session AK keypair (stands in for tpm2_createprimary AK)
-  const ak = generateKeyPairSync('rsa', { modulusLength: 2048 });
-  const akPem = ak.publicKey.export({ type: 'spki', format: 'pem' }).toString();
-
-  const customInfo = 'gcp_wallet_xyz';
-  const reportBody = {
+  const report = {
     custom_info: customInfo,
     enclave_config: {
-      boot_measurements: {
-        binary_sha256: 'bb'.repeat(32),
-        disk_manifest: { 'EFI/BOOT/vmlinuz': 'cc'.repeat(32), 'EFI/BOOT/initrd.img': 'dd'.repeat(32), 'EFI/BOOT/grub.cfg': 'ee'.repeat(32) },
-      },
-      domain: 'login.example.com',
+      boot_measurements: { binary_sha256: binarySha, disk_manifest: DISK_MANIFEST },
+      domain: 'login.airma.de',
     },
     paypal_user_info_raw_hash: '11'.repeat(32),
-    session_context: {},
+    session_context: sessionContext,
     timestamp_ms: Date.now(),
-    hardware_level_attestation: null, // filled below (needs nonce)
+    hardware_level_attestation: hw || null,
   };
-
-  // Expected nonce — same formula as runAudit step 1 (SEC-02: 160-byte
-  // pre-image including binary_sha256 + canonical manifest composite)
-  // NOTE: pubkey hash is over the raw DER (SPKI), not the PEM text — matches
-  // the enclave's PKey::public_key_to_der() and the page's pemToBuffer().
-  const pemToDer = (pem) => Buffer.from(pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
-  const expectedNonceHex = await nonce160Hex(
-    Buffer.from(reportBody.paypal_user_info_raw_hash, 'hex'),
+  const nonce = await nonce160Hex(
+    fromHex(report.paypal_user_info_raw_hash),
     new Uint8Array(sha256(pemToDer(encPem))),
-    customInfo,
-    reportBody.enclave_config.boot_measurements.binary_sha256,
-    reportBody.enclave_config.boot_measurements.disk_manifest,
+    customInfo, binarySha, DISK_MANIFEST,
   );
-
-  // PCR values: all five quoted PCRs; pcr_15 must equal calculatePcr15(manifest)
-  const pcr15 = await calculatePcr15(reportBody.enclave_config.boot_measurements.disk_manifest);
-  const pcrValues = {};
-  for (const p of [0, 4, 8, 9]) pcrValues['pcr_' + p] = sha256(Buffer.from(`pcr${p}`)).toString('hex');
-  pcrValues['pcr_15'] = pcr15;
-
-  // Composite digest = SHA256(concat of the 5 PCR digests in order 0,4,8,9,15)
-  const composite = sha256(Buffer.concat([0, 4, 8, 9, 15].map(p => Buffer.from(pcrValues['pcr_' + p], 'hex'))));
-
-  // Build TPMS_ATTEST exactly as parseTpmsAttest expects
-  const qSigner = Buffer.alloc(32, 0x41);
-  const extra = Buffer.from(expectedNonceHex, 'hex');
-  const parts = [];
-  const hdr = Buffer.alloc(8);
-  hdr.writeUInt32BE(0xFF544347, 0); // magic
-  hdr.writeUInt16BE(0x8018, 4);     // ST_ATTEST_QUOTE
-  hdr.writeUInt16BE(qSigner.length, 6);
-  parts.push(hdr, qSigner);
-  const edSz = Buffer.alloc(2); edSz.writeUInt16BE(extra.length, 0);
-  parts.push(edSz, extra);
-  const tail = Buffer.alloc(17 + 8, 0); // clockInfo + firmwareVersion
-  parts.push(tail);
-  const selCount = Buffer.alloc(4); selCount.writeUInt32BE(1, 0);
-  parts.push(selCount);
-  const pcrSel = Buffer.from([0x00, 0x0b, 0x03, 0x00, 0x04, 0x0f]); // sha256 bank, 3 bytes select
-  parts.push(pcrSel);
-  const dgSz = Buffer.alloc(2); dgSz.writeUInt16BE(composite.length, 0);
-  parts.push(dgSz, composite);
-  const quoteMsg = Buffer.concat(parts);
-  const quoteSig = rsaSign('sha256', quoteMsg, ak.privateKey);
-
-  // Google AK cert with the allowlisted issuer (public data by design)
-  const gkeys = forge.pki.rsa.generateKeyPair(2048);
-  const gcert = forge.pki.createCertificate();
-  gcert.publicKey = gkeys.publicKey;
-  gcert.serialNumber = '02';
-  gcert.validity.notBefore = new Date(Date.now() - 86400000);
-  gcert.validity.notAfter = new Date(Date.now() + 86400000);
-  const gdn = [{ name: 'commonName', value: 'gcp-instance' }, { name: 'organizationName', value: 'EK/AK CA Intermediate' }];
-  gcert.setSubject(gdn);
-  gcert.setIssuer(gdn);
-  gcert.sign(gkeys.privateKey, forge.md.sha256.create());
-  const googleCertPem = forge.pki.certificateToPem(gcert);
-
-  reportBody.hardware_level_attestation = {
-    ak_pub_pem: akPem,
-    tpm_quote_msg: quoteMsg.toString('base64'),
-    tpm_quote_sig: quoteSig.toString('base64'),
-    pcr_values: pcrValues,
-    google_ak_cert_pem: googleCertPem,
-    platform_type: 'GCP',
-  };
-
-  const payload = JSON.stringify(reorder(reportBody));
-  const sig = rsaSign('sha256', Buffer.from(payload), enc.privateKey);
+  // hwBuilder(nonce, pEncDer): the second arg lets pre-flight fixtures build
+  // the v161 client-binding hash over THIS envelope's real P_enc.
+  if (hwBuilder) report.hardware_level_attestation = await hwBuilder(nonce, pemToDer(encPem));
+  const payload = JSON.stringify(reorder(report));
+  let sig = rsaSign('sha256', Buffer.from(payload), enc.privateKey);
+  if (corruptEnclaveSig) { const b = Buffer.from(sig); b[5] ^= 0xff; sig = b; }
   return {
-    attestation_report: reportBody,
-    enclave_signature_b64: sig.toString('base64'),
-    enclave_signing_public_key: encPem,
+    envelope: {
+      attestation_report: report,
+      enclave_signature_b64: sig.toString('base64'),
+      enclave_signing_public_key: encPem,
+    },
+    nonce, encPem,
   };
 }
+function tdxHw({ quoteB64, chain = goodChain, markerOverrides = {}, probeNotes = ['configfs-tsm: report obtained'] }) {
+  return {
+    tdx_quote_b64: quoteB64,
+    pck_cert_pem: chain.leaf.pem + chain.int.pem,
+    tdx_evidence_source: 'configfs-tsm',
+    tdx_evidence_marker: Object.assign({
+      hardware_signed_tdx_quote: !!quoteB64,
+      tdx_quote_status: quoteB64 ? 'ok' : 'unavailable_no_guest_device',
+      tdx_td_report_present: !quoteB64,
+    }, markerOverrides),
+    tdx_evidence_probe: { notes: probeNotes },
+    platform_type: 'Intel TDX',
+  };
+}
+const reportDataFor = (nonce) => concat(fromHex(nonce), new Uint8Array(32)); // nonce || zeros
 
-// ---- Optional: a genuine captured OCI report (not committed — instance
-// hardware captures are gitignored). Supply via GENUINE_REPORT to enable
-// Tests 1 and 3; the self-contained Tests 2/4/5 always run.
-const genuinePath = process.env.GENUINE_REPORT || '/tmp/report.json';
-let genuine = null;
-try { genuine = JSON.parse(readFileSync(genuinePath, 'utf8')); } catch { /* optional */ }
-const ghw = genuine && genuine.attestation_report.hardware_level_attestation;
-const snp = ghw && ghw.snp_report_b64
-  ? Uint8Array.from(atob(ghw.snp_report_b64), c => c.charCodeAt(0))
-  : null;
-const genuineMeasurement = snp ? Buffer.from(snp.subarray(144, 192)).toString('hex') : null;
-
-// Test 1: genuine report — launch digest must be recognized as pinned
-console.log('\nTest 1: genuine OCI report — measurement pinning');
-if (genuineMeasurement) {
-  const pinned = script.includes(`'${genuineMeasurement}'`);
-  check('captured launch digest is pinned in EXPECTED_SNP_MEASUREMENTS', pinned,
-    `measurement=${genuineMeasurement}`);
-} else {
-  console.log('  ⚠️ skipped (no GENUINE_REPORT capture available — self-contained tests still run)');
+// ===========================================================================
+console.log('Test 0: extracted script passes node --check');
+{
+  const tmp = join(dir, 'verify-script.js');
+  writeFileSync(tmp, script);
+  const r = spawnSync(process.execPath, ['--check', tmp], { encoding: 'utf8' });
+  check('syntax gate', r.status === 0, (r.stderr || '').split('\n')[0]);
 }
 
-// Test 2: spoofed Google-cert report must NOT pass the silicon root
-console.log('\nTest 2: Google-cert paste spoof (Critical Vuln 1)');
+console.log('\nTest 1: static trust anchors in source (drift guards)');
 {
-  // The attacker pastes a Google AK certificate. The historical repo copies
-  // were truncated, so build a syntactically-valid cert with the ALLOWLISTED
-  // issuer ('EK/AK CA Intermediate') — a real complete cert is public data
-  // (every GCP VM exposes its own), so issuer checks cannot be the only gate.
+  const defRoots = globalThis.TRUSTED_INTEL_ROOTS;
+  check('Intel root pin present verbatim', script.includes(REAL_INTEL_PIN));
+  check('bogus v4 body_size parser removed', !script.includes('qdv.getUint32(48, true)'));
+  check('Google branch no longer uses RSA-only forge cert parser',
+    !script.includes('parseAnyCertToForge(akCertPem'));
+  check('runtime default roots = exactly the Intel DCAP root',
+    Array.isArray(defRoots) && defRoots.length === 1 && defRoots[0].sha256 === REAL_INTEL_PIN,
+    JSON.stringify(defRoots && defRoots.map(r => r.sha256)));
+  check('embedded Intel root PEM matches its pinned sha256 (self-consistent anchor)',
+    Array.isArray(defRoots) && defRoots[0].pem
+      && sha256(pemToDer(defRoots[0].pem)).toString('hex') === REAL_INTEL_PIN);
+}
+
+// Positive tests substitute the anchor with the synthetic root (the DEFAULT is
+// guarded by Test 1 and exercised again in Test 8 against an attacker chain).
+const DEFAULT_ROOTS = JSON.parse(JSON.stringify(globalThis.TRUSTED_INTEL_ROOTS));
+const GOOD_ROOTS = [{ sha256: goodRootSha, pem: goodChain.root.pem }];
+globalThis.TRUSTED_INTEL_ROOTS = GOOD_ROOTS;
+
+console.log('\nTest 2: valid quote v4 (TDREPORT10) — full green audit');
+let v4Envelope;
+{
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  v4Envelope = built;
+  const { ok, alert } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('audit returns true', ok === true, `alert=${alert}`);
+  check('firmwareCheck verified', row('firmwareCheck').cls === 'check-item verified', `cls=${row('firmwareCheck').cls}`);
+  check('TDX silicon root message', fw.includes('Intel TDX Silicon Root Verified'), fw.slice(0, 900));
+  check('chain pinned (leaf → Intel root)', /leaf → Intel SGX Root CA pinned/.test(fw), fw.slice(0, 900));
+  check('MRTD read at mr_td @136 equals pinned EXPECTED_MRTD', fw.includes(EXPECTED_MRTD.slice(0, 32)) && !fw.includes('22'.repeat(16)), fw.match(/MRTD: [0-9a-f]+…/)?.[0]);
+  check('session binding stated', fw.includes("report_data[0..32] == this session's combined nonce"));
+  check('tpmCheck green (TPM-less platform)', row('tpmCheck').cls === 'check-item verified', row('tpmCheck').cls);
+  check('githubCheck green (attested provenance)', row('githubCheck').cls === 'check-item verified', row('githubCheck').cls);
+  check('enclaveCheck green', row('enclaveCheck').cls === 'check-item verified', row('enclaveCheck').cls);
+}
+
+console.log('\nTest 3: valid quote v5 body_type=2 (TDREPORT10) — chain incl. root dedupe');
+{
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 5, bodyType: 2, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem, goodChain.root.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  const { ok, alert } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('audit returns true', ok === true, `alert=${alert}`);
+  check('v5 accepted with pinned chain', fw.includes('Intel TDX Silicon Root Verified') && fw.includes('leaf → Intel SGX Root CA pinned'), fw.slice(0, 900));
+  // v165: fixture MRTD now defaults to EXPECTED_MRTD (the pin gate rejects
+  // anything else), so assert the displayed value equals the pin prefix.
+  check('MRTD correct (pinned EXPECTED_MRTD)', fw.includes(EXPECTED_MRTD.slice(0, 32)) && !fw.includes('22'.repeat(16)), fw.match(/MRTD: [0-9a-f]+…/)?.[0]);
+}
+
+console.log('\nTest 4: valid quote v5 body_type=3 (TDREPORT15, 648 B) — report_data NOT last 64');
+{
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 5, bodyType: 3, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  const { ok, alert } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('audit returns true (binding read at @520, not tail)', ok === true, `alert=${alert}`);
+  check('TD15 verified', fw.includes('Intel TDX Silicon Root Verified'), fw.slice(0, 900));
+}
+
+console.log('\nTest 5: report_data does not carry this session nonce → binding=false');
+{
+  const built = await buildEnvelope({
+    hwBuilder: async () => {
+      const wrong = new Uint8Array(64).fill(0x7e);
+      const q = await buildTdxQuote({
+        version: 4, reportData: wrong,
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  const { ok, alert } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('audit fails', ok === false, `ok=${ok}`);
+  check('binding=false in verdict', fw.includes('binding=false'), fw.slice(0, 900));
+  check('shows expected nonce vs quote', fw.includes('expected session nonce'), fw.slice(0, 900));
+  check('silicon row failed', row('firmwareCheck').cls === 'check-item failed', row('firmwareCheck').cls);
+}
+
+console.log('\nTest 6: tampered quote signature → quote_sig=false (other checks still hold)');
+{
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce), tamperQuoteSig: true,
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  const { ok } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('audit fails', ok === false, `ok=${ok}`);
+  check('quote_sig=false, binding still true', fw.includes('quote_sig=false') && fw.includes('binding=true'), fw.slice(0, 900));
+}
+
+console.log('\nTest 6b: quote signed by the PCK key (old-bug shape) → must FAIL');
+{
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce), quoteSigByPckKey: true,
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  const { ok } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('audit fails', ok === false, `ok=${ok}`);
+  check('quote_sig=false while attkey_bind=true (key roles enforced)',
+    fw.includes('quote_sig=false') && fw.includes('attkey_bind=true'), fw.slice(0, 900));
+}
+
+console.log('\nTest 6c: TDX pre-flight v161 client binding (regression 2026-10-21)');
+{
+  // The TDX branch must honour session_context.preflight exactly like the SNP
+  // branch: a pre-flight envelope's report_data carries
+  //   SHA-256(P_enc ∥ code_challenge ∥ P_client ∥ client_nonce ∥ custom_info),
+  // [32..64] zero — NOT the SEC-02 session nonce (no PayPal user yet).
+  // The TDX path lacked this branch until 2026-10-21 and failed EVERY live
+  // pre-flight envelope with binding=false.
+  const clientEnc = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const clientPubDer = clientEnc.publicKey.export({ type: 'spki', format: 'der' });
+  const clientNonceHex = '7f'.repeat(32);
+  const codeChallenge = 'E9xrX1s2qO0hAaBcDeFgHiJkLmNoPqRsTuVwXyZ012345';
+  const pfCustom = 'wallet_pref_1';
+  const v161ReportData = (pEncDer) => {
+    const pre = Buffer.concat([
+      pEncDer, Buffer.from(codeChallenge, 'utf8'), clientPubDer,
+      Buffer.from(clientNonceHex, 'hex'), Buffer.from(pfCustom, 'utf8'),
+    ]);
+    return concat(new Uint8Array(sha256(pre)), new Uint8Array(32)); // digest ‖ zeros
+  };
+  const pfCtx = {
+    binding: 'v161', code_challenge: codeChallenge,
+    client_pub_b64: clientPubDer.toString('base64'),
+    client_nonce_hex: clientNonceHex, custom_info: pfCustom,
+  };
+
+  // (a) quote binds the v161 client inputs → binding=true, silicon verified
+  const good = await buildEnvelope({
+    sessionContext: { preflight: pfCtx },
+    hwBuilder: async (_nonce, pEncDer) => tdxHw({
+      quoteB64: (await buildTdxQuote({
+        version: 4, reportData: v161ReportData(pEncDer),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      })).b64,
+    }),
+  });
+  const g = await runAuditWith(good.envelope);
+  const gfw = fwDesc();
+  check('audit returns true (v161 binding honoured on TDX)', g.ok === true, `alert=${g.alert}`);
+  check('silicon root verified with v161 binding', gfw.includes('Intel TDX Silicon Root Verified'), gfw.slice(0, 900));
+  check('silicon row green (verified)', row('firmwareCheck').cls === 'check-item verified', row('firmwareCheck').cls);
+  check('success message names the v161.2 client binding',
+    gfw.includes('report_data == v161.2 client binding'), gfw.match(/report_data[^<]*/)?.[0]);
+
+  // (b) envelope claims v161 pre-flight but the quote carries SEC-02-shaped
+  //     data → binding=false (substituted/foreign quote fails closed)
+  const bad = await buildEnvelope({
+    sessionContext: { preflight: pfCtx },
+    hwBuilder: async (nonce) => tdxHw({
+      quoteB64: (await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      })).b64,
+    }),
+  });
+  const b = await runAuditWith(bad.envelope);
+  const bfw = fwDesc();
+  check('audit fails on foreign quote data', b.ok === false, `ok=${b.ok}`);
+  check('binding=false in verdict', bfw.includes('binding=false'), bfw.slice(0, 900));
+  check('failure names the expected v161.2 client binding',
+    bfw.includes('expected v161.2 client binding'), bfw.slice(0, 900));
+}
+
+console.log('\nTest 7: QE-report binding corrupted → attkey_bind=false');
+{
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce), corruptQeReportData: true,
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  const { ok } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('audit fails', ok === false, `ok=${ok}`);
+  check('attkey_bind=false', fw.includes('attkey_bind=false'), fw.slice(0, 900));
+}
+
+console.log('\nTest 8: attacker chain with LOOKALIKE Intel DNs (default pin active)');
+{
+  globalThis.TRUSTED_INTEL_ROOTS = DEFAULT_ROOTS; // real Intel anchor
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce),
+        // attacker chain INCLUDING its own lookalike root — every link inside
+        // is valid; only the sha256 anchor tells it apart from Intel's.
+        innerChainPems: [evilChain.leaf.pem, evilChain.int.pem, evilChain.root.pem],
+        leafKey: evilChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64, chain: evilChain });
+    },
+  });
+  const { ok, alert } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('audit fails', ok === false, `ok=${ok}`);
+  check('root_chain=false (anchor is the only thing that catches it)',
+    fw.includes('root_chain=false'), fw.slice(0, 900));
+  check('issuer regex alone was satisfied (lookalike DNs)', fw.includes('issuer_intel=true'), fw.slice(0, 900));
+  check('chain message names the pinned root', fw.includes('does NOT reach a pinned Intel root'), fw.slice(0, 900));
+  check('alert is the silicon-root failure', /No valid Silicon Root/.test(alert || ''), alert);
+  globalThis.TRUSTED_INTEL_ROOTS = GOOD_ROOTS; // restore for remaining positive-path fixtures
+}
+
+console.log('\nTest 9–12: header field guards (vendor / tee / version / key type)');
+async function headerCase(name, opts, expectRe) {
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote(Object.assign({
+        version: 4, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      }, opts));
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  const { ok, alert } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check(name + ' rejected', ok === false, `ok=${ok}`);
+  check(name + ' precise reason', expectRe.test(fw), fw.slice(0, 900));
+}
+await headerCase('foreign QE vendor id', { vendorId: new Uint8Array(16).fill(0xab) }, /unknown QE vendor id/);
+await headerCase('tee_type 0 (SGX)', { teeType: 0x00000000 }, /is not TDX/);
+await headerCase('quote version 3', { version: 3 }, /unsupported quote version 3/);
+await headerCase('att_key_type 3', { attKeyType: 3 }, /ECDSA P-256 \(type 2\)/);
+
+console.log('\nTest 13: certification data type 5 (no QE report) → rejected');
+{
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce), outerCertType: 5,
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  const { ok } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('audit fails', ok === false, `ok=${ok}`);
+  check('type-6 requirement stated', /certification data type 5 unsupported/.test(fw), fw.slice(0, 900));
+}
+
+console.log('\nTest 13b: v5 body_size field inconsistent with body_type → rejected');
+{
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 5, bodyType: 2, forceBodySize: 648, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  const { ok } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('audit fails', ok === false, `ok=${ok}`);
+  check('size/type mismatch stated', /implies 584 bytes, size field says 648/.test(fw), fw.slice(0, 900));
+}
+
+console.log('\nTest 14: unsigned TDREPORT only → honest verdict + probe transcript');
+{
+  const built = await buildEnvelope({
+    // attach the TDREPORT BEFORE signing (any post-sign mutation breaks the
+    // enclave signature by design — Test 16 relies on exactly that)
+    hwBuilder: async () => {
+      const hw = tdxHw({
+        quoteB64: null,
+        markerOverrides: { hardware_signed_tdx_quote: false, tdx_td_report_present: true },
+        probeNotes: ['probe: configfs-tsm timeout after 2000 ms', 'probe: /dev/tdx_guest absent'],
+      });
+      hw.tdx_td_report_b64 = Buffer.from(new Uint8Array(1024).fill(0x01)).toString('base64');
+      return hw;
+    },
+  });
+  const { ok, alert } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('audit fails', ok === false, `ok=${ok}`);
+  check('honest verdict text', fw.includes('No hardware-signed TDX evidence'), fw.slice(0, 900));
+  check('probe transcript surfaced', fw.includes('configfs-tsm timeout'), fw.slice(0, 900));
+  check('alert names the silicon-root failure', /No valid Silicon Root/.test(alert || ''), alert);
+}
+
+console.log('\nTest 15: no silicon evidence at all → fail closed');
+{
+  const built = await buildEnvelope({
+    hw: { platform_type: 'AMD SEV-SNP' } // no SNP report, no TDX, no Google/TPM
+  });
+  const { ok, alert } = await runAuditWith(built.envelope);
+  check('audit fails', ok === false, `ok=${ok}`);
+  check('alert names silicon-root failure', /No valid Silicon Root/.test(alert || ''), alert);
+}
+
+console.log('\nTest 16: tampered enclave signature → hard fail (unauthenticated report)');
+{
+  const built = await buildEnvelope({
+    hw: tdxHw({ quoteB64: null }), corruptEnclaveSig: true,
+  });
+  const { ok, alert } = await runAuditWith(built.envelope);
+  check('audit fails', ok === false, `ok=${ok}`);
+  check('enclave signature INVALID reason', /enclave signature over this report is INVALID/.test(alert || ''), alert);
+  check('enclaveCheck row failed', row('enclaveCheck').cls === 'check-item failed', row('enclaveCheck').cls);
+}
+
+console.log('\nTest 17: pre-flight pin violation → deterministic fail before anything else');
+{
+  const other = generateKeyPairSync('rsa', { modulusLength: 2048 }).publicKey
+    .export({ type: 'spki', format: 'pem' }).toString();
+  globalThis.preFlightPubKeyPem = other;
+  const { ok, alert } = await runAuditWith(v4Envelope.envelope);
+  check('audit fails', ok === false, `ok=${ok}`);
+  check('PRE-FLIGHT VIOLATION reason', /PRE-FLIGHT VIOLATION/.test(alert || ''), alert);
+  globalThis.preFlightPubKeyPem = '';
+}
+
+console.log('\nTest 18: Google-cert paste spoof (no TPM evidence) → blocked, DN extraction works');
+{
   const keys = forge.pki.rsa.generateKeyPair(2048);
-  const spoofCert = forge.pki.createCertificate();
-  spoofCert.publicKey = keys.publicKey;
-  spoofCert.serialNumber = '01';
-  spoofCert.validity.notBefore = new Date(Date.now() - 86400000);
-  spoofCert.validity.notAfter = new Date(Date.now() + 86400000);
+  const spoof = forge.pki.createCertificate();
+  spoof.publicKey = keys.publicKey;
+  spoof.serialNumber = '01';
+  spoof.validity.notBefore = new Date(Date.now() - 86400000);
+  spoof.validity.notAfter = new Date(Date.now() + 86400000);
   const dn = [
     { name: 'commonName', value: 'attacker-controlled' },
     { name: 'organizationName', value: 'EK/AK CA Intermediate' },
   ];
-  spoofCert.setSubject(dn);
-  spoofCert.setIssuer(dn); // self-signed, but issuer string matches the allowlist
-  spoofCert.sign(keys.privateKey, forge.md.sha256.create());
-  const cert = forge.pki.certificateToPem(spoofCert);
-  // Attacker signs the report with THEIR OWN key — the enclave public key
-  // travels inside the report, so the signature check passes by construction.
-  // This mirrors the real threat: attacker-run code producing a self-consistent
-  // report and pasting the public Google cert as the silicon anchor.
-  const { generateKeyPairSync, sign: rsaSign } = await import('crypto');
-  const { publicKey, privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
-  const pubPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  spoof.setSubject(dn);
+  spoof.setIssuer(dn);
+  spoof.sign(keys.privateKey, forge.md.sha256.create());
+  const built = await buildEnvelope({
+    hw: { google_ak_cert_pem: forge.pki.certificateToPem(spoof), platform_type: 'GCP' },
+  });
+  const { ok, alert } = await runAuditWith(built.envelope);
+  check('audit fails', ok === false, `ok=${ok}`);
+  check('reached the TPM-guard (issuer DN parsed correctly)',
+    /cannot anchor/.test(alert || ''), alert);
+  check('NOT rejected at issuer stage (would mean DN extraction broke)',
+    !/not issued by a known Google/.test(alert || ''), alert);
+}
 
-  // reorder() in the page sorts keys recursively — replicate it
-  const reorder = (obj) => {
-    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return obj;
-    const out = {};
-    Object.keys(obj).sort().forEach(k => { out[k] = reorder(obj[k]); });
-    return out;
-  };
-  const reportBody = {
-    custom_info: 'attacker_wallet',
-    enclave_config: { boot_measurements: { binary_sha256: 'aa'.repeat(32), disk_manifest: {} }, domain: 'x' },
-    paypal_user_info_raw_hash: '11'.repeat(32),
-    hardware_level_attestation: {
-      google_ak_cert_pem: cert,   // public data pasted in
-      // no ak_pub_pem / tpm_quote_msg / tpm_quote_sig, no SNP report
+console.log('\nTest 19: provenance unattested → GitHub row fails with the precise reason');
+{
+  fetchMode = '404';
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
     },
-    timestamp_ms: Date.now(),
-    session_context: {},
-  };
-  const payload = JSON.stringify(reorder(reportBody));
-  const sig = rsaSign('sha256', Buffer.from(payload), privateKey);
-  const spoof = {
-    attestation_report: reportBody,
-    enclave_signature_b64: sig.toString('base64'),
-    enclave_signing_public_key: pubPem,
-  };
-  const alertMsg = await runAuditWith(spoof);
-  const fw = fwStatus();
-  check('silicon root check fails (firmwareCheck not verified)', !fw || fw.className !== 'verified',
-    `className=${fw && fw.className}`);
-  check('alert reports audit failure', !!alertMsg && alertMsg.startsWith('Audit Failed'),
-    `alert=${alertMsg}`);
-  check('spoof blocked by TPM-evidence guard (public cert alone is not silicon)',
-    !!alertMsg && /public data and cannot anchor/i.test(alertMsg),
-    `alert=${alertMsg}`);
+  });
+  const { ok } = await runAuditWith(built.envelope);
+  const gh = row('githubCheck');
+  check('GitHub provenance row failed', gh.cls === 'check-item failed', gh.cls);
+  check('reason names missing attestation', gh.desc.includes('NO GitHub attestation exists'), gh.desc.slice(0, 200));
+  check('hardware root still verified (layered: silicon is the hard gate)',
+    row('firmwareCheck').cls === 'check-item verified', row('firmwareCheck').cls);
+  fetchMode = 'ok';
 }
 
-// Test 3: tampered launch digest must fail the measurement pin
-console.log('\nTest 3: tampered SEV-SNP MEASUREMENT (ghost-enclave guard)');
-if (!genuine) {
-  console.log('  ⚠️ skipped (no GENUINE_REPORT capture available)');
-}
-if (genuine) {
-  const tampered = JSON.parse(JSON.stringify(genuine));
-  const hw2 = tampered.attestation_report.hardware_level_attestation;
-  const raw = Buffer.from(hw2.snp_report_b64, 'base64');
-  raw[144] ^= 0xff; // flip a byte in the MEASUREMENT field
-  hw2.snp_report_b64 = raw.toString('base64');
-  const alertMsg = await runAuditWith(tampered);
-  const fw = fwStatus();
-  check('firmwareCheck fails with tampered digest', fw.className !== 'verified',
-    `className=${fw.className}`);
-  const desc = fw.querySelector().innerHTML || fw.innerHTML || '';
-  check('failure mentions unpinned launch digest', /not pinned/i.test(desc) || /Launch digest/i.test(desc) || /not pinned/i.test(alertMsg || ''),
-    `desc=${desc} alert=${alertMsg}`);
-}
-
-// Test 4: nonce parity — verify.html expectedNonce must equal the enclave's
-// compute_session_nonce for the same inputs (cross-implementation vector)
-console.log('\nTest 4: nonce formula parity (SEC-02 code binding)');
+console.log('\nTest 20: legit GCP report still passes (Google-branch regression, ported)');
 {
-  // Independent reference implementation of the 160-byte pre-image
-  const { createHash } = await import('crypto');
-  const sha256 = (buf) => createHash('sha256').update(buf).digest();
-  const paypalHash = sha256(Buffer.from('{"sub":"user"}'));
-  const pubkeyHash = sha256(Buffer.from('fake-der-bytes'));
-  const customInfoHash = sha256(Buffer.from('walletA'));
-  const binary = Buffer.from('ab'.repeat(32), 'hex');
-  const manifest = { 'EFI/BOOT/vmlinuz': 'cc'.repeat(32), 'EFI/BOOT/initrd.img': 'dd'.repeat(32) };
-  const canonical = JSON.stringify(Object.keys(manifest).sort().map(k => [k, manifest[k]]));
-  const manHash = sha256(Buffer.from(canonical));
-  const reference = sha256(Buffer.concat([paypalHash, pubkeyHash, customInfoHash, binary, manHash])).toString('hex');
-
-  // The same computation as written in verify.html's runAudit()
-  const jsNonce = await nonce160Hex(paypalHash, pubkeyHash, 'walletA', 'ab'.repeat(32), manifest);
-  check('JS expectedNonce matches independent reference', jsNonce === reference,
-    `js=${jsNonce} ref=${reference}`);
-  check('pre-image is the 160-byte 5-element form', Buffer.concat([paypalHash, pubkeyHash, customInfoHash, binary, manHash]).length === 160);
-
-  // The Rust side pins this exact vector in security_tests::session_nonce_binds_custom_info
-  const RUST_PIN = '398c2c1b18583ac9c3935ffdea04f0b2a3dfdd927140072bd50511e9f77db8f7';
-  check('JS expectedNonce matches the Rust-pinned parity vector', jsNonce === RUST_PIN,
-    `js=${jsNonce} rustPin=${RUST_PIN}`);
-}
-
-// Test 5: legitimate GCP report (Google cert + fully-verified TPM quote) must PASS
-console.log('\nTest 5: legitimate GCP report still passes (no regression)');
-{
-  const gcpReport = await buildLegitGcpReport();
-
-  // v163 (audit VULN-04 follow-up): the TPM check is TRI-STATE now. With all
-  // four golden pins CAPTURED (set here to this fixture's own quoted values)
-  // a legitimate report must reach full green ✅. Unpinned → amber ⚠️
-  // degraded and mismatch → ❌ hard fail are asserted in Test 11. Pins are
-  // restored right after so later tests see the default (all-null) baseline.
-  const pcrs = gcpReport.attestation_report.hardware_level_attestation.pcr_values;
-  const savedPins = { ...GOLDEN_PCRS };
-  for (const k of Object.keys(GOLDEN_PCRS)) if (pcrs[k]) GOLDEN_PCRS[k] = pcrs[k];
-
-  const alertMsg = await runAuditWith(gcpReport);
-  const fw = fwStatus();
-  check('no audit-failure alert', !alertMsg, `alert=${alertMsg}`);
-  check('silicon root verified (firmwareCheck passes)', fw && fw.className.includes('verified'),
-    `className=${fw && fw.className}`);
-  const tpmEl = document.getElementById('tpmCheck');
-  check('TPM quote verified strictly + all 4 golden pins enforced (green ✅)',
-    tpmEl && tpmEl.className.includes('verified'),
-    `className=${tpmEl && tpmEl.className}`);
-  Object.assign(GOLDEN_PCRS, savedPins);
-}
-
-// Test 6 (audit SEC-04): an OCI-claiming report (SNP evidence present) must
-// NOT be satisfiable by a locally-forged TPM quote + pasted Google cert.
-// Historically `googleVerified || snpVerified` let this pass: the TPM quote
-// is fully self-consistent on ANY TPM 2.0 machine (right nonce, right PCR
-// digest) and the Google EK cert is public data.
-console.log('\nTest 6: OCI report + forged local TPM quote + Google cert (SEC-04 bypass)');
-{
-  const { generateKeyPairSync, sign: rsaSign, createHash } = await import('crypto');
-  const sha256 = (b) => createHash('sha256').update(b).digest();
-
-  const enc = generateKeyPairSync('rsa', { modulusLength: 2048 });
-  const encPem = enc.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  // TPM evidence: TPMS_ATTEST over the session nonce + PCRs, signed by an AK.
   const ak = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const akPem = ak.publicKey.export({ type: 'spki', format: 'pem' }).toString();
-  const customInfo = 'oci_spoof_wallet';
-  const reportBody = {
-    custom_info: customInfo,
-    enclave_config: {
-      boot_measurements: { binary_sha256: 'cc'.repeat(32), disk_manifest: {} },
-      domain: 'x',
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const pcrValues = {};
+      for (const p of [0, 4, 8, 9]) pcrValues['pcr_' + p] = sha256(Buffer.from(`pcr${p}`)).toString('hex');
+      pcrValues['pcr_15'] = await calculatePcr15(DISK_MANIFEST);
+      const composite = sha256(Buffer.concat([0, 4, 8, 9, 15].map(p => Buffer.from(pcrValues['pcr_' + p], 'hex'))));
+      const qSigner = Buffer.alloc(32, 0x41);
+      const extra = Buffer.from(nonce, 'hex');
+      const parts = [];
+      const hdrB = Buffer.alloc(8);
+      hdrB.writeUInt32BE(0xFF544347, 0);
+      hdrB.writeUInt16BE(0x8018, 4);
+      hdrB.writeUInt16BE(qSigner.length, 6);
+      parts.push(hdrB, qSigner);
+      const edSz = Buffer.alloc(2); edSz.writeUInt16BE(extra.length, 0);
+      parts.push(edSz, extra, Buffer.alloc(25, 0)); // clockInfo + firmwareVersion
+      const selCount = Buffer.alloc(4); selCount.writeUInt32BE(1, 0);
+      parts.push(selCount, Buffer.from([0x00, 0x0b, 0x03, 0x00, 0x04, 0x0f]));
+      const dgSz = Buffer.alloc(2); dgSz.writeUInt16BE(composite.length, 0);
+      parts.push(dgSz, composite);
+      const quoteMsg = Buffer.concat(parts);
+      const quoteSig = rsaSign('sha256', quoteMsg, ak.privateKey);
+      const gkeys = forge.pki.rsa.generateKeyPair(2048);
+      const gcert = forge.pki.createCertificate();
+      gcert.publicKey = gkeys.publicKey;
+      gcert.serialNumber = '02';
+      gcert.validity.notBefore = new Date(Date.now() - 86400000);
+      gcert.validity.notAfter = new Date(Date.now() + 86400000);
+      const gdn = [{ name: 'commonName', value: 'gcp-instance' }, { name: 'organizationName', value: 'EK/AK CA Intermediate' }];
+      gcert.setSubject(gdn);
+      gcert.setIssuer(gdn);
+      gcert.sign(gkeys.privateKey, forge.md.sha256.create());
+      return {
+        ak_pub_pem: akPem,
+        tpm_quote_msg: quoteMsg.toString('base64'),
+        tpm_quote_sig: quoteSig.toString('base64'),
+        pcr_values: pcrValues,
+        google_ak_cert_pem: forge.pki.certificateToPem(gcert),
+        platform_type: 'GCP',
+      };
     },
-    paypal_user_info_raw_hash: '22'.repeat(32),
-    session_context: {},
-    timestamp_ms: Date.now(),
-    hardware_level_attestation: null, // nonce-dependent
-  };
-  const pemToDer = (pem) => Buffer.from(pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
-  const expectedNonceHex = await nonce160Hex(
-    Buffer.from(reportBody.paypal_user_info_raw_hash, 'hex'),
-    new Uint8Array(sha256(pemToDer(encPem))),
-    customInfo,
-    reportBody.enclave_config.boot_measurements.binary_sha256,
-    reportBody.enclave_config.boot_measurements.disk_manifest,
-  );
-
-  // Forged but fully self-consistent TPM quote (the attacker's own machine).
-  const pcr15 = await calculatePcr15(reportBody.enclave_config.boot_measurements.disk_manifest);
-  const pcrValues = {};
-  for (const p of [0, 4, 8, 9]) pcrValues['pcr_' + p] = sha256(Buffer.from(`pcr${p}`)).toString('hex');
-  pcrValues['pcr_15'] = pcr15;
-  const composite = sha256(Buffer.concat([0, 4, 8, 9, 15].map(p => Buffer.from(pcrValues['pcr_' + p], 'hex'))));
-  const qSigner = Buffer.alloc(32, 0x41);
-  const extra = Buffer.from(expectedNonceHex, 'hex');
-  const parts = [];
-  const hdr = Buffer.alloc(8);
-  hdr.writeUInt32BE(0xFF544347, 0);
-  hdr.writeUInt16BE(0x8018, 4);
-  hdr.writeUInt16BE(qSigner.length, 6);
-  parts.push(hdr, qSigner);
-  const edSz = Buffer.alloc(2); edSz.writeUInt16BE(extra.length, 0);
-  parts.push(edSz, extra, Buffer.alloc(17 + 8, 0));
-  const selCount = Buffer.alloc(4); selCount.writeUInt32BE(1, 0);
-  parts.push(selCount, Buffer.from([0x00, 0x0b, 0x03, 0x00, 0x04, 0x0f]));
-  const dgSz = Buffer.alloc(2); dgSz.writeUInt16BE(composite.length, 0);
-  parts.push(dgSz, composite);
-  const quoteMsg = Buffer.concat(parts);
-  const quoteSig = rsaSign('sha256', quoteMsg, ak.privateKey);
-
-  const gkeys = forge.pki.rsa.generateKeyPair(2048);
-  const gcert = forge.pki.createCertificate();
-  gcert.publicKey = gkeys.publicKey;
-  gcert.serialNumber = '03';
-  gcert.validity.notBefore = new Date(Date.now() - 86400000);
-  gcert.validity.notAfter = new Date(Date.now() + 86400000);
-  const gdn = [{ name: 'commonName', value: 'spoof' }, { name: 'organizationName', value: 'EK/AK CA Intermediate' }];
-  gcert.setSubject(gdn); gcert.setIssuer(gdn);
-  gcert.sign(gkeys.privateKey, forge.md.sha256.create());
-
-  // Garbage SNP evidence: the report CLAIMS OCI (vcek+report present) but the
-  // bytes are attacker-controlled, so the SNP path can never verify.
-  const fakeSnp = Buffer.alloc(1184, 0x5a).toString('base64');
-  const fakeVcek = Buffer.from('not-a-cert').toString('base64');
-  reportBody.hardware_level_attestation = {
-    ak_pub_pem: akPem,
-    tpm_quote_msg: quoteMsg.toString('base64'),
-    tpm_quote_sig: quoteSig.toString('base64'),
-    pcr_values: pcrValues,
-    google_ak_cert_pem: forge.pki.certificateToPem(gcert),
-    snp_report_b64: fakeSnp,
-    vcek_der_b64: fakeVcek,
-    platform_type: 'OCI SEV-SNP',
-  };
-
-  const payload = JSON.stringify(reorder(reportBody));
-  const sig = rsaSign('sha256', Buffer.from(payload), enc.privateKey);
-  const spoof = {
-    attestation_report: reportBody,
-    enclave_signature_b64: sig.toString('base64'),
-    enclave_signing_public_key: encPem,
-  };
-
-  // Stub provenance: every lookup 404s (nothing here is CI-built)
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ attestations: [] }) });
-  const alertMsg = await runAuditWith(spoof);
-  globalThis.fetch = realFetch;
-
-  const fw = fwStatus();
-  check('silicon root FAILS (platform enforcement kills the OR-bypass)',
-    !fw || fw.className !== 'verified', `className=${fw && fw.className}`);
-  check('audit fails with an alert', !!alertMsg && alertMsg.startsWith('Audit Failed'), `alert=${alertMsg}`);
-  check('failure is the silicon root, not something earlier',
-    !!alertMsg && /Silicon Root of Trust/i.test(alertMsg), `alert=${alertMsg}`);
-  const gh = document.getElementById('githubCheck');
-  const ghDesc = (gh && (gh.innerHTML || (gh.querySelector() && gh.querySelector().innerHTML))) || '';
-  check('provenance diagnostics explain the unattested binary (no bare ❌)',
-    /no GitHub attestation exists for this exact SHA-256/i.test(ghDesc), `ghDesc=${ghDesc.slice(0, 200)}`);
-  check('provenance diagnostics flag the empty disk_manifest',
-    /empty disk_manifest/i.test(ghDesc), `ghDesc=${ghDesc.slice(0, 200)}`);
-}
-
-// ---- Test 7: SNP evidence WITHOUT a verifiable endorsement leaf (v154) ----
-// The enclave only publishes a VCEK/VLEK that actually verifies the live
-// report. A report that carries an SNP report but no vcek_der_b64 means the
-// enclave could NOT obtain any key that signs it — the audit must fail closed
-// with a precise explanation, not silently skip the silicon root.
-console.log('\nTest 7: OCI report with SNP evidence but no endorsement leaf');
-{
-  const nodeCrypto = require('crypto');
-  const sha256 = (buf) => nodeCrypto.createHash('sha256').update(buf).digest();
-  const enc = forge.pki.rsa.generateKeyPair(2048);
-  const encPem = forge.pki.publicKeyToPem(enc.publicKey);
-  const reportBody = {
-    custom_info: 'NONE',
-    enclave_config: { boot_measurements: { binary_sha256: 'dd'.repeat(32), disk_manifest: {} }, domain: 'x' },
-    paypal_user_info_raw_hash: '33'.repeat(32),
-    session_context: {},
-    timestamp_ms: Date.now(),
-    hardware_level_attestation: null,
-  };
-  const pemToDer = (pem) => Buffer.from(pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
-  const expectedNonceHex = await nonce160Hex(
-    Buffer.from(reportBody.paypal_user_info_raw_hash, 'hex'),
-    new Uint8Array(sha256(pemToDer(encPem))),
-    'NONE',
-    reportBody.enclave_config.boot_measurements.binary_sha256,
-    reportBody.enclave_config.boot_measurements.disk_manifest,
-  );
-  reportBody.hardware_level_attestation = {
-    snp_report_b64: Buffer.alloc(1184, 0x5a).toString('base64'), // no vcek_der_b64!
-    vcek_source: 'kds-undecodable',
-    platform_type: 'AMD SEV-SNP',
-  };
-  const payload = JSON.stringify(reorder(reportBody));
-  const sig = nodeCrypto.createSign('sha256').update(payload).sign(forge.pki.privateKeyToPem(enc.privateKey));
-  const report = { attestation_report: reportBody, enclave_signature_b64: sig.toString('base64'), enclave_signing_public_key: encPem };
-
-  const alertMsg = await runAuditWith(report);
-  check('audit fails with an alert', !!alertMsg && alertMsg.startsWith('Audit Failed'), `alert=${alertMsg}`);
-  check('failure is the silicon root', !!alertMsg && /Silicon Root of Trust/i.test(alertMsg), `alert=${alertMsg}`);
-  const fw = fwStatus();
-  const fwHtml = (fw && (fw.innerHTML || (fw.querySelector() && fw.querySelector().innerHTML))) || '';
-  check('precise fail-closed explanation is shown',
-    /NO verifiable endorsement key/i.test(fwHtml), `fw=${fwHtml.slice(0, 200)}`);
-  check('vcek_source is surfaced to the auditor', /kds-undecodable/.test(fwHtml), `fw=${fwHtml.slice(0, 200)}`);
-}
-
-// Test 8 (v160): SNP report_data binding = SHA-256(P_enc ∥ nonce) parity
-// with the Rust enclave, plus the pre-flight (Pillar 4) enforcement: a
-// pinned P_enc must match the audited report's key, and runPreflight pins
-// only on a fully-passing live audit (fails closed otherwise).
-console.log('\nTest 8: v160 report_data binding + pre-flight pin');
-{
-  const { createHash } = await import('crypto');
-  const sha256 = (b) => createHash('sha256').update(b).digest();
-  const der = Buffer.from('fake-der-bytes');
-  const nonce = '398c2c1b18583ac9c3935ffdea04f0b2a3dfdd927140072bd50511e9f77db8f7';
-  const BINDING_PIN = '22a092286d97a00032a2c8b1a24b3c4691ff9fad6d1759c18d17b7a5354c248f';
-
-  const jsBinding = await snpBindingHex(der, nonce);
-  check('JS snpBindingHex matches independent reference',
-    jsBinding === sha256(Buffer.concat([der, Buffer.from(nonce, 'hex')])).toString('hex'), `js=${jsBinding}`);
-  check('JS snpBindingHex matches the Rust-pinned parity vector',
-    jsBinding === BINDING_PIN, `js=${jsBinding} rustPin=${BINDING_PIN}`);
-
-  // 8a. Pre-flight happy path: a fully-valid live envelope pins its P_enc.
-  const legit = await buildLegitGcpReport();
-  const realFetch = globalThis.fetch;
-  const realUrl = document.getElementById('preflightUrl').value;
-  globalThis.fetch = async () => ({
-    ok: true, status: 200,
-    text: async () => JSON.stringify(legit),
-    json: async () => ({ attestations: [] }),
   });
-  document.getElementById('preflightUrl').value = 'https://legit.example.com';
-  preFlightPubKeyPem = null;
-  const pfOk = await runPreflight();
-  check('runPreflight passes on a fully-valid live envelope', pfOk === true, `pfOk=${pfOk}`);
-  check('runPreflight pins the live enclave P_enc',
-    preFlightPubKeyPem === legit.enclave_signing_public_key,
-    `pinned=${(preFlightPubKeyPem || '').slice(0, 40)}`);
-
-  // 8b. Post-login report signed by a DIFFERENT key → deterministic failure.
-  const swapped = await buildLegitGcpReport();
-  swapped.enclave_signing_public_key = forge.pki.publicKeyToPem(forge.pki.rsa.generateKeyPair(2048).publicKey);
-  let alertMsg = await runAuditWith(swapped);
-  check('swapped enclave key fails the pre-flight pin',
-    !!alertMsg && /PRE-FLIGHT VIOLATION/.test(alertMsg), `alert=${alertMsg}`);
-
-  // 8c. Same key as the pin → no pre-flight failure (audit proceeds).
-  alertMsg = await runAuditWith(legit);
-  check('pinned key accepted (no PRE-FLIGHT failure)',
-    !alertMsg || !/PRE-FLIGHT/.test(alertMsg), `alert=${alertMsg}`);
-
-  // 8d. runPreflight fails closed: unreachable enclave / non-https origin.
-  preFlightPubKeyPem = null;
-  document.getElementById('preflightUrl').value = 'https://legit.example.com';
-  globalThis.fetch = async () => ({ ok: false, status: 503, text: async () => '' });
-  const pfFail = await runPreflight();
-  check('runPreflight fails closed when the enclave is unreachable',
-    pfFail === false && preFlightPubKeyPem === null, `pfFail=${pfFail}`);
-  document.getElementById('preflightUrl').value = 'not-a-url';
-  const pfBad = await runPreflight();
-  check('runPreflight rejects a non-https origin', pfBad === false, `pfBad=${pfBad}`);
-
-  // restore session state for any later runs
-  globalThis.fetch = realFetch;
-  document.getElementById('preflightUrl').value = realUrl;
-  preFlightPubKeyPem = null;
+  const { ok, alert } = await runAuditWith(built.envelope);
+  check('audit returns true', ok === true, `alert=${alert}`);
+  check('Google silicon anchor verified', fwDesc().includes('Google Confidential Hardware Verified'), fwDesc().slice(0, 200));
+  // GOLDEN_PCRS is unset on this branch → the TPM row is the AMBER degraded
+  // state (never green, never red) once quote+nonce+composite verify.
+  check('TPM row amber-degraded (quote+nonce+composite verified, no golden pins)',
+    row('tpmCheck').cls === 'check-item warning', row('tpmCheck').cls + ' — ' + row('tpmCheck').desc.slice(0, 120));
 }
 
-// Test 9 (v161, plan Pillars 2–5): CLIENT-BOUND report_data binding parity
-// with the Rust enclave — SHA-256(P_enc_SPKI_DER ∥ code_challenge ∥
-// P_client_SPKI_DER ∥ client_nonce ∥ custom_info) — plus the
-// binding-sensitivity matrix and a drift guard on the shipped function.
-// Mirrors tpm::preflight_report_data_binding() ↔
-// security_tests::preflight_binding_parity_v161 ↔ verify.html
-// preflightBindingHex() (update all three together).
-console.log('\nTest 9: v161 client-bound report_data binding parity');
+console.log('\nTest 21: nonce formula parity (SEC-02 reference vector)');
 {
-  const { createHash } = await import('crypto');
-  const sha256 = (...parts) => createHash('sha256').update(Buffer.concat(parts.map(p => Buffer.from(p)))).digest('hex');
-
-  const pubkeyDer = Buffer.from('fake-der-bytes');
-  const codeChallenge = 'TEST_CHALLENGE_v161_parity';
-  const clientPub = Buffer.from('fake-client-ecdh-der');
-  const clientNonce = Buffer.from('11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff', 'hex');
-  // v161.2: five-element pre-image — custom_info is the last element.
-  const customInfo = 'user_wallet_xyz_v1612';
-  const RUST_PIN = 'c459f5fad84e4b00bf1080e7e379ec3d40806edb82de5b2525509f1dc0874f0e';
-
-  // JS implementation lifted from verify.html's preflightBindingHex()
-  const jsBinding = async (ci) => {
-    const enc = new TextEncoder();
-    const cib = enc.encode(ci);
-    const pre = new Uint8Array(pubkeyDer.length + enc.encode(codeChallenge).length + clientPub.length + clientNonce.length + cib.length);
-    let o = 0;
-    pre.set(pubkeyDer, o); o += pubkeyDer.length;
-    pre.set(enc.encode(codeChallenge), o); o += enc.encode(codeChallenge).length;
-    pre.set(clientPub, o); o += clientPub.length;
-    pre.set(clientNonce, o); o += clientNonce.length;
-    pre.set(cib, o);
-    return Buffer.from(await crypto.subtle.digest('SHA-256', pre)).toString('hex');
-  };
-
-  const js = await jsBinding(customInfo);
-  check('JS preflightBindingHex matches independent reference',
-    js === sha256(pubkeyDer, codeChallenge, clientPub, clientNonce, customInfo), `js=${js}`);
-  check('JS preflightBindingHex matches the Rust-pinned parity vector',
-    js === RUST_PIN, `js=${js} rustPin=${RUST_PIN}`);
-  check('canonical absent custom_info ("NONE") matches its Rust-pinned vector',
-    (await jsBinding('NONE')) === '52bc1e5b3d53435f6a6e7fb4cd8d371e9fdefe0232c1fe63b4571e10acd27564');
-  check('binding is sensitive to the client nonce',
-    sha256(pubkeyDer, codeChallenge, clientPub, Buffer.alloc(32), customInfo) !== js);
-  check('binding is sensitive to the PKCE challenge',
-    sha256(pubkeyDer, 'OTHER', clientPub, clientNonce, customInfo) !== js);
-  check('binding is sensitive to the client public key',
-    sha256(pubkeyDer, codeChallenge, Buffer.from('other'), clientNonce, customInfo) !== js);
-  check('binding is sensitive to the user custom_info (v161.2)',
-    sha256(pubkeyDer, codeChallenge, clientPub, clientNonce, 'attacker_wallet') !== js);
-  check('binding differs from the v160 session binding by construction',
-    js !== sha256(pubkeyDer, clientNonce));
-
-  // v161.2 drift guard: the SHIPPED preflightBindingHex in verify.html must
-  // agree with this mirror on the same inputs (same discipline as Test 10 —
-  // a renamed/reordered pre-image element fails here, not in production).
-  {
-    const vhtml = readFileSync(new URL('../verify.html', import.meta.url), 'utf8');
-    const fn = vhtml.match(/async function preflightBindingHex\([\s\S]*?\n    }/);
-    check('preflightBindingHex located in verify.html', !!fn);
-    const realFn = new Function(`${fn[0]}; return preflightBindingHex;`)();
-    const shipped = await realFn(pubkeyDer, codeChallenge, clientPub, clientNonce.toString('hex'), customInfo);
-    check('shipped preflightBindingHex matches the mirror + Rust pin',
-      shipped === RUST_PIN, `shipped=${shipped}`);
-    const shippedNone = await realFn(pubkeyDer, codeChallenge, clientPub, clientNonce.toString('hex'));
-    check('shipped preflightBindingHex defaults absent custom_info to "NONE"',
-      shippedNone === '52bc1e5b3d53435f6a6e7fb4cd8d371e9fdefe0232c1fe63b4571e10acd27564', `shippedNone=${shippedNone}`);
-  }
-
-  // RFC 5869 Test Case 1 via WebCrypto HKDF — pins the browser's deriveKey
-  // to the enclave's crypto::hkdf_sha256 (same vector asserted in Rust
-  // security_tests::preflight_session_is_client_bound), so the E2EE session
-  // key derived on BOTH sides of the v161 callback is byte-identical.
-  const tc1Ikm = Buffer.alloc(22, 0x0b);
-  const tc1Salt = Buffer.from([...Array(13).keys()]);
-  const tc1Info = Buffer.from([...Array(10).keys()].map(i => 0xf0 + i));
-  const baseKey = await crypto.subtle.importKey('raw', tc1Ikm, 'HKDF', false, ['deriveBits']);
-  const okm = new Uint8Array(await crypto.subtle.deriveBits(
-    { name: 'HKDF', hash: 'SHA-256', salt: tc1Salt, info: tc1Info }, baseKey, 42 * 8));
-  check('WebCrypto HKDF matches RFC 5869 TC1 (== enclave hkdf_sha256)',
-    Buffer.from(okm).toString('hex') === '3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865',
-    `okm=${Buffer.from(okm).toString('hex').slice(0, 32)}…`);
+  const paypalHash = sha256(Buffer.from('{"sub":"user"}'));
+  const pubkeyHash = sha256(Buffer.from('fake-der-bytes'));
+  const binary = Buffer.from('ab'.repeat(32), 'hex');
+  const manifest = { 'EFI/BOOT/vmlinuz': 'cc'.repeat(32), 'EFI/BOOT/initrd.img': 'dd'.repeat(32) };
+  const reference = sha256(Buffer.concat([
+    paypalHash, pubkeyHash, sha256(Buffer.from('walletA')), binary,
+    sha256(Buffer.from(JSON.stringify(Object.keys(manifest).sort().map(k => [k, manifest[k]])))),
+  ])).toString('hex');
+  const jsNonce = await nonce160Hex(paypalHash, pubkeyHash, 'walletA', 'ab'.repeat(32), manifest);
+  check('harness mirror matches independent reference', jsNonce === reference, `js=${jsNonce} ref=${reference}`);
 }
 
-// Test 10: the SHIPPED E2EE callback page (render_e2ee_page in src/main.rs)
-// — extract the real embedded JS, de-format the Rust `format!` braces, and
-// drive it in a sandbox against a genuine-shaped enclave blob. Guards the
-// Firefox callback failure: both ECDH importKey calls MUST carry
-// namedCurve: 'P-256' (EcKeyImportParams requires it — without it the
-// callback dies at "An invalid or illegal string was specified").
-console.log('\nTest 10: shipped E2EE callback page decrypts + signature-verifies');
+console.log('\nTest 21b: untrusted-report HTML injection neutralized (esc() sink audit)');
 {
-  const mainRs = readFileSync(new URL('../src/main.rs', import.meta.url), 'utf8');
-  const m = mainRs.match(/fn render_e2ee_page[\s\S]*?r#"([\s\S]*?)"#/);
-  check('render_e2ee_page raw template located in src/main.rs', !!m);
-  const PH = '<script type="application/json" id="e2ee-blob">{}</script>';
-  check('blob placeholder present in template', !!m && m[1].includes(PH));
+  // The report under audit is UNTRUSTED input: updateStatus() renders with
+  // innerHTML, so report-derived fragments (marker fields, probe notes,
+  // error messages, cert DNs) MUST arrive escaped — otherwise a forged
+  // report can inject markup into the auditor's verdict DOM even while every
+  // cryptographic gate fails.
+  const IMG = '<img src=x onerror="window.__pwned=1">';
+  const built = await buildEnvelope({
+    hwBuilder: async () => tdxHw({
+      quoteB64: null,
+      markerOverrides: {
+        auditor_note: IMG,
+        tdx_quote_status: '">' + IMG,
+      },
+      probeNotes: ['<svg onload="window.__pwned=1"> configfs ok'],
+    }),
+  });
+  const { ok } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('injected-marker report still fails closed (no silicon root)', ok === false, `ok=${ok}`);
+  check('auditor_note rendered escaped (no raw <img tag in HTML)',
+    !fw.includes('<img src=x') && fw.includes('&lt;img src=x'), fw.slice(0, 400));
+  check('probe note rendered escaped (no raw <svg tag in HTML)',
+    !fw.includes('<svg') && fw.includes('&lt;svg'), fw.slice(0, 400));
+  check('marker status rendered escaped (no attribute-breakout quote pair)',
+    !fw.includes('">' + '<img'), fw.slice(0, 400));
 
-  // --- Enclave-side fixture mirroring the Rust crypto exactly: ---
-  // ECDH(P-256) → HKDF-SHA256(salt=client_nonce, info=payload label) →
-  // AES-256-GCM(AAD=client_nonce); envelope signed by S_enc over the
-  // canonical (sorted-key) attestation_report — same as
-  // crypto::derive_e2ee_session_key + encrypt_aad + generate_attestation.
-  const clientKp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
-  const jwk = JSON.parse(JSON.stringify(await crypto.subtle.exportKey('jwk', clientKp.privateKey)));
+  // 21b cont.: the GitHub provenance row renders runIds from the API payload
+  // and the atomicity run number — both must arrive escaped too.
+  fetchMode = 'xss';
+  await runAuditWith(built.envelope);
+  const ghDesc = row('githubCheck').desc;
+  fetchMode = 'ok';
+  check('github-runId rendered escaped (no raw <img in provenance row)',
+    !ghDesc.includes('<img src=x') && ghDesc.includes('&lt;img src=x'), ghDesc.slice(0, 400));
+}
+
+console.log('\nTest 21c: golden-PCR pcr_values injection neutralized');
+{
+  // Test 20's self-consistent TPM fixture, but with a hostile pcr_0 value.
+  // The quote still verifies internally (composite built over the same
+  // values), so the DEGRADED-TRUST warning renders goldenDetails — which
+  // interpolates the quoted value and MUST escape it.
+  const IMG = '<img src=x onerror="window.__pwned=1">';
+  const ak = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const akPem = ak.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const pcrValues = {};
+      pcrValues['pcr_0'] = IMG + '00'.repeat(16); // hostile, 16-char window keeps the payload prefix
+      for (const p of [4, 8, 9]) pcrValues['pcr_' + p] = sha256(Buffer.from(`pcr${p}`)).toString('hex');
+      pcrValues['pcr_15'] = await calculatePcr15(DISK_MANIFEST);
+      // Use the PAGE's own composite function so the fixture is self-consistent
+      // with how verify.html parses hostile hex (NaN→0 pairs).
+      const composite = Buffer.from(await calculatePcrCompositeDigest(pcrValues), 'hex');
+      const qSigner = Buffer.alloc(32, 0x41);
+      const extra = Buffer.from(nonce, 'hex');
+      const parts = [];
+      const hdrB = Buffer.alloc(8);
+      hdrB.writeUInt32BE(0xFF544347, 0);
+      hdrB.writeUInt16BE(0x8018, 4);
+      hdrB.writeUInt16BE(qSigner.length, 6);
+      parts.push(hdrB, qSigner);
+      const edSz = Buffer.alloc(2); edSz.writeUInt16BE(extra.length, 0);
+      parts.push(edSz, extra, Buffer.alloc(25, 0));
+      const selCount = Buffer.alloc(4); selCount.writeUInt32BE(1, 0);
+      parts.push(selCount, Buffer.from([0x00, 0x0b, 0x03, 0x00, 0x04, 0x0f]));
+      const dgSz = Buffer.alloc(2); dgSz.writeUInt16BE(composite.length, 0);
+      parts.push(dgSz, composite);
+      const quoteMsg = Buffer.concat(parts);
+      const quoteSig = rsaSign('sha256', quoteMsg, ak.privateKey);
+      const gkeys = forge.pki.rsa.generateKeyPair(2048);
+      const gcert = forge.pki.createCertificate();
+      gcert.publicKey = gkeys.publicKey;
+      gcert.serialNumber = '02';
+      gcert.validity.notBefore = new Date(Date.now() - 86400000);
+      gcert.validity.notAfter = new Date(Date.now() + 86400000);
+      const gdn = [{ name: 'commonName', value: 'gcp-instance' }, { name: 'organizationName', value: 'EK/AK CA Intermediate' }];
+      gcert.setSubject(gdn);
+      gcert.setIssuer(gdn);
+      gcert.sign(gkeys.privateKey, forge.md.sha256.create());
+      return {
+        ak_pub_pem: akPem,
+        tpm_quote_msg: quoteMsg.toString('base64'),
+        tpm_quote_sig: quoteSig.toString('base64'),
+        pcr_values: pcrValues,
+        google_ak_cert_pem: forge.pki.certificateToPem(gcert),
+        platform_type: 'GCP',
+      };
+    },
+  });
+  const { ok } = await runAuditWith(built.envelope);
+  const tpmDesc = row('tpmCheck').desc;
+  check('hostile-pcr report still passes its self-consistent checks', ok === true, `ok=${ok}`);
+  check('golden-PCR UNPINNED detail rendered escaped (no raw <img in tpm row)',
+    !tpmDesc.includes('<img src=x') && tpmDesc.includes('&lt;img src=x'), tpmDesc.slice(0, 400));
+}
+
+console.log('\nTest 21d: ENCLAVE CODE PIN gate rejects non-audited binary');
+{
+  // v165: the pin is what stops colluding owner+cloud from green-lighting
+  // arbitrary code — CI provenance alone cannot (the owner controls the repo).
+  // The report is correctly S_ENC-signed for the wrong binary: only the pin
+  // can catch it. (hw must be present: step 3 rejects evidence-less reports
+  // before the pin gate runs; marker-only evidence suffices.)
+  const built = await buildEnvelope({ binarySha: 'ff'.repeat(32), hw: {} });
+  const { ok, alert } = await runAuditWith(built.envelope);
+  check('audit fails closed', ok === false, `ok=${ok}`);
+  check('failure names the CODE PIN violation', /ENCLAVE CODE PIN VIOLATION/.test(alert || ''), (alert || '').slice(0, 200));
+}
+
+console.log('\nTest 21e: MRTD pin gate rejects a different launch chain');
+{
+  // A fully valid Intel-signed quote + valid binding/chain, but MRTD from a
+  // different (ghost) launch image → silicon root must FAIL (mrtd_pin=false).
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+        mrtdFill: 0x42, // ghost launch chain
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  const { ok, alert } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('audit fails closed despite valid quote', ok === false, `ok=${ok}`);
+  check('silicon row shows mrtd_pin=false', /mrtd_pin=false/.test(fw), fw.slice(0, 400));
+  check('ghost-launch wording surfaced', /MRTD pin mismatch/.test(fw), fw.slice(0, 400));
+}
+
+console.log('\nTest 21f: unattested boot-chain files (shim/grub) fail the provenance row');
+{
+  // v165: BOOTX64.EFI (shim/UKI) and grubx64.efi must be IN the row — a
+  // backdoored loader swapped by the cloud provider shows up here.
+  fetchMode = '404';
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  await runAuditWith(built.envelope);
+  const gh = row('githubCheck');
+  fetchMode = 'ok';
+  check('provenance row failed without CI attestations', gh.cls === 'check-item failed', gh.cls);
+  check('row names the unattested shim/BOOTX64 component',
+    gh.desc.includes('EFI Boot Chain (BOOTX64.EFI') && gh.desc.includes('NO GitHub attestation'), gh.desc.slice(0, 700));
+  check('row names the unattested grubx64 component', gh.desc.includes('EFI Bootloader (grubx64.efi)'), gh.desc.slice(0, 700));
+}
+
+console.log('\nTest 23: v164 post-login handoff — E2EE decrypt round-trip + report download');
+{
+  // The /callback page (v164) performs no crypto: it stashes the ciphertext
+  // blob into sessionStorage and verify.html decrypts it fail-closed. These
+  // tests exercise exactly that path: a correct blob decrypts via WebCrypto,
+  // a substituted P_enc pin fails closed, a tampered ciphertext fails closed
+  // (GCM auth), and the unlocked download button saves the audited envelope
+  // with a sanitized filename (untrusted flow tag).
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  const envJson = JSON.stringify(built.envelope);
+  const b64 = (u8) => Buffer.from(u8).toString('base64');
+
+  // Build the E2EE blob exactly like the enclave:
+  // HKDF-SHA256(shared, salt=nonce, info='paypal-auth-vm/e2ee/v1') -> AES-256-GCM, AAD=nonce
+  const client = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+  const enclaveKp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+  const jwkStr = JSON.stringify(await crypto.subtle.exportKey('jwk', client.privateKey));
   const nonceBytes = crypto.getRandomValues(new Uint8Array(32));
-  const nonceHex = Buffer.from(nonceBytes).toString('hex');
-
-  const enclaveKp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
-  const ikm = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: clientKp.publicKey }, enclaveKp.privateKey, 256));
-  const hkdfBase = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveKey']);
-  const aesKey = await crypto.subtle.deriveKey(
+  const nonceHex = [...nonceBytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+  const shared = await crypto.subtle.deriveBits({ name: 'ECDH', public: enclaveKp.publicKey }, client.privateKey, 256);
+  const base = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
+  const key = await crypto.subtle.deriveKey(
     { name: 'HKDF', hash: 'SHA-256', salt: nonceBytes, info: new TextEncoder().encode('paypal-auth-vm/e2ee/v1') },
-    hkdfBase, { name: 'AES-GCM', length: 256 }, true, ['encrypt']);
-
-  const rsaKp = await crypto.subtle.generateKey(
-    { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
-    true, ['sign', 'verify']);
-  const spkiB64 = Buffer.from(await crypto.subtle.exportKey('spki', rsaKp.publicKey)).toString('base64');
-  const rsaPem = '-----BEGIN PUBLIC KEY-----\n' + spkiB64.match(/.{1,64}/g).join('\n') + '\n-----END PUBLIC KEY-----';
-
-  const reorder = o => (o === null || typeof o !== 'object' || Array.isArray(o)) ? o
-    : Object.keys(o).sort().reduce((acc, k) => (acc[k] = reorder(o[k]), acc), {});
-  const report = { attestation_report: {
-    timestamp_ms: 1760000000000,
-    paypal_user_info: { sub: 'e2ee-qa@test', verified_account: 'true' },
-    paypal_user_info_raw_hash: 'aa'.repeat(32),
-  } };
-  const envelope = {
-    attestation_report: report.attestation_report,
-    enclave_signing_public_key: rsaPem,
-  };
-  envelope.enclave_signature_b64 = Buffer.from(await crypto.subtle.sign(
-    'RSASSA-PKCS1-v1_5', rsaKp.privateKey,
-    new TextEncoder().encode(JSON.stringify(reorder(envelope.attestation_report))))).toString('base64');
-
+    base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = new Uint8Array(await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv, additionalData: nonceBytes }, aesKey,
-    new TextEncoder().encode(JSON.stringify(envelope))));
-  const blob = {
-    alg: 'AES-256-GCM+HKDF-SHA256+ECDH-P256', aad: 'client_nonce',
-    iv_b64: Buffer.from(iv).toString('base64'),
-    ct_b64: Buffer.from(ct).toString('base64'),
-    enclave_ecdh_public_key_b64: Buffer.from(await crypto.subtle.exportKey('spki', enclaveKp.publicKey)).toString('base64'),
-    enclave_signing_public_key: rsaPem,
-    state: 'test-state', flow: 'verified',
+    { name: 'AES-GCM', iv, additionalData: nonceBytes }, key, new TextEncoder().encode(envJson)));
+  const blobBase = {
+    alg: 'AES-256-GCM+HKDF-SHA256+ECDH-P256',
+    aad: 'client_nonce',
+    iv_b64: b64(iv),
+    ct_b64: b64(ct),
+    enclave_ecdh_public_key_b64: b64(new Uint8Array(await crypto.subtle.exportKey('spki', enclaveKp.publicKey))),
+    enclave_signing_public_key: built.encPem,
+    state: 'handoff-test',
+    flow: 'verified',
   };
+  const clone = (o) => JSON.parse(JSON.stringify(o));
 
-  // --- Extract + de-format the shipped page ---
-  let page = m[1].replace(PH, JSON.stringify(blob));
-  page = page.replace(/\{\{/g, '{').replace(/\}\}/g, '}');
-  const pageScript = (page.match(/<script>([\s\S]*)<\/script>/) || [])[1];
-  check('embedded page script extracted', !!pageScript);
+  const dec = await localDecryptAndVerify(clone(blobBase), jwkStr, nonceHex, built.encPem);
+  check('handoff blob decrypts to the login envelope',
+    dec.attestation_report.custom_info === built.envelope.attestation_report.custom_info);
 
-  // --- Sandbox: DOM + sessionStorage as the browser would provide ---
-  globalThis.sessionStorage = {
-    _s: { pav_client_jwk: JSON.stringify(jwk), pav_client_nonce: nonceHex, pav_p_enc: rsaPem },
-    getItem(k) { return k in this._s ? this._s[k] : null; },
-    setItem(k, v) { this._s[k] = String(v); },
-  };
-  elements['e2ee-blob'] = Object.assign(makeEl(), { textContent: JSON.stringify(blob) });
-  elements['st'] = makeEl();
-  elements['openAuditor'] = makeEl();
-  const runPage = async () => {
-    elements['st'].innerHTML = '';
-    new Function(pageScript)();
-    for (let i = 0; i < 100 && !elements['st'].innerHTML; i++) await new Promise(r => setTimeout(r, 20));
-    return elements['st'].innerHTML;
-  };
+  let threw = '';
+  try {
+    await localDecryptAndVerify(clone(blobBase), jwkStr, nonceHex,
+      '-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqG9w0BAQEFAAOCAQ8A\n-----END PUBLIC KEY-----\n');
+  } catch (e) { threw = e.message; }
+  check('substituted P_enc pin fails closed', /PRE-FLIGHT VIOLATION/.test(threw), threw);
 
-  const okMsg = await runPage();
-  check('callback page decrypts the enclave blob', /✅/.test(okMsg), okMsg.replace(/<[^>]+>/g, ' ').slice(0, 160));
-  check('callback page shows the PayPal identity from inside the ciphertext', okMsg.includes('e2ee-qa@test'), okMsg.slice(0, 160));
-  check('callback page enforced the pre-flight P_enc pin', okMsg.includes('P_enc pin matched'), okMsg.slice(0, 160));
+  const bad = clone(blobBase);
+  const rawCt = Uint8Array.from(atob(bad.ct_b64), (c) => c.charCodeAt(0));
+  rawCt[0] ^= 0xff;
+  bad.ct_b64 = b64(rawCt);
+  threw = '';
+  try { await localDecryptAndVerify(bad, jwkStr, nonceHex, built.encPem); } catch (e) { threw = e.message; }
+  check('tampered ciphertext fails closed (GCM auth)', threw !== '', threw);
 
-  // Tampered ciphertext must fail closed (AES-GCM tag), not render ✅
-  const badBlob = { ...blob, ct_b64: Buffer.from(ct.map((b, i) => i === 0 ? b ^ 0xff : b)).toString('base64') };
-  let page2 = m[1].replace(PH, JSON.stringify(badBlob)).replace(/\{\{/g, '{').replace(/\}\}/g, '}');
-  const script2 = (page2.match(/<script>([\s\S]*)<\/script>/) || [])[1];
-  elements['e2ee-blob'].textContent = JSON.stringify(badBlob);
-  elements['st'].innerHTML = '';
-  new Function(script2)();
-  for (let i = 0; i < 100 && !elements['st'].innerHTML; i++) await new Promise(r => setTimeout(r, 20));
-  check('tampered ciphertext fails closed', /❌/.test(elements['st'].innerHTML), elements['st'].innerHTML.slice(0, 160));
+  // --- the unlocked download button (v164 downloadReportFile)
+  elements['attestationInput'].value = '';
+  lastAlert = null;
+  check('download refuses when no decrypted report is present',
+    downloadReportFile() === false && /No decrypted report/.test(lastAlert), lastAlert);
+
+  const clicks = [];
+  const origCreate = document.createElement;
+  const origBody = document.body;
+  document.createElement = (tag) => ({ tagName: tag, href: '', download: '', click() { clicks.push(this); }, remove() {} });
+  document.body = { appendChild() {} };
+  let dlBlob = null;
+  const origCuo = URL.createObjectURL;
+  const origRuo = URL.revokeObjectURL;
+  URL.createObjectURL = (b) => { dlBlob = b; return 'blob:fake'; };
+  URL.revokeObjectURL = () => {};
+  elements['attestationInput'].value = JSON.stringify({ ...built.envelope, flow: '../../evil<script>name' });
+  const got = downloadReportFile();
+  if (origCreate === undefined) delete document.createElement; else document.createElement = origCreate;
+  if (origBody === undefined) delete document.body; else document.body = origBody;
+  if (origCuo === undefined) delete URL.createObjectURL; else URL.createObjectURL = origCuo;
+  if (origRuo === undefined) delete URL.revokeObjectURL; else URL.revokeObjectURL = origRuo;
+  const dlText = dlBlob ? await dlBlob.text() : '';
+  check('download saves the audited envelope',
+    got === true && clicks.length === 1 && JSON.parse(dlText).attestation_report !== undefined,
+    `got=${got} clicks=${clicks.length} bytes=${dlText.length}`);
+  check('download filename flow tag is sanitized',
+    /^attestation-report-evilscriptname-\d{4}-/.test(clicks[0] ? clicks[0].download : ''),
+    clicks[0] ? clicks[0].download : '(no click)');
 }
 
-// Test 11 (audit v162): app pin (VULN-03), golden-PCR pins (VULN-04),
-// local-auditor mode (VULN-02), and plaintext-fallback removal (VULN-05).
-console.log('\nTest 11: v162 audit remediations (VULN-02/03/04/05)');
-{
-  const mainRs = readFileSync(new URL('../src/main.rs', import.meta.url), 'utf8');
-
-  // --- static structure ---------------------------------------------------
-  check('local-auditor mode functions shipped in verify.html (VULN-02)',
-    ['localPreflight', 'localClaim', 'localDecryptAndVerify'].every(f => html.includes(`function ${f}`)));
-  check('app pin enforced on BOTH pre-flight paths (VULN-03)',
-    (html.match(/checkExpectedApp\(pf\.signed_fields\)/g) || []).length >= 2);
-  check('EXPECTED_APPS allow-list present',
-    /var EXPECTED_APPS = \[[\s\S]*?client_id/.test(html));
-  check('GOLDEN_PCRS pin mechanism present (VULN-04)',
-    /var GOLDEN_PCRS = \{/.test(html) && html.includes('GOLDEN PCR PIN VIOLATION'));
-  // the identifier may appear in explanatory comments — check live CODE only
-  const codeLines = mainRs.split('\n').filter(l => !l.trim().startsWith('//'));
-  check('plaintext pending_attestations map removed (VULN-05)',
-    !codeLines.some(l => l.includes('pending_attestations')));
-  check('encrypted blob vault + single-use claim shipped',
-    mainRs.includes('e2ee_blobs') && mainRs.includes('take_fresh'));
-  check('callback fails closed on a non-preflight session (VULN-05)',
-    mainRs.includes('non-preflight session reached the callback tail'));
-  check('/e2ee-blob route registered with CORS for file:// claim',
-    mainRs.includes('"/e2ee-blob"') && mainRs.includes('ACCESS_CONTROL_ALLOW_ORIGIN'));
-
-  // --- checkExpectedApp unit (VULN-03) -----------------------------------
-  const EXPECTED_APPS = (0, eval)('EXPECTED_APPS');
-  check('EXPECTED_APPS non-empty + sandbox entries pinned',
-    Array.isArray(EXPECTED_APPS) && EXPECTED_APPS.length >= 2
-    && EXPECTED_APPS.every(a => a.client_id && a.authorize_base && a.scope && a.flow));
-  const app0 = EXPECTED_APPS[0];
-  // signed_fields uses `paypal_client_id`; the pin table uses `client_id`
-  const sfFrom = (app, over = {}) => ({ flow: app.flow, paypal_client_id: app.client_id,
-    authorize_base: app.authorize_base, scope: app.scope, ...over });
-  let threw = null;
-  try { checkExpectedApp(sfFrom(app0)); } catch (e) { threw = e; }
-  check('audited app accepted', !threw, threw && threw.message);
-  for (const [field, evil] of [
-    ['paypal_client_id', 'SWAPPED_OWNER_CLIENT_ID'],
-    ['scope', 'https%3A%2F%2Furi.paypal.com%2Fservices%2Frealtimepayment'],
-    ['authorize_base', 'https://attacker.example/authorize'],
-    ['flow', 'full'],
-  ]) {
-    let err = null;
-    try { checkExpectedApp(sfFrom(app0, { [field]: evil })); } catch (e) { err = e; }
-    check(`swap of ${field} aborts before redirect`, !!err && /APP PIN VIOLATION/.test(err.message),
-      err && err.message.slice(0, 80));
+// ---- Optional: a REAL report captured from the live enclave ---------------
+// (node scripts/e2e-sandbox.mjs sets this setup: REAL_REPORT=/tmp/report-verified.json)
+// Runs against the DEFAULT Intel anchor — the synthetic root is swapped out so
+// the genuine PCK chain must reach the pinned Intel DCAP root for real.
+if (process.env.REAL_REPORT) {
+  console.log(`\nTest 22: REAL live report (${process.env.REAL_REPORT}) — DEFAULT Intel anchor`);
+  globalThis.TRUSTED_INTEL_ROOTS = DEFAULT_ROOTS;
+  let live = null;
+  try {
+    live = JSON.parse(readFileSync(process.env.REAL_REPORT, 'utf8'));
+  } catch (e) {
+    check('live report parses as JSON', false, e.message);
   }
-
-  // --- localDecryptAndVerify round-trip (VULN-02) -------------------------
-  // Fixture mirrors enclave crypto exactly (same construction as Test 10).
-  const clientKp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
-  const jwkStr = JSON.stringify(await crypto.subtle.exportKey('jwk', clientKp.privateKey));
-  const nonceBytes = crypto.getRandomValues(new Uint8Array(32));
-  const nonceHex = Buffer.from(nonceBytes).toString('hex');
-  const enclaveKp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
-  const ikm = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: clientKp.publicKey }, enclaveKp.privateKey, 256));
-  const hkdfBase = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveKey']);
-  const aesKey = await crypto.subtle.deriveKey(
-    { name: 'HKDF', hash: 'SHA-256', salt: nonceBytes, info: new TextEncoder().encode('paypal-auth-vm/e2ee/v1') },
-    hkdfBase, { name: 'AES-GCM', length: 256 }, true, ['encrypt']);
-  const rsaKp = await crypto.subtle.generateKey(
-    { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
-    true, ['sign', 'verify']);
-  const spkiB64 = Buffer.from(await crypto.subtle.exportKey('spki', rsaKp.publicKey)).toString('base64');
-  const rsaPem = '-----BEGIN PUBLIC KEY-----\n' + spkiB64.match(/.{1,64}/g).join('\n') + '\n-----END PUBLIC KEY-----';
-  const reorder = o => (o === null || typeof o !== 'object' || Array.isArray(o)) ? o
-    : Object.keys(o).sort().reduce((acc, k) => (acc[k] = reorder(o[k]), acc), {});
-  const envelope = {
-    attestation_report: { timestamp_ms: 1760000000000, paypal_user_info: { sub: 'local-auditor@test' } },
-    enclave_signing_public_key: rsaPem,
-  };
-  envelope.enclave_signature_b64 = Buffer.from(await crypto.subtle.sign(
-    'RSASSA-PKCS1-v1_5', rsaKp.privateKey,
-    new TextEncoder().encode(JSON.stringify(reorder(envelope.attestation_report))))).toString('base64');
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = new Uint8Array(await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv, additionalData: nonceBytes }, aesKey,
-    new TextEncoder().encode(JSON.stringify(envelope))));
-  const blob = {
-    alg: 'AES-256-GCM+HKDF-SHA256+ECDH-P256', aad: 'client_nonce',
-    iv_b64: Buffer.from(iv).toString('base64'), ct_b64: Buffer.from(ct).toString('base64'),
-    enclave_ecdh_public_key_b64: Buffer.from(await crypto.subtle.exportKey('spki', enclaveKp.publicKey)).toString('base64'),
-    enclave_signing_public_key: rsaPem, state: 'test-state', flow: 'verified',
-  };
-  const dec = await localDecryptAndVerify(blob, jwkStr, nonceHex, rsaPem);
-  check('local claim decrypts + S_enc-verifies + P_enc-pins',
-    dec.attestation_report.paypal_user_info.sub === 'local-auditor@test');
-  const otherRsa = await crypto.subtle.generateKey(
-    { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
-    true, ['sign', 'verify']);
-  const otherSpki = Buffer.from(await crypto.subtle.exportKey('spki', otherRsa.publicKey)).toString('base64');
-  const otherPem = '-----BEGIN PUBLIC KEY-----\n' + otherSpki.match(/.{1,64}/g).join('\n') + '\n-----END PUBLIC KEY-----';
-  const badPin = await localDecryptAndVerify(blob, jwkStr, nonceHex, otherPem).then(
-    () => null, e => e);
-  check('substituted blob fails closed against the P_enc pin',
-    !!badPin && /P_enc/.test(badPin.message), badPin && badPin.message.slice(0, 80));
-  const badCt = await localDecryptAndVerify(
-    { ...blob, ct_b64: Buffer.from(Buffer.from(blob.ct_b64, 'base64').map((b, i) => i === 0 ? b ^ 0xff : b)).toString('base64') },
-    jwkStr, nonceHex, rsaPem).then(() => null, e => e);
-  check('tampered ciphertext fails closed (AES-GCM tag)', !!badCt, badCt && String(badCt));
-
-  // --- golden-PCR enforcement (VULN-04, tri-state follow-up) --------------
-  const gcp = await buildLegitGcpReport();
-  const gcpPcr0 = gcp.attestation_report.hardware_level_attestation.pcr_values.pcr_0;
-  const tpmCls = () => (document.getElementById('tpmCheck') || {}).className || '';
-  const tpmDesc = () => {
-    const el = document.getElementById('tpmCheck');
-    const p = el && el.querySelector('p');
-    return (p && p.innerHTML) || '';
-  };
-
-  // static: the tri-state machinery itself must be shipped (CSS + updateStatus)
-  check('amber .warning state styled in CSS',
-    /\.warning\s*\{\s*border-left: 4px solid var\(--warning\)/.test(html));
-  check('updateStatus accepts the tri-state warning value',
-    /state === 'warning'/.test(html) && /--warning:/.test(html));
-
-  GOLDEN_PCRS.pcr_0 = gcpPcr0;
-  let gAlert = await runAuditWith(gcp);
-  check('audit passes when the golden pin matches the quoted PCR', !gAlert, `alert=${gAlert}`);
-  check('PARTIAL pins (1/4) render amber ⚠️ degraded, never green ✅',
-    tpmCls().includes('warning') && !tpmCls().includes('verified'), `className=${tpmCls()}`);
-
-  GOLDEN_PCRS.pcr_0 = 'ff'.repeat(32);
-  gAlert = await runAuditWith(gcp);
-  check('audit FAILS on golden pin mismatch (self-consistent forged quote)',
-    !!gAlert && /GOLDEN PCR PIN VIOLATION/.test(gAlert), `alert=${gAlert}`);
-  check('pin mismatch renders failed ❌ state on the TPM check',
-    tpmCls().includes('failed'), `className=${tpmCls()}`);
-
-  GOLDEN_PCRS.pcr_0 = null;
-  gAlert = await runAuditWith(gcp);
-  check('unset pin degrades to warning-only (pre-capture baseline)', !gAlert, `alert=${gAlert}`);
-  check('unpinned quote shows DEGRADED TRUST warning, not a silent pass',
-    tpmCls().includes('warning') && !tpmCls().includes('verified')
-    && /Degraded Trust/.test(tpmDesc()) && /UNPINNED/.test(tpmDesc()),
-    `className=${tpmCls()} desc=${tpmDesc().slice(0, 140)}`);
-
-  // all four pins captured + matching → full green ✅ (the complete tri-state)
-  const allPcrs = gcp.attestation_report.hardware_level_attestation.pcr_values;
-  for (const k of Object.keys(GOLDEN_PCRS)) if (allPcrs[k]) GOLDEN_PCRS[k] = allPcrs[k];
-  gAlert = await runAuditWith(gcp);
-  check('ALL four golden pins matched → verified ✅ (tri-state complete)',
-    !gAlert && tpmCls().includes('verified'), `alert=${gAlert} className=${tpmCls()}`);
-  for (const k of Object.keys(GOLDEN_PCRS)) GOLDEN_PCRS[k] = null;
-}
-
-// Test 12 (optional, live): end-to-end LOCAL-AUDITOR round-trip against a
-// running enclave. Needs a human to complete the PayPal login, so it only
-// runs when PAV_HOST is set:
-//   PAV_HOST=https://staging.host PAV_EMAIL=you@test node scripts/test-verify-security.mjs
-console.log('\nTest 12: live local-auditor E2EE round-trip');
-{
-  const liveHost = (process.env.PAV_HOST || '').replace(/\/$/, '');
-  if (!liveHost) {
-    console.log('  ⚠️ skipped — set PAV_HOST (+ PAV_EMAIL) to exercise the live vault claim');
-  } else {
-    globalThis.fetch = nativeFetch;
-    const store = new Map();
-    globalThis.localStorage = {
-      getItem: k => (store.has(k) ? store.get(k) : null),
-      setItem: (k, v) => store.set(k, String(v)),
-      removeItem: k => store.delete(k),
-    };
-    globalThis.location = { protocol: 'file:', hash: '' };
-    elements['localEnclaveHost'] = makeEl();
-    elements['localEnclaveHost'].value = liveHost;
-    elements['customInfoInput'] = makeEl();
-    elements['customInfoInput'].value = process.env.PAV_EMAIL || 'v162-e2e';
-    elements['localLoginStatus'] = makeEl();
-    elements['localPaypalUrl'] = makeEl();
-
-    await localPreflight();
-    let st = elements['localLoginStatus'].innerText;
-    check('local pre-flight: hardware audit + app pin passed', st.startsWith('✅'), st.slice(0, 200));
-    const sess = JSON.parse(store.get('pav_local_session') || 'null');
-    check('keys + state stored in the LOCAL origin only', !!sess && !!sess.jwk && !!sess.p_enc && !!sess.state);
-    const authUrl = elements['localPaypalUrl'].href || '';
-    check('authorize URL built after pin checks', /state=/.test(authUrl), authUrl.slice(0, 120));
-    if (sess && authUrl) {
-      console.log('  ▶ Open this URL, log in with ' + (process.env.PAV_EMAIL || '(your PayPal test account)') + ':');
-      console.log('    ' + authUrl);
-      console.log('  ▶ Waiting for the callback to vault the blob…');
-      let blob = null;
-      const deadline = Date.now() + Number(process.env.PAV_TIMEOUT_S || 300) * 1000;
-      while (Date.now() < deadline && !blob) {
-        const r = await nativeFetch(`${liveHost}/e2ee-blob?state=${encodeURIComponent(sess.state)}`);
-        if (r.ok) blob = await r.json();
-        else await new Promise(res => setTimeout(res, 4000));
-      }
-      check('vault yielded the single-use blob after login', !!blob, blob ? '' : 'timeout — login not completed in time');
-      if (blob) {
-        const env = await localDecryptAndVerify(blob, sess.jwk, sess.nonceHex, sess.p_enc);
-        check('live blob decrypted + S_enc verified against pinned P_enc', !!env.attestation_report);
-        const dAlert = await runAuditWith(env);
-        check('full audit passes on the live delivered report', !dAlert, `alert=${dAlert}`);
-        const sub = env.attestation_report.paypal_user_info && env.attestation_report.paypal_user_info.sub;
-        check('PayPal identity recovered from inside the ciphertext', !!sub, `sub=${sub}`);
-        store.delete('pav_local_session');
-      }
-    }
+  if (live) {
+    const { ok, alert } = await runAuditWith(live);
+    const fw = fwDesc();
+    check('live audit returns true', ok === true, `alert=${alert}`);
+    check('live TDX silicon root verified', /Intel TDX Silicon Root Verified/.test(fw), fw.slice(0, 900));
+    check('live chain reaches the REAL pinned Intel root', /leaf → Intel SGX Root CA pinned \(44a0196b/.test(fw), fw.slice(0, 900));
+    check('live session-nonce binding in report_data', fw.includes("report_data[0..32] == this session's combined nonce"), fw.slice(0, 900));
+    check('live MRTD surfaced', /MRTD: [0-9a-f]{32}…/.test(fw), fw.match(/MRTD: [0-9a-f]+…/)?.[0]);
+    check('live provenance row green', row('githubCheck').cls === 'check-item verified',
+      row('githubCheck').cls + ' — ' + row('githubCheck').desc.slice(0, 300));
+    check('live tpmCheck green (TPM-less TDX)', row('tpmCheck').cls === 'check-item verified', row('tpmCheck').cls);
   }
 }
 
+// ===========================================================================
+rmSync(dir, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${fail} failed`);
-if (fail > 0) process.exit(1);
 process.exit(fail ? 1 : 0);
