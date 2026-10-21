@@ -243,7 +243,7 @@
     <div class="grid" style="margin-top: -10px;">
         <div class="input-card" style="grid-column: span 2;">
             <label>Step 4 — Manual audit: verify a report you already have</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem;">Have a report JSON from an earlier login (the Download button on the result page)? Upload or paste it below to audit it offline. The optional certificate field additionally binds a saved TLS certificate to the report.</p>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">Have a saved report JSON (💾 offered on the login success page, or the Download button that appears after any passing audit)? Upload or paste it below to audit it offline — the saved file works with <b>any</b> copy of the auditor, including the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color: #64b5f6;">GitHub Pages copy</a> or your own saved <code>verify.html</code>. The optional certificate field additionally binds a saved TLS certificate to the report.</p>
             <label style="margin-top: 8px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Attestation JSON report</label>
             <div style="margin-bottom: 15px;">
                 <input type="file" id="reportFile" accept=".json" class="file-input">
@@ -267,6 +267,10 @@
 
     <div id="resultsArea" class="results">
         <div class="status-card">
+            <!-- v164: unlocked only by a fully green audit — the saved JSON is
+                 the user's portable evidence, auditable OFFLINE in any copy of
+                 the auditor (external GitHub Pages copy / saved local copy). -->
+            <button id="reportDownloadBtn" onclick="downloadReportFile()" style="display:none; width:100%; margin-bottom:18px;">💾 Download Attestation Report (JSON)</button>
             <div class="timestamp-box">
                 Account Security Bound at:<br>
                 <span id="signTime">Not verified</span>
@@ -580,7 +584,7 @@
     // this page. Rotate ONLY together with the enclave source change, in the
     // same reviewed commit (CI-harness fixtures read this value).
     // ========================================================================
-    var EXPECTED_ENCLAVE_SHA256 = '32599439af9ae4e8a5bf0d5536242188cd4351a8057f53431334226a42fe20ae';
+    var EXPECTED_ENCLAVE_SHA256 = 'cbd680c892634c85e4ffe7d9072b165ce6c36a3f934fd8a07f203c7c15c49ac3';
 
     // ========================================================================
     // v162 (audit VULN-04): GOLDEN PCR PINS — CI-captured constants for the
@@ -767,12 +771,62 @@
 
     // On load: restore a decrypted E2EE report handed over by /callback
     // (same origin) and auto-start the secure login from the homepage links.
+    // v164 — the /callback handoff: the enclave's success page performs NO
+    // crypto of its own; it only stashes the LOGIN-BOUND ciphertext blob in
+    // this origin's sessionStorage (`pav_e2ee_blob`). The decrypt + S_enc
+    // signature check + pre-flight P_enc pin + full audit ALL happen here, so
+    // a tampered blob or a swapped enclave fails closed and nothing is ever
+    // downloaded. After a login the report is auto-downloaded (?afterlogin=1)
+    // so the user holds a portable JSON they can audit OFFLINE in ANY copy of
+    // the auditor (GitHub Pages copy / saved local copy) — the copy served by
+    // the webservice is a convenience, never the only auditor.
     // (typeof guard: the node security harness evals this script headless.)
-    if (typeof window !== 'undefined') window.addEventListener('DOMContentLoaded', () => {
+    if (typeof window !== 'undefined') window.addEventListener('DOMContentLoaded', async () => {
+        const say = m => { try { const el = document.getElementById('secureLoginStatus'); if (el) el.innerText = m; } catch (e) {} };
+        // Restore the pre-flight-pinned P_enc (survives the PayPal round-trip
+        // via sessionStorage) so the post-login audit still enforces the pin.
+        try {
+            const pin = sessionStorage.getItem('pav_p_enc');
+            if (pin && !preFlightPubKeyPem) preFlightPubKeyPem = pin;
+        } catch (e) { /* no sessionStorage (harness) — skip */ }
         const saved = sessionStorage.getItem('pav_e2ee_report');
         if (saved) {
             const el = document.getElementById('attestationInput');
             if (el && !el.value) el.value = saved;
+        }
+        // Login handoff: decrypt the blob stashed by /callback in THIS tab.
+        try {
+            const raw = sessionStorage.getItem('pav_e2ee_blob');
+            if (raw) {
+                const jwk = sessionStorage.getItem('pav_client_jwk');
+                const nonceHex = sessionStorage.getItem('pav_client_nonce');
+                if (!jwk || !nonceHex) {
+                    say('❌ This tab has no session keys — the encrypted report can only be opened in the tab that created the key. Start the login again from this page.');
+                } else {
+                    const pinned = sessionStorage.getItem('pav_p_enc');
+                    // Fail closed: never decrypt a login report without the
+                    // pre-flight-pinned P_enc to check it against.
+                    if (!pinned) throw new Error('No pre-flight pin in this tab — refusing to decrypt an unpinned report. Start the login again from this page.');
+                    say('⏳ Decrypting your attestation report…');
+                    const env = await localDecryptAndVerify(JSON.parse(raw), jwk, nonceHex, pinned);
+                    try { const b = JSON.parse(raw); if (b && b.flow) sessionStorage.setItem('pav_e2ee_flow', String(b.flow)); } catch (e) { /* keep default tag */ }
+                    const pretty = JSON.stringify(env, null, 2);
+                    sessionStorage.setItem('pav_e2ee_report', pretty);
+                    const el = document.getElementById('attestationInput');
+                    if (el) el.value = pretty;
+                    if (await runAudit()) {
+                        if (location.search.indexOf('afterlogin=1') !== -1 && downloadReportFile()) {
+                            say('✅ Report decrypted, audited, and saved as a JSON file. You can audit it offline in ANY copy of the auditor (GitHub Pages copy or your own saved verify.html) — this site is only a convenience.');
+                        } else {
+                            say('✅ Report decrypted and fully audited — use the 💾 Download button in the results below to save the JSON.');
+                        }
+                    } else {
+                        say('❌ Audit FAILED — nothing was downloaded. See the results below.');
+                    }
+                }
+            }
+        } catch (e) {
+            say('❌ ' + e.message);
         }
         // UX: when the enclave itself serves this page (https origin), pre-fill
         // the enclave-address fields so the visitor never has to retype the URL.
@@ -2135,12 +2189,49 @@
                 const reportLeaf = getLeafCert(report.session_context.tls_certificate_pem);
                 updateStatus('tlsCheck', userLeaf === reportLeaf, userLeaf === reportLeaf ? "TLS channel bound." : "TLS mismatch!");
             }
+
+            // v164: a fully green audit unlocks the report download — the
+            // saved JSON is what the user audits offline in ANY external
+            // auditor copy; this page is only a convenience.
+            try { document.getElementById('reportDownloadBtn').style.display = 'block'; } catch (e) { /* stub-safe */ }
             return true;
         } catch (e) { 
             console.error(e); 
             alert("Audit Failed: " + e.message);
             return false; 
         }
+    }
+
+    // v164: download the DECRYPTED report currently under audit. Triggered by
+    // the unlocked results button or the post-login handoff (?afterlogin=1).
+    // The file is the user's portable evidence — auditable offline in any
+    // external auditor copy. The filename's flow tag is sanitized (report
+    // content is untrusted until the audit above has passed).
+    function downloadReportFile() {
+        let env = null;
+        try {
+            const ta = document.getElementById('attestationInput');
+            env = JSON.parse((ta && ta.value) ? ta.value : 'null');
+        } catch (e) { env = null; }
+        if (!env || !env.attestation_report) {
+            alert('No decrypted report to download yet — complete the login (Step 1/3) or paste a report (Step 4) first.');
+            return false;
+        }
+        let flowTag = 'report';
+        try {
+            flowTag = String(env.flow || sessionStorage.getItem('pav_e2ee_flow') || 'report')
+                .replace(/[^a-z0-9_-]/gi, '').slice(0, 24) || 'report';
+        } catch (e) { /* no sessionStorage (harness) — keep default */ }
+        const blob = new Blob([JSON.stringify(env, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'attestation-report-' + flowTag + '-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 5000);
+        return true;
     }
 </script>
 

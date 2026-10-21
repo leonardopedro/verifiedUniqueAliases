@@ -826,6 +826,7 @@ const HTML_TEMPLATE: &str = r#"
     <title>Confidential PayPal Auth</title>
     <style>
         body { font-family: monospace; max-width: 800px; margin: 50px auto; padding: 20px; background: #0a0a0a; color: #e0e0e0; }
+        .info p { margin: 10px 0; }
         .container { border: 2px solid #0070ba; padding: 30px; border-radius: 10px; background: #1a1a1a; }
         .btn { background: #0070ba; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; display: inline-block; font-size: 16px; border: none; cursor: pointer; }
         .info { background: #2a2a2a; padding: 15px; margin: 20px 0; border-radius: 5px; border-left: 4px solid #0070ba; }
@@ -834,6 +835,27 @@ const HTML_TEMPLATE: &str = r#"
 </head>
 <body><div class="container">{{CONTENT}}</div></body></html>
 "#;
+
+// The post-login success page. SECURITY (v164): this page performs NO crypto
+// and renders NO plaintext — it hands the LOGIN-BOUND encrypted blob to the
+// visitor's browser tab (sessionStorage on this origin); verify.html (same
+// origin) then decrypts it fail-closed (S_enc signature + pre-flight P_enc
+// pin), runs the full audit, and offers the report as a downloadable JSON the
+// user can audit offline in ANY external auditor copy (GitHub Pages copy /
+// saved local copy) — the copy served by this site is only a convenience.
+// Abuse/DoS posture: NO new surface. Reports are ONLY minted after a completed
+// PayPal code exchange (this route consumes a one-time pending_oauth state);
+// nothing here generates attestations for unauthenticated callers.
+const CALLBACK_CONTENT: &str = r#"<h1>Authentication Succeeded</h1>
+            <div class="info">
+                <h3>Hardware-Attested Delivery (Encrypted)</h3>
+                <p>Your verified PayPal status has been sealed in RAM and encrypted to your local client key. This page renders nothing — decryption happens only inside your browser tab.</p>
+                <p><a class="btn" href="/verify.html?afterlogin=1">💾 Get my attestation report &amp; run the audit</a></p>
+                <p style="font-size:14px; color:#9e9e9e;">Your tab will decrypt the report, verify its hardware signature and pre-flight key pin, run the full audit, and save the report as a JSON file. That file audits offline in <b>any</b> copy of the auditor — the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color:#64b5f6;">GitHub Pages auditor</a> or your own saved <code>verify.html</code>; the copy served by this site is only a convenience. No attestation report is ever generated without a completed PayPal login.</p>
+                <p><a href="/verify.html" style="color:#64b5f6;">Open Local Auditor (report loads without auto-download)</a></p>
+            </div>
+            <script type="application/json" id="e2ee-blob">__E2EE_BLOB__</script>
+            <script>try{sessionStorage.setItem('pav_e2ee_blob', document.getElementById('e2ee-blob').textContent);}catch(e){}</script>"#;
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -1595,20 +1617,12 @@ async fn callback(
     // Save for local claim
     state.pending_e2ee_blobs.write().insert(state_param.clone(), (e2ee_blob.clone(), Instant::now()));
 
-    // Never render plaintext user info: only return the encrypted blob container
-    let html = HTML_TEMPLATE.replace(
-        "{{CONTENT}}",
-        &format!(
-            r#"<h1>Authentication Succeeded</h1>
-            <div class="info">
-                <h3>Hardware-Attested Delivery (Encrypted)</h3>
-                <p>Your verified PayPal status has been sealed in RAM and encrypted to your local client key.</p>
-                <a class="btn" href="/verify.html">Open Local Auditor</a>
-            </div>
-            <script type="application/json" id="e2ee-blob">{}</script>"#,
-            e2ee_blob.to_string().replace("</", "<\\/")
-        ),
-    );
+    // Never render plaintext user info: only return the encrypted blob
+    // container (v164: the page then stashes it into sessionStorage and
+    // hands decryption/audit/download to verify.html in the user's tab).
+    let content = CALLBACK_CONTENT
+        .replace("__E2EE_BLOB__", &e2ee_blob.to_string().replace("</", "<\\/"));
+    let html = HTML_TEMPLATE.replace("{{CONTENT}}", &content);
 
     let _ = state.record_egress(addr.ip(), html.len() as u64);
     Html(html).into_response()

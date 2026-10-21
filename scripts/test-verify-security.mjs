@@ -992,6 +992,104 @@ console.log('\nTest 21f: unattested boot-chain files (shim/grub) fail the proven
   check('row names the unattested grubx64 component', gh.desc.includes('EFI Bootloader (grubx64.efi)'), gh.desc.slice(0, 700));
 }
 
+console.log('\nTest 23: v164 post-login handoff — E2EE decrypt round-trip + report download');
+{
+  // The /callback page (v164) performs no crypto: it stashes the ciphertext
+  // blob into sessionStorage and verify.html decrypts it fail-closed. These
+  // tests exercise exactly that path: a correct blob decrypts via WebCrypto,
+  // a substituted P_enc pin fails closed, a tampered ciphertext fails closed
+  // (GCM auth), and the unlocked download button saves the audited envelope
+  // with a sanitized filename (untrusted flow tag).
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  const envJson = JSON.stringify(built.envelope);
+  const b64 = (u8) => Buffer.from(u8).toString('base64');
+
+  // Build the E2EE blob exactly like the enclave:
+  // HKDF-SHA256(shared, salt=nonce, info='paypal-auth-vm/e2ee/v1') -> AES-256-GCM, AAD=nonce
+  const client = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+  const enclaveKp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+  const jwkStr = JSON.stringify(await crypto.subtle.exportKey('jwk', client.privateKey));
+  const nonceBytes = crypto.getRandomValues(new Uint8Array(32));
+  const nonceHex = [...nonceBytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+  const shared = await crypto.subtle.deriveBits({ name: 'ECDH', public: enclaveKp.publicKey }, client.privateKey, 256);
+  const base = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
+  const key = await crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: nonceBytes, info: new TextEncoder().encode('paypal-auth-vm/e2ee/v1') },
+    base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: nonceBytes }, key, new TextEncoder().encode(envJson)));
+  const blobBase = {
+    alg: 'AES-256-GCM+HKDF-SHA256+ECDH-P256',
+    aad: 'client_nonce',
+    iv_b64: b64(iv),
+    ct_b64: b64(ct),
+    enclave_ecdh_public_key_b64: b64(new Uint8Array(await crypto.subtle.exportKey('spki', enclaveKp.publicKey))),
+    enclave_signing_public_key: built.encPem,
+    state: 'handoff-test',
+    flow: 'verified',
+  };
+  const clone = (o) => JSON.parse(JSON.stringify(o));
+
+  const dec = await localDecryptAndVerify(clone(blobBase), jwkStr, nonceHex, built.encPem);
+  check('handoff blob decrypts to the login envelope',
+    dec.attestation_report.custom_info === built.envelope.attestation_report.custom_info);
+
+  let threw = '';
+  try {
+    await localDecryptAndVerify(clone(blobBase), jwkStr, nonceHex,
+      '-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqG9w0BAQEFAAOCAQ8A\n-----END PUBLIC KEY-----\n');
+  } catch (e) { threw = e.message; }
+  check('substituted P_enc pin fails closed', /PRE-FLIGHT VIOLATION/.test(threw), threw);
+
+  const bad = clone(blobBase);
+  const rawCt = Uint8Array.from(atob(bad.ct_b64), (c) => c.charCodeAt(0));
+  rawCt[0] ^= 0xff;
+  bad.ct_b64 = b64(rawCt);
+  threw = '';
+  try { await localDecryptAndVerify(bad, jwkStr, nonceHex, built.encPem); } catch (e) { threw = e.message; }
+  check('tampered ciphertext fails closed (GCM auth)', threw !== '', threw);
+
+  // --- the unlocked download button (v164 downloadReportFile)
+  elements['attestationInput'].value = '';
+  lastAlert = null;
+  check('download refuses when no decrypted report is present',
+    downloadReportFile() === false && /No decrypted report/.test(lastAlert), lastAlert);
+
+  const clicks = [];
+  const origCreate = document.createElement;
+  const origBody = document.body;
+  document.createElement = (tag) => ({ tagName: tag, href: '', download: '', click() { clicks.push(this); }, remove() {} });
+  document.body = { appendChild() {} };
+  let dlBlob = null;
+  const origCuo = URL.createObjectURL;
+  const origRuo = URL.revokeObjectURL;
+  URL.createObjectURL = (b) => { dlBlob = b; return 'blob:fake'; };
+  URL.revokeObjectURL = () => {};
+  elements['attestationInput'].value = JSON.stringify({ ...built.envelope, flow: '../../evil<script>name' });
+  const got = downloadReportFile();
+  if (origCreate === undefined) delete document.createElement; else document.createElement = origCreate;
+  if (origBody === undefined) delete document.body; else document.body = origBody;
+  if (origCuo === undefined) delete URL.createObjectURL; else URL.createObjectURL = origCuo;
+  if (origRuo === undefined) delete URL.revokeObjectURL; else URL.revokeObjectURL = origRuo;
+  const dlText = dlBlob ? await dlBlob.text() : '';
+  check('download saves the audited envelope',
+    got === true && clicks.length === 1 && JSON.parse(dlText).attestation_report !== undefined,
+    `got=${got} clicks=${clicks.length} bytes=${dlText.length}`);
+  check('download filename flow tag is sanitized',
+    /^attestation-report-evilscriptname-\d{4}-/.test(clicks[0] ? clicks[0].download : ''),
+    clicks[0] ? clicks[0].download : '(no click)');
+}
+
 // ---- Optional: a REAL report captured from the live enclave ---------------
 // (node scripts/e2e-sandbox.mjs sets this setup: REAL_REPORT=/tmp/report-verified.json)
 // Runs against the DEFAULT Intel anchor — the synthetic root is swapped out so
