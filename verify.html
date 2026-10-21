@@ -186,32 +186,37 @@
 
 <div class="container">
     <header>
-        <a href="index.html" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Back to Hub</a>
-        <h1>Secure Enclave Auditor</h1>
-        <p class="subtitle">Hardware-Rooted Attestation Verification v140</p>
+        <a href="https://leonardopedro.github.io/verifiedUniqueAliases/" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Project Hub (source code, privacy, terms)</a>
+        <h1>Hardware-Attested PayPal Login</h1>
+        <p class="subtitle">Prove the machine handling your PayPal login is genuine confidential-computing hardware — then log in.</p>
     </header>
 
     <div class="grid">
-        <div class="input-card">
-            <label>Attestation JSON Report</label>
-            <div style="margin-bottom: 15px;">
-                <input type="file" id="reportFile" accept=".json" class="file-input">
-            </div>
-            <textarea id="attestationInput" placeholder="Paste report or use file upload above..."></textarea>
+        <div class="input-card" style="grid-column: span 2; border-color: #4caf50; background: rgba(76, 175, 80, 0.05);">
+            <label style="color: #4caf50;">⭐ Most visitors only need this: click “Log in with PayPal” in Step 1</label>
+            <p style="color: var(--text-dim); font-size: 0.95rem; margin: 0;">Before you are sent to PayPal, this page downloads the enclave's live hardware proof (an Intel TDX quote) and audits it here, in your browser. If any check fails, the login does not start. The later steps are optional tools for auditing manually.</p>
         </div>
-        <div class="input-card">
-            <label>Browser TLS Certificate (Optional)</label>
-            <div style="margin-bottom: 15px;">
-                <input type="file" id="certFile" class="file-input">
+    </div>
+
+    <div class="grid" style="margin-top: -10px;">
+        <div class="input-card" style="grid-column: span 2; border-color: #4caf50;">
+            <label>Step 1 — Log in with PayPal (recommended)</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">Your browser generates a throwaway encryption key that never leaves this page. It is baked into the enclave's hardware quote together with the login challenge, so the proof audited below is proof about <i>this</i> login. Your PayPal identity comes back encrypted to that key — neither the site owner (who holds the PayPal client secret and can issue TLS certificates for this domain) nor the cloud provider (who sees all traffic leaving the machine) can read it. After the hardware audit passes, <b>this page</b> builds the PayPal link; the enclave never redirects you.</p>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                <button onclick="executePreflightAndLogin('verified')" style="background:#4caf50;">🔒 Log in with PayPal (Verified account only)</button>
+                <button onclick="executePreflightAndLogin('full')">🔒 Log in with PayPal (Share full profile)</button>
             </div>
-            <textarea id="certInput" placeholder="Paste .pem or use file upload above..."></textarea>
+            <input type="text" id="customInfoInput" maxlength="512"
+                placeholder="Optional: your public key / wallet / nonce — bound into the hardware quote and the report"
+                style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
+            <p id="secureLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
         </div>
-        <button onclick="runAudit()">Perform Cryptographic Audit</button>
     </div>
 
     <div class="grid" style="margin-top: -10px;">
         <div class="input-card" style="grid-column: span 2;">
-            <label>Step 1 — Pre-Flight: verify the LIVE enclave BEFORE logging in</label>
+            <label>Step 2 — Optional: audit the enclave before logging in</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">Want to inspect the hardware proof <i>before</i> starting a login? Paste the enclave's address (the same page you are on) and run the pre-flight check: it fetches <code>/debug/envelope</code>, audits it in full, and pins the enclave's one-time key. Step 1 then fails if that key changes — so you log into the exact machine you audited.</p>
             <div style="display: flex; gap: 10px;">
                 <input type="text" id="preflightUrl" placeholder="https://login.example-domain" style="flex: 1; background: #0d1117; border: 1px solid #30363d; border-radius: 8px; color: #58a6ff; padding: 10px; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; outline: none;">
                 <button onclick="runPreflight()" style="grid-column: auto; margin: 0; padding: 10px 18px; font-size: 0.95rem; border-radius: 8px; white-space: nowrap;">Pre-Flight Check</button>
@@ -221,22 +226,9 @@
     </div>
 
     <div class="grid" style="margin-top: -10px;">
-        <div class="input-card" style="grid-column: span 2; border-color: #4caf50;">
-            <label>Step 0 — Secure Login (Pillars 2–5): hardware-bound, client-encrypted</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem;">Generates YOUR ephemeral session keypair in this browser and binds it — together with the PKCE challenge — into the AMD SEV-SNP hardware quote. After the live hardware audit passes, THIS page builds the PayPal authorize URL (the enclave never redirects). Your identity comes back encrypted to your key: neither the domain owner (who holds the PayPal client secret and can mint genuine TLS certs) nor the cloud provider (who sees all RAM-exit traffic) can read it.</p>
-            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                <button onclick="executePreflightAndLogin('verified')" style="background:#4caf50;">🔒 Secure Login (Verified only)</button>
-                <button onclick="executePreflightAndLogin('full')">🔒 Secure Login (Full Data)</button>
-            </div>
-            <input type="text" id="customInfoInput" maxlength="512"
-                placeholder="Optional: your public key / wallet / nonce — bound into the AMD hardware quote and the report"
-                style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
-            <p id="secureLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
-        </div>
-
-        <div class="info">
-            <label>Step 0-L — Local Auditor (strongest): keys never touch the enclave origin</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem;">Audit VULN-02: a TLS-terminating owner can inject script into any page served from the enclave origin. This flow closes it — run THIS page from a trusted local copy (right-click → Save As from the GitHub raw URL, then open as a <code>file://</code> page): your keys are generated here and the encrypted report is claimed from <code>/e2ee-blob</code> over your own channel. Anything injected on the enclave origin sees ciphertext only.</p>
+        <div class="input-card" style="grid-column: span 2;">
+            <label>Step 3 — Advanced: run this page from your own copy (strongest)</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">A server owner with a TLS certificate for this domain can inject script into any page it serves — including this one. To remove that trust entirely: save this page from the project's GitHub (<code>verify.html</code>), open the saved file locally (<code>file://</code>), and use the two buttons below in order. Your keys are then created on <i>your</i> machine and the encrypted report is fetched over your own channel — anything injected on the enclave's origin only ever sees ciphertext.</p>
             <input type="text" id="localEnclaveHost" placeholder="https://login.airma.de"
                 style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
             <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px;">
@@ -245,6 +237,31 @@
             </div>
             <a id="localPaypalUrl" style="display:none; margin-top:10px;" class="btn" target="_blank" rel="noopener">Continue to PayPal →</a>
             <p id="localLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
+        </div>
+    </div>
+
+    <div class="grid" style="margin-top: -10px;">
+        <div class="input-card" style="grid-column: span 2;">
+            <label>Step 4 — Manual audit: verify a report you already have</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">Have a report JSON from an earlier login (the Download button on the result page)? Upload or paste it below to audit it offline. The optional certificate field additionally binds a saved TLS certificate to the report.</p>
+            <label style="margin-top: 8px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Attestation JSON report</label>
+            <div style="margin-bottom: 15px;">
+                <input type="file" id="reportFile" accept=".json" class="file-input">
+            </div>
+            <textarea id="attestationInput" placeholder="Paste report or use file upload above..."></textarea>
+            <label style="margin-top: 12px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Browser TLS certificate (optional)</label>
+            <div style="margin-bottom: 15px;">
+                <input type="file" id="certFile" class="file-input">
+            </div>
+            <textarea id="certInput" placeholder="Paste .pem or use file upload above..."></textarea>
+            <button onclick="runAudit()" style="margin-top: 15px;">Perform Cryptographic Audit</button>
+        </div>
+    </div>
+
+    <div class="grid" style="margin-top: -10px;">
+        <div class="input-card" style="grid-column: span 2;">
+            <label>Seeing “No valid Silicon Root of Trust”?</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem; margin: 0;">The audit is fail-closed: that alert means the hardware evidence in the report did not verify. The two common benign causes are (1) <b>this auditor page is out of date</b> — always take the latest <code>verify.html</code> from the project's GitHub rather than a cached copy — and (2) the report came from an older enclave build. Only trust a report that passes every check here.</p>
         </div>
     </div>
 
@@ -757,6 +774,16 @@
             const el = document.getElementById('attestationInput');
             if (el && !el.value) el.value = saved;
         }
+        // UX: when the enclave itself serves this page (https origin), pre-fill
+        // the enclave-address fields so the visitor never has to retype the URL.
+        try {
+            if (location.protocol === 'https:' && location.host) {
+                const pf = document.getElementById('preflightUrl');
+                if (pf && !pf.value) pf.value = location.origin;
+                const lh = document.getElementById('localEnclaveHost');
+                if (lh && !lh.value) lh.value = location.origin;
+            }
+        } catch (e) { /* no location (harness) — skip */ }
         if (location.hash === '#login-verified') executePreflightAndLogin('verified');
         if (location.hash === '#login-full') executePreflightAndLogin('full');
     });
@@ -2096,7 +2123,9 @@
                 : "❌ No AMD SNP, Google AK, or Intel TDX evidence present in report"));
 
             if (!siliconOk) {
-                throw new Error("CRITICAL: No valid Silicon Root of Trust (AMD, Google, or Intel TDX) found in report.");
+                // Harness pins /No valid Silicon Root/ (Test 8/14/15) — the
+                // appended hint keeps that substring intact.
+                throw new Error("CRITICAL: No valid Silicon Root of Trust (AMD, Google, or Intel TDX) found in report. If you believe this enclave is genuine, this copy of the auditor may be out of date — download the latest verify.html from the project's GitHub and re-run.");
             }
 
             // 6. TLS Binding
