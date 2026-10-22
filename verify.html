@@ -574,6 +574,29 @@
     var EXPECTED_MRTD = 'e0199499baacb2e4f4bc73046f25bedf674d42defbe4e854242bd6554a9d155edf7f3bff8e6202e63ed230e59ab2568a';
 
     // ========================================================================
+    // v166 AUDIT (plan.md Phase 4): GOLDEN RTMR PINS — HARD silicon gates.
+    // The four Runtime Measurement Registers inside the Intel-signed quote
+    // body (TDREPORT10 offsets 328..520). Live evidence (2026-10-21): RTMR0/1/2
+    // are non-zero, byte-identical across independent instances AND reboots of
+    // the same image, and changed when the initramfs content changed — i.e.
+    // the boot chain IS hardware-measured on this platform (the old "RTMR[0]
+    // all zeros, no vTPM" comment above is superseded). RTMR3 stays zero
+    // (nothing extends it) and is pinned as zeros so ANY extension trips the
+    // gate. With owner+cloud collusion both this file and the deployment are
+    // attacker-controlled — but an independent auditor copy pins THESE bytes:
+    // a modified /init or swapped image produces different RTMRs → hard fail.
+    // NOTE: verify.html now ships on the UNMEASURED ESP (R1-R3), so editing a
+    // pin does NOT feed back into RTMR2 — pins rotate only with real boot-chain
+    // changes, in a reviewed commit, recaptured via a golden boot:
+    //     node scripts/capture-golden-pcrs.mjs <host> --update   (GCP path)
+    //     TDX: parse a live quote body @328..520 (see scripts/e2e-sandbox.mjs)
+    // ========================================================================
+    var EXPECTED_RTMR0 = 'a50078ab426e8e044b88eca0192a0fb7fec69e31f55f7575af3e0ab865611eeb6cc29a1110d99f7562af1f0d84a3338b';
+    var EXPECTED_RTMR1 = '6fa0352319182f7ec8cb713223cbc1853506caf719c64d04475a26975ae8ebf72003f592dcf0aafe392cc74de33d3f90';
+    var EXPECTED_RTMR2 = 'ddda51ea044d56934745af1d95478dd6726642514860dc384418a1390f382507afdaa51b1b901fdb89956b3a5032f17d';
+    var EXPECTED_RTMR3 = '000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000';
+
+    // ========================================================================
     // v165 AUDIT: ENCLAVE CODE PIN — the ONE gate that stops colluding
     // owner+cloud from green-lighting arbitrary code: CI provenance alone
     // cannot, because the owner controls the repo (a malicious push is still
@@ -1942,6 +1965,12 @@
                         // MRTD (mr_td): after tee_tcb_svn16 + mr_seam48 + mr_signer_seam48
                         // + seam_attributes8 + td_attributes8 + xfam8 = offset 136.
                         const qMrtdHex = hx(qBody.subarray(136, 184));
+                        // RTMR0..3: mr_config/mr_owner don't apply — the four
+                        // runtime registers sit at 328..520 (48 B each, SHA-384),
+                        // directly before report_data @520. Same offsets the
+                        // in-guest CCEL replay uses (src/intel_tdx.rs).
+                        const qRtmrHex = [328, 376, 424, 472].map(o => hx(qBody.subarray(o, o + 48)));
+                        if (qRtmrHex.some(h => h.length !== 96)) throw new Error('RTMR registers truncated in quote body');
                         // ---- auth data (v4/v5 AuthDataV4):
                         //   u32 LE len | sig64 (raw r||s) | attkey64 (raw X||Y)
                         //   | cert_type u16 | cert_len u32 | cert body ----
@@ -2089,7 +2118,15 @@
                         // is unset. Scope/rotation: see the EXPECTED_MRTD block.
                         const mrtdPin = (typeof EXPECTED_MRTD === 'string' && EXPECTED_MRTD) ? EXPECTED_MRTD : '';
                         const mrtdOk = !!mrtdPin && qMrtdHex === mrtdPin;
-                        tdxVerified = qBindingOk && qSigOk && attKeyBound && qeRepSigOk && issuerIntelOk && chainOk && mrtdOk;
+                        // v166 RTMR HARD PINS (plan Phase 4): every register
+                        // must equal its golden pin — fail-closed if a pin is
+                        // missing/malformed, same contract as EXPECTED_MRTD.
+                        const rtPins = [EXPECTED_RTMR0, EXPECTED_RTMR1, EXPECTED_RTMR2, EXPECTED_RTMR3]
+                            .map(p => (typeof p === 'string' && /^[0-9a-f]{96}$/.test(p)) ? p : '');
+                        const rtMismatch = rtPins.map((p, i) => (p && qRtmrHex[i] !== p) ? i : -1).filter(i => i >= 0);
+                        const rtmrPinPresent = rtPins.every(p => !!p);
+                        const rtmrOk = rtmrPinPresent && rtMismatch.length === 0;
+                        tdxVerified = qBindingOk && qSigOk && attKeyBound && qeRepSigOk && issuerIntelOk && chainOk && mrtdOk && rtmrOk;
                         if (tdxVerified) {
                             siliconMsg = `✅ <b>Intel TDX Silicon Root Verified</b><br>` +
                                 `🔏 Quote signature ECDSA P-256/SHA-256 by its attestation key over header+TDREPORT (v${qVersion}${bodyType ? ', body type ' + bodyType : ''}) valid<br>` +
@@ -2099,11 +2136,14 @@
                                 `🔐 ${pfCtxTdx && pfCtxTdx.binding === 'v161'
                                     ? 'report_data == v161.2 client binding (P_enc ∥ code_challenge ∥ P_client ∥ client_nonce ∥ custom_info), [32..64] zero — bound ✓'
                                     : "report_data[0..32] == this session's combined nonce, [32..64] zero — bound ✓"}<br>` +
-                                `📏 MRTD: ${qMrtdHex.substring(0, 32)}… pinned ✓ (launch-chain ghost guard; source: ${esc(hw.tdx_evidence_source || 'unknown')})`;
+                                `📏 MRTD: ${qMrtdHex.substring(0, 32)}… pinned ✓ (launch-chain ghost guard; source: ${esc(hw.tdx_evidence_source || 'unknown')})<br>` +
+                                `📏 RTMR0–3 hard pins: ${qRtmrHex.map((h, i) => 'RTMR' + i + ' ' + h.substring(0, 12) + '…').join(', ')} ✓ — running-code measurements match the audited golden build`;
                         } else {
                             siliconMsg = `❌ <b>Intel TDX quote present but verification FAILED</b> ` +
-                                `(binding=${qBindingOk}, quote_sig=${qSigOk}, attkey_bind=${attKeyBound}, qe_report_sig=${qeRepSigOk}, issuer_intel=${issuerIntelOk}, root_chain=${chainOk}, mrtd_pin=${mrtdOk})<br>` +
+                                `(binding=${qBindingOk}, quote_sig=${qSigOk}, attkey_bind=${attKeyBound}, qe_report_sig=${qeRepSigOk}, issuer_intel=${issuerIntelOk}, root_chain=${chainOk}, mrtd_pin=${mrtdOk}, rtmr_pin=${rtmrOk})<br>` +
                                 (!mrtdOk ? `⚠️ MRTD pin mismatch: quoted launch measurement ${esc(qMrtdHex.slice(0, 32))}… ≠ the pinned audited chain — a DIFFERENT launch image (ghost enclave). Do NOT trust.<br>` : '') +
+                                (!rtmrPinPresent ? `⚠️ RTMR pins incomplete in THIS auditor copy — fail-closed (a tampered/stale verifier cannot pass).<br>` : '') +
+                                (!rtmrOk && rtmrPinPresent ? `⚠️ RTMR HARDWARE PIN VIOLATION on register(s) ${rtMismatch.map(i => 'RTMR' + i).join(', ')}: quoted value(s) ${rtMismatch.map(i => esc(qRtmrHex[i].slice(0, 16)) + '…').join(', ')} ≠ golden pin(s) ${rtMismatch.map(i => esc(rtPins[i].slice(0, 16)) + '…').join(', ')} — the MEASURED running code differs from the audited build (tampered kernel/initrd//init or boot config). Do NOT trust.<br>` : '') +
                                 `⚠️ PCK issuer was: "${esc(pckIssuer || 'n/a')}" — do NOT trust this report.<br>` +
                                 `⛓️ ${chainLabel}` +
                                 (!qBindingOk

@@ -1238,19 +1238,26 @@ pub struct PreflightRequest {
 }
 
 async fn serve_verify_html() -> impl IntoResponse {
-    // Served from the initramfs on disk, NOT embedded via include_str!. This
-    // is deliberate: EXPECTED_ENCLAVE_SHA256 (the code-pin gate) lives in this
-    // file and must equal the running binary's self-measure SHA256(/init).
-    // Embedding the auditor would make that self-referential (pin ==
-    // SHA256(binary containing pin)), an unsatisfiable fixed point. See
-    // build-initramfs-tools.sh where verify.html is copied to /verify.html.
-    match std::fs::read("/verify.html") {
+    // Served from the ESP (disk file), NOT embedded via include_str!. This
+    // is deliberate: EXPECTED_ENCLAVE_SHA256 (the code-pin gate) and the
+    // EXPECTED_MRTD/EXPECTED_RTMR* hardware pins live in this file and must
+    // be stable constants that the measured boot chain's hash can be
+    // compared against. v167 (plan.md): the auditor moved from the
+    // initramfs to the ESP because hardware measurements (RTMR2) cover the
+    // initrd — a pin INSIDE the initrd would shift the very register it
+    // pins (self-reference). The ESP copy is not loaded by the boot
+    // chain, so editing pins does not move any RTMR.
+    match std::fs::read("/boot/efi/verify.html") {
         Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], bytes).into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "verify.html not present in initramfs",
-        )
-            .into_response(),
+        // legacy images kept the auditor in the initramfs root
+        Err(_) => match std::fs::read("/verify.html") {
+            Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], bytes).into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "verify.html not present on ESP or initramfs",
+            )
+                .into_response(),
+        },
     }
 }
 
@@ -1659,6 +1666,53 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             error!("FATAL: {}", e);
             enclave_init::poweroff();
         });
+
+        // v165 Phase 3: BOOT-TIME FAIL-CLOSED QUOTE PROBE. Before any traffic
+        // is accepted, require a silicon-signed TD Quote from configfs TSM /
+        // /dev/tdx_guest and replay the ACPI CCEL event log against the
+        // quoted RTMR0..3. No quote → halt (the platform cannot attest).
+        // CCEL replay mismatch → halt (host presents inconsistent evidence).
+        // CCEL log unavailable in-guest is NOT a halt: it is recorded in the
+        // probe transcript and integrity stays enforced remotely by
+        // verify.html's EXPECTED_MRTD/EXPECTED_RTMR* hard pins over the quote.
+        #[cfg(feature = "alibabacloud")]
+        {
+            let boot_nonce = {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(b"paypal-auth-vm-boot-attestation-probe-v165");
+                h.update(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos().to_le_bytes())
+                    .unwrap_or([0u8; 16]));
+                hex::encode(h.finalize())
+            };
+            info!("--- BOOT-TIME TDX QUOTE PROBE (fail-closed) ---");
+            let ev = intel_tdx::collect_silicon_evidence(&boot_nonce, None);
+            match ev.quote_b64.as_ref() {
+                None => {
+                    error!("FAIL-CLOSED: no silicon-signed TD Quote at boot (status={:?}). Halting before serving traffic.", ev.quote_status);
+                    for n in ev.notes.iter().take(20) { error!("  probe: {}", n); }
+                    enclave_init::poweroff();
+                }
+                Some(qb64) => {
+                    use base64::Engine as _;
+                    let quote = base64::engine::general_purpose::STANDARD
+                        .decode(qb64)
+                        .map_err(|e| format!("boot probe: quote b64: {}", e))?;
+                    match intel_tdx::ccel_replay_vs_quote(&quote) {
+                        Ok(notes) => {
+                            info!("BOOT QUOTE PROBE OK ({} bytes, source={})", quote.len(), ev.quote_source.as_deref().unwrap_or("?"));
+                            for n in notes { info!("  ccel: {}", n); }
+                        }
+                        Err(e) => {
+                            error!("FAIL-CLOSED: {} — halting before serving traffic.", e);
+                            enclave_init::poweroff();
+                        }
+                    }
+                }
+            }
+        }
 
         // 1. Generate Ephemeral Enclave Identity (RAM ONLY, Never Logged)
         let enclave_identity = EphemeralEnclaveIdentity::generate()?;

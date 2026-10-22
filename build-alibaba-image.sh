@@ -28,14 +28,17 @@ KERNEL="./output/vmlinuz"
 INITRD="./output/initramfs-paypal-auth.img"
 SHIM="./output/shimx64.efi"
 GRUB="./output/grubx64.efi"
+# v167 (plan.md): the auditor lives on the ESP, NOT in the initramfs —
+# RTMR2 covers the initrd, so pins inside the initrd would be circular.
+VERIFY="./verify.html"
 
-for f in "$KERNEL" "$INITRD" "$SHIM" "$GRUB"; do
+for f in "$KERNEL" "$INITRD" "$SHIM" "$GRUB" "$VERIFY"; do
     [ -f "$f" ] || { echo "MISSING: $f"; exit 1; }
 done
 
 # --- Compute minimal ESP size -----------------------------------------------
 # Sum of file sizes + margin, rounded up to 1 MiB, min 32 MiB (FAT32 floor)
-TOTAL=$(( $(stat -c%s "$KERNEL") + $(stat -c%s "$INITRD") + $(stat -c%s "$SHIM") + $(stat -c%s "$GRUB") + 4096 ))
+TOTAL=$(( $(stat -c%s "$KERNEL") + $(stat -c%s "$INITRD") + $(stat -c%s "$SHIM") + $(stat -c%s "$GRUB") + $(stat -c%s "$VERIFY") + 4096 ))
 MARGIN_TOTAL=$(( TOTAL * 12 / 10 ))          # +20% margin for FAT tables / dirs
 ESP_BYTES=$(( (MARGIN_TOTAL / 1048576 + 1) * 1048576 ))
 if [ "$ESP_BYTES" -lt 33554432 ]; then ESP_BYTES=33554432; fi   # FAT32 floor 32 MiB
@@ -52,7 +55,7 @@ export MTOOLSRC="$OUTPUT_DIR/.mtoolsrc"
 export MTOOLS_NO_CONF=1
 
 # Normalize all ESP source timestamps so the FAT image is byte-reproducible
-touch -d "@$SOURCE_DATE_EPOCH" "$SHIM" "$GRUB" "$KERNEL" "$INITRD"
+touch -d "@$SOURCE_DATE_EPOCH" "$SHIM" "$GRUB" "$KERNEL" "$INITRD" "$VERIFY"
 
 mmd -i "$ESP_IMAGE" ::/EFI
 mmd -i "$ESP_IMAGE" ::/EFI/BOOT
@@ -60,6 +63,8 @@ mcopy -i "$ESP_IMAGE" "$SHIM"   ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "$ESP_IMAGE" "$GRUB"   ::/EFI/BOOT/grubx64.efi
 mcopy -i "$ESP_IMAGE" "$KERNEL" ::/EFI/BOOT/vmlinuz
 mcopy -i "$ESP_IMAGE" "$INITRD" ::/EFI/BOOT/initrd.img
+# ESP root: the enclave serves it at /verify.html from /boot/efi/verify.html
+mcopy -i "$ESP_IMAGE" "$VERIFY" ::/verify.html
 
 # grub.cfg sits NEXT TO grubx64.efi ($cmdpath) so Debian's signed grub finds it
 # regardless of its embedded prefix. No root= — the initramfs is the rootfs.
@@ -67,7 +72,7 @@ cat > "$OUTPUT_DIR/grub.cfg" <<'GRUBEOF'
 set default=0
 set timeout=0
 menuentry "PayPal Auth VM (Alibaba Cloud Intel TDX)" {
-    linux /EFI/BOOT/vmlinuz console=tty0 console=ttyS0,115200n8 net.ifnames=0 biosdevname=0
+    linux /EFI/BOOT/vmlinuz console=tty0 console=ttyS0,115200n8 net.ifnames=0 biosdevname=0 swiotlb=524288
     initrd /EFI/BOOT/initrd.img
 }
 GRUBEOF

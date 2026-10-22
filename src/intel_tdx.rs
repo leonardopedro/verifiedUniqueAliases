@@ -801,6 +801,256 @@ pub fn collect_silicon_evidence(
     ev
 }
 
+// ===========================================================================
+// v165 Phase 2/3: CCEL EVENT-LOG REPLAY + BOOT-TIME FAIL-CLOSED QUOTE PROBE
+//
+// plan.md Phases 2–3 (live evidence 2026-10-21: RTMR0/1/2 are non-zero and
+// IMAGE-BOUND — identical across instances/reboots of the same image, changed
+// when the initramfs changed — so the boot chain DOES extend them on this
+// platform; the auditor's EXPECTED_RTMR* pins are the remote enforcement).
+//
+// This module adds the IN-GUEST half: parse the ACPI CCEL (CC Event Log,
+// TCG crypto-agile format), replay the SHA-384 extend chain, and compare the
+// replayed RTMR0..3 against the values inside the SILICON-SIGNED quote body.
+// A mismatch means the event log does not describe the measured launch — the
+// host is presenting inconsistent evidence — and the caller must HALT
+// (fail-closed). If the platform does not expose the log area at all, that is
+// recorded honestly in `notes` and the check degrades to the quote pins
+// enforced remotely by verify.html (EXPECTED_MRTD/EXPECTED_RTMR*).
+//
+// Spec: TCG PC Client PFP (crypto-agile event log) + Intel TDX RTMR rules:
+//   initial RTMR[i] = SHA-384(1024 zero bytes); extend:
+//   RTMR[i] = SHA-384(RTM R[i] ∥ digest). Event PCRIndex 0..3 == RTMR0..3.
+// ===========================================================================
+
+/// Try every known exposure of the CCEL log area. Linux publishes the CCEL
+/// *table* (header + LogAreaAddress) under acpi/tables/; the log AREA itself
+/// is a separate physical region which QEMU/EDK2 may or may not alias into
+/// the sysfs data directory. Record where it was (or was not) found.
+pub fn read_ccel_log(notes: &mut Vec<String>) -> Option<Vec<u8>> {
+    // 1) data/CCEL — some firmware ships the log area as a raw data table.
+    if let Ok(b) = std::fs::read("/sys/firmware/acpi/tables/data/CCEL") {
+        if b.len() > 32 {
+            notes.push(format!("ccel: raw log read from data/CCEL ({} bytes)", b.len()));
+            return Some(b);
+        }
+    }
+    // 2) the CCEL table itself — if its Length covers more than the 44-byte
+    //    header, the log may be embedded inline after it (QEMU does this).
+    if let Ok(tbl) = std::fs::read("/sys/firmware/acpi/tables/CCEL") {
+        if tbl.len() >= 44 {
+            let table_len = u32::from_le_bytes([tbl[4], tbl[5], tbl[6], tbl[7]]) as usize;
+            if table_len > 44 && table_len <= tbl.len() {
+                notes.push(format!(
+                    "ccel: table Length={} > header — embedded log area ({} bytes)",
+                    table_len,
+                    table_len - 44
+                ));
+                return Some(tbl[44..table_len].to_vec());
+            }
+            notes.push(format!(
+                "ccel: ACPI table present ({} bytes, Length={}) but the log area it points to is a separate physical region not exposed via sysfs on this kernel",
+                tbl.len(), table_len
+            ));
+        }
+    } else {
+        notes.push("ccel: /sys/firmware/acpi/tables/CCEL absent (no CC Event Log ACPI table)".into());
+    }
+    // 3) /dev/mem is deliberately NOT probed: CONFIG_STRICT_DEVMEM blocks it
+    //    on this kernel and trying would only add noise.
+    notes.push("ccel: log area UNAVAILABLE in-guest — integrity enforced by the auditor's EXPECTED_RTMR* hard pins over the silicon-signed quote".into());
+    None
+}
+
+/// digestSize per TCG algId (fallback when the Spec ID header table lacks one).
+fn tcg_digest_size(alg: u16) -> Option<usize> {
+    match alg {
+        0x0004 => Some(20),  // SHA-1
+        0x000B => Some(32),  // SHA-256
+        0x000C => Some(48),  // SHA-384
+        0x000D => Some(64),  // SHA-512
+        0x0012 => Some(32),  // SHA3-256
+        0x0013 => Some(48),  // SHA3-384
+        0x0014 => Some(64),  // SHA3-512
+        _ => None,
+    }
+}
+
+/// Replay a TCG crypto-agile event log onto RTMR0..3. Returns the four
+/// replayed registers (SHA-384 state each) or a parse/replay error.
+pub fn replay_ccel(log: &[u8]) -> Result<[[u8; 48]; 4], String> {
+    use sha2::{Digest, Sha384};
+    let rd32 = |o: usize| -> Result<u32, String> {
+        log.get(o..o + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or_else(|| format!("ccel: truncated u32 @{} (log {} bytes)", o, log.len()))
+    };
+    // Initial RTMR state: SHA-384 over 1024 zero bytes (TDX spec).
+    let init = Sha384::digest([0u8; 1024]);
+    let mut rtmr = [[0u8; 48]; 4];
+    for r in rtmr.iter_mut() {
+        r.copy_from_slice(&init);
+    }
+
+    let mut off = 0usize;
+    let mut ev_count = 0usize;
+    let mut extend_count = 0usize;
+    // Algorithm size table from the Spec ID Event header (algId -> size).
+    let mut alg_sizes: Vec<(u16, usize)> = Vec::new();
+
+    while off + 12 <= log.len() {
+        let pcr_index = rd32(off)?;
+        let event_type = rd32(off + 4)?;
+        let digest_count = rd32(off + 8)?;
+        if digest_count > 16 {
+            return Err(format!("ccel: implausible digestCount {} @{}", digest_count, off));
+        }
+        let mut pos = off + 12;
+        let mut sha384_digest: Option<[u8; 48]> = None;
+        for _ in 0..digest_count {
+            if pos + 2 > log.len() {
+                return Err(format!("ccel: truncated algId @{}", pos));
+            }
+            let alg = u16::from_le_bytes([log[pos], log[pos + 1]]);
+            pos += 2;
+            let size = alg_sizes
+                .iter()
+                .find(|(a, _)| *a == alg)
+                .map(|(_, s)| *s)
+                .or_else(|| tcg_digest_size(alg))
+                .ok_or_else(|| format!("ccel: unknown digest alg 0x{:04x} @{}", alg, pos - 2))?;
+            if pos + size > log.len() {
+                return Err(format!("ccel: truncated digest @{} (need {})", pos, size));
+            }
+            if alg == 0x000C && size == 48 && sha384_digest.is_none() {
+                let mut d = [0u8; 48];
+                d.copy_from_slice(&log[pos..pos + 48]);
+                sha384_digest = Some(d);
+            }
+            pos += size;
+        }
+        if pos + 4 > log.len() {
+            return Err(format!("ccel: truncated eventSize @{}", pos));
+        }
+        let event_size = u32::from_le_bytes([log[pos], log[pos + 1], log[pos + 2], log[pos + 3]]) as usize;
+        pos += 4;
+        if pos + event_size > log.len() {
+            return Err(format!("ccel: event data overruns log @{} (size {})", pos, event_size));
+        }
+
+        // Spec ID Event (the log header, eventType 0x00000001): harvest the
+        // declared digest-size table; it is NOT extended into any RTMR.
+        if event_type == 0x0000_0001 && alg_sizes.is_empty() {
+            let ev = &log[pos..pos + event_size];
+            // signature[16] + platformClass u32 + minor/major/errata/uintn u8
+            // + numberOfAlgorithms u32 + n * {algId u16, digestSize u16}
+            if ev.len() >= 28 && ev.starts_with(b"Spec ID Event03\x00") {
+                let n = u32::from_le_bytes([ev[24], ev[25], ev[26], ev[27]]) as usize;
+                for i in 0..n.min(8) {
+                    let base = 28 + i * 4;
+                    if base + 4 <= ev.len() {
+                        let a = u16::from_le_bytes([ev[base], ev[base + 1]]);
+                        let s = u16::from_le_bytes([ev[base + 2], ev[base + 3]]) as usize;
+                        alg_sizes.push((a, s));
+                    }
+                }
+                notes_size_hint(&alg_sizes);
+            }
+        } else if event_type != 0x0000_0003
+            && pcr_index <= 3
+            && !matches!(pcr_index, 0x8000_0000..)
+        {
+            // EV_NO_ACTION (0x3) never extends; PCRIndex >= 0x80000000 are
+            // TCG "specialty" events that also do not extend.
+            if let Some(d) = sha384_digest {
+                let mut h = Sha384::new();
+                h.update(rtmr[pcr_index as usize]);
+                h.update(d);
+                rtmr[pcr_index as usize].copy_from_slice(&h.finalize());
+                extend_count += 1;
+            }
+        }
+        ev_count += 1;
+        off = pos + event_size;
+    }
+    if ev_count == 0 {
+        return Err("ccel: no events parsed (empty or non-TCG log)".into());
+    }
+    let _ = extend_count;
+    Ok(rtmr)
+}
+
+fn notes_size_hint(_alg_sizes: &[(u16, usize)]) {}
+
+/// Extract MRTD + RTMR0..3 from a v4/v5 Intel TDX quote body (TDREPORT10).
+/// Offsets (body-relative): mr_td 136..184, rtmr0 328..376, rtmr1 376..424,
+/// rtmr2 424..472, rtmr3 472..520 — the same layout verify.html pins.
+pub fn quote_measurements(quote: &[u8]) -> Result<([u8; 48], [[u8; 48]; 4]), String> {
+    if quote.len() < 48 {
+        return Err("quote truncated (<48 B header)".into());
+    }
+    let version = u16::from_le_bytes([quote[0], quote[1]]);
+    let tee_type = u32::from_le_bytes([quote[4], quote[5], quote[6], quote[7]]);
+    if tee_type != 0x81 {
+        return Err(format!("tee_type 0x{:x} is not TDX", tee_type));
+    }
+    let body_off = match version {
+        4 => 48usize,
+        5 => 54usize, // v5 preamble: body_type u16 + body_size u32
+        v => return Err(format!("unsupported quote version {}", v)),
+    };
+    if quote.len() < body_off + 584 {
+        return Err(format!("quote truncated before TDREPORT body ({} bytes)", quote.len()));
+    }
+    let body = &quote[body_off..body_off + 584];
+    let mut mrtd = [0u8; 48];
+    mrtd.copy_from_slice(&body[136..184]);
+    let mut rt = [[0u8; 48]; 4];
+    for i in 0..4 {
+        rt[i].copy_from_slice(&body[328 + i * 48..376 + i * 48]);
+    }
+    Ok((mrtd, rt))
+}
+
+/// Full in-guest measurement audit: replay CCEL onto RTMR0..3 and require
+/// exact equality with the silicon-signed quote's own RTMR fields.
+///
+/// Returns Ok(notes) on match or when the log is unavailable (recorded in
+/// notes; remote EXPECTED_RTMR* pins remain the enforcement), Err(reason) on
+/// a PARSED log that REPLAYS TO DIFFERENT VALUES — the caller must halt.
+pub fn ccel_replay_vs_quote(quote: &[u8]) -> Result<Vec<String>, String> {
+    let mut notes = Vec::new();
+    let (_mrtd, quoted_rt) = quote_measurements(quote)?;
+    for i in 0..4 {
+        notes.push(format!("quote RTMR{} = {}", i, hex::encode(quoted_rt[i])));
+    }
+    let log = match read_ccel_log(&mut notes) {
+        Some(l) => l,
+        None => return Ok(notes), // absence is honest + audited remotely
+    };
+    let replayed = replay_ccel(&log)?;
+    let mut mismatched = Vec::new();
+    for i in 0..4 {
+        if replayed[i] != quoted_rt[i] {
+            mismatched.push(format!(
+                "RTMR{}: log-replay {} ≠ quoted {}",
+                i,
+                hex::encode(replayed[i]),
+                hex::encode(quoted_rt[i])
+            ));
+        }
+    }
+    if mismatched.is_empty() {
+        notes.push("ccel: replay of the event log reproduces the quoted RTMR0..3 EXACTLY — log and silicon agree".into());
+        Ok(notes)
+    } else {
+        Err(format!(
+            "CCEL REPLAY MISMATCH (host presents inconsistent measurements): {}",
+            mismatched.join("; ")
+        ))
+    }
+}
+
 /// Names of shipped kernel modules whose filename matches any substring.
 /// Used by /debug/attestation to prove whether `tdx-guest.ko` etc. are even
 /// present in the image (the boot-time loader's scan filters may miss them).

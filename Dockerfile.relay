@@ -1,0 +1,130 @@
+# =============================================================================
+# Dockerfile.relay - Minimal OSS-transfer relay disk image (1 GiB, BIOS).
+#
+# The relay only shuttles the ~46 MiB enclave disk image between the HK
+# bucket (reachable from outside mainland) and the Beijing bucket (intranet
+# only), so it gets:
+#   - Debian trixie minbase + linux-image-cloud-amd64 + curl + ca-certs
+#   - systemd-networkd DHCP (no cloud-init, no aliyun agent, no sshd)
+#   - a relay-runner unit that fetches http://100.100.100.200/latest/user-data
+#     at boot and executes it as the transfer script, then powers the
+#     instance OFF (self economy-stop; the API-side StopCharging stop is the
+#     belt-and-braces counterpart)
+#   - GRUB (i386-pc / MBR) assembled WITHOUT loop devices: the 1 GiB raw
+#     file gets an MBR partition table, the rootfs via `mke2fs -E offset`,
+#     and boot code via plain dd into the post-MBR gap.
+# =============================================================================
+FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        debootstrap fdisk e2fsprogs grub-common grub-pc-bin \
+        ca-certificates curl xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- rootfs (minbase + kernel + curl) ---------------------------------------
+RUN debootstrap --variant=minbase --arch=amd64 \
+        --include=systemd-sysv,linux-image-cloud-amd64,curl,ca-certificates,iproute2 \
+        trixie /rootfs http://deb.debian.org/debian
+
+# ---- chroot configuration ---------------------------------------------------
+RUN set -e; \
+    echo 'relay' > /rootfs/etc/hostname; \
+    printf '127.0.0.1 localhost\n127.0.1.1 relay\n' > /rootfs/etc/hosts; \
+    printf '/dev/vda1 / ext4 defaults 0 1\n' > /rootfs/etc/fstab; \
+    # DHCP on any interface name (net.ifnames=0 on cmdline makes it eth0)
+    mkdir -p /rootfs/etc/systemd/network; \
+    printf '[Match]\nName=en* eth*\n\n[Network]\nDHCP=yes\n' \
+        > /rootfs/etc/systemd/network/10-dhcp.network; \
+    ln -sf /lib/systemd/system/systemd-networkd.service \
+        /rootfs/etc/systemd/system/systemd-networkd.service; \
+    mkdir -p /rootfs/etc/systemd/system/multi-user.target.wants; \
+    ln -sf /lib/systemd/system/systemd-networkd.service \
+        /rootfs/etc/systemd/system/multi-user.target.wants/systemd-networkd.service; \
+    # DNS: STATIC Alibaba VPC resolvers (100.100.2.136/138). 2026-10-21 bug:
+    # the old image symlinked /etc/resolv.conf to systemd-resolved's stub,
+    # but trixie ships resolved as a SEPARATE package (it was never installed,
+    # its postinst also needs dbus) -> the symlink dangled, every lookup failed
+    # rc=2 and the HK OSS GET died in 25ms with curl(6). Static file + the
+    # DHCP-installed host routes to those resolvers (verified in probe4) needs
+    # no extra daemons; the runner keeps a dangling-symlink fallback anyway.
+    printf 'nameserver 100.100.2.136\nnameserver 100.100.2.138\n' \
+        > /rootfs/etc/resolv.conf; \
+    # stable kernel/initrd names for grub
+    ln -sf "$(cd /rootfs/boot && ls vmlinuz-* | head -1)" /rootfs/boot/vmlinuz; \
+    ln -sf "$(cd /rootfs/boot && ls initrd.img-* | head -1)" /rootfs/boot/initrd.img; \
+    # runner: fetch IMDS user_data, execute it, then power off (economy)
+    mkdir -p /rootfs/usr/local/sbin; \
+    printf '%s\n' \
+      '#!/bin/bash' \
+      '# IMDS user_data transfer runner (no agent, no sshd).' \
+      'set +e' \
+      'exec > /dev/console 2>&1' \
+      'echo "<0>RELAY-RUNNER-START" > /dev/kmsg' \
+      'echo "RELAY-RUNNER-START user_data_bytes_pending"' \
+      'sleep 5' \
+      'curl -fsS --max-time 30 http://100.100.100.200/latest/user-data -o /tmp/ud.sh' \
+      'UDLEN=$(stat -c%s /tmp/ud.sh 2>/dev/null || echo 0)' \
+      '# DNS guard (2026-10-21 bug: systemd-resolved was NOT installed - trixie ships it as a separate package - so /etc/resolv.conf dangled, every lookup failed with rc=2/curl(6) and the HK GET died in 25ms. Wait for the stub; if it never appears, fall back to Alibaba VPC DNS directly.)' \
+      'for i in $(seq 1 20); do [ -e /etc/resolv.conf ] && break; sleep 1; done' \
+      'if [ ! -e /etc/resolv.conf ]; then { echo nameserver 100.100.2.136; echo nameserver 100.100.2.138; } > /etc/resolv.conf; echo "<0>RELAY-RUNNER static-resolv-fallback" > /dev/kmsg; fi' \
+      'DNSOK=0; for i in $(seq 1 40); do if getent hosts oss-cn-hongkong.aliyuncs.com >/dev/null 2>&1; then DNSOK=1; break; fi; sleep 1; done' \
+      'echo "RELAY-RUNNER dns_ok=$DNSOK user_data_bytes=$UDLEN"' \
+      'echo "<0>RELAY-RUNNER dns_ok=$DNSOK user_data_bytes=$UDLEN" > /dev/kmsg' \
+      'echo "RELAY-RUNNER user_data_bytes=$UDLEN"' \
+      'echo "<0>RELAY-RUNNER user_data_bytes=$UDLEN" > /dev/kmsg' \
+      'if [ -s /tmp/ud.sh ]; then bash /tmp/ud.sh | tee /tmp/ud.log; fi' \
+      'echo "RELAY-RUNNER-DONE"' \
+      'echo "<0>RELAY-RUNNER-DONE" > /dev/kmsg' \
+      'sync' \
+      'sleep 30' \
+      'systemctl poweroff' \
+      > /rootfs/usr/local/sbin/relay-runner; \
+    chmod 0755 /rootfs/usr/local/sbin/relay-runner; \
+    printf '%s\n' \
+      '[Unit]' \
+      'Description=OSS transfer relay (IMDS user_data)' \
+      'After=network-online.target' \
+      'Wants=network-online.target' \
+      '' \
+      '[Service]' \
+      'Type=oneshot' \
+      'ExecStart=/usr/local/sbin/relay-runner' \
+      'TimeoutStartSec=infinity' \
+      '' \
+      '[Install]' \
+      'WantedBy=multi-user.target' \
+      > /rootfs/etc/systemd/system/relay-runner.service; \
+    ln -sf /lib/systemd/system/relay-runner.service \
+        /rootfs/etc/systemd/system/multi-user.target.wants/relay-runner.service; \
+    # no sshd, no agent by design; loud serial GRUB.
+    # BUG FIX (2026-10-21, hung relay boot): the old printf used the 3-liner as
+    # its FORMAT (no %s conversion) so the menuentry argument was SILENTLY
+    # DROPPED — grub.cfg was 52 bytes with no menu entry, GRUB fell to an
+    # invisible VGA-only `grub>` prompt and the instance hung forever with
+    # zero serial output. Every line is now a %s ARGUMENT, GRUB talks to the
+    # SERIAL port (visible via GetInstanceConsoleOutput), and the kernel boots
+    # without `quiet` so a hang is diagnosable from the console API alone.
+    mkdir -p /rootfs/boot/grub; \
+    printf '%s\n' \
+      'serial --unit=0 --speed=115200' \
+      'terminal_output serial' \
+      'set default=0' \
+      'set timeout=0' \
+      'menuentry "relay" {' \
+      '  linux /boot/vmlinuz root=/dev/vda1 ro console=ttyS0,115200n8 console=tty0 net.ifnames=0 loglevel=7 earlyprintk=serial,ttyS0,115200' \
+      '  initrd /boot/initrd.img' \
+      '}' \
+      > /rootfs/boot/grub/grub.cfg
+
+# ---- assemble the 1 GiB raw disk (no loop devices anywhere) ----------------
+RUN set -e; \
+    truncate -s 1G /disk-relay.raw; \
+    printf 'label: dos\nstart=2048, size=2095104, type=83, bootable\n' | sfdisk /disk-relay.raw; \
+    mke2fs -F -t ext4 -q -E offset=1048576 -d /rootfs /disk-relay.raw; \
+    # GRUB i386-pc: boot code in MBR (bytes 0..445, table preserved), core in the gap
+    grub-mkimage -O i386-pc -p '(hd0,msdos1)/boot/grub' -o /core.img \
+        biosdisk part_msdos ext2 linux configfile normal search gzio reboot; \
+    dd if=/usr/lib/grub/i386-pc/boot.img of=/disk-relay.raw bs=440 count=1 conv=notrunc; \
+    dd if=/core.img of=/disk-relay.raw bs=512 seek=1 conv=notrunc; \
+    echo "disk assembled: $(stat -c%s /disk-relay.raw) bytes"

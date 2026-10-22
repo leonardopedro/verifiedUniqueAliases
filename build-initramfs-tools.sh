@@ -146,15 +146,12 @@ copy_bin_and_deps "tpm2_createak"
 ln -sf "$BIN_PATH" ./init
 chmod 755 ./init
 
-# Ship verify.html as a DISK FILE (served at runtime), NOT embedded in the
-# binary via include_str!. This breaks the code-pin gate's self-reference:
-# EXPECTED_ENCLAVE_SHA256 lives in this file and must equal the running
-# binary's self-measure SHA256(/init). If the auditor were baked into the
-# binary, that would require pin == SHA256(binary containing pin) — an
-# unsatisfiable fixed point. Keeping it on the disk makes the pin a stable
-# constant the binary's hash can actually equal.
-cp "$SRC_ROOT/verify.html" ./verify.html
-chmod 644 ./verify.html
+# v167 (plan.md Phase 4): verify.html is NO LONGER copied into the
+# initramfs. The hardware measurements (RTMR2) cover the initrd, so an
+# auditor file with pin constants inside the initrd would move the very
+# register it pins (self-reference). The auditor now lives on the ESP
+# (build-alibaba-image.sh copies it to ::/verify.html; the enclave serves
+# /boot/efi/verify.html), which the boot chain does not measure.
 
 # 5b. Forcefully inject hardware modules (platform-dependent)
 # mkinitramfs may skip these if not running on the target hardware.

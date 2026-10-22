@@ -122,11 +122,34 @@ GCP Confidential VMs (n2d with AMD SEV-SNP) **do not pre-provision persistent At
    - It must be **stopped in Economy mode immediately after each
      transfer** (`StopInstance --StoppedMode StopCharging`) — it must
      never idle in the running state.
-3. **Relay VM: spot / preemptible.**
+3. **Relay VM: spot / preemptible, in-place disk rewrites only.**
    - Create it with `InstanceChargeType=PostPaid` +
      `SpotStrategy=SpotAsPriceGo` (spot pricing, no protection period).
-   - A pre-existing non-spot relay may only be replaced by creating the
-     spot one, verifying it with a real transfer, then releasing the old.
+   - **Updating the relay image = rewrite the disk of the SAME relay
+     instance** (`StopInstance` → `ReplaceSystemDisk --ImageId <new relay
+     image>` → `StartInstance`), exactly like the Confidential VM in
+     item 1. **Never create a new relay VM (or release the old one) to
+     roll out a new image** as long as it has only a 1 GiB disk —
+     user-mandated 2026-10-22. Same rule for the Confidential VM:
+     in-place disk rewrite, never a replacement instance.
+   - `InstanceChargeType=Spot` is rejected (`InvalidInstanceChargeType
+     .NotFound`); spot billing is `PostPaid` + `SpotStrategy` only.
+   - **Proven in-place rollout (2026-10-22)**: `StopInstance` →
+     `ReplaceSystemDisk --ImageId <new>` (hand-signed RPC; the CLI exposes
+     no usable size flag) → `ModifyInstanceAttribute UserData <self-test>`
+     → `StartInstance` → poll status. Same instance id, VPC, EIP all kept.
+   - A >1 GiB disk **cannot** be downsized by `ReplaceSystemDisk`
+     (`InvalidSystemDiskSize.ValueNotSupported`, hit on the 40 GiB relay):
+     the new disk keeps the old disk's size/category (40 GiB
+     cloud_efficiency). Accept it; do not recreate the VM just to shrink.
+   - A guest-side `systemctl poweroff` leaves `StoppedMode=KeepCharging`
+     (still bills while stopped!) — always follow up with
+     `StopInstance --StoppedMode StopCharging` to flip it to economy
+     (verified 2026-10-22 on the relay).
+   - Relay self-test convention: user_data powers OFF on success and
+     **hangs in `Running` on any FAIL** — instance status is the
+     pass/fail signal, since serial console output is lost on stop.
+     Verified: HK Range-GET md5 == intranet PUT 200 on the dnsfix image.
 
 ### Target Instance Type: ecs.c9i.xlarge (4 vCPU / 8 GiB, Intel TDX) in cn-beijing-i
 - Live-proven 2026-10-16: spot `ecs.c9i.xlarge` (SpotAsPriceGo, no protection period) boots the ESP image end-to-end — DHCP, IMDS, `user_data` config load, NVMe ESP measurement (6 files), HTTP:80 + HTTPS:443, all green
@@ -174,6 +197,34 @@ made from an OSS object via `ImportImage`.
   `SignatureNonce`, `Timestamp`) — see `/tmp/ecs-call.mjs` pattern
 - `RunInstances` returns `InstanceIdSets.InstanceIdSet` (capital D) — reading
   `.InstanceidSet` silently yields an empty instance id
+- **New instances are NOT how images are rolled out** — see "🖥️ Instance &
+  Disk Policy" above: rewrite the existing VM's disk with
+  `ReplaceSystemDisk` (Confidential VM and Relay VM alike, whatever the
+  disk size — the relay stays 40 GiB because downsizing is refused). Do
+  not `RunInstances` a replacement and do not release the old box.
+- `RunInstances` with `InstanceChargeType=Spot` →
+  `InvalidInstanceChargeType.NotFound` (2026-10-21). Spot =
+  `InstanceChargeType=PostPaid` + `SpotStrategy=SpotAsPriceGo`.
+  `OperationDenied.NoStock` on a launch → pick another instance type via
+  `DescribeAvailableResource --DestinationResource instanceType
+  --SpotStrategy SpotAsPriceGo` rather than another zone/region.
+- **Serial console output is lost once an instance stops**
+  (`GetInstanceConsoleOutput` returns 0 bytes after `Stopped`) — and the
+  relay runner powers itself off. Poll the console *while the instance is
+  Running*, or design the `user_data` test to leave a verifiable artifact
+  (e.g. PUT a result object to OSS) instead of relying on console logs.
+- **STS tokens in `~/.aliyun/config.json` expire on the hour boundary**
+  (`sts_expiration`); presigned OSS URLs embed the STS token and die with
+  it, so a transfer started near expiry fails even if the URL's own
+  `Expires` is later. Any `aliyun` CLI call after expiry rotates the
+  token automatically — re-generate presigned URLs AFTER that call.
+- **OSS object verification from the operator host**: `aliyun oss stat`
+  needs `--endpoint $BUCKET.oss-cn-beijing.aliyuncs.com` (virtual-host);
+  plain region endpoints return `PublicEndpointForbidden`/`AccessDenied`.
+  Data-plane GET still fails from outside mainland — verify objects via a
+  presigned GET executed on an in-VPC instance with RunCommand (response
+  nests under `Invocation.InvocationResults.InvocationResult`, base64
+  `Output`).
 - `DeleteDisk` takes lowercase `--force`; `StopInstance` takes `--ForceStop`
 - **EIP bind/unbind is VPC-side and rejects `InstanceType`**: ECS
   `DisassociateEipAddress` and `UnassociatePublicIpAddress` do not exist

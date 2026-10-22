@@ -204,7 +204,7 @@ async function buildTdxQuote(o) {
     version = 4, bodyType = 2, reportData, innerChainPems, leafKey,
     tamperQuoteSig = false, corruptQeReportData = false, quoteSigByPckKey = false,
     vendorId = INTEL_VENDOR, teeType = 0x81, attKeyType = 2,
-    outerCertType = 6, forceBodySize = null, mrtdFill = null,
+    outerCertType = 6, forceBodySize = null, mrtdFill = null, rtmrFill = null,
   } = o;
   if (!reportData || reportData.length !== 64) throw new Error('reportData must be 64 bytes');
   const bodyLen = bodyType === 3 ? 648 : 584;
@@ -242,7 +242,22 @@ async function buildTdxQuote(o) {
   fillAt(body, 184, 48, 0x77);  // mr_config_id
   fillAt(body, 232, 48, 0x88);  // mr_owner
   fillAt(body, 280, 48, 0x99);  // mr_owner_config
-  for (let k = 0; k < 4; k++) fillAt(body, 328 + k * 48, 48, 0xa0 + k); // rt_mr0..3
+  // RTMR0..3 @328..520 — v166: default fixture = the PINNED golden values
+  // (EXPECTED_RTMR0..3 gates reject anything else); pass rtmrFill as a byte
+  // to fill ALL four registers with it (exercises the mismatch path), or a
+  // 1-based register number [1..4] to hit just that one. Empty/absent pins →
+  // zeros → never match (fail-closed, same as verify.html).
+  for (let k = 0; k < 4; k++) {
+    const pin = [EXPECTED_RTMR0, EXPECTED_RTMR1, EXPECTED_RTMR2, EXPECTED_RTMR3][k];
+    const pinHex = (typeof pin === 'string' && /^[0-9a-f]{96}$/.test(pin)) ? pin : '';
+    if (rtmrFill === null) {
+      body.set(Uint8Array.from(Buffer.from(pinHex, 'hex')), 328 + k * 48);
+    } else if (typeof rtmrFill === 'number' && rtmrFill >= 1 && rtmrFill <= 4) {
+      if (rtmrFill === k + 1) fillAt(body, 328 + k * 48, 48, 0x42); else body.set(Uint8Array.from(Buffer.from(pinHex, 'hex')), 328 + k * 48);
+    } else {
+      fillAt(body, 328 + k * 48, 48, rtmrFill);
+    }
+  }
   body.set(reportData, 520);    // report_data @520..584 (TD15 appends AFTER it)
   if (bodyLen === 648) { fillAt(body, 584, 16, 0xbb); fillAt(body, 600, 48, 0xcc); } // tee_tcb_svn2 + mr_service_td
   // attestation key (raw X||Y) + quote signature over header(+preamble)||body
@@ -968,6 +983,29 @@ console.log('\nTest 21e: MRTD pin gate rejects a different launch chain');
   check('ghost-launch wording surfaced', /MRTD pin mismatch/.test(fw), fw.slice(0, 400));
 }
 
+console.log('\nTest 21e2: RTMR pin gate rejects a tampered measurement register');
+{
+  // Fully valid Intel-signed quote + valid binding/chain + valid MRTD, but
+  // RTMR2 (the running-code register) filled from a DIFFERENT image → the
+  // HARDWARE measurement gate must fail (rtmr_pin=false, rtmr_pin=false).
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+        rtmrFill: 3, // ghost RTMR2 only (register #3)
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+  });
+  const { ok, alert } = await runAuditWith(built.envelope);
+  const fw = fwDesc();
+  check('audit fails closed despite valid quote+MRTD', ok === false, `ok=${ok}`);
+  check('silicon row shows rtmr_pin=false', /rtmr_pin=false/.test(fw), fw.slice(0, 500));
+  check('RTMR violation names the register', /RTMR HARDWARE PIN VIOLATION on register\(s\) RTMR2/.test(fw), fw.slice(0, 600));
+}
+
 console.log('\nTest 21f: unattested boot-chain files (shim/grub) fail the provenance row');
 {
   // v165: BOOTX64.EFI (shim/UKI) and grubx64.efi must be IN the row — a
@@ -1111,6 +1149,7 @@ if (process.env.REAL_REPORT) {
     check('live chain reaches the REAL pinned Intel root', /leaf → Intel SGX Root CA pinned \(44a0196b/.test(fw), fw.slice(0, 900));
     check('live session-nonce binding in report_data', fw.includes("report_data[0..32] == this session's combined nonce"), fw.slice(0, 900));
     check('live MRTD surfaced', /MRTD: [0-9a-f]{32}…/.test(fw), fw.match(/MRTD: [0-9a-f]+…/)?.[0]);
+    check('live RTMR hard pins all four enforced', /RTMR0–3 hard pins/.test(fw), fw.slice(fw.indexOf('RTMR0–3'), fw.indexOf('RTMR0–3') + 260));
     check('live provenance row green', row('githubCheck').cls === 'check-item verified',
       row('githubCheck').cls + ' — ' + row('githubCheck').desc.slice(0, 300));
     check('live tpmCheck green (TPM-less TDX)', row('tpmCheck').cls === 'check-item verified', row('tpmCheck').cls);
