@@ -90,13 +90,11 @@ prod `StopInstance ForceStop` → `ReplaceSystemDisk --SystemDisk.Size 1`
 
 ### 0.5 Known-informational (do NOT treat as regressions)
 
-- `EXPECTED_ENCLAVE_SHA256 = 'ba1a3bfe…'` in verify.html vs live binary
-  `23053c65…`: the self-reported digest mismatch only renders an amber
-  INFORMATIONAL note (v168 design — code identity is decided exclusively by
-  the MRTD/RTMR silicon pins). Both digests resolve green in the GitHub
-  attestations API; `23053c65` is the NEWER CI run. Rotate the constant in a
-  reviewed commit when convenient — remember the README digest must rotate in
-  the same commit (harness Test 28 gates it).
+- ✅ **RESOLVED 2026-10-24 (audit round 2, R2-2)**: `EXPECTED_ENCLAVE_SHA256`
+  rotated to the live binary `23053c650c4bfb88652ebe66cb79a216d66376051666662b5167400bf17a4633`
+  in the same reviewed commit as the README `verify.html` digest (harness
+  Test 28/21d). Self-report remains informational by design — code identity
+  is decided exclusively by the MRTD/RTMR silicon pins.
 - Sandbox-minted reports show `identityCheck = warning` by design (v177).
 
 ### 0.6 Relay transfer runbook — what actually works (all hit live)

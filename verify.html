@@ -674,7 +674,13 @@
     // never attested; see AGENTS.md "attested build" note. The value below is
     // the digest GitHub attestations resolve for this source tree.
     // ========================================================================
-    var EXPECTED_ENCLAVE_SHA256 = 'ba1a3bfe71c4726a36fe53475e130864f0c57a5aa57e6af86cc65a167e1e8a8b';
+    // v182 rotation (2026-10-24, audit round 2): stale pin ba1a3bfe… → the
+    // v180/v181 ATTESTED binary, live since the 2026-10-23 deploy. Verified:
+    // the GitHub attestations API resolves sha256:23053c65… green, and the
+    // pre-/post-swap envelopes (/tmp/env180.json, /tmp/env181.json) both
+    // self-report the identical digest. Rotate again with the next binary
+    // release, in the same reviewed commit (harness Test 21d/28 anchor it).
+    var EXPECTED_ENCLAVE_SHA256 = '23053c650c4bfb88652ebe66cb79a216d66376051666662b5167400bf17a4633';
 
     // ========================================================================
     // v162 (audit VULN-04): GOLDEN PCR PINS — CI-captured constants for the
@@ -2020,7 +2026,10 @@
                         // Without this branch every TDX pre-flight envelope failed
                         // binding=false by construction (2026-10-21).
                         const pfCtxTdx = report.session_context && report.session_context.preflight;
-                        let expectedTdxBindingHex, tdxBindingLabel, tdxBindingLoose32 = false;
+                        let expectedTdxBindingHex, tdxBindingLabel;
+                        // v182 (audit.md Step 4 — no wildcard slots): the
+                        // client-session slot note carried to the success row.
+                        let tdxClientSlotNote = '[32..64] zero';
                         if (pfCtxTdx && pfCtxTdx.binding === 'v161') {
                             expectedTdxBindingHex = (await preflightBindingHex(
                                 pubKeyBuffer, pfCtxTdx.code_challenge, b64ToDer(pfCtxTdx.client_pub_b64), pfCtxTdx.client_nonce_hex,
@@ -2028,25 +2037,41 @@
                             )).padEnd(128, '0');
                             tdxBindingLabel = 'v161.2 client binding (P_enc ∥ code_challenge ∥ P_client ∥ client_nonce ∥ custom_info ∥ PayPal_Client_ID)';
                         } else {
-                            // v179 (plan Phase 1 — session substitution): same
-                            // client-session slot as the SNP path — login
-                            // reports bind SHA-256(P_client ∥ Nonce_client)
-                            // into report_data[32..64]. Strict with the session
-                            // in hand; informational without it (paste audit).
+                            // v179 (plan Phase 1 — session substitution): login
+                            // reports bind SHA-256(P_client ∥ Nonce_client) into
+                            // report_data[32..64].
+                            // v182 (audit.md Step 4 — NO wildcard slots): BOTH
+                            // 32-byte slots are enforced in EVERY audit mode.
+                            // Session in hand → compare against THIS tab's own
+                            // P_client/nonce. Paste audit (no session) →
+                            // RECOMPUTE the slot from the report's own
+                            // session_context.client_pub_b64/client_nonce_hex
+                            // and require the match. The v179 "informational"
+                            // [32..64] wildcard is GONE: a quote minted for a
+                            // different session — or a legacy v173-era loose
+                            // slot — now fails closed instead of passing with
+                            // a warning (collusion model: an authentic-but-
+                            // stale report must not replay as green).
                             const isLoginReport = !!report.paypal_user_info;
+                            const scLogin = report.session_context || {};
                             if (isLoginReport && auditorSessionBindingHex) {
                                 expectedTdxBindingHex = expectedNonce + auditorSessionBindingHex;
                                 tdxBindingLabel = 'session nonce + client-session binding (P_client ∥ Nonce_client)';
+                                tdxClientSlotNote = '[32..64] == client-session binding — both slots bound ✓';
+                            } else if (isLoginReport && scLogin.client_pub_b64 && /^[0-9a-f]{64}$/i.test(String(scLogin.client_nonce_hex || ''))) {
+                                expectedTdxBindingHex = expectedNonce + await clientSessionBindingHex(b64ToDer(scLogin.client_pub_b64), scLogin.client_nonce_hex);
+                                tdxBindingLabel = 'session nonce + client-session binding recomputed from the report\'s own session_context (paste audit)';
+                                tdxClientSlotNote = '[32..64] == client-session binding (recomputed from the report\'s own session_context) — both slots bound ✓';
                             } else {
+                                // Non-login envelope (no PayPal identity): the
+                                // SEC-02 nonce alone is the binding; [32..64]
+                                // is zero by construction — strictly compared.
                                 expectedTdxBindingHex = expectedNonce.padEnd(128, '0');
                                 // wording pinned by the offline harness (Test 2/5)
                                 tdxBindingLabel = 'session nonce';
                             }
-                            tdxBindingLoose32 = isLoginReport && !auditorSessionBindingHex;
                         }
-                        const qBindingOk = tdxBindingLoose32
-                            ? qReportDataHex.substring(0, 64) === expectedTdxBindingHex.substring(0, 64)
-                            : qReportDataHex === expectedTdxBindingHex;
+                        const qBindingOk = qReportDataHex === expectedTdxBindingHex;
                         // MRTD (mr_td): after tee_tcb_svn16 + mr_seam48 + mr_signer_seam48
                         // + seam_attributes8 + td_attributes8 + xfam8 = offset 136.
                         const qMrtdHex = hx(qBody.subarray(136, 184));
@@ -2220,7 +2245,7 @@
                                 `📜 PCK leaf "${esc(pckSubject)}" issued by: ${esc(pckIssuer)}<br>` +
                                 `🔐 ${pfCtxTdx && pfCtxTdx.binding === 'v161'
                                     ? 'report_data == v161.2 client binding (P_enc ∥ code_challenge ∥ P_client ∥ client_nonce ∥ custom_info ∥ PayPal_Client_ID), [32..64] zero — bound ✓'
-                                    : "report_data[0..32] == this session's combined nonce, [32..64] zero — bound ✓"}<br>` +
+                                    : `report_data[0..32] == this session's combined nonce, ${tdxClientSlotNote}`}<br>` +
                                 `📏 MRTD: ${qMrtdHex.substring(0, 32)}… pinned ✓ (launch-chain ghost guard; source: ${esc(hw.tdx_evidence_source || 'unknown')})<br>` +
                                 `📏 RTMR0–3 hard pins: ${qRtmrHex.map((h, i) => 'RTMR' + i + ' ' + h.substring(0, 12) + '…').join(', ')} ✓ — running-code measurements match the audited golden build`;
                         } else {

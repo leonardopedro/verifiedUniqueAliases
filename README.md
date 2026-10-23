@@ -1,90 +1,91 @@
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/leonardopedro/verifiedUniqueAliases)
+# Alibaba Cloud Confidential Auth VM — Reproducible & Attested
 
-# GCP Confidential Auth VM — Reproducible & Attested
-
-Hardware-attested PayPal OAuth service on **GCP Confidential VM** (AMD SEV-SNP).
-Built for 100% bit-by-bit reproducibility and a mathematically unbroken chain of trust from AMD silicon to GitHub provenance.
+Hardware-attested PayPal OAuth service on **Alibaba Cloud ECS** (Intel TDX confidential compute).
+Built for bit-by-bit reproducibility and an unbroken chain of trust from **Intel silicon** to **GitHub CI provenance**, then audited **in your browser** — no server trust required.
 
 **Live endpoint**: `https://login.airma.de`
 
 ---
 
-## 🚀 Current Status (v145)
+## 🚀 Current Status (v181)
 
 | Component | Status |
 |---|---|
 | **Base OS (Debian 13 Trixie, pinned snapshot)** | ✅ Stable |
-| **Binary TPM `TPMS_ATTEST` Parsing** | ✅ Fully Verified |
-| **PCR Composite Digest Verification** | ✅ Fully Verified |
-| **PCR 15 Software Manifest Binding** | ✅ Fully Verified |
-| **Google EK Certificate (NVRAM, 1560 bytes)** | ✅ Fully Retrieved |
-| **Silicon Anchor: EK Cert Issuer Verification** | ✅ Fully Verified |
-| **Embedded TLS Pinning (no filesystem trust)** | ✅ Hardened |
-| **Pinned HTTPS Time Sync + RTC Pre-seed** | ✅ Hardened |
-| **Atomic Reproducible Build** | ✅ Achieved |
+| **Intel TDX hardware quote (PCK chain → Intel SGX Root CA)** | ✅ Fully Verified |
+| **MRTD + RTMR0–3 golden silicon pins** | ✅ Hard gates (fail-closed) |
+| **SEC-02 session nonce (5-component, 160-byte binding)** | ✅ Fully Verified |
+| **Client-session binding (both `report_data` slots, every audit mode)** | ✅ No wildcard slots (v182) |
+| **E2EE report blob (sealed to your browser's throwaway key)** | ✅ One-time vault claim, 600 s TTL |
+| **Auditor isolation (enclave-origin copy refuses keys)** | ✅ Web Auditor Tampering defense |
+| **Embedded TLS Pinning (`src/paypal.pem`, no filesystem trust)** | ✅ Hardened |
+| **Atomic Reproducible Build (Docker/CI pipeline only)** | ✅ Achieved |
 | **GitHub Sigstore Supply Chain Provenance** | ✅ Achieved |
 
-### v145 — GCP vTPM Two-Key Architecture
-
-All cryptographic audit checks pass end-to-end in `verify.html`:
-
-1. **✅ Enclave Identity Signature** — RSA-4096 signature over canonicalized JSON report
-2. **✅ PayPal Identity Binding** — Session nonce = `SHA-256(user_hash ∥ pubkey_hash)`
-3. **✅ TPM Hardware Proof** — Binary `TPMS_ATTEST` parsed; session AK signature, nonce, and PCR composite hash all verified
-4. **✅ Silicon Root of Trust** — Google EK Certificate retrieved from NVRAM `0x01c00002`; issuer verified as `EK/AK CA Intermediate` under Google's CA hierarchy; instance identity decoded from subject fields
-5. **✅ GitHub Build Provenance** — Sigstore attestation confirms binary + image atomicity + PCR 15 binding
-6. **✅ TLS Certificate Binding** — Optional: confirms browser connection matches signed report
+The former GCP (AMD SEV-SNP / vTPM) and Oracle paths were **permanently deleted** in v180
+(audit.md §3.1): Intel TDX is compiled unconditionally, and the multi-cloud quote
+dispatch is gone — a report with no hardware-signed Intel TDX quote is rejected
+outright (cross-cloud quote substitution closed at the first gate).
 
 ---
 
 ## 🔐 Cryptographic Chain of Trust
 
 ```
-GitHub Sigstore Provenance
-    └─► disk_manifest SHA-256
-            └─► PCR 15 (measured at boot into hardware TPM)
-                    └─► PCR Composite Hash (SHA-256 of PCRs 0,4,8,9,15)
-                            └─► TPMS_ATTEST (Session AK-signed: PCR composite + session nonce)
-                                    └─► Session Nonce
-                                            └─► PayPal Identity + Enclave Public Key
-
-Google EK Certificate (NVRAM 0x01c00002, Google-signed, permanent)
-    └─► Proves: this is a real GCP Confidential VM running AMD SEV-SNP silicon
+GitHub Actions CI attestation (Sigstore, per-commit)
+    └─► independent golden MRTD/RTMR0–3 pins (computed in CI, not by the enclave)
+            └─► Intel-signed TD Quote (ECDSA P-256 over header+TDREPORT;
+                attestation key bound into the QE report; QE report signed
+                by the PCK leaf → chain to the PINNED Intel SGX Root CA)
+                    └─► REPORTDATA[0..32] = SEC-02 session nonce
+                        (SHA-256 over [paypal_identity ∥ P_enc ∥ custom_info
+                         ∥ binary_sha256 ∥ canonical-manifest_hash])
+                    └─► REPORTDATA[32..64] = SHA-256(P_client ∥ Nonce_client)
+                        (client-session binding — enforced in EVERY audit mode)
+                            └─► report signed by the enclave's RSA-2048 key (S_enc)
+                                    └─► report sealed end-to-end (ECDH+AES-GCM)
+                                        to the throwaway key born in YOUR browser
 ```
 
-> **Key insight**: The Google EK Certificate and the TPM Quote signing key (session AK) are **two separate keys**. The EK cert proves *hardware identity*; the session AK proves *measurement integrity* for this specific session. This is the correct TPM 2.0 attestation model.
+> **Key insight**: an Intel-signed quote proves *silicon*; the golden MRTD/RTMR pins prove
+> the silicon launched *the audited boot chain*; the two `report_data` slots bind the quote
+> to *this PayPal session* and *this browser's* client key. Self-reported fields
+> (e.g. `boot.binary_sha256`) never gate anything — code identity is decided exclusively
+> by the silicon pins over the hardware quote.
 
 ---
 
 ## 🏗️ Build & Verifiability Workflow
 
-### 1. Atomic Reproducible Build
-The entire stack is built in a deterministic multi-stage Docker pipeline producing a bit-perfect `disk.tar.gz` that matches GitHub Actions provenance.
+### 1. The only ATTESTED build is the Docker/CI pipeline
+
+A plain host build (`cargo build --release`, e.g. under Nix) is **not** bit-identical to
+the pipeline build and is never attested — deploy only Docker-built disks:
 
 ```bash
-docker build -f Dockerfile.repro -t paypal-auth-vm-repro .
+bash build-alibaba-docker.sh    # rootless podman works; reproduces CI bit-for-bit
 ```
 
-### 2. Full Deployment
+### 2. Import & deploy
+
 ```bash
-bash deploy-gcp.sh
+bash import-alibaba-image.sh     # OSS upload → ImportImage (NVMe-flagged)
+bash deploy-alibaba.sh           # ecs.c9i.* spot, cn-beijing, config via user_data/IMDS
 ```
-This script: rotates EAB keys → builds the image locally → uploads to GCS → registers GCP custom image → tears down old VM → provisions new SEV-SNP Confidential VM.
 
 ### 3. High-Fidelity Audit: `verify.html`
 
-The browser-based auditor performs a 6-stage cryptographic validation entirely in-browser using WebCrypto — no server trust required.
+The browser-based auditor performs a multi-stage cryptographic validation entirely
+in-browser using WebCrypto — no server trust required.
 
 **Recommended: local air-gapped verification**
 
 ```bash
-# 1. Capture TLS certificate from the live endpoint
-echo | openssl s_client -connect login.airma.de:443 -showcerts \
-  | sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' > cert.pem
-
-# 2. After PayPal login, download the attestation report from the callback page
-
-# 3. Open verify.html locally, upload report + cert, click Audit
+# 1. Save verify.html from this repository (NOT from login.airma.de — that copy
+#    is untrusted by design and refuses key generation)
+# 2. Open it via file://, enter https://login.airma.de, run the secure login
+# 3. The report decrypts, audits and downloads in YOUR browser; audit it
+#    offline in any copy afterwards
 ```
 
 #### Verify the auditor itself first (out-of-band digest)
@@ -95,11 +96,11 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 157,602 bytes | `b30d6830bafc738c8f0170195a0f8f7d1c330efd58f49ab6e4242310bc34c356` |
+| `verify.html` | 159,828 bytes | `4ef08e03a9ca12acb298e06e8649e29bf926210a356510b9aa0be912b371a2e8` |
 
 ```bash
 sha256sum verify.html
-# b30d6830bafc738c8f0170195a0f8f7d1c330efd58f49ab6e4242310bc34c356  verify.html
+# 4ef08e03a9ca12acb298e06e8649e29bf926210a356510b9aa0be912b371a2e8  verify.html
 ```
 
 - Rotate this hash in the **same reviewed commit** that changes `verify.html`;
@@ -119,39 +120,42 @@ sha256sum verify.html
 
 | File | Purpose |
 |---|---|
-| `src/main.rs` | Rust PID 1: DHCP, TPM attestation, ACME TLS, PayPal OAuth, report signing |
-| `src/google_ca.pem` | Embedded Google Root CA (compiled into binary via `include_bytes!`) |
+| `src/main.rs` | Rust PID 1: DHCP, Intel TDX attestation, ACME TLS, PayPal OAuth, E2EE vault, report signing |
+| `src/intel_tdx.rs` | TDX evidence acquisition: DCAP quote, CCEL replay, PCK/TCB handling |
 | `src/paypal.pem` | Embedded TLS trust root for the pinned PayPal API endpoints — **DigiCert Global Root G2** (SHA-256 `cb3ccbb7…ab1cb5f`, fingerprint pinned by test `paypal_api_root_is_digicert_g2_v179`) |
-| `verify.html` | Browser auditor: binary TPM parser, DER cert decoder, WebCrypto, GitHub API |
-| `deploy-gcp.sh` | End-to-end deployment (EAB rotation → build → GCS → GCP VM) |
-| `Dockerfile.repro` | Multi-stage reproducible build (Debian Trixie pinned snapshots) |
+| `verify.html` | Browser auditor: TD Quote parser, PCK chain walk to the pinned Intel root, WebCrypto, GitHub attestation lookup |
+| `build-alibaba-docker.sh` | The reproducible build (Debian Trixie pinned snapshots) |
 | `build-initramfs-tools.sh` | Initramfs construction with kernel module selection |
-| `build-gcp-gpt-image.sh` | GPT disk image assembly (ESP + GRUB + measured boot) |
-| `.github/workflows/` | Sigstore provenance attestation for all build artifacts |
-| `AGENTS.md` | Security architecture, chain of trust, known constraints, and implementation notes |
+| `build-alibaba-disk.sh` | ESP + GPT disk image assembly (measured boot chain) |
+| `import-alibaba-image.sh` / `deploy-alibaba.sh` | Image import and instance deployment (cn-beijing) |
+| `.github/workflows/build-attest.yml` | Sigstore provenance + independent MRTD/RTMR golden pins |
+| `scripts/` | Security harness (`test-verify-security.mjs`), E2E flows, golden-RTMR tooling |
+| `AGENTS.md` · `audit.md` · `plan.md` · `HANDOVER.md` | Security architecture, audit trail, handover notes |
 
 ---
 
 ## 🛡️ Security Architecture Highlights
 
-- **PID 1 Isolation**: The Rust binary is the only process. No shell, no cron, no systemd. All whitelisted binaries (TPM tools, `nft`, `ip`) are statically resolved at build time.
-- **Embedded TLS Roots**: `google_ca.pem` and `paypal.pem` compiled directly into the binary with `include_bytes!`. No filesystem CA store is trusted.
-- **Kernel Egress Firewall**: `nftables` ruleset loaded at boot; only DNS (53), metadata (169.254.169.254), and HTTPS (443) egress permitted.
-- **TPM-Sealed DEK**: A random Data Encryption Key is sealed to PCR policy (0,4,8,9,15) using the owner-hierarchy primary. Any modification to measured boot components breaks the seal.
-- **One-Shot Attestation**: Each attestation report is signed with a freshly-generated RSA-4096 key (loaded from GCP Secret Manager). The nonce cryptographically binds the report to one specific PayPal session.
-- **Two-Key Silicon Anchor**: The hardware identity (Google EK Certificate, permanent, NVRAM) is decoupled from the session signing key (session AK, ephemeral, created per-attestation). Neither key alone is sufficient; both are required to pass the audit.
+- **PID 1 Isolation**: The Rust binary is the only process. No shell, no cron, no systemd. All whitelisted binaries (`tpm2`, `nft`, `ip`) are statically resolved at build time.
+- **Embedded TLS Root**: `paypal.pem` is compiled directly into the binary with `include_bytes!` and pinned at the transport layer. No filesystem CA store is trusted.
+- **Kernel Egress Firewall**: `nftables` ruleset loaded at boot; only DNS (53), the Alibaba IMDS (`100.100.100.200:80`), ACME (80/443) and HTTPS (443) egress permitted; per-IP and global bandwidth budgets enforced in-process.
+- **Fail-closed minting**: no silicon-signed TD Quote → HTTP 503, no report is ever emitted.
+- **No pre-login quote** (v180): `/attest/login-session` is pure signed bookkeeping — a hardware quote is minted only *after* a PayPal-verified code exchange, so the attacker filter is the completed login itself.
+- **E2EE report handoff**: the report is sealed (ECDH P-256 + AES-128-GCM) to a throwaway key that is born in and never leaves your trusted browser copy; the enclave's vault serves it **once**, to the matching claim hash, with a 600 s TTL.
+- **Auditor isolation**: key generation, login and decryption run only on `file://` or the pinned GitHub Pages copy — the enclave-origin copy refuses all key-generating flows (Web Auditor Tampering defense).
 
 ---
 
 ## 🔍 Verification Output (expected green state)
 
 ```
+✅ Intel TDX Silicon Root Verified
+   Quote signature ECDSA P-256/SHA-256 valid · attestation key bound into the QE report
+   PCK chain: … certs, leaf → Intel SGX Root CA pinned (44a0196b…)
+   report_data == session nonce ∥ client-session binding — both slots bound ✓
+   MRTD … pinned ✓ · RTMR0–3 hard pins … ✓ — running-code measurements match the audited golden build
 ✅ Enclave Identity Signature   — Report signature verified.
-✅ PayPal Identity Binding      — Identity cryptographically hashed.
-✅ TPM Hardware Proof           — TPM Quote, Nonce, and PCR Digest verified.
-✅ Silicon Root of Trust        — Google Confidential Hardware Verified
-                                   EK Cert Issuer: EK/AK CA Intermediate (Google LLC)
-                                   Hardware Identity: europe-west4-a · paypal-auth-vm-v60
-✅ GitHub Build Provenance      — Binary + Image Atomicity + PCR 15 hardware binding
+✅ PayPal Identity Binding      — Identity cryptographically hashed and environment-pinned (production).
+✅ GitHub Build Provenance      — Binary + disk attested; silicon pins decide code identity.
 ✅ TLS Certificate Binding      — TLS channel bound.
 ```

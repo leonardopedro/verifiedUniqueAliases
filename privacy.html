@@ -80,7 +80,7 @@
             Your reports allow me to correct or minimize issues for the benefit of the entire community.</p>
             
             <h2 id="data-handling">4. Data Handling</h2>
-            <p>All evidence so far suggests that this service operates in encrypted RAM (AMD SEV-SNP), it does not utilize persistent databases for user profiles and your data exists only for the duration of the session required to perform the OAuth flow and generate your attestation report. But it is up to the user (you) to verify this is so in the remote attestation.</p>
+            <p>All evidence so far suggests that this service operates in encrypted RAM (Intel TDX confidential compute on Alibaba Cloud ECS), it does not utilize persistent databases for user profiles and your data exists only for the duration of the session required to perform the OAuth flow and generate your attestation report. The report itself is delivered end-to-end encrypted to a key generated in your own browser (never in the enclave), so even the service operator cannot read it after the fact — once the one-time report claim has been made. But it is up to the user (you) to verify this is so in the remote attestation.</p>
         </div>
         <div class="footer">
             &copy; 2026 Verified Unique Aliases

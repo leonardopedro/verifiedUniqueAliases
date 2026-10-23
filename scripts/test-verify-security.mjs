@@ -1494,13 +1494,38 @@ console.log('\nTest 30: v179 client-session binding — report_data[32..64] = SH
   check('30b silicon row names the client-session binding',
     /client-session binding/.test(fwDesc()), fwDesc().slice(0, 400));
 
-  // (c) paste audit WITHOUT any local session: the slot cannot be verified
-  //     against a key this browser never had — informational only, while
-  //     report_data[0..32] (identity ∥ code) stays strictly enforced.
+  // (c) paste audit WITHOUT any local session and WITHOUT reconstructible
+  //     client session fields (legacy/pre-v179 report): the slot cannot be
+  //     verified, so it must FAIL CLOSED — the v179 "informational slot"
+  //     wildcard is gone (audit.md Step 4: no unverified quote slots).
+  //     Under the collusion model an authentic-but-stale report must not
+  //     replay as green through the paste path.
   globalThis.auditorSessionBindingHex = null;
   const c = await runAuditWith(theirs.envelope);
-  check('30c paste audit without a session still audits green (slot informational)', c.ok === true,
-    `ok=${JSON.stringify(c.ok)} alert=${c.alert}`);
+  check('30c paste audit without session fields fails closed (no wildcard slot)', c.ok === false,
+    `ok=${JSON.stringify(c.ok)}`);
+
+  // (c2) paste audit WITHOUT a local session but WITH the report's own
+  //      session_context: the slot is RECOMPUTED from client_pub_b64/
+  //      client_nonce_hex and STRICTLY enforced — green exactly when the
+  //      quote commits to those fields.
+  const repPubB64 = Buffer.from('client-pub-der-30').toString('base64');
+  const repNonceHex = '7f'.repeat(32);
+  const repBinding = bindingFor('client-pub-der-30', 0x7f);
+  const scExtras = { ...loginExtras, session_context: { client_pub_b64: repPubB64, client_nonce_hex: repNonceHex } };
+  const minePaste = await buildEnvelope({ hwBuilder: greenSlot(repBinding), reportExtras: scExtras });
+  const c2 = await runAuditWith(minePaste.envelope);
+  check('30c2 paste audit recomputes the slot from the report session_context (green)', c2.ok === true,
+    `ok=${JSON.stringify(c2.ok)} alert=${c2.alert}`);
+  check('30c2 success row names both verified slots',
+    /both slots bound/.test(fwDesc()), fwDesc().slice(0, 400));
+
+  // (c3) THE PASTE ATTACK: the report's session_context claims one client
+  //      session while the hardware quote commits to another → fail closed.
+  const theirsPaste = await buildEnvelope({ hwBuilder: greenSlot(otherBinding), reportExtras: scExtras });
+  const c3 = await runAuditWith(theirsPaste.envelope);
+  check('30c3 substituted client session fails closed in paste audit', c3.ok === false,
+    `ok=${JSON.stringify(c3.ok)}`);
 
   // (d) an UNBOUND (zero-slot) report with a session in hand must fail: the
   //     slot is strictly enforced whenever the auditor holds the session.
