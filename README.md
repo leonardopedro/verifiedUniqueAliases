@@ -87,6 +87,32 @@ echo | openssl s_client -connect login.airma.de:443 -showcerts \
 # 3. Open verify.html locally, upload report + cert, click Audit
 ```
 
+#### Verify the auditor itself first (out-of-band digest)
+
+`verify.html` is the only thing between you and a tampered enclave, so it must
+not be trusted on faith either. Its digest is published **here**, separate from
+the file it describes:
+
+| Artifact | Size | SHA-256 |
+|---|---|---|
+| `verify.html` | 167,927 bytes | `afaed15405185b0e3adb8a955e3c2e635252d2cd31db14dd59df5ea4ff1c4d7d` |
+
+```bash
+sha256sum verify.html
+# afaed15405185b0e3adb8a955e3c2e635252d2cd31db14dd59df5ea4ff1c4d7d  verify.html
+```
+
+- Rotate this hash in the **same reviewed commit** that changes `verify.html`;
+  `node scripts/test-verify-security.mjs` fails when the README and the file
+  disagree (Test 28), so a stale digest cannot be published silently.
+- Compare against a second source when you can (release note, mirror, another
+  checkout): this README lives in the same repository whose owner the threat
+  model distrusts, so one source alone is a weak anchor.
+- The copy served by the enclave itself (`https://login.airma.de/verify.html`)
+  is untrusted by design — it refuses every key-generating flow (auditor
+  isolation), so a tampered ESP copy cannot steal your keys. It also cannot
+  prove anything: check the digest of the file you actually run.
+
 ---
 
 ## 📂 Repository Structure

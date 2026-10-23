@@ -119,6 +119,11 @@ COPY --from=image-builder /grubx64.efi /build/output/grubx64.efi
 COPY --from=image-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin
 COPY --from=image-builder /packages.txt /build/packages.txt
 COPY build-alibaba-image.sh ./
+# verify.html ships on the ESP (v167) and build-alibaba-image.sh refuses to
+# assemble without it — the assembler stage must copy it too (2026-10-22 fix:
+# only the initramfs stage had it, so every assembly since v167 died at
+# "MISSING: ./verify.html").
+COPY verify.html ./
 
 RUN chmod +x build-alibaba-image.sh && ./build-alibaba-image.sh && \
     cp /build/output-alibaba/disk-alibaba.raw /disk-alibaba.raw && \

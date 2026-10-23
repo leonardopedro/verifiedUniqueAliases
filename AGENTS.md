@@ -59,6 +59,16 @@ The project uses a **single codebase** with conditional compilation to support b
 
 ---
 
+## 🚧 Project status: DEVELOPMENT / DEBUG PHASE (user-mandated 2026-10-22)
+
+This service is **not production-final — it is actively being improved and
+hardened**. Brief webservice downtime during builds, image rollouts,
+placement retries and attestation debugging is **expected and acceptable**;
+do not let outage-avoidance block experiments or rollbacks. Prefer rolling
+forward with fixes over preserving uptime. (The instance/snapshot/image
+rollback path should still be kept in place so any experiment can be
+undone.)
+
 ## ⚠️ Critical Architectural Knowledge: GCP vTPM Two-Key Model
 
 This is the single most important piece of knowledge for any agent working on this project.
@@ -92,6 +102,38 @@ GCP Confidential VMs (n2d with AMD SEV-SNP) **do not pre-provision persistent At
 ---
 
 ## Alibaba Cloud Platform Notes
+
+### 🚨 Golden rules (2026-10-23 — every one of these cost hours at least once)
+
+1. **The reserved EIP must be associated with the VM, always.** The Cloudflare
+   DNS-01 token is source-IP-restricted to `101.200.178.251`
+   (`eip-2zet05jbat6wr6rp7elrc`); without the EIP the enclave can NEVER get a
+   certificate, no matter how good the image is. No EIP ⇒ no TLS ⇒ dark box.
+   Check the EIP **before** you judge an image (see the ACME section below).
+2. **"Running + dark" is never proof of a broken image or a wedged host.**
+   Fail-closed halts sleep forever and the ACME retry loop serves nothing.
+   Get positive evidence (ESP `boot-probe.log`, or a boot log that reaches the
+   probe) before declaring a regression.
+3. **The serial console is a 64 KiB head-capped buffer that never rolls and
+   never resets per boot**, and it is **emptied when the instance stops**.
+   Check the timestamps inside a capture against the boot under test; poll it
+   only while the instance is `Running`; never plan a diagnosis around reading
+   it after a self-poweroff.
+4. **Never A/B two images without EIP parity.** A same-hour comparison where
+   only one instance held the reserved EIP proves nothing about the images
+   (this exact mistake produced the false "v172 is broken" verdict on
+   2026-10-22).
+5. **Only a bucket outside mainland China is readable from the operator
+   host.** The relay bucket `paypal-tdx-relay-1792227992` lives in
+   **`oss-cn-hongkong`** and is the designated operator-facing sink (PUT and
+   GET both work from the operator host and from a mainland ECS guest).
+   Objects in the mainland buckets (`paypal-tdx-image-…`, `paypal-tdx-img-…`)
+   are **write-only from the operator side**. Never build a forensic loop that
+   needs to read a mainland object.
+6. **Never `grep` a raw block device.** Stream it through
+   `tr -c '[:print:]' '\n'` with a bounded `dd` range (see the ESP recipe
+   below) — `grep -aob` on `/dev/vdb` treats the whole device as one "line"
+   and OOM-kills the guest (3.6 GB RSS observed).
 
 ### 🖥️ Instance & Disk Policy (user-mandated 2026-10-21 — apply on every deploy)
 
@@ -138,6 +180,22 @@ GCP Confidential VMs (n2d with AMD SEV-SNP) **do not pre-provision persistent At
      `ReplaceSystemDisk --ImageId <new>` (hand-signed RPC; the CLI exposes
      no usable size flag) → `ModifyInstanceAttribute UserData <self-test>`
      → `StartInstance` → poll status. Same instance id, VPC, EIP all kept.
+   - **`user_data` does NOT re-run on a plain stop/start** (verified
+     2026-10-23): after the instance's first boot, cloud-init is already
+     marked configured, so `ModifyInstanceAttribute UserData` + `StartInstance`
+     executes **nothing** — a perfect silent no-op (no artifact, no error).
+     The `ReplaceSystemDisk` step is what re-arms it. When a relay test
+     produces no artifact, check this before hunting a curl/network bug.
+   - **A relay script must not start with `exec >>/var/log/… 2>&1`**: if that
+     redirect fails at that point in boot, bash exits immediately and nothing
+     upstream is reached. Write a "started" marker to the artifact sink FIRST,
+     then do the work, then write the result — so a silent script death is
+     distinguishable from a failed upload.
+   - **The relay can stop itself seconds after `StartInstance`** (observed
+     2026-10-23: `Starting` → `Stopped` within ~15 s, three cycles, no artifact,
+     empty console). Treat "I started the relay" as unproven: always require a
+     marker object in the bucket before believing the script ran, and prefer the
+     enclave's own self-report for anything that must be reliable.
    - A >1 GiB disk **cannot** be downsized by `ReplaceSystemDisk`
      (`InvalidSystemDiskSize.ValueNotSupported`, hit on the 40 GiB relay):
      the new disk keeps the old disk's size/category (40 GiB
@@ -166,6 +224,158 @@ GCP Confidential VMs (n2d with AMD SEV-SNP) **do not pre-provision persistent At
   rules are in `setup_firewall()` (2026-10-16 fix)
 - `RunInstances --UserData` takes base64; the metadata endpoint returned the
   raw JSON in the live test, but `fetch_config()` accepts either form
+- Reading it back: `DescribeInstanceAttribute` returns an **empty
+  `UserData` field** — the config is only visible through the dedicated
+  `DescribeUserData` API (`UserData.Value`, base64). An empty
+  `DescribeInstanceAttribute` response does NOT mean the instance is
+  unconfigured.
+
+### ACME DNS-01 ONLY works from the reserved EIP (2026-10-22, user-confirmed)
+- The `dns01_secret` (Cloudflare API token) is **IP-restricted to the reserved
+  EIP** (`eip-2zet05jbat6wr6rp7elrc` = `101.200.178.251`). From any other
+  source IP the API answers `9109 "Cannot use the access token from location:
+  …"`, and `InRamAcmeManager::dns01_publish` surfaces that as its generic
+  `Cloudflare zone not found` error (it reads `result[0].id` from the error
+  body). The token itself verifies fine (`/user/tokens/verify`) — only the
+  source-IP check fails, so the symptom looks like a missing zone.
+- Therefore **the reserved EIP must be associated with the enclave VM** for
+  boot-time cert issuance (and renewal) to work. An instance without the EIP
+  ALWAYS ends in `ACME certificate failed: Cloudflare zone not found. Retrying
+  …` and serves nothing — that is expected behavior, not an image bug. Moving
+  the EIP to another instance silently breaks ACME for whoever loses it.
+- **Debugging order for a dark instance:** (1) EIP association, (2) token
+  state, (3) only then the image. A same-hour A/B of two images is invalid if
+  only one held the EIP during its ACME window — 2026-10-22: exactly this
+  produced a false "v172 image is broken" verdict (vm-2 ran v172 without the
+  EIP and was killed before its ACME retry could succeed; the known-good boot
+  then had the EIP from the start and greened out in 4 min).
+
+### Boot diagnosis: the 64 KiB console trap + the ESP probe transcript
+- `GetInstanceConsoleOutput` returns a buffer that is **head-capped at 65,536
+  bytes and frozen when full** — it does not roll, and it does not reset per
+  boot. A fetch can return a capture from hours and several boots ago (seen:
+  a buffer fetched at 16:25 still showed a 15:14 boot tail). Always check the
+  wall-clock timestamps INSIDE the capture against the boot being debugged
+  before concluding anything.
+- Verbose TDVF/OVMF firmware can eat the whole budget before the kernel prints
+  anything (a boot that "froze at kernel 0.595 s" is usually just the cap).
+  Likewise a log line landing at offset ~65505 (e.g. `BOOT-TIME TDX QUOTE
+  PROBE`) proves NOTHING about what followed. The 2026-10-22 "all v170+ images
+  wedge at the probe banner" conclusion was exactly this artifact: the same
+  capture for v169 (2.7 KB less firmware noise) shows the probe PASSING
+  (`QUOTE PROBE OK (5006 bytes, source=configfs_tsm)`).
+- Reliable boot channel: the boot quote probe appends its transcript to the
+  ESP (`/boot/efi/boot-probe.log`, per boot): `PROBE start`, `attempt n/8: no
+  quote (status=…)`, `probe done: quote=<bool> attempts=N`, `BOOT QUOTE PROBE
+  OK (N bytes, source=…)`, `ccel: …`, `FAIL-CLOSED: …`. Read it via an online
+  snapshot of the system disk + the relay instance (attach the snapshot disk,
+  grep the raw block device — no mount/toolchain needed).
+- Fail-closed halts do NOT stop the instance: `enclave_init::poweroff()`
+  deliberately sleeps forever (evidence preservation, no reboot). So
+  `Status=Running` + dark ports is the expected signature of a fail-closed
+  halt OR of the ACME retry loop — never treat "Running + dark" as proof of a
+  wedged host.
+- **Reading the ESP from a snapshot without mounting anything** (works on the
+  minimal relay image): the ESP is GPT partition 1 = LBA 2048, 41 MiB:
+  `dd if=/dev/vdb bs=512 skip=2048 count=83968 | tr -c '[:print:]' '\n' |
+  grep -aE 'BOOT-TIME TDX QUOTE PROBE|attempt [0-9]/8|probe done: quote|
+  BOOT QUOTE PROBE OK|FAIL-CLOSED|ccel:'`.
+  `grep -aob` (or any line-oriented `grep` straight on the device) treats the
+  whole 20–40 GiB device as a single line, buffers it, and OOM-kills the
+  guest — always bound `count` and strip binary through `tr` first.
+- **A guest-side verdict channel must leave the mainland or hit the control
+  plane.** A `user_data` script CAN `PUT` to
+  `$BUCKET.oss-cn-beijing-internal.aliyuncs.com` (intranet, works), but the
+  operator cannot read that object back (see below), so it is only a useful
+  sink if a same-region host later reads it — not as an answer channel.
+  The one channel that always returns to an outside operator is instance
+  state: end the script with `poweroff -f` on success and `sleep infinity` on
+  failure, then read `Status` (`Stopped` vs `Running`).
+
+### 🚫 Evidence channels from an operator host outside mainland China
+
+| Channel | From outside mainland | Notes |
+|---|---|---|
+| ECS/RPC control plane (`DescribeInstances`, `DescribeUserData`, `GetInstanceConsoleOutput`, snapshots, EIP) | ✅ works | the only always-available path |
+| **HK bucket** `paypal-tdx-relay-1792227992` (`oss-cn-hongkong`) | ✅ works both ways | presigned PUT+GET verified 2026-10-23 for a mainland guest and the operator host — **this is the exfil sink to use** |
+| Mainland buckets (`oss-cn-beijing`) | ❌ read blocked | `GetObject` → 403 `AccessDenied` (vhost) / `PublicEndpointForbidden` (path style); `*.oss-accelerate.aliyuncs.com` → `InvalidRequest "OSS Transfer Acceleration is not configured on this bucket"` |
+| `aliyun oss ls` (bucket list) | ✅ works | cross-region listing is fine — it is *object* operations that fail |
+| `aliyun oss ls/stat` on an object | ❌ | always targets `oss-cn-hongkong`; 403 blames your bucket (see API traps) |
+| Instance serial console | ⚠️ image-dependent | prod: 64 KiB head-capped and can be 100% TDVF firmware noise; the relay image returns **empty `ConsoleOutput`** (no serial console in its cmdline) while `LastUpdateTime` still advances |
+| `RunCommand` / cloud assistant | ❌ on the relay | `DescribeCloudAssistantStatus` returned an empty set for `OthersLinux_64` |
+| Enclave boot self-report → HK `{prefix}/latest.json` | ✅ works | `src/selfreport.rs`; signed PUT from the guest, presigned GET from the operator host (see the self-report section) |
+
+So the guest→operator channel that actually works is: **guest PUTs to the HK
+bucket, operator presigned-GETs it**. Verified 2026-10-23
+(`forensic/channel-test.txt`: PUT 200, GET returned the body).
+Two further console facts, both verified the same day: the response field is
+**`ConsoleOutput`** (reading `.Output` silently yields `''`), and an empty
+string does not mean "no boot" — `LastUpdateTime` keeps advancing.
+
+### Boot self-report (`src/selfreport.rs`) — the dark-box channel (2026-10-23)
+
+A dark enclave now reports its own state to the **Hong Kong** bucket, so
+"why is it dark?" is answerable from the operator host minutes after a boot,
+with no console, no snapshot, no relay, and no in-VPC helper.
+
+- **What it publishes**: `{prefix}/latest.json` (stable, poll this) plus
+  `{prefix}/{host}-{unix}-{kind}.json` (history). `kind` is `stage`
+  (progress heartbeat), `fatal` (a retry-loop failure such as an ACME error),
+  `ok` (TLS in RAM, serving) or `halt` (fail-closed, with the exact reason).
+- **Payload**: `schema`, `kind`, `ok`, `stage`, `reason`, `ts_unix`,
+  `uptime_s`, `hostname`, `kernel`. Stages in order: `mount` → `cmdline` →
+  `drivers` → `measure` → `firewall` → `harden` → `network` → `config` →
+  `probe` → `acme` → `serving`. So a halted box says exactly how far it got.
+- **Never any secret**: the payload carries status strings and counters only —
+  no token, key or config value. `payload_never_contains_sink_secrets` and
+  `live_roundtrip_when_enabled` pin that and the wire format.
+- **Best effort by construction**: each upload runs on a detached thread with
+  a 10 s timeout, so a dead network costs one kmsg line and can never delay,
+  alter or abort a boot decision. `enclave_init::poweroff()` publishes the
+  recorded reason **once** and then parks as before.
+- **Signed in-guest, not presigned**: a presigned URL embeds an STS token that
+  dies within hours — exactly how stale `user_data` URLs failed silently here.
+  The enclave signs each request itself (OSS V1, HMAC-SHA1).
+- **Configuration** (any one of, in precedence order): `/boot/efi/selfreport.json`
+  (read before `user_data`, so a boot that never gets config can still report),
+  the `PAV_SELFREPORT_JSON` env var, or the `self_report` object in the enclave
+  config (`config.example.json`). Missing ⇒ reporting is simply off.
+- **Scope the credential to `PutObject` on that prefix** (RAM user, not the
+  deploy AK). It is a guest-visible secret like the rest of the config.
+- **Trap found by the live test**: OSS signs `Content-Type`. Sending the header
+  without canonicalizing it returns a bare **403** with no explanation —
+  `string_to_sign()` takes the content type, and the PUT path passes
+  `application/json` while GET passes `""`.
+- **Verify it yourself against the real bucket** (inert without the env var):
+  `PAV_SELFREPORT_LIVE_SINK='{"bucket":…,"endpoint":…,"access_key_id":…,"access_key_secret":…}' cargo test live_roundtrip`
+  — it performs a real signed PUT + GET through the production path. Manual
+  check from the operator host: presign a GET for `{prefix}/latest.json` on
+  the HK bucket.
+- **Limitation**: after `egress_lockdown()` only 443 to the PayPal pins is
+  allowed, so a halt *after* lockdown cannot publish. Every current halt site
+  (network, config, probe, ACME) runs before lockdown; keep it that way or add
+  the sink host to the lockdown rule deliberately.
+
+### Boot diagnosis order for a dark instance (use this, in this order)
+
+0. **Re-list the instances first.** Ids in this file go stale: the Round-1 id
+   `i-2ze0sd65q6qhot55aerq` no longer exists, and every call against it answers
+   `InvalidParameter "The instanceId provided is not valid"` — which is easy
+   to misread as an API quirk while you keep polling a dead id (2026-10-23).
+   `DescribeInstances` (no filter, or plural `InstanceIds`) is the source of
+   truth for id → name → image → EIP.
+1. `DescribeInstances` → `Status`; `EipAddress.AllocationId` == the reserved
+   EIP? (No ⇒ stop here, that alone explains "no TLS ever".)
+2. `DescribeUserData` (not `DescribeInstanceAttribute`) → config present and
+   contains `domain`, `dns_zone`, `dns01_secret`?
+3. `GetInstanceConsoleOutput` **while Running** → check the in-capture
+   timestamps match this boot; look for `ACME certificate obtained` vs
+   `ACME certificate failed: Cloudflare zone not found` vs
+   `FAIL-CLOSED:` / `BOOT QUOTE PROBE`.
+4. Only if 1–3 are inconclusive: snapshot the system disk, attach it to the
+   relay, read `/boot/efi/boot-probe.log` off the raw device (recipe above).
+5. Only then form an opinion about the image; and if you compare two images,
+   give both the EIP for the whole comparison window.
 
 ### Alibaba-Specific Provisions Required
 - Provisioning relies on downloading a versioned asset (`aliyun-cli`) and extracting it manually to bypass GPG restrictions
@@ -179,6 +389,10 @@ GCP Confidential VMs (n2d with AMD SEV-SNP) **do not pre-provision persistent At
 `400 PublicEndpointForbidden "please use CNAME instead"`, regardless of
 region/endpoint. Bucket control-plane calls (`ls`, `stat`, `bucket-cname`)
 still work, so the failure looks like a bucket misconfiguration — it is not.
+**The exception is a bucket that itself lives outside the mainland**: the
+Hong Kong bucket `paypal-tdx-relay-1792227992` (`oss-cn-hongkong`) is fully
+readable and writable from the operator host *and* from a mainland ECS guest
+(verified 2026-10-23) — it is the project's chosen evidence-transfer sink.
 Workaround used by `import-alibaba-image.sh`: push the bytes to a **same-region
 ECS instance** and PUT them there over the **intranet** endpoint, addressed in
 virtual-host style (`$BUCKET.oss-cn-beijing-internal.aliyuncs.com`, path-style
@@ -197,6 +411,8 @@ made from an OSS object via `ImportImage`.
   `SignatureNonce`, `Timestamp`) — see `/tmp/ecs-call.mjs` pattern
 - `RunInstances` returns `InstanceIdSets.InstanceIdSet` (capital D) — reading
   `.InstanceidSet` silently yields an empty instance id
+- `DescribeInstanceAttribute` does NOT populate `UserData` (returns empty) —
+  use `DescribeUserData` for the instance config
 - **New instances are NOT how images are rolled out** — see "🖥️ Instance &
   Disk Policy" above: rewrite the existing VM's disk with
   `ReplaceSystemDisk` (Confidential VM and Relay VM alike, whatever the
@@ -218,13 +434,28 @@ made from an OSS object via `ImportImage`.
   it, so a transfer started near expiry fails even if the URL's own
   `Expires` is later. Any `aliyun` CLI call after expiry rotates the
   token automatically — re-generate presigned URLs AFTER that call.
-- **OSS object verification from the operator host**: `aliyun oss stat`
-  needs `--endpoint $BUCKET.oss-cn-beijing.aliyuncs.com` (virtual-host);
-  plain region endpoints return `PublicEndpointForbidden`/`AccessDenied`.
-  Data-plane GET still fails from outside mainland — verify objects via a
-  presigned GET executed on an in-VPC instance with RunCommand (response
-  nests under `Invocation.InvocationResults.InvocationResult`, base64
-  `Output`).
+  Symptom from hand-signed callers (`/tmp/ecs-call.mjs`):
+  `InvalidSecurityToken.Expired` — run `aliyun sts GetCallerIdentity` once
+  and retry; the profile (mode `OAuth`) self-refreshes.
+- **The `aliyun oss` subcommand cannot be aimed at another region from the
+  operator host** (verified 2026-10-23). `aliyun oss ls --help` lists
+  `--region`/`--profile` but **not** `--endpoint`, and in practice object
+  operations always target `oss-cn-hongkong.aliyuncs.com` (the CLI's built-in
+  default), returning the very misleading
+  `403 AccessDenied "The bucket you are attempting to access must be
+  addressed using the specified endpoint"` — it names your bucket, so it
+  reads like an ACL/region misconfiguration. `--region cn-beijing` is
+  ignored. Passing a bucket-prefixed `--endpoint` instead builds a doubled
+  host (`$BUCKET.$BUCKET.oss-cn-beijing.aliyuncs.com`) and fails TLS.
+  **Bucket listing (`aliyun oss ls`, no path) is fine** and shows each
+  bucket's region. For object I/O use presigned vhost URLs generated by
+  `/tmp/oss-puturl.mjs` / `/tmp/oss-geturl.mjs` against the HK bucket.
+- **Cloud assistant / `RunCommand` is not guaranteed either**: the relay runs
+  Alibaba's `OthersLinux_64` image. `DescribeCloudAssistantStatus` with
+  `InstanceIds` returned an **empty set** for the relay (it does execute
+  `user_data` at boot, so an init path exists, but do not assume a command
+  agent). Confirm `InstanceCloudAssistantStatusSet` is non-empty **before**
+  designing a diagnostic that needs `RunCommand`.
 - `DeleteDisk` takes lowercase `--force`; `StopInstance` takes `--ForceStop`
 - **EIP bind/unbind is VPC-side and rejects `InstanceType`**: ECS
   `DisassociateEipAddress` and `UnassociatePublicIpAddress` do not exist
@@ -250,6 +481,43 @@ made from an OSS object via `ImportImage`.
   after an EIP swap, watching "Running" on the new box while the old one had
   already stopped). List all + filter client-side, or pass the plural
   `InstanceIds` form
+
+### TCG event-log & RTMR traps (hit live 2026-10-22)
+
+- **The CCEL log IS readable in-guest on Alibaba TDX** (`read_ccel_log()`
+  finds it at `data/CCEL`, a fixed 65536-byte area), so the boot-time replay
+  gate is live there — and it found two parser issues on first contact:
+- **The trailing padding of a fixed-size firmware log area is NOT part of the
+  log**: Alibaba's real CCEL holds 1626 bytes of real events followed by
+  0xFF/0x00 padding to 65536 bytes; parsing past the events reads
+  `digestCount = 0xFFFFFFFF` (real failure:
+  `implausible digestCount 4294967295 @1626`). Both parsers treat tails of
+  only 0x00/0xFF bytes (any mix) as end-of-log — and since the replay must reproduce
+  the quote EXACTLY, truncating there can never widen what is accepted.
+- **The FIRST event of a crypto-agile TCG log uses the legacy `TCG_PCR_EVENT`
+  fixed layout** (pcr u32 | type u32 | **digest[20]** | eventSize u32 @28 |
+  event @32), not `TCG_PCR_EVENT2` (TCG PC Client PFP). Both parsers handle
+  it; it is the EV_NO_ACTION "Spec ID Event03" header carrying the
+  algorithm-size table.
+- **RTMR reset convention: ZERO** ("The RTMR array is initialized to zero on
+  build", Intel TDX Module Base Arch spec). Settled empirically 2026-10-22:
+  the unextended RTMR3 in a live quote reads all-zeros. An earlier assumption
+  here used SHA-384(1024×0x00); `ccel_replay_vs_quote` still accepts EITHER
+  reset convention (recording which matched) so a future platform that
+  differs cannot brick the boot.
+- **Parse failure ≠ mismatch**: a log we cannot parse is noted + hex-dumped
+  (first 2 KiB) and boot continues (enforcement deferred to the quote's RTMR
+  pins); only a parsed log that REPLAYS to values ≠ the quote halts via
+  `poweroff()` (the plan mandates the halt for inconsistent measurements).
+- **Shared golden vectors** live in `/tmp/gen-vectors.mjs` and are asserted
+  identically by `security_tests::ccel_replay_selftest_v168` (Rust) and
+  `node scripts/calculate-golden-rtmr.mjs --selftest` (JS) — regenerate and
+  update BOTH literals in the same commit when parser semantics change.
+- **Host test env (NixOS)**: `cargo test` needs pkg-config + OpenSSL headers
+  from the store or openssl-sys build fails:
+  `export PATH=/nix/store/*pkg-config-wrapper*/bin:$PATH` and
+  `PKG_CONFIG_PATH=/nix/store/*openssl-3*-dev/lib/pkgconfig`. (A disk-full
+  incident truncated the cached build and surfaced this.)
 
 ### Cloudflare DNS-01 token is IP-pinned to the reserved EIP (proven live 2026-10-20)
 
@@ -398,9 +666,22 @@ The system presents a signed **Remote Attestation Report** on the OAuth callback
 - **No persistent AK handles on GCP**: `tpm2 getcap handles-persistent` always returns empty on GCP Confidential VMs — the enclave creates a session signing AK via `tpm2_createprimary` each boot.
 - **NVRAM buffer must be unbounded**: `tpm2 nvread -s <size>` truncates large certs. Always use `tpm2 nvread` without a size argument to retrieve the complete 1560-byte EC certificate blob.
 - **Nonce binding formula (SEC-02 / verify.html v160 — the 5-component form)**: `nonce = SHA-256` over the 160-byte concatenation `[0..32] sha256(compact sorted PayPal userinfo JSON)` ∥ `[32..64] sha256(enclave signing pubkey SPKI DER)` ∥ `[64..96] sha256(custom_info string — `"NONE"` when absent or empty)` ∥ `[96..128] boot_measurements.binary_sha256 (self-measure of /init)` ∥ `[128..160] sha256(canonical compact JSON of sorted [path, sha256] disk-manifest pairs)`. The TPM quote's `extraData` and the TDX quote's `report_data[0..32]` MUST contain exactly this 32-byte digest or the entire attestation fails validation. (The old 2-component formula — `SHA-256(SHA-256(user JSON) ∥ SHA-256(key DER))` — was pre-SEC-02 and produced `binding=false` against every current verify.html build; the enclave was fixed 2026-10-19.)
+- **Pre-flight REPORTDATA binding (v168 — 6-component form)**: `report_data[0..32] = SHA-256` over `P_enc SPKI DER ∥ code_challenge ∥ P_client SPKI DER ∥ client_nonce ∥ custom_info ("NONE" when absent) ∥ PayPal_Client_ID`, `[32..64]` zero. The PayPal APP id is the SIXTH element (plan Phase 3.1) so an over-scoped app swap changes the hardware-quoted bytes; verify.html enforces `EXPECTED_APPS` against the signed fields AND the report's `paypal_client_id` (login reports), both fail-closed. Mirrors: `compute_preflight_binding()` (Rust) ↔ `preflightBindingHex()` (verify.html) ↔ `security_tests::preflight_binding_parity_v168` + harness Test 6c — **update all four together**. (The callback/login report keeps the SEC-02 5-component nonce above — unchanged.)
 - **`tpm2` standalone binary vs wrapper**: In the minimal initramfs filesystem, the unified `tpm2` binary should always be invoked directly — wrapper aliases like `tpm2_getcap` often don't exist, causing silent failures. Use pattern `tpm2 getcap` instead of `tpm2-getcap`.
 - **DHCP timeout**: NATIVE implementation waits up to 30 seconds for DHCPAC before rejecting. If the cloud metadata service is slow responding, increase the socket timeout in PID-1 init (currently set to 30 seconds in the socket setup path).
 - **PCIe slot exhaustion**: Each module loaded via `insmod` occupies PCI space on bare-metal virtualized infrastructures; batch loads where possible in `insmod_all()` function.
+- **ACME DNS-01 is bound to the reserved EIP** (Cloudflare token IP
+  restriction) — no reserved IP on the VM ⇒ `Cloudflare zone not found`,
+  forever. See "ACME DNS-01 ONLY works from the reserved EIP".
+- **"Running + dark" ≠ wedged host** — fail-closed halts sleep forever by
+  design and the ACME retry loop serves nothing; diagnose via the ESP
+  `boot-probe.log` transcript, not the (frozen, 64 KiB) serial console.
+- **Mainland OSS buckets are write-only from the operator host** — presigned
+  or not, `GetObject` is refused; only the **Hong Kong** relay bucket
+  (`paypal-tdx-relay-1792227992`) is readable. Send guest evidence there.
+- **Serial console is wiped when the instance stops**, so a `user_data` script
+  that powers off before printing its result destroys the result. Print, then
+  hold the instance in `Running`; only power off for a pure pass/fail signal.
 
 ---
 
@@ -416,11 +697,175 @@ The system presents a signed **Remote Attestation Report** on the OAuth callback
   `api.github.com/repos/<o>/<r>/attestations/sha256:<hex>`; local disk
   `00963ad5…`, binary `ebe9fa31…`, initrd `ab97b8ed…` are byte-identical to
   CI's attested digests.
-- **Live deployment**: new TDX instance `i-2ze0sd65q6qhot55aerq` holds the
-  reserved EIP and serves TLS; old `i-2zefwa6bdimeg1rbcfsg` is the rollback
-  (**Stopped** once live E2E went green; restart + re-attach EIP to roll
-  back). Round-1 **E2E passed live** on both flows (CSRF cookie + PKCE
-  against real PayPal), live harness 90/90, console-PII 0 — details in
-  HANDOVER.md §3.
+- **Live deployment (historical — ids below are GONE)**: Round 1 ran on
+  `i-2ze0sd65q6qhot55aerq` with rollback `i-2zefwa6bdimeg1rbcfsg`; both were
+  replaced and calls against them now return `InvalidParameter "The
+  instanceId provided is not valid"`. Round-1 **E2E passed live** on both
+  flows (CSRF cookie + PKCE against real PayPal), live harness 90/90,
+  console-PII 0 — details in HANDOVER.md §3.
+- **Actual instance inventory (cn-beijing, 2026-10-23 00:05Z)** — always
+  re-verify with `DescribeInstances` before acting:
+  | InstanceId | Name | Image | EIP | Status |
+  |---|---|---|---|---|
+  | `i-2ze686o40uawcau9vt9v` | paypal-auth-vm-1g | `m-2zed3wq8aubcqq0nofx2` | **101.200.178.251** | Running, ports 80/443 **closed** |
+  | `i-2ze7b9txw6v7c7gtrqwt` | paypal-auth-vm-2 | `m-2zei3anvjitmgflr61kj` | — | Running, no EIP (cannot obtain a cert) |
+  | `i-2ze19752fjlhw6rf4mpl` | oss-relay-tmp2 | `m-2zeaptkfw533l239al3z` | — | Stopped (economic) |
 - **State of play + remaining task list live in `HANDOVER.md`** (repo root) —
   read it before continuing the audit cycle.
+
+## Security Audit Status — Round 2 (2026-10-22, v168)
+
+Independent end-to-end audit against the pasted audit plan
+(*Hardware Verification of Running Code — Intel TDX on Alibaba Cloud*), same
+threat model (cloud provider + owner of `login.airma.de` untrusted, may
+collude). What changed:
+
+1. **Self-measurement fallacy closed (plan 1.2)** — `boot.binary_sha256` is
+   computed by the binary under suspicion, so it no longer decides pass/fail.
+   The verdict is now decided EXCLUSIVELY by the silicon gates (`EXPECTED_MRTD`
+   + `EXPECTED_RTMR0..3` over the Intel-signed quote). The digest stays as a
+   LOUD informational warning (staleness/consistency signal) — see the
+   `EXPECTED_ENCLAVE_SHA256` comment in verify.html. Harness Test 21d asserts
+   the new semantics.
+2. **Auditor isolation (plan 3.3)** — key generation / login / decryption run
+   ONLY in a trusted auditor context (`file://` copy or the pinned GitHub Pages
+   copy). The copy served by the enclave's own origin REFUSES all
+   key-generating flows (Web Auditor Tampering: the owner can rewrite that
+   script at will); paste-report auditing still works there. Harness Test 24.
+3. **Malicious-App defense (plan 3.1)** — PayPal client id is hardware-bound
+   into pre-flight `REPORTDATA` (6-component formula above) and carried in the
+   signed login report (`paypal_client_id`); `EXPECTED_APPS` gates both,
+   fail-closed. Harness Test 21g + 6c.
+4. **Fail-closed report minting (plan 2.2)** — no silicon-signed TD Quote →
+   the enclave returns **HTTP 503** and never emits a report
+   (`unavailable_no_guest_device` reports are impossible on alibabacloud
+   builds). The v165 boot probe still halts the box before serving if the
+   platform cannot attest at all.
+5. **Post-boot egress lockdown (plan 4.1)** — after config + ACME complete,
+   `enclave_init::egress_lockdown()` flushes the output chain and allows ONLY
+   loopback + established + `443 → {104.16.124.74, 146.75.123.1}` (the
+   `hardened_client()` PayPal pins). IMDS `100.100.100.200`, GCP metadata,
+   DNS and port 80 are dropped — they are boot-only needs (user_data, DNS-01
+   ACME, HTTPS time sync) and afterwards pure exfil surface. If per-request
+   quote generation ever proves to need the Alibaba PCCS endpoint, allow
+   THAT IP explicitly (resolved before lockdown) — never re-open DNS/:80.
+6. **Kernel hardening (plan 4.2)** — `harden_kernel()`: `swapoff` everything
+   (TDX encrypts RAM, NOT swap — swapped pages would hit the host disk in
+   plaintext; fail-closed if swap survives), `kexec_load_disabled=1` (an
+   unmeasured kernel must never load past the RTMR pins), `suid_dumpable=0`.
+7. **Cmdline injection gate (plan 1.1)** — `enclave_init::verify_cmdline()`
+   halts unless `/proc/cmdline` equals `EXPECTED_CMDLINE` (pinned constant,
+   drift-guarded against build-alibaba-image.sh by
+   `cmdline_pin_matches_build_script`).   the grub.cfg string itself is already
+   deterministic + SOURCE_DATE_EPOCH-pinned; the RTMR pins cover the measured
+   boot chain remotely.
+8. **Golden-RTMR tooling (plan 5)** — `scripts/calculate-golden-rtmr.mjs`:
+   offline CCEL replay (byte-compatible with `intel_tdx::replay_ccel`, with a
+   per-event coverage breakdown), pin extraction from live quotes
+   (`--report`), log↔quote cross-check, and `--update` pin rotation for
+   verify.html. `--selftest` shares one golden vector with
+   `security_tests::ccel_replay_selftest_v168` (Rust ↔ JS replay parity).
+
+Tests: harness **115 checks** (was 99) + Rust **6** incl. three
+cross-implementation parity vectors. Rotation procedure for boot-chain
+changes: rebuild → in-place disk rewrite (Instance & Disk Policy) →
+`node scripts/calculate-golden-rtmr.mjs --report <live /debug/envelope> --update`
+→ commit verify.html in the same reviewed commit.
+
+## Security Audit Status — Round 3 (2026-10-23, v169)
+
+Third independent pass over the live report + `verify.html` flow, same threat
+model (cloud provider + owner of `login.airma.de` collude; the Intel TDX
+silicon and the pinned trust anchors — Intel root CA, AMD ARKs, golden
+MRTD/RTMR — are honest). Baseline before the pass: harness 115/115, Rust 6
+tests. Everything below is fixed and covered by a regression test.
+
+**Fixed (each with a regression test)**
+
+1. **IDENTITY PREIMAGE BINDING (critical).** `verify.html` built the hardware
+   nonce from the report's *self-asserted* `paypal_user_info_raw_hash` and
+   never hashed the identity it displayed. A quote could attest hash H while
+   the envelope showed a DIFFERENT user's record — and because the pinned
+   RTMRs cover code+disk but NOT the IMDS config that drives behaviour, this
+   was reachable without touching a measured byte. The auditor now recomputes
+   `SHA-256(JSON.stringify(paypal_user_info))` and fails closed on mismatch;
+   envelopes with no identity MUST carry the `PRELOGIN_NO_USER` placeholder
+   hash. Parity is pinned on both sides by
+   `security_tests::paypal_identity_json_layout_pinned` +
+   `prelogin_placeholder_hash_pinned` (Rust) and harness Test 26.
+2. **SANDBOX ENVIRONMENT BINDING (high).** A sandbox login is a *genuine*
+   hardware attestation of a **synthetic** identity — `verified_account:true`
+   there belongs to any account the owner creates. Every pin could be green
+   while the "verified PayPal user" on screen was the operator's own. The
+   signed reports now carry `paypal_environment` (`production`/`sandbox`, also
+   in the pre-flight signed fields), and the auditor refuses anything that is
+   not `production`, including an undeclared (pre-v169) value. Test 27.
+3. **UNVERIFIED-ACCOUNT CHECK (medium).** The page displayed a "verified"
+   identity without checking `paypal_user_info.verified_account === "true"`
+   (the enclave enforced it server-side only). Now checked in the signed
+   report, fail-closed. Test 27.
+4. **AUDITOR DEPENDENCY INTEGRITY (high).** `verify.html` loaded node-forge
+   from cdnjs with **no SRI**; forge parses the X.509 chains that anchor both
+   TDX and AMD trust, so a substituted build could make `x509SignedBy()`
+   accept anything. The tag is now `integrity="sha384-…"` +
+   `crossorigin="anonymous"`, pinned to the exact bytes the harness evaluates
+   (drift-guarded in Test 1), and the page fails closed with an actionable
+   alert when forge is absent instead of silently skipping chain checks.
+5. **RESPONSE HARDENING (medium).** All attestation/session responses now send
+   `Cache-Control: no-store`, `Referrer-Policy: no-referrer`,
+   `X-Content-Type-Options: nosniff`; HTML responses add
+   `Content-Security-Policy: frame-ancestors 'none'` (clickjacking). The
+   callback URL carries a one-time PayPal grant and the sealed report — it
+   must never be cached or leak through `Referer`.
+6. **BOUNDED SESSION TABLES (low).** `pending_oauth` and
+   `pending_e2ee_blobs` are capped (`MAX_PENDING_OAUTH` /
+   `MAX_PENDING_E2EE_BLOBS`, 4096 each) with TTL eviction instead of
+   unbounded growth from an unauthenticated caller.
+
+**Deliberately NOT changed (justified, not overlooked)**
+
+- **The provenance row stays advisory, never a gate.** Every digest it checks
+  (`binary_sha256`, `disk_manifest`) is *self-reported* by the enclave, so
+  gating on it would resurrect exactly the self-measurement fallacy v168
+  removed; a hard gate would also brick air-gapped audits whenever GitHub is
+  unreachable. Code identity is decided only by the MRTD/RTMR silicon pins.
+  (Comment in `verify.html` at the row.)
+- **TLS-certificate binding stays advisory.** It only runs when the user
+  pastes a certificate, and it cannot be security-relevant while the report
+  itself is sealed to a client-generated ECDH key: a TLS-terminating owner
+  sees ciphertext either way.
+- **The static `/debug/envelope` pre-flight is a convenience, not the gate.**
+  It has no client nonce (replayable), which is why the secure flow uses
+  `POST /attest/preflight` with a fresh browser nonce; a replayed *login*
+  report is impossible because it is encrypted to the fresh client key and
+  pinned to the pre-flight `P_enc`.
+- **`GET /e2ee-blob?state=…` is a bearer one-time token.** It returns only
+  ciphertext whose key never leaves the browser; knowing `state` buys a DoS
+  (claiming it first), not disclosure.
+- **The auditor's own provenance cannot be fixed in-band.**
+  `verify.html` is fetched from GitHub Pages / a saved file, and the owner
+  controls that repository. **Mitigated, not eliminated**: `README.md` now
+  publishes the auditor's SHA-256 **and byte size** in the "Verify the auditor
+  itself first" table, and harness **Test 28** fails the suite if that value
+  drifts from the file — so the digest can never silently go stale (a stale
+  digest is worse than none: it teaches users to ignore mismatches).
+  **Rotation rule: any commit touching `verify.html` MUST update the README
+  digest/size in the same reviewed commit** (Test 28 enforces it). Users are
+  still told to compare against a second independent source (release note,
+  mirror, another checkout) — the README lives in the repository the threat
+  model distrusts. The enclave-served copy refuses every key-generating flow,
+  so a tampered ESP copy cannot steal keys.
+
+**Deviations from the pasted plan (justified)**:
+- Cmdline text: `quiet` omitted (it would hide the TDX probe transcript on the
+  serial console — the project's primary diagnosis channel), `selinux=0`
+  omitted (it disables MAC if ever enabled), `panic=1` omitted (no security
+  gain — a panicked kernel serves nothing; rebooting only destroys evidence).
+  The injection defense is determinism + `verify_cmdline()` + RTMR pins.
+- UKI monolithic boot (plan.md repo variant) NOT adopted: live evidence
+  (2026-10-21) shows GRUB 2.12's EFI CC measurement protocol extends
+  kernel/initrd/cmdline into RTMR0–2 on this platform, and the pins enforce
+  exactly those registers; `calculate-golden-rtmr.mjs --ccel` prints the
+  per-event coverage to re-verify on demand.
+- `verify.html` served from the unmeasured ESP stays (pins must not live in
+  the measured initrd — self-reference), but it is now fenced by item 2.

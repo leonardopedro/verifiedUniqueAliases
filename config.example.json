@@ -8,5 +8,13 @@
     "eab_hmac_key": "YOUR_EAB_HMAC_KEY",
     "staging": false,
     "acme_account_json": "",
-    "attestation_signing_key": "YOUR_RSA_PRIVATE_KEY_PEM"
+    "attestation_signing_key": "YOUR_RSA_PRIVATE_KEY_PEM",
+    "self_report": {
+        "bucket": "paypal-tdx-relay-1792227992",
+        "endpoint": "oss-cn-hongkong.aliyuncs.com",
+        "prefix": "boot",
+        "access_key_id": "STS_OR_RAM_ACCESS_KEY_ID_WITH_PUT_ONLY",
+        "access_key_secret": "RAM_SECRET_FOR_THAT_KEY",
+        "sts_token": null
+    }
 }

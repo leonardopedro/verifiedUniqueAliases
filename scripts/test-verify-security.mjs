@@ -305,20 +305,39 @@ const DISK_MANIFEST = {
 // EXPECTED_ENCLAVE_SHA256 in verify.html) — the code-pin gate rejects
 // anything else, by design.
 const BINARY_SHA = EXPECTED_ENCLAVE_SHA256;
-async function buildEnvelope({ hw, customInfo = 'wallet_test_1', corruptEnclaveSig = false, hwBuilder, binarySha = BINARY_SHA, sessionContext = {} }) {
+// v169: the auditor now RECOMPUTES the identity hash from the report's own
+// `paypal_user_info` and fails closed unless the declared hash matches. Fixtures
+// therefore derive the hash exactly like the enclave does; pre-login envelopes
+// must carry the documented placeholder.
+const PRELOGIN_HASH = sha256(Buffer.from('PRELOGIN_NO_USER', 'utf8')).toString('hex');
+const identityHashOf = (userInfo) => sha256(Buffer.from(JSON.stringify(userInfo), 'utf8')).toString('hex');
+
+async function buildEnvelope({ hw, customInfo = 'wallet_test_1', corruptEnclaveSig = false, hwBuilder, binarySha = BINARY_SHA, sessionContext = {}, reportExtras = null }) {
   const enc = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const encPem = enc.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  // An explicit value in reportExtras wins (negative tests need to lie).
+  const declaredIdentityHash = (reportExtras && reportExtras.paypal_user_info_raw_hash)
+    || ((reportExtras && reportExtras.paypal_user_info) ? identityHashOf(reportExtras.paypal_user_info) : PRELOGIN_HASH);
   const report = {
     custom_info: customInfo,
     enclave_config: {
       boot_measurements: { binary_sha256: binarySha, disk_manifest: DISK_MANIFEST },
       domain: 'login.airma.de',
     },
-    paypal_user_info_raw_hash: '11'.repeat(32),
+    paypal_user_info_raw_hash: declaredIdentityHash,
+    // v169: login reports declare the PayPal environment; reportExtras may
+    // override it (the sandbox-refusal test needs to).
+    paypal_environment: 'production',
+    // v169: and the flow that minted them (see Test 29).
+    flow: 'verified',
     session_context: sessionContext,
     timestamp_ms: Date.now(),
     hardware_level_attestation: hw || null,
   };
+  // v168: reportExtras lets fixtures add login-report fields (paypal_user_info,
+  // paypal_client_id) BEFORE the envelope is signed — the S_enc signature
+  // covers them, exactly like the enclave's callback report.
+  if (reportExtras) Object.assign(report, reportExtras);
   const nonce = await nonce160Hex(
     fromHex(report.paypal_user_info_raw_hash),
     new Uint8Array(sha256(pemToDer(encPem))),
@@ -377,6 +396,22 @@ console.log('\nTest 1: static trust anchors in source (drift guards)');
   check('embedded Intel root PEM matches its pinned sha256 (self-consistent anchor)',
     Array.isArray(defRoots) && defRoots[0].pem
       && sha256(pemToDer(defRoots[0].pem)).toString('hex') === REAL_INTEL_PIN);
+
+  // v169: the auditor's only third-party dependency must be SRI-pinned to the
+  // exact bytes this harness evaluates — an unpinned CDN copy could ship a
+  // forge whose x509SignedBy() accepts any PCK chain.
+  const forgeTag = (/<script[^>]*forge[^>]*>/.exec(html) || [''])[0];
+  const sri = (/integrity="(sha384-[^"]+)"/.exec(forgeTag) || [])[1];
+  const localForge = createHash('sha384')
+    .update(readFileSync(join(repoRoot, 'node_modules/node-forge/dist/forge.min.js')))
+    .digest('base64');
+  check('forge bundle is SRI-pinned', !!sri, forgeTag.slice(0, 160));
+  check('SRI pin equals the audited forge bytes', sri === 'sha384-' + localForge,
+    `tag=${sri} local=sha384-${localForge}`);
+  check('SRI-pinned script requests CORS (required for integrity checks)',
+    /crossorigin="anonymous"/.test(forgeTag), forgeTag.slice(0, 160));
+  check('auditor fails closed when forge is missing (no silent chain skip)',
+    /AUDITOR DEPENDENCY MISSING/.test(script));
 }
 
 // Positive tests substitute the anchor with the synthetic root (the DEFAULT is
@@ -522,10 +557,17 @@ console.log('\nTest 6c: TDX pre-flight v161 client binding (regression 2026-10-2
   const clientNonceHex = '7f'.repeat(32);
   const codeChallenge = 'E9xrX1s2qO0hAaBcDeFgHiJkLmNoPqRsTuVwXyZ012345';
   const pfCustom = 'wallet_pref_1';
-  const v161ReportData = (pEncDer) => {
+  // v168 (plan Phase 3.1): the PayPal APP id is the SIXTH element of the
+  // hardware binding — a swapped/over-scoped app must change the quoted
+  // REPORTDATA. Mirrors compute_preflight_binding() (Rust) ↔
+  // preflightBindingHex (verify.html) ↔ the vector in
+  // security_tests::preflight_binding_parity_v168.
+  const pfAppId = 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p';
+  const v161ReportData = (pEncDer, appId = pfAppId) => {
     const pre = Buffer.concat([
       pEncDer, Buffer.from(codeChallenge, 'utf8'), clientPubDer,
       Buffer.from(clientNonceHex, 'hex'), Buffer.from(pfCustom, 'utf8'),
+      Buffer.from(appId, 'utf8'),
     ]);
     return concat(new Uint8Array(sha256(pre)), new Uint8Array(32)); // digest ‖ zeros
   };
@@ -533,6 +575,7 @@ console.log('\nTest 6c: TDX pre-flight v161 client binding (regression 2026-10-2
     binding: 'v161', code_challenge: codeChallenge,
     client_pub_b64: clientPubDer.toString('base64'),
     client_nonce_hex: clientNonceHex, custom_info: pfCustom,
+    paypal_client_id: pfAppId,
   };
 
   // (a) quote binds the v161 client inputs → binding=true, silicon verified
@@ -572,6 +615,26 @@ console.log('\nTest 6c: TDX pre-flight v161 client binding (regression 2026-10-2
   check('binding=false in verdict', bfw.includes('binding=false'), bfw.slice(0, 900));
   check('failure names the expected v161.2 client binding',
     bfw.includes('expected v161.2 client binding'), bfw.slice(0, 900));
+
+  // (c) v168: the APP id is HARDWARE-BOUND — a quote bound to a different
+  //     (over-scoped) app id verifies its own binding but must fail the
+  //     EXPECTED_APPS gate (and vice versa: an audited app id in the report
+  //     with a quote bound to a foreign app fails binding).
+  const evilCtx = Object.assign({}, pfCtx, { paypal_client_id: 'EVIL-OVERSCOPED-APP-ID' });
+  const evil = await buildEnvelope({
+    sessionContext: { preflight: evilCtx },
+    hwBuilder: async (_nonce, pEncDer) => tdxHw({
+      quoteB64: (await buildTdxQuote({
+        version: 4, reportData: v161ReportData(pEncDer, 'EVIL-OVERSCOPED-APP-ID'),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      })).b64,
+    }),
+  });
+  const ev = await runAuditWith(evil.envelope);
+  check('over-scoped app id fails closed (APP PIN)', ev.ok === false, `ok=${ev.ok}`);
+  check('failure names the pre-flight APP PIN VIOLATION',
+    /APP PIN VIOLATION \(pre-flight\)/.test(ev.alert || ''), (ev.alert || '').slice(0, 240));
 }
 
 console.log('\nTest 7: QE-report binding corrupted → attkey_bind=false');
@@ -948,17 +1011,236 @@ console.log('\nTest 21c: golden-PCR pcr_values injection neutralized');
     !tpmDesc.includes('<img src=x') && tpmDesc.includes('&lt;img src=x'), tpmDesc.slice(0, 400));
 }
 
-console.log('\nTest 21d: ENCLAVE CODE PIN gate rejects non-audited binary');
+console.log('\nTest 21d: self-reported binary digest is INFORMATIONAL (v168) — silicon pins gate');
 {
-  // v165: the pin is what stops colluding owner+cloud from green-lighting
-  // arbitrary code — CI provenance alone cannot (the owner controls the repo).
-  // The report is correctly S_ENC-signed for the wrong binary: only the pin
-  // can catch it. (hw must be present: step 3 rejects evidence-less reports
-  // before the pin gate runs; marker-only evidence suffices.)
-  const built = await buildEnvelope({ binarySha: 'ff'.repeat(32), hw: {} });
+  // plan Phase 1.2: binary_sha256 is computed by the very binary under
+  // suspicion (a backdoored /init claims the audited hash — the
+  // "self-measurement fallacy"), so it must NOT decide the verdict. A FULLY
+  // hardware-verified report (MRTD + RTMR pins green) whose self-report
+  // differs passes with a loud warning saying exactly that; the MRTD/RTMR
+  // tests (21e/21e2) are the gates that reject tampered code.
+  const built = await buildEnvelope({
+    binarySha: 'ff'.repeat(32),
+    hwBuilder: async (nonce) => tdxHw({
+      quoteB64: (await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      })).b64,
+    }),
+  });
   const { ok, alert } = await runAuditWith(built.envelope);
-  check('audit fails closed', ok === false, `ok=${ok}`);
-  check('failure names the CODE PIN violation', /ENCLAVE CODE PIN VIOLATION/.test(alert || ''), (alert || '').slice(0, 200));
+  check('hardware-verified report passes — the self-report is not a gate', ok === true, `alert=${alert}`);
+  check('mismatch surfaced as a loud informational warning',
+    /SELF-REPORTED CODE DIGEST MISMATCH/.test(row('githubCheck').desc), row('githubCheck').desc.slice(0, 300));
+  check('warning explicitly says it is NOT a gate',
+    /informational, NOT a gate/.test(row('githubCheck').desc), row('githubCheck').desc.slice(0, 300));
+  // …and an evidence-less report still fails closed for lack of a silicon
+  // root (the old fixture's verdict — now attributed to the RIGHT cause).
+  const bare = await buildEnvelope({ binarySha: 'ff'.repeat(32), hw: {} });
+  const e2 = await runAuditWith(bare.envelope);
+  check('evidence-less report still fails closed (no silicon root)', e2.ok === false, `ok=${e2.ok}`);
+}
+
+console.log('\nTest 21g: APP PIN — the PayPal app that minted the identity is gated (v168)');
+{
+  const green = async (nonce) => tdxHw({
+    quoteB64: (await buildTdxQuote({
+      version: 4, reportData: reportDataFor(nonce),
+      innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+      leafKey: goodChain.leaf.key,
+    })).b64,
+  });
+  // (a) login report minted by an app NOT in the audited allow-list → fail
+  const evil = await buildEnvelope({
+    hwBuilder: green,
+    reportExtras: {
+      paypal_user_info: { user_id: 'U1', sub: 'evil-sub', verified_account: 'true' },
+      paypal_client_id: 'EVIL-OVERSCOPED-APP-ID',
+    },
+  });
+  const e = await runAuditWith(evil.envelope);
+  check('over-scoped app fails closed', e.ok === false, `ok=${e.ok}`);
+  check('failure names the login-report APP PIN VIOLATION',
+    /APP PIN VIOLATION \(login report\)/.test(e.alert || ''), (e.alert || '').slice(0, 240));
+  // (b) the audited app id → the very same report passes
+  const good = await buildEnvelope({
+    hwBuilder: green,
+    reportExtras: {
+      paypal_user_info: { user_id: 'U1', sub: 'good-sub', verified_account: 'true' },
+      paypal_client_id: 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p',
+    },
+  });
+  const g = await runAuditWith(good.envelope);
+  check('audited app id passes', g.ok === true, `alert=${g.alert}`);
+  // (c) a login report that carries NO app id at all fails closed too
+  const missing = await buildEnvelope({
+    hwBuilder: green,
+    reportExtras: { paypal_user_info: { user_id: 'U1', sub: 'x', verified_account: 'true' } },
+  });
+  const m = await runAuditWith(missing.envelope);
+  check('login report without an app id fails closed', m.ok === false, `ok=${m.ok}`);
+}
+
+console.log('\nTest 26: identity preimage binding — the quote must attest the identity SHOWN (v169)');
+{
+  const green = async (nonce) => tdxHw({
+    quoteB64: (await buildTdxQuote({
+      version: 4, reportData: reportDataFor(nonce),
+      innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+      leafKey: goodChain.leaf.key,
+    })).b64,
+  });
+  const AUDITED_APP = 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p';
+  const shown = { user_id: 'U1', sub: 'shown-sub', verified_account: 'true', payer_id: null };
+
+  // (a) honest login report: declared hash == hash of the identity carried
+  const good = await buildEnvelope({
+    hwBuilder: green,
+    reportExtras: { paypal_user_info: shown, paypal_client_id: AUDITED_APP },
+  });
+  const g = await runAuditWith(good.envelope);
+  check('honest login report passes the preimage gate', g.ok === true, `alert=${g.alert}`);
+
+  // (b) THE ATTACK: quote binds hash H, envelope displays a different record
+  const other = { user_id: 'EVIL-PAYER', sub: 'other-sub', verified_account: 'true', payer_id: null };
+  const spoof = await buildEnvelope({
+    hwBuilder: green,
+    reportExtras: {
+      paypal_user_info: other,                      // displayed record
+      paypal_user_info_raw_hash: identityHashOf(shown), // hardware-bound record
+      paypal_client_id: AUDITED_APP,
+    },
+  });
+  const s = await runAuditWith(spoof.envelope);
+  check('identity/quote mismatch fails closed', s.ok === false, `ok=${s.ok}`);
+  check('failure names the IDENTITY PREIMAGE VIOLATION',
+    /IDENTITY PREIMAGE VIOLATION/.test(s.alert || ''), (s.alert || '').slice(0, 240));
+
+  // (c) a pre-login envelope may not assert an arbitrary hash: without a user
+  //     record it MUST carry the documented placeholder.
+  const arbitrary = await buildEnvelope({
+    hwBuilder: green,
+    reportExtras: { paypal_user_info_raw_hash: 'ab'.repeat(32) },
+  });
+  const a = await runAuditWith(arbitrary.envelope);
+  check('pre-login report with an arbitrary identity hash fails closed', a.ok === false, `ok=${a.ok}`);
+  check('placeholder hash is accepted for pre-login', PRELOGIN_HASH.length === 64);
+}
+
+console.log('\nTest 27: environment binding — two-verdict model: sandbox = green integrity, non-green identity (v169/v177)');
+{
+  const green = async (nonce) => tdxHw({
+    quoteB64: (await buildTdxQuote({
+      version: 4, reportData: reportDataFor(nonce),
+      innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+      leafKey: goodChain.leaf.key,
+    })).b64,
+  });
+  const AUDITED_APP = 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p';
+  const who = { user_id: 'U9', sub: 'sandbox-sub', verified_account: 'true', payer_id: null };
+
+  // (a) production login audits green
+  const prod = await buildEnvelope({
+    hwBuilder: green,
+    reportExtras: { paypal_user_info: who, paypal_client_id: AUDITED_APP, paypal_environment: 'production' },
+  });
+  const p = await runAuditWith(prod.envelope);
+  check('production login passes', p.ok === true, `alert=${p.alert}`);
+
+  // (b) THE ATTACK: the owner points users at sandbox PayPal and logs them in
+  //     with an account it controls — every integrity check is genuinely green.
+  //     v177 two-verdict model: the INTEGRITY audit passes (it is a real TDX
+  //     attestation of the audited code) but the IDENTITY verdict must be the
+  //     non-green SANDBOX state — never a verified production identity.
+  const sandbox = await buildEnvelope({
+    hwBuilder: green,
+    reportExtras: { paypal_user_info: who, paypal_client_id: AUDITED_APP, paypal_environment: 'sandbox' },
+  });
+  const s = await runAuditWith(sandbox.envelope);
+  check('sandbox report returns the SANDBOX verdict (truthy, not green-true)', s.ok === 'sandbox', `ok=${JSON.stringify(s.ok)}`);
+  const idRow = row('identityCheck');
+  check('identity row carries the SANDBOX banner', /SANDBOX IDENTITY/.test(idRow.desc), idRow.desc.slice(0, 200));
+  check('identity row is NOT green', idRow.cls !== 'verified' && !/✅/.test(idRow.desc.split('<br>')[0]), idRow.cls);
+  check('sandbox banner states it proves the enclave, not the user',
+    /proves the enclave, not the person/i.test(idRow.desc), idRow.desc.slice(0, 240));
+  check('sandbox banner demands production before trusting an identity',
+    /paypal_environment="production"/.test(idRow.desc), idRow.desc.slice(0, 240));
+
+  // (c) an UNVERIFIED PayPal account must not produce a green report either
+  const unverified = await buildEnvelope({
+    hwBuilder: green,
+    reportExtras: {
+      paypal_user_info: { user_id: 'U8', sub: 'unv', verified_account: 'false', payer_id: null },
+      paypal_client_id: AUDITED_APP,
+      paypal_environment: 'production',
+    },
+  });
+  const u = await runAuditWith(unverified.envelope);
+  check('unverified account fails closed', u.ok === false, `ok=${u.ok}`);
+  check('failure names the unverified-account refusal',
+    /UNVERIFIED ACCOUNT REFUSED/.test(u.alert || ''), (u.alert || '').slice(0, 200));
+
+  // (d) an older report that does not declare the environment is refused too
+  //     (fail closed on absence — the verdict split never relaxes this).
+  const legacy = await buildEnvelope({
+    hwBuilder: green,
+    reportExtras: { paypal_user_info: who, paypal_client_id: AUDITED_APP, paypal_environment: '' },
+  });
+  const l = await runAuditWith(legacy.envelope);
+  check('undeclared environment fails closed', l.ok === false, `ok=${l.ok}`);
+  check('message names the undeclared case', /undeclared/i.test(l.alert || ''), (l.alert || '').slice(0, 220));
+
+  // (e) a made-up environment value must not be silently accepted as either
+  //     verdict — only "production" and "sandbox" are defined.
+  const weird = await buildEnvelope({
+    hwBuilder: green,
+    reportExtras: { paypal_user_info: who, paypal_client_id: AUDITED_APP, paypal_environment: 'staging' },
+  });
+  const w = await runAuditWith(weird.envelope);
+  check('unknown environment value fails closed', w.ok === false, `ok=${w.ok}`);
+  check('message names the unknown-environment case', /ENVIRONMENT UNKNOWN/.test(w.alert || ''), (w.alert || '').slice(0, 220));
+}
+
+console.log('\nTest 29: flow binding — the sealed report must match the flow the user chose (v169)');
+{
+  const green = async (nonce) => tdxHw({
+    quoteB64: (await buildTdxQuote({
+      version: 4, reportData: reportDataFor(nonce),
+      innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+      leafKey: goodChain.leaf.key,
+    })).b64,
+  });
+  const AUDITED_APP = 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p';
+  const who = { user_id: 'U7', sub: 'flow-sub', verified_account: 'true', payer_id: null };
+  const mk = (extra) => buildEnvelope({
+    hwBuilder: green,
+    reportExtras: Object.assign({ paypal_user_info: who, paypal_client_id: AUDITED_APP }, extra),
+  });
+
+  // (a) matching intent audits green
+  globalThis.selectedFlow = 'verified';
+  const okFlow = await runAuditWith((await mk({ flow: 'verified' })).envelope);
+  check('matching flow passes', okFlow.ok === true, `alert=${okFlow.alert}`);
+
+  // (b) THE ATTACK: minimal disclosure requested, but the sealed report was
+  //     minted by the audited PII app (so the app pin itself passes).
+  const AUDITED_FULL_APP = 'ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0';
+  const escalated = await runAuditWith((await mk({ flow: 'full', paypal_client_id: AUDITED_FULL_APP })).envelope);
+  check('flow escalation fails closed', escalated.ok === false, `ok=${escalated.ok}`);
+  check('failure names FLOW ESCALATION', /FLOW ESCALATION/.test(escalated.alert || ''), (escalated.alert || '').slice(0, 200));
+
+  // (c) a report with no flow at all is refused (cannot tell which app minted it)
+  const noFlow = await runAuditWith((await mk({ flow: '' })).envelope);
+  check('undeclared flow fails closed', noFlow.ok === false, `ok=${noFlow.ok}`);
+  check('failure names the missing flow binding', /FLOW BINDING MISSING/.test(noFlow.alert || ''), (noFlow.alert || '').slice(0, 200));
+
+  // (d) flow must be consistent with the app that produced it
+  globalThis.selectedFlow = null;
+  const mismatch = await runAuditWith((await mk({ flow: 'verified', paypal_client_id: AUDITED_FULL_APP })).envelope);
+  check('flow/app mismatch fails closed', mismatch.ok === false, `ok=${mismatch.ok}`);
+  check('failure names FLOW/APP MISMATCH', /FLOW\/APP MISMATCH/.test(mismatch.alert || ''), (mismatch.alert || '').slice(0, 200));
+  globalThis.selectedFlow = null;
 }
 
 console.log('\nTest 21e: MRTD pin gate rejects a different launch chain');
@@ -1128,6 +1410,44 @@ console.log('\nTest 23: v164 post-login handoff — E2EE decrypt round-trip + re
     clicks[0] ? clicks[0].download : '(no click)');
 }
 
+console.log('\nTest 24: auditor isolation — key generation refused outside file:// / GitHub Pages (v168)');
+{
+  // plan Phase 3.3: a copy served by the enclave's own origin is attacker-
+  // script (Web Auditor Tampering) — every key-generating entry point must
+  // REFUSE there, while file:// and the pinned GitHub Pages copy work.
+  const setLoc = (loc) => { if (loc === null) delete globalThis.location; else globalThis.location = loc; };
+  const el = (id) => document.getElementById(id);
+  setLoc({ protocol: 'https:', host: 'login.airma.de', origin: 'https://login.airma.de' });
+  check('enclave-origin copy is untrusted', trustedAuditorContext() === false);
+  el('localEnclaveHost').value = 'https://login.airma.de';
+  await executePreflightAndLogin('verified');
+  check('secure-login refuses on the enclave origin',
+    /UNTRUSTED AUDITOR ORIGIN/.test(el('secureLoginStatus').innerText),
+    el('secureLoginStatus').innerText.slice(0, 140));
+  await localPreflight();
+  check('local pre-flight refuses on the enclave origin',
+    /UNTRUSTED AUDITOR ORIGIN/.test(el('localLoginStatus').innerText),
+    el('localLoginStatus').innerText.slice(0, 140));
+  await localClaim();
+  check('claim refuses on the enclave origin',
+    /UNTRUSTED AUDITOR ORIGIN/.test(el('localLoginStatus').innerText),
+    el('localLoginStatus').innerText.slice(0, 140));
+  setLoc({ protocol: 'file:', host: '', origin: 'null' });
+  check('file:// copy is trusted', trustedAuditorContext() === true);
+  setLoc({ protocol: 'https:', host: 'leonardopedro.github.io', origin: 'https://leonardopedro.github.io' });
+  check('GitHub Pages copy is trusted', trustedAuditorContext() === true);
+  setLoc({ protocol: 'https:', host: 'attacker.example', origin: 'https://attacker.example' });
+  check('any other https origin is untrusted', trustedAuditorContext() === false);
+  setLoc(null);
+}
+
+console.log('\nTest 25: scripts/calculate-golden-rtmr.mjs --selftest (CCEL replay parity, plan Phase 5)');
+{
+  const r = spawnSync(process.execPath, [join(repoRoot, 'scripts', 'calculate-golden-rtmr.mjs'), '--selftest'], { encoding: 'utf8' });
+  check('golden-RTMR tool selftest passes (same vector as the Rust replay_ccel test)',
+    r.status === 0, ((r.stdout || '') + (r.stderr || '')).slice(0, 400));
+}
+
 // ---- Optional: a REAL report captured from the live enclave ---------------
 // (node scripts/e2e-sandbox.mjs sets this setup: REAL_REPORT=/tmp/report-verified.json)
 // Runs against the DEFAULT Intel anchor — the synthetic root is swapped out so
@@ -1154,6 +1474,24 @@ if (process.env.REAL_REPORT) {
       row('githubCheck').cls + ' — ' + row('githubCheck').desc.slice(0, 300));
     check('live tpmCheck green (TPM-less TDX)', row('tpmCheck').cls === 'check-item verified', row('tpmCheck').cls);
   }
+}
+
+console.log('\nTest 28: README publishes the auditor digest (out-of-band integrity)');
+{
+  // The auditor is the one component users must be able to check WITHOUT
+  // trusting this repository's live contents. README.md carries its SHA-256 so
+  // a downloaded copy can be verified offline; this guard fails the suite if
+  // that published value drifts from the file it describes — a stale digest is
+  // worse than none, because it teaches users to ignore mismatches.
+  const readme = readFileSync(join(repoRoot, 'README.md'), 'utf8');
+  const verifyBytes = readFileSync(join(repoRoot, 'verify.html'));
+  const digest = createHash('sha256').update(verifyBytes).digest('hex');
+  check('README publishes the CURRENT verify.html sha256', readme.includes(digest), digest);
+  check('published digest is a 64-hex token', /[0-9a-f]{64}/.test(readme));
+  const sizeLine = /verify\.html` \| ?([\d,]+) bytes/.exec(readme);
+  check('published size matches the file',
+    !!sizeLine && parseInt(sizeLine[1].replace(/,/g, ''), 10) === verifyBytes.length,
+    `readme=${sizeLine && sizeLine[1]} file=${verifyBytes.length}`);
 }
 
 // ===========================================================================

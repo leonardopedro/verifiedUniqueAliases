@@ -3,6 +3,7 @@
 //! Hardened Zero-Trust Implementation against Colluding Owner & Cloud Provider
 
 mod intel_tdx;
+mod selfreport;
 
 const GOOGLE_CA_PEM: &[u8] = include_bytes!("google_ca.pem");
 const PAYPAL_CA_PEM: &[u8] = include_bytes!("paypal.pem");
@@ -93,6 +94,134 @@ mod enclave_init {
         }
     }
 
+    // =========================================================================
+    // v168 (independent security audit — plan Phases 1.1 / 4.1 / 4.2): boot
+    // artifact + kernel hardening and post-boot egress lockdown.
+    // Threat model: the cloud host controls the virtual disk (grub.cfg, and
+    // with it the kernel command line), the virtual network, and the
+    // metadata service. The EXPECTED_RTMR* pins in verify.html decide code
+    // identity REMOTELY; these gates close the in-guest half.
+    // =========================================================================
+
+    /// The EXACT kernel command line built by build-alibaba-image.sh (the
+    /// grub.cfg `linux` line after the kernel path). Drift guard:
+    /// security_tests::cmdline_pin_matches_build_script asserts this constant
+    /// stays byte-identical to the build script. Deliberate deviations from
+    /// plan.md's example text, all justified: `quiet` is omitted because the
+    /// TDX probe transcript must stay visible on the serial console (the
+    /// project's primary diagnosis channel); `selinux=0` would disable a MAC
+    /// policy if one is ever enabled (the initramfs ships none); `panic=1`
+    /// reboots out of a panicked kernel, trading diagnosability for no
+    /// security gain (a panicked kernel serves nothing). The actual defense
+    /// against hypervisor argument injection is (a) determinism — this exact
+    /// pinned string — plus (b) verify_cmdline() below and (c) the auditor's
+    /// RTMR pins over the measured boot chain.
+    pub const EXPECTED_CMDLINE: &str =
+        "console=tty0 console=ttyS0,115200n8 net.ifnames=0 biosdevname=0 swiotlb=524288";
+
+    /// Fail closed on any kernel command line other than the audited one —
+    /// the in-guest half of "hypervisor argument injection" defense (the
+    /// remote half is the RTMR pin over the measured cmdline event).
+    /// GRUB may legitimately prefix BOOT_IMAGE=<path>; everything else must
+    /// match EXPECTED_CMDLINE exactly.
+    pub fn verify_cmdline() {
+        let observed = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+        let observed = observed.trim_matches('\0').trim();
+        kmsg(&format!("Kernel cmdline: {:?}", observed));
+        let stripped = observed
+            .strip_prefix("BOOT_IMAGE=")
+            .and_then(|s| s.find(' ').map(|i| &s[i + 1..]))
+            .unwrap_or(observed);
+        if stripped != EXPECTED_CMDLINE {
+            kmsg(&format!(
+                "FATAL: kernel cmdline mismatch — hypervisor/GRUB argument injection suspected. expected {:?} got {:?}. Halting.",
+                EXPECTED_CMDLINE, stripped
+            ));
+            poweroff();
+        }
+        kmsg("Kernel cmdline matches the audited pin.");
+    }
+
+    /// v168 (plan Phase 4.2): kernel defense-in-depth for the secret-bearing
+    /// runtime. TDX memory encryption covers DRAM ONLY — a swapped-out page
+    /// would reach the host-controlled virtual disk in plaintext; kexec
+    /// could later load an UNMEASURED kernel past the RTMR pins; suid-
+    /// dumpable core dumps can carry key material to disk. Fail closed.
+    pub fn harden_kernel() {
+        kmsg("Hardening kernel (swapoff / kexec_load_disabled / suid_dumpable=0)...");
+        // 1. swap must never be active while secrets are in RAM.
+        if let Ok(swaps) = std::fs::read_to_string("/proc/swaps") {
+            for line in swaps.lines().skip(1) {
+                let dev = line.split_whitespace().next().unwrap_or("");
+                if dev.is_empty() {
+                    continue;
+                }
+                if let Ok(c) = std::ffi::CString::new(dev) {
+                    let rc = unsafe { libc::swapoff(c.as_ptr()) };
+                    kmsg(&format!("  swapoff({}) -> {}", dev, rc));
+                }
+            }
+        }
+        let remaining = std::fs::read_to_string("/proc/swaps")
+            .map(|s| s.lines().skip(1).filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0);
+        if remaining != 0 {
+            kmsg("FATAL: swap still active after swapoff — secrets could page to the host-controlled disk. Halting.");
+            poweroff();
+        }
+        // 2. sysctl hardening. A kernel built without the knob is acceptable
+        // (nothing to disable); a knob that REFUSES the hardened value is not.
+        for (path, val, name) in [
+            ("/proc/sys/kernel/kexec_load_disabled", "1", "kexec_load_disabled"),
+            ("/proc/sys/fs/suid_dumpable", "0", "suid_dumpable"),
+        ] {
+            if !std::path::Path::new(path).exists() {
+                kmsg(&format!("  {} absent in this kernel — nothing to disable", name));
+                continue;
+            }
+            if std::fs::write(path, val).is_err() {
+                kmsg(&format!("FATAL: cannot set {} = {} — halting.", name, val));
+                poweroff();
+            }
+            let rb = std::fs::read_to_string(path).unwrap_or_default();
+            if rb.trim() != val {
+                kmsg(&format!("FATAL: {} did not stick (read back {:?}) — halting.", name, rb.trim()));
+                poweroff();
+            }
+        }
+        kmsg("Kernel hardening applied.");
+    }
+
+    /// v168 (plan Phase 4.1): POST-BOOT EGRESS LOCKDOWN. The boot-time rules
+    /// keep IMDS (100.100.100.200), GCP metadata (169.254.169.254), DNS and
+    /// port 80 open — necessary for user_data + ACME DNS-01 + HTTPS time
+    /// sync, but afterwards they are pure exfiltration surface (DNS queries
+    /// alone can leak secrets to a colluding resolver). Once the TLS cert is
+    /// in RAM, the ONLY runtime egress is the PayPal API on 443 to the
+    /// pinned IPs — hardened_client() resolves those names to these same
+    /// addresses, so no DNS lookup is ever needed again. (DHCP is a one-shot
+    /// BOOTP exchange at boot — there is no lease renewal daemon to starve.)
+    pub fn egress_lockdown() {
+        kmsg("POST-BOOT EGRESS LOCKDOWN: dropping IMDS/metadata, DNS, port 80; 443 only to pinned PayPal endpoints...");
+        let commands = [
+            "flush chain inet filter output",
+            "add rule inet filter output oif lo accept",
+            "add rule inet filter output ct state established,related accept",
+            // == hardened_client() pin set (api-m.paypal.com / api-m.sandbox) ==
+            "add rule inet filter output ip daddr { 104.16.124.74, 146.75.123.1 } tcp dport 443 accept",
+        ];
+        for cmd in commands {
+            match std::process::Command::new("/usr/sbin/nft").arg(cmd).status() {
+                Ok(s) if s.success() => {}
+                _ => {
+                    kmsg(&format!("FATAL: egress lockdown command '{}' failed — halting (fail closed).", cmd));
+                    poweroff();
+                }
+            }
+        }
+        kmsg("Egress locked down: output policy drop except loopback + PayPal pinned 443.");
+    }
+
     pub fn mount_filesystems() {
         fn mount_fs(source: &str, target: &str, fstype: &str) {
             std::fs::create_dir_all(target).ok();
@@ -113,6 +242,44 @@ mod enclave_init {
         std::fs::create_dir_all("/boot/efi").ok();
         mount_fs("/dev/sda1", "/boot/efi", "vfat");
         mount_fs("/dev/vda1", "/boot/efi", "vfat");
+        // v175 (live debug 2026-10-23): the ESP is NOT always /dev/sda1 or
+        // /dev/vda1 — an NVMe system disk (imported images are flagged
+        // NvmeSupport=supported) exposes it as /dev/nvme0n1p1. The hardcoded
+        // pair silently mounted NOTHING, so /verify.html 500'd with
+        // "not present on ESP or initramfs" while the file sat right there on
+        // the ESP (the measurement path's dynamic scan found it — see
+        // measure_boot_components). Mount whichever partition actually
+        // carries a FAT filesystem with content.
+        let esp_has_content = |target: &str| -> bool {
+            // The real ESP always carries the boot chain under EFI/ and the
+            // auditor at its root — require one of them so a random FAT
+            // partition can never be mistaken for the measured ESP.
+            std::path::Path::new(target).join("EFI").is_dir()
+                || std::path::Path::new(target).join("verify.html").is_file()
+        };
+        if !esp_has_content("/boot/efi") {
+            if let Ok(entries) = std::fs::read_dir("/sys/class/block") {
+                let mut candidates: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.chars().any(|c| c.is_ascii_digit()))
+                    .collect();
+                candidates.sort();
+                for dev_name in candidates {
+                    let dev_path = format!("/dev/{}", dev_name);
+                    let src = std::ffi::CString::new(dev_path).unwrap();
+                    let tgt = std::ffi::CString::new("/boot/efi").unwrap();
+                    let fst = std::ffi::CString::new("vfat").unwrap();
+                    let rc = unsafe {
+                        libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), 0, std::ptr::null())
+                    };
+                    if rc == 0 && esp_has_content("/boot/efi") {
+                        kmsg("ESP mounted at /boot/efi via block-device scan (NVMe or non-sda/vda layout)");
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     pub fn measure_boot_components() -> std::collections::BTreeMap<String, String> {
@@ -125,7 +292,18 @@ mod enclave_init {
             let src = std::ffi::CString::new(source).unwrap();
             let tgt = std::ffi::CString::new(target).unwrap();
             let fst = std::ffi::CString::new("vfat").unwrap();
-            unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), libc::MS_RDONLY, std::ptr::null()) == 0 }
+            // v176 (live debug 2026-10-23): when the SAME partition is already
+            // mounted RW at /boot/efi (mount_filesystems' block scan), a
+            // second MS_RDONLY mount fails with "Can't mount, would change RO
+            // state" and the manifest came back EMPTY. Try RO first, fall back
+            // to RW — this mount is read-only in spirit either way.
+            let ro = unsafe {
+                libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), libc::MS_RDONLY, std::ptr::null())
+            };
+            ro == 0
+                || unsafe {
+                    libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), 0, std::ptr::null()) == 0
+                }
         }
 
         if let Ok(entries) = std::fs::read_dir("/sys/class/block") {
@@ -326,7 +504,12 @@ mod enclave_init {
         Ok(())
     }
 
+    /// Fail closed: publish the recorded reason to the out-of-mainland report
+    /// sink FIRST (best effort, detached), then park forever. Parking — not
+    /// rebooting — preserves the evidence and never hides the failure behind a
+    /// boot loop.
     pub fn poweroff() -> ! {
+        crate::selfreport::halt();
         loop { std::thread::sleep(std::time::Duration::from_secs(60)); }
     }
 }
@@ -633,6 +816,7 @@ pub fn compute_preflight_binding(
     client_pub_der: &[u8],
     client_nonce: &[u8; 32],
     custom_info: &str,
+    paypal_client_id: &str,
 ) -> [u8; 64] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -641,6 +825,12 @@ pub fn compute_preflight_binding(
     hasher.update(client_pub_der);
     hasher.update(client_nonce);
     hasher.update(custom_info.as_bytes());
+    // v168 (plan Phase 3.1): the PayPal APP is hardware-bound too — a
+    // malicious owner swapping in an over-scoped PayPal client_id must
+    // change the quoted REPORTDATA and trip verify.html's EXPECTED_APPS /
+    // binding gates. Formula (byte order):
+    //   SHA-256(P_enc ∥ code_challenge ∥ P_client ∥ Nonce ∥ custom_info ∥ PayPal_Client_ID)
+    hasher.update(paypal_client_id.as_bytes());
     let digest = hasher.finalize();
 
     let mut report_data = [0u8; 64];
@@ -807,6 +997,10 @@ mod tpm {
 
 const MAX_TRACKED_IPS: usize = 1000;
 const MAX_CONCURRENT_CONNECTIONS: usize = 50;
+/// Ceiling on in-flight PayPal authorization sessions (see attest_preflight).
+const MAX_PENDING_OAUTH: usize = 4096;
+/// Ceiling on sealed, not-yet-claimed E2EE reports (see callback).
+const MAX_PENDING_E2EE_BLOBS: usize = 4096;
 const GLOBAL_EGRESS_BYTES_PER_HOUR: u64 = 512 * 1024 * 1024;
 const IP_EGRESS_BYTES_PER_HOUR: u64 = 25 * 1024 * 1024;
 const ZEROSSL_CA_DIRECTORY: &str = "https://acme.zerossl.com/v2/DV90";
@@ -874,6 +1068,10 @@ struct Config {
     dns_api_token: Option<String>,
     #[serde(default, alias = "dns01")]
     dns_zone: Option<String>,
+    /// Optional boot self-report sink (see `selfreport`). Absent = the enclave
+    /// only reports to the local kernel log, exactly as before.
+    #[serde(default)]
+    self_report: Option<selfreport::SinkConfig>,
 }
 
 #[derive(Clone)]
@@ -1057,6 +1255,9 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
             staging: std::env::var("STAGING").map(|s| s == "true").unwrap_or(false),
             dns_api_token: std::env::var("DNS_API_TOKEN").ok(),
             dns_zone: std::env::var("DNS_ZONE").ok(),
+            self_report: std::env::var("PAV_SELFREPORT_JSON")
+                .ok()
+                .and_then(|s| serde_json::from_str::<selfreport::SinkConfig>(&s).ok()),
         });
     }
 
@@ -1237,6 +1438,42 @@ pub struct PreflightRequest {
     pub custom_info: Option<String>,
 }
 
+/// v169 (independent audit): every response that carries attestation data,
+/// session material or user-bound ciphertext gets the same hardened header set.
+///
+///   * `Cache-Control: no-store` — a callback URL carries a one-time PayPal
+///     grant plus the sealed report; it must never land in a browser or proxy
+///     cache where a later (possibly compromised) context can read it.
+///   * `Referrer-Policy: no-referrer` — the callback query string must not leak
+///     through any Referer on a subsequent navigation.
+///   * `X-Content-Type-Options: nosniff` — response bodies are attacker-
+///     influenced JSON; never let a browser re-interpret them.
+fn with_secure_headers(mut resp: Response) -> Response {
+    use axum::http::header::{HeaderName, HeaderValue};
+    let h = resp.headers_mut();
+    h.insert(HeaderName::from_static("cache-control"), HeaderValue::from_static("no-store"));
+    h.insert(HeaderName::from_static("referrer-policy"), HeaderValue::from_static("no-referrer"));
+    h.insert(HeaderName::from_static("x-content-type-options"), HeaderValue::from_static("nosniff"));
+    resp
+}
+
+/// HTML responses additionally refuse framing (clickjacking): the auditor's
+/// buttons create keys and start PayPal logins, and the callback page renders a
+/// sealed report — neither may be embedded by another origin. `frame-ancestors`
+/// alone does not restrict inline scripts, so the pages keep working.
+fn html_with_secure_headers(bytes: Vec<u8>) -> Response {
+    let mut resp = (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        bytes,
+    )
+        .into_response();
+    resp.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("content-security-policy"),
+        axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    with_secure_headers(resp)
+}
+
 async fn serve_verify_html() -> impl IntoResponse {
     // Served from the ESP (disk file), NOT embedded via include_str!. This
     // is deliberate: EXPECTED_ENCLAVE_SHA256 (the code-pin gate) and the
@@ -1248,10 +1485,10 @@ async fn serve_verify_html() -> impl IntoResponse {
     // pins (self-reference). The ESP copy is not loaded by the boot
     // chain, so editing pins does not move any RTMR.
     match std::fs::read("/boot/efi/verify.html") {
-        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], bytes).into_response(),
+        Ok(bytes) => html_with_secure_headers(bytes),
         // legacy images kept the auditor in the initramfs root
         Err(_) => match std::fs::read("/verify.html") {
-            Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], bytes).into_response(),
+            Ok(bytes) => html_with_secure_headers(bytes),
             Err(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "verify.html not present on ESP or initramfs",
@@ -1320,9 +1557,21 @@ async fn attest_preflight(
         &client_pub,
         &client_nonce,
         custom_info_str,
+        &cid,
     );
 
     let quote_res = tpm::quote(&hex::encode(&report_data[..32]), Some(report_data));
+
+    // v168 (plan Phase 2.2): FAIL-CLOSED report minting. A report without a
+    // silicon-signed quote is unverifiable — it must never leave the enclave.
+    #[cfg(feature = "alibabacloud")]
+    if quote_res.tdx_quote_b64.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "hardware quote unavailable — attestation report refused (fail closed)",
+        )
+            .into_response();
+    }
 
     use rand::Rng;
     let state_token = hex::encode(rand::thread_rng().gen::<[u8; 32]>());
@@ -1334,7 +1583,10 @@ async fn attest_preflight(
         "code_challenge": code_challenge,
         "state": state_token,
         "flow": label,
-        "paypal_client_id": cid,
+        "paypal_client_id": cid.clone(),
+        // v169: the environment is signed (and app-pinned) at pre-flight too,
+        // so a redirect into sandbox PayPal cannot be passed off as production.
+        "paypal_environment": if state.staging { "sandbox" } else { "production" },
         "redirect_uri": state.redirect_uri,
         "authorize_base": auth_base,
         "scope": scope,
@@ -1351,7 +1603,24 @@ async fn attest_preflight(
         B64STD.encode(signer.sign_to_vec().unwrap())
     };
 
-    state.pending_oauth.write().insert(state_token.clone(), (label, pkce));
+    // Bounded session table: every entry lives 600 s, but an unauthenticated
+    // caller can create them at line rate, so cap the table and fail closed
+    // (503) instead of letting the enclave's RAM be driven upward from the
+    // network. The legitimate peak is tiny (one entry per concurrent login).
+    {
+        let mut pending = state.pending_oauth.write();
+        if pending.len() >= MAX_PENDING_OAUTH {
+            pending.retain(|_, (_, p)| p.created_at.elapsed() < Duration::from_secs(600));
+            if pending.len() >= MAX_PENDING_OAUTH {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "too many pending authorization sessions — retry later",
+                )
+                    .into_response();
+            }
+        }
+        pending.insert(state_token.clone(), (label.clone(), pkce));
+    }
 
     let binary_sha256 = hex::encode(sha2::Sha256::digest(&std::fs::read("/init").unwrap_or_default()));
     // Pre-flight is pre-login: paypal_user_info_raw_hash carries the documented
@@ -1372,6 +1641,8 @@ async fn attest_preflight(
                 "client_pub_b64": B64STD.encode(&client_pub),
                 "client_nonce_hex": payload.client_nonce_hex,
                 "custom_info": custom_info_str,
+                "paypal_client_id": cid,
+                "flow": label,
             }
         },
         "hardware_level_attestation": quote_res,
@@ -1388,12 +1659,11 @@ async fn attest_preflight(
         "enclave_signing_public_key": state.enclave_identity.pubkey_pem,
         "signed_fields": signed_fields,
         "preflight_signature_b64": signature,
-    });
-
-    let mut resp = ([(axum::http::header::CONTENT_TYPE, "application/json")], Json(body)).into_response();
+    });    let mut resp = ([(axum::http::header::CONTENT_TYPE, "application/json")], Json(body)).into_response();
     resp.headers_mut().insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, axum::http::HeaderValue::from_static("*"));
-    resp
+    with_secure_headers(resp)
 }
+
 
 // ----------------------------------------------------------------------------
 // Standalone Auditor Envelope (GET /debug/envelope)
@@ -1433,6 +1703,16 @@ async fn debug_envelope(
     report_data[0..32].copy_from_slice(&nonce);
     let quote_res = tpm::quote(&hex::encode(nonce), Some(report_data));
 
+    // v168 (plan Phase 2.2): FAIL-CLOSED report minting.
+    #[cfg(feature = "alibabacloud")]
+    if quote_res.tdx_quote_b64.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "hardware quote unavailable — attestation report refused (fail closed)",
+        )
+            .into_response();
+    }
+
     let attestation_report = serde_json::json!({
         "custom_info": custom_info,
         "paypal_user_info_raw_hash": paypal_hash,
@@ -1456,7 +1736,7 @@ async fn debug_envelope(
 
     let mut resp = ([(axum::http::header::CONTENT_TYPE, "application/json")], Json(body)).into_response();
     resp.headers_mut().insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, axum::http::HeaderValue::from_static("*"));
-    resp
+    with_secure_headers(resp)
 }
 
 // ----------------------------------------------------------------------------
@@ -1481,7 +1761,7 @@ async fn get_e2ee_blob(
         Some((payload, _)) => {
             let mut resp = Json(payload).into_response();
             resp.headers_mut().insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, axum::http::HeaderValue::from_static("*"));
-            resp
+            with_secure_headers(resp)
         }
         None => (StatusCode::NOT_FOUND, "No E2EE payload for session or already claimed").into_response(),
     }
@@ -1538,9 +1818,7 @@ async fn callback(
 
     // Zeroize sensitive token memory immediately
     zeroize_str(&mut token_obj.access_token);
-    if let Some(ref mut idt) = token_obj.id_token { zeroize_str(idt); }
-
-    let minimized = userinfo.verified_only();
+    if let Some(ref mut idt) = token_obj.id_token { zeroize_str(idt); }        let minimized = userinfo.verified_only();
     if minimized.verified_account.as_deref() != Some("true") {
         return (StatusCode::FORBIDDEN, "PayPal account must be verified").into_response();
     }
@@ -1565,10 +1843,40 @@ async fn callback(
     report_data[0..32].copy_from_slice(&nonce);
     let quote_res = tpm::quote(&hex::encode(nonce), Some(report_data));
 
+    // v168 (plan Phase 2.2): FAIL-CLOSED report minting.
+    #[cfg(feature = "alibabacloud")]
+    if quote_res.tdx_quote_b64.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "hardware quote unavailable — attestation report refused (fail closed)",
+        )
+            .into_response();
+    }
+
     let report_payload = serde_json::json!({
         "paypal_user_info": minimized,
         "paypal_user_info_raw_hash": paypal_user_raw_hash,
         "custom_info": custom_info,
+        // v168 (plan Phase 3 — Malicious PayPal App defense): WHICH app
+        // minted this identity is part of the signed report, so the auditor's
+        // EXPECTED_APPS gate covers the login report itself, not just the
+        // pre-flight fields.
+        "paypal_client_id": cid,
+        // v169 (audit finding — FLOW BINDING): WHICH flow minted this report.
+        // `flow` is the label the pre-flight chose ("verified" = minimal scope,
+        // "full" = PII app) and it is derived server-side from the pending
+        // session — never from the client. verify.html requires it to match the
+        // app pin AND the flow this browser asked for, so an enclave cannot
+        // silently upgrade a minimal-disclosure login into the over-scoped app.
+        "flow": flow.clone(),
+        // v169 (audit finding): WHICH PayPal ENVIRONMENT answered. A sandbox
+        // login is a REAL hardware attestation of a SYNTHETIC identity —
+        // anybody (including the owner) can mint `verified_account: true`
+        // there. Without this field a sandbox report and a production report
+        // audit identically green, so the owner could satisfy every check with
+        // an account it controls. The auditor now requires `production` for a
+        // login report and refuses `sandbox` outright.
+        "paypal_environment": if state.staging { "sandbox" } else { "production" },
         "timestamp_ms": chrono::Utc::now().timestamp_millis() as u64,
         "enclave_config": {
             "boot_measurements": {
@@ -1621,8 +1929,23 @@ async fn callback(
         "flow": flow,
     });
 
-    // Save for local claim
-    state.pending_e2ee_blobs.write().insert(state_param.clone(), (e2ee_blob.clone(), Instant::now()));
+    // Save for local claim. Bounded like pending_oauth: a completed PayPal
+    // login is required to add one, but the table must still have a ceiling so
+    // it can never grow without limit between the 60 s cleanup ticks. On
+    // overflow the OLDEST entry is dropped (its owner can simply log in again).
+    {
+        let mut blobs = state.pending_e2ee_blobs.write();
+        if blobs.len() >= MAX_PENDING_E2EE_BLOBS {
+            let oldest = blobs
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                blobs.remove(&k);
+            }
+        }
+        blobs.insert(state_param.clone(), (e2ee_blob.clone(), Instant::now()));
+    }
 
     // Never render plaintext user info: only return the encrypted blob
     // container (v164: the page then stashes it into sessionStorage and
@@ -1632,7 +1955,7 @@ async fn callback(
     let html = HTML_TEMPLATE.replace("{{CONTENT}}", &content);
 
     let _ = state.record_egress(addr.ip(), html.len() as u64);
-    Html(html).into_response()
+    html_with_secure_headers(html.into_bytes())
 }
 
 // ----------------------------------------------------------------------------
@@ -1640,9 +1963,20 @@ async fn callback(
 // ----------------------------------------------------------------------------
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     enclave_init::mount_filesystems();
+    // Boot self-report: resolve the sink from the ESP before anything can
+    // fail, so even a boot with missing/expired `user_data` can say why it is
+    // dark. Absent file = reporting simply stays off.
+    selfreport::init_from_bootstrap_file("/boot/efi/selfreport.json");
+    selfreport::stage("cmdline");
+    enclave_init::verify_cmdline();
+    selfreport::stage("drivers");
     enclave_init::load_drivers();
+    selfreport::stage("measure");
     let boot_manifest = enclave_init::measure_boot_components();
+    selfreport::stage("firewall");
     enclave_init::setup_firewall();
+    selfreport::stage("harden");
+    enclave_init::harden_kernel();
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async {
@@ -1658,14 +1992,25 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .with_ansi(false)
             .init();
 
-        if let Err(_) = enclave_init::configure_network().await {
+        selfreport::stage("network");
+        if let Err(e) = enclave_init::configure_network().await {
+            selfreport::note_failure(format!("network: {}", e));
             enclave_init::poweroff();
         }
+        selfreport::progress();
 
+        selfreport::stage("config");
         let config = fetch_config().await.unwrap_or_else(|e| {
             error!("FATAL: {}", e);
+            // Most common dark-box cause: IMDS answered but the config was
+            // absent/undecodable, or credentials were placeholders.
+            selfreport::note_failure(format!("config: {}", e));
             enclave_init::poweroff();
         });
+        // `user_data` may carry the sink too; the ESP file (if present, etc.)
+        // wins because it is measured with the image.
+        selfreport::init(config.self_report.clone());
+        selfreport::progress();
 
         // v165 Phase 3: BOOT-TIME FAIL-CLOSED QUOTE PROBE. Before any traffic
         // is accepted, require a silicon-signed TD Quote from configfs TSM /
@@ -1687,12 +2032,81 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .unwrap_or([0u8; 16]));
                 hex::encode(h.finalize())
             };
+            // Evidence collection reads configfs outblob / issues TDX ioctls
+            // that the host VMM must answer — a wedged host TSM leaves those
+            // reads blocked FOREVER (live-observed 2026-10-22: probe banner
+            // printed, then silence across reboots; the host attestation
+            // backend was healthy minutes earlier). Bound each attempt to
+            // 10 s and RETRY: the backend can heal mid-boot, and the plan
+            // only forbids serving traffic without a quote — it does not
+            // require dying on the first transient outage. After ~6.5 min
+            // without a quote: fail closed, never serve.
+            fn collect_bounded(nonce: &str) -> intel_tdx::TdxEvidence {
+                let nonce = nonce.to_string();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let ev = intel_tdx::collect_silicon_evidence(&nonce, None);
+                    let _ = tx.send(ev);
+                });
+                // 60 s bound: live hosts quote anywhere in 5 ms..12 s (the
+                // flaky TSM service also freezes the console lock when it
+                // wedges, so these transcripts also land on the ESP below).
+                match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                    Ok(ev) => ev,
+                    Err(_) => {
+                        let mut ev = intel_tdx::TdxEvidence::default();
+                        ev.quote_status = Some("timeout".into());
+                        ev.notes.push(
+                            "evidence collection TIMED OUT after 60 s (host TSM/VMM wedged?)"
+                                .into(),
+                        );
+                        ev
+                    }
+                }
+            }
+            // Survive console blindness (a wedged TSM freezes printk): append
+            // the probe transcript to the ESP so the next operator can read it.
+            fn probe_log(line: &str) {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/boot/efi/boot-probe.log")
+                {
+                    let _ = writeln!(f, "{} {}", std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs()).unwrap_or(0), line);
+                }
+            }
             info!("--- BOOT-TIME TDX QUOTE PROBE (fail-closed) ---");
-            let ev = intel_tdx::collect_silicon_evidence(&boot_nonce, None);
+            selfreport::stage("probe");
+            probe_log("BOOT-TIME TDX QUOTE PROBE start");
+            let mut attempts = 0u32;
+            let ev = loop {
+                attempts += 1;
+                let ev = collect_bounded(&boot_nonce);
+                if ev.quote_b64.is_some() || attempts >= 8 {
+                    break ev;
+                }
+                warn!(
+                    "boot quote probe attempt {}/8: no quote (status={:?}) — retrying in 20s",
+                    attempts, ev.quote_status
+                );
+                probe_log(&format!("attempt {}/8: no quote (status={:?})", attempts, ev.quote_status));
+                for n in ev.notes.iter().take(6) {
+                    warn!("  probe: {}", n);
+                }
+                std::thread::sleep(std::time::Duration::from_secs(20));
+            };
+            probe_log(&format!("probe done: quote={} attempts={}", ev.quote_b64.is_some(), attempts));
             match ev.quote_b64.as_ref() {
                 None => {
-                    error!("FAIL-CLOSED: no silicon-signed TD Quote at boot (status={:?}). Halting before serving traffic.", ev.quote_status);
+                    error!("FAIL-CLOSED: no silicon-signed TD Quote after {} attempts (status={:?}). Halting before serving traffic.", attempts, ev.quote_status);
                     for n in ev.notes.iter().take(20) { error!("  probe: {}", n); }
+                    selfreport::note_failure(format!(
+                        "probe: no silicon-signed TD Quote after {} attempts (status={:?})",
+                        attempts, ev.quote_status
+                    ));
                     enclave_init::poweroff();
                 }
                 Some(qb64) => {
@@ -1703,10 +2117,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     match intel_tdx::ccel_replay_vs_quote(&quote) {
                         Ok(notes) => {
                             info!("BOOT QUOTE PROBE OK ({} bytes, source={})", quote.len(), ev.quote_source.as_deref().unwrap_or("?"));
-                            for n in notes { info!("  ccel: {}", n); }
+                            probe_log(&format!("BOOT QUOTE PROBE OK ({} bytes, source={})", quote.len(), ev.quote_source.as_deref().unwrap_or("?")));
+                            for n in notes.iter() {
+                                info!("  ccel: {}", n);
+                                probe_log(&format!("ccel: {}", n));
+                            }
                         }
                         Err(e) => {
                             error!("FAIL-CLOSED: {} — halting before serving traffic.", e);
+                            probe_log(&format!("FAIL-CLOSED: {}", e));
+                            selfreport::note_failure(format!("probe: {}", e));
                             enclave_init::poweroff();
                         }
                     }
@@ -1783,6 +2203,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Generating fresh in-memory ephemeral TLS keypair (RAM ONLY)...");
         let ephemeral_tls_key = openssl::pkey::PKey::from_rsa(openssl::rsa::Rsa::generate(4096)?)?;
 
+        selfreport::stage("acme");
         let acme_mgr = InRamAcmeManager::new(&config);
         let mut retry_delay = Duration::from_secs(15);
         let cert_chain_pem = loop {
@@ -1793,6 +2214,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 Err(e) => {
                     warn!("ACME certificate failed: {}. Retrying in {:?} (no self-signed fallback)...", e, retry_delay);
+                    // A retry loop serves NOTHING (no self-signed fallback), so
+                    // this is the classic "Running + dark" state — publish it
+                    // instead of leaving the operator to guess. Includes the
+                    // usual `Cloudflare zone not found`, i.e. the reserved-EIP
+                    // / token-scope failure.
+                    selfreport::failure(format!("acme: {}", e));
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
                 }
@@ -1801,7 +2228,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&cert_chain_pem).to_string());
         let ssl_acceptor = build_in_memory_ssl_acceptor(&cert_chain_pem, &ephemeral_tls_key)?;
+        // v168 (plan Phase 4.1): config fetched + cert in RAM — IMDS, DNS and
+        // port 80 have no legitimate user anymore. Lock egress down BEFORE
+        // the first user session can carry plaintext anywhere.
+        enclave_init::egress_lockdown();
         state.https_ready.store(true, Ordering::Relaxed);
+        selfreport::stage("serving");
+        selfreport::serving();
 
         let https_listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 443))).await?;
         info!("HTTPS server listening on port 443 with in-RAM TLS configuration.");
@@ -1845,6 +2278,46 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 mod security_tests {
     use super::*;
 
+    /// v169 (audit finding: identity preimage binding). verify.html recomputes
+    /// SHA-256(JSON.stringify(paypal_user_info)) and requires it to equal the
+    /// hash bound into the quote's report_data. That only works if the enclave
+    /// serializes the minimized identity in exactly this byte layout — field
+    /// order, nulls kept, compact. Pin it (and the digest) here so any change
+    /// to PayPalUserInfo or its serde attributes breaks THIS test instead of
+    /// silently bricking every honest login audit.
+    #[test]
+    fn paypal_identity_json_layout_pinned() {
+        use sha2::{Digest, Sha256};
+        let u = PayPalUserInfo {
+            user_id: "U1".into(),
+            sub: None,
+            verified_account: Some("true".into()),
+            payer_id: None,
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert_eq!(
+            json,
+            r#"{"user_id":"U1","sub":null,"verified_account":"true","payer_id":null}"#,
+            "minimized-identity JSON layout drifted — verify.html hashes JSON.stringify() of this, so they MUST match"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(json.as_bytes())),
+            "b66320f7fe060efa71cdd8bc7fed8a2e9d873b78aff6e5747d14326f7bf4429f",
+            "identity digest drifted from the auditor's vector"
+        );
+    }
+
+    /// The pre-login placeholder is part of the binding contract too: auditors
+    /// REQUIRE it for envelopes with no user record (v169), so its value is a
+    /// wire constant both sides must agree on.
+    #[test]
+    fn prelogin_placeholder_hash_pinned() {
+        assert_eq!(
+            crate::prelogin_paypal_hash(),
+            "703d1ea4a5131eef7089ca7c41d877ba32df741a7f24ab3d580e56f297c2fb52"
+        );
+    }
+
     #[test]
     fn require_credentials_rejects_empty_or_placeholders() {
         let bad = Config {
@@ -1858,6 +2331,7 @@ mod security_tests {
             staging: false,
             dns_api_token: None,
             dns_zone: None,
+            self_report: None,
         };
         assert!(require_credentials(bad).is_err());
     }
@@ -1892,5 +2366,106 @@ mod security_tests {
 
         let acceptor = build_in_memory_ssl_acceptor(&cert_pem, &pkey);
         assert!(acceptor.is_ok());
+    }
+
+    // =====================================================================
+    // v168 (independent security audit): CROSS-IMPLEMENTATION PARITY
+    // VECTORS. Every hardware-bound formula lives in THREE places — the
+    // enclave (here), verify.html (JS mirror) and scripts/test-verify-security.mjs
+    // (independent reference). These golden vectors (shared with the JS
+    // harness and scripts/calculate-golden-rtmr.mjs --selftest) pin all
+    // three to identical bytes; drift in any one fails the suite.
+    // =====================================================================
+
+    #[test]
+    fn preflight_binding_parity_v168() {
+        // SHA-256(P_enc ∥ code_challenge ∥ P_client ∥ Nonce ∥ custom_info ∥ PayPal_Client_ID)
+        let rd = compute_preflight_binding(
+            b"test-enc-pub-der",
+            "E9xrX1s2qO0hAaBcDeFgHiJkLmNoPqRsTuVwXyZ012345",
+            b"test-client-pub-der",
+            &[0x7f; 32],
+            "wallet_test_1",
+            "AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p",
+        );
+        assert_eq!(
+            hex::encode(&rd[..32]),
+            "3b85617fdb4c68eeb86748dcb02572b610b4800ac6479d8760fd4e0cbde5249c",
+            "preflight REPORTDATA binding drifted — update Rust + verify.html + harness together"
+        );
+        assert_eq!(&rd[32..], &[0u8; 32][..], "report_data[32..64] must stay zero");
+    }
+
+    #[test]
+    fn sec02_nonce_parity_v168() {
+        use sha2::{Digest, Sha256};
+        let paypal_hash = hex::encode(Sha256::digest(br#"{"sub":"user"}"#));
+        let mut manifest = std::collections::BTreeMap::new();
+        manifest.insert("EFI/BOOT/vmlinuz".to_string(), "cc".repeat(32));
+        manifest.insert("EFI/BOOT/initrd.img".to_string(), "dd".repeat(32));
+        let nonce = sec02_nonce(&paypal_hash, b"fake-der-bytes", "walletA", &"ab".repeat(32), &manifest);
+        assert_eq!(
+            hex::encode(nonce),
+            "398c2c1b18583ac9c3935ffdea04f0b2a3dfdd927140072bd50511e9f77db8f7",
+            "SEC-02 session-nonce formula drifted — update Rust + verify.html + harness together"
+        );
+    }
+
+    #[test]
+    fn cmdline_pin_matches_build_script() {
+        let script = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/build-alibaba-image.sh"))
+            .expect("build-alibaba-image.sh must be readable");
+        let needle = format!("linux /EFI/BOOT/vmlinuz {}", enclave_init::EXPECTED_CMDLINE);
+        assert!(
+            script.contains(&needle),
+            "build-alibaba-image.sh grub.cfg cmdline drifted from enclave_init::EXPECTED_CMDLINE — update BOTH in the same reviewed commit"
+        );
+    }
+
+    #[test]
+    fn ccel_replay_selftest_v168() {
+        // Synthetic TCG crypto-agile log (LEGACY-FORMAT Spec ID Event03
+        // header + multi-digest event + EV_NO_ACTION + one extension per
+        // MrIndex 0..3: MrIndex 0 = MRTD (never replayed), 1..3 extend
+        // RTMR0..2 — the real TCG/UEFI CC-log convention, live-verified
+        // against Alibaba's CCEL + the Intel-signed quote (2026-10-23).
+        // Same vector as scripts/calculate-golden-rtmr.mjs --selftest —
+        // Rust and JS must replay to identical bytes. The header is in the
+        // TCG_PCR_EVENT fixed layout the spec mandates for the first event.
+        let log = hex::decode(concat!(
+            "0000000003000000000000000000000000000000000000000000000025000000",
+            "53706563204944204576656e743033000000000000000000020000000b002000",
+            "0c003000000000000005000000020000000b0033d30b8c9c1d527af7444096d2",
+            "b224043288d17f4cf5dbe0ee08e5bf298cd6240c0091ade0d63b78f8cb3163a5",
+            "f7d379803d28736d8750a81a426e5de3e00881102f3272b2f9043d30a096b6f3",
+            "c5329921010c0000006576656e742d412d646174610100000003000000010000",
+            "000c009600d212482f5fed7c434809b63b80169bea1512b2a1489c5cc4285fdd",
+            "778df105b240fbb073c16dda5f85a5b16f29910700000069676e6f7265640100",
+            "000004000000010000000c0079109388ed26aa95abbba22ba7e6ec7e7b1bb6a9",
+            "5d1c0fe5fee15bfb79d308193b795f188399d1686d5d7b50c34965a80c000000",
+            "6576656e742d422d646174610200000006000000010000000c00ff337190a80a",
+            "44f709bbb0bb74ddd96c78bdc55cc05db46d2ab151cc1e413737fcf0cf4b27ea",
+            "d87aae6b767f0ec49cdc0c0000006576656e742d432d64617461030000000400",
+            "0080010000000c00eca41f8a750a060cc532afd0a6f016c9f61e5da3f116d21f",
+            "39b5e7493e8fe6ac108b59d8e68c06a401a32bf0a0daa2070c0000006576656e",
+            "742d442d64617461",
+        ))
+        .unwrap();
+        let r = intel_tdx::replay_ccel(&log).expect("selftest log must parse and replay");
+        assert_eq!(hex::encode(r[0]), "eebd6b944d3c5aa23713edd5d40ca48affc1293b88889884c27fb683cb5531564d65db8c442738fda0f2bf122deea144");
+        assert_eq!(hex::encode(r[1]), "4a7aaec7d4d007acc2857e15a6515dcfbf5cbc659932b1cd08ea00fd5835f788ea553202f642bc405f44c7d86211cf5c");
+        assert_eq!(hex::encode(r[2]), "5ff9199110228b30594d6d62215ba34d933f7de43ae402f5ab1d531a09b511bd2e82107879730afd7292caefe83584ae");
+        // MrIndex 0 = MRTD: never replayed into any RTMR, so RTMR3 stays at
+        // its reset value (ZERO — TDX Module Base Arch spec).
+        assert_eq!(hex::encode(r[3]), "0".repeat(96));
+
+        // Trailing padding tolerance (live Alibaba CCEL: 1626 real bytes in a
+        // 65536-byte data/CCEL area, 0xFF-then-0x00 padded). The replay of the
+        // padded buffer must equal the clean-log replay.
+        let mut padded = log.clone();
+        padded.extend(std::iter::repeat(0xFFu8).take(512));
+        padded.extend(std::iter::repeat(0x00u8).take(512));
+        let r2 = intel_tdx::replay_ccel(&padded).expect("padded log must parse and replay");
+        assert_eq!(r, r2, "trailing 0xFF/0x00 padding must not change the replay");
     }
 }
