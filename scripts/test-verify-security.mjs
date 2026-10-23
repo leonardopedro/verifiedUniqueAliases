@@ -1634,6 +1634,132 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
   }
 }
 
+console.log('\nTest 33: v181 pasted-ENCRYPTED-blob audit — decrypt with this copy\'s session key, fail closed elsewhere');
+{
+  // User report (2026-10-23): pasting the success page\'s "Copy encrypted
+  // report" blob into the auditor answered "Audit Failed: Invalid report."
+  // — runAudit only understood decrypted envelopes. v181 makes the
+  // documented recovery flow work: a TRUSTED copy that still holds the
+  // throwaway S_client key decrypts the pasted blob and audits the envelope
+  // (all localDecryptAndVerify checks intact); every other situation fails
+  // closed with actionable guidance, never a bare parse error.
+  globalThis.localStorage = (() => { const m = new Map(); return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) }; })();
+  globalThis.sessionStorage = (() => { const m = new Map(); return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) }; })();
+  const setLoc = (loc) => { if (loc === null) delete globalThis.location; else globalThis.location = loc; };
+  setLoc({ protocol: 'file:', host: '', origin: 'null' });
+
+  // Real login-session material: client ECDH key + nonce + v179 binding
+  // slot, exactly like the flow that produced the user's pasted blob.
+  const client = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+  const jwkStr = JSON.stringify(await crypto.subtle.exportKey('jwk', client.privateKey));
+  const clientNonceBytes = crypto.getRandomValues(new Uint8Array(32));
+  const clientNonceHex = [...clientNonceBytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+  const clientPubDer = new Uint8Array(await crypto.subtle.exportKey('spki', client.publicKey));
+  const bindingHex = await clientSessionBindingHex(clientPubDer, clientNonceHex);
+
+  const built = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4,
+        // report_data = quote nonce ‖ client-session binding (v179 slot), so
+        // the keyed paste path enforces the binding exactly like localClaim.
+        reportData: concat(fromHex(nonce), fromHex(bindingHex)),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+    // A genuine login report (paypal_user_info present) — the shape the
+    // enclave mints post-PayPal and the shape the user actually pasted.
+    reportExtras: {
+      paypal_user_info: { user_id: 'U1', sub: 'paste-sub', verified_account: 'true', payer_id: null },
+      paypal_client_id: 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p',
+    },
+  });
+
+  // Seal the envelope to the client key exactly like the enclave does
+  // (Test 23's construction): HKDF-SHA256(shared, salt=nonce) → AES-256-GCM,
+  // AAD = nonce.
+  const enclaveKp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+  const shared = await crypto.subtle.deriveBits({ name: 'ECDH', public: enclaveKp.publicKey }, client.privateKey, 256);
+  const kdfBase = await crypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveKey']);
+  const e2eKey = await crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: clientNonceBytes, info: new TextEncoder().encode('paypal-auth-vm/e2ee/v1') },
+    kdfBase, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: clientNonceBytes }, e2eKey, new TextEncoder().encode(JSON.stringify(built.envelope))));
+  const b64 = (u8) => Buffer.from(u8).toString('base64');
+  const blobBase = {
+    alg: 'AES-256-GCM+HKDF-SHA256+ECDH-P256',
+    aad: 'client_nonce',
+    iv_b64: b64(iv),
+    ct_b64: b64(ct),
+    enclave_ecdh_public_key_b64: b64(new Uint8Array(await crypto.subtle.exportKey('spki', enclaveKp.publicKey))),
+    enclave_signing_public_key: built.encPem,
+    state: 'paste-test-state',
+    flow: 'verified',
+  };
+  const clone = (o) => JSON.parse(JSON.stringify(o));
+  const sessionFor = (over = {}) => JSON.stringify({
+    host: 'https://login.airma.de', jwk: jwkStr, nonceHex: clientNonceHex,
+    customInfo: 'NONE', p_enc: built.encPem, state: 'paste-test-state',
+    flow: 'verified', clientPubB64: '', sessionBindingHex: bindingHex, ...over,
+  });
+  const auditBlob = async (blob) => {
+    lastAlert = null;
+    elements['attestationInput'].value = JSON.stringify(blob);
+    elements['certInput'].value = '';
+    const ok = await runAudit();
+    return { ok, alert: lastAlert };
+  };
+
+  try {
+    // (a) keyed trusted copy — the documented recovery flow — decrypts and
+    // audits the envelope fully green.
+    globalThis.localStorage.setItem('pav_local_session', sessionFor());
+    let r = await auditBlob(clone(blobBase));
+    check('keyed trusted copy decrypts the pasted blob and audits green', r.ok === true, String(r.alert).slice(0, 200));
+    const persisted = JSON.parse(elements['attestationInput'].value || 'null');
+    check('textarea now holds the decrypted envelope (re-audit + 💾 download work)',
+      persisted && !!persisted.attestation_report, elements['attestationInput'].value.slice(0, 60));
+    check('decrypted envelope persisted for the download button',
+      /"attestation_report"/.test(globalThis.sessionStorage.getItem('pav_e2ee_report') || ''), 'missing pav_e2ee_report');
+
+    // (b) no key in this copy → actionable guidance, never the old parse error.
+    globalThis.localStorage.removeItem('pav_local_session');
+    r = await auditBlob(clone(blobBase));
+    check('no key: fails closed with ENCRYPTED BLOB guidance',
+      r.ok === false && /ENCRYPTED BLOB/.test(r.alert) && /Claim Encrypted Report/.test(r.alert), String(r.alert).slice(0, 220));
+    check('no key: the old cryptic error is gone', !/Invalid report\./.test(r.alert), String(r.alert).slice(0, 120));
+
+    // (c) enclave-served copy → decryption refused outright even WITH a key
+    // (Web Auditor Tampering defense — decryption never runs there).
+    globalThis.localStorage.setItem('pav_local_session', sessionFor());
+    setLoc({ protocol: 'https:', host: 'login.airma.de', origin: 'https://login.airma.de' });
+    r = await auditBlob(clone(blobBase));
+    check('enclave-origin copy refuses the pasted blob outright',
+      r.ok === false && /UNTRUSTED AUDITOR ORIGIN/.test(r.alert), String(r.alert).slice(0, 200));
+    setLoc({ protocol: 'file:', host: '', origin: 'null' });
+
+    // (d) blob sealed to a DIFFERENT login session's key → fail closed with
+    // the decrypt-failure guidance (GCM auth / wrong shared secret).
+    const other = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+    const wrongJwk = JSON.stringify(await crypto.subtle.exportKey('jwk', other.privateKey));
+    globalThis.localStorage.setItem('pav_local_session', sessionFor({ jwk: wrongJwk }));
+    r = await auditBlob(clone(blobBase));
+    check('wrong-session key: fail closed with decrypt-failure guidance',
+      r.ok === false && /Could not decrypt the pasted blob/.test(r.alert), String(r.alert).slice(0, 220));
+  } finally {
+    setLoc(null);
+    delete globalThis.localStorage;
+    delete globalThis.sessionStorage;
+    globalThis.preFlightPubKeyPem = null;
+    globalThis.auditorSessionBindingHex = null;
+    elements['attestationInput'].value = '';
+  }
+}
+
 // ===========================================================================
 rmSync(dir, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${fail} failed`);

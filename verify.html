@@ -1545,12 +1545,71 @@
         return Array.from(new Uint8Array(finalHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
+    // ========================================================================
+    // v181 (user report 2026-10-23): PASTED-ENCRYPTED-BLOB path. The success
+    // page's "Copy encrypted report" hands out ciphertext sealed to a
+    // throwaway ECDH key (S_client) that only ever existed in the browser
+    // where the login started — and the documented recovery flow says to
+    // paste that blob into a TRUSTED auditor and audit there. Before v181
+    // runAudit() only understood decrypted reports and answered the pasted
+    // ciphertext with a cryptic "Invalid report.". Now it detects the sealed
+    // blob shape and decrypts it HERE with the same session key material as
+    // localClaim(); all of localDecryptAndVerify's fail-closed checks (P_enc
+    // key-continuity, S_enc report signature, AES-GCM auth, session-binding
+    // restore) apply unchanged. No key in this copy → fail closed with
+    // instructions; on the enclave-served copy → refuse outright
+    // (Web Auditor Tampering defense — decryption never runs there).
+    // ========================================================================
+    async function decryptPastedBlob(blob) {
+        if (!trustedAuditorContext()) throw untrustedOriginError();
+        let sess = null;
+        try { sess = JSON.parse(localStorage.getItem('pav_local_session') || 'null'); } catch (e) { /* ignore */ }
+        let jwk = (sess && sess.jwk) || null;
+        let nonceHex = (sess && sess.nonceHex) || null;
+        let pinned = (sess && sess.p_enc) || null;
+        if (!jwk || !nonceHex) {
+            // v164 same-origin callback handoff keys, as a fallback source.
+            try {
+                jwk = jwk || sessionStorage.getItem('pav_client_jwk');
+                nonceHex = nonceHex || sessionStorage.getItem('pav_client_nonce');
+                pinned = pinned || sessionStorage.getItem('pav_p_enc');
+            } catch (e) { /* ignore */ }
+        }
+        if (!jwk || !nonceHex) {
+            throw new Error('ENCRYPTED BLOB pasted (ciphertext, not a decrypted report): this browser copy holds NO decryption key for it — the throwaway key only ever existed in the copy where the PayPal login started. Go back to that tab and press “🔓 2. Claim Encrypted Report”, or audit the plain attestation-report-*.json you downloaded after the login (that file audits in ANY copy of the auditor, no keys needed).');
+        }
+        try { const sb = sessionStorage.getItem('pav_session_binding_hex'); if (sb) auditorSessionBindingHex = sb; } catch (e) { /* ignore */ }
+        if (sess && sess.sessionBindingHex) auditorSessionBindingHex = sess.sessionBindingHex;
+        if (pinned) preFlightPubKeyPem = pinned;
+        if (blob.flow) { try { sessionStorage.setItem('pav_e2ee_flow', String(blob.flow)); } catch (e) { /* ignore */ } }
+        try {
+            return await localDecryptAndVerify(blob, jwk, nonceHex, pinned);
+        } catch (e) {
+            // Wrong session's blob, tampered ciphertext or a swapped enclave
+            // key — every one is a fail-closed outcome; make the paste-audit
+            // UX say what to do next instead of surfacing a raw crypto error.
+            throw new Error('Could not decrypt the pasted blob with THIS copy\'s session key (' + e.message + '). Either it was sealed to a DIFFERENT login session or it was tampered with — in both cases, fail closed: claim it from the tab where that login started, or audit that session\'s downloaded attestation-report-*.json instead.');
+        }
+    }
+
     async function runAudit() {
         try {
             const inputVal = document.getElementById('attestationInput').value;
             if (!inputVal) throw new Error("Please provide an attestation report.");
             
-            const rawData = JSON.parse(inputVal);
+            let rawData = JSON.parse(inputVal);
+            // v181: pasted ENCRYPTED blob → decrypt in this trusted copy
+            // (key material + fail-closed checks in decryptPastedBlob above),
+            // then audit the plaintext envelope like any other report.
+            if (rawData && !rawData.attestation_report && !rawData.report
+                && rawData.ct_b64 && rawData.iv_b64 && rawData.enclave_ecdh_public_key_b64) {
+                rawData = await decryptPastedBlob(rawData);
+                // Persist the plaintext (same convention as localClaim) so
+                // the 💾 download button and a re-audit use the envelope.
+                const pretty = JSON.stringify(rawData, null, 2);
+                document.getElementById('attestationInput').value = pretty;
+                try { sessionStorage.setItem('pav_e2ee_report', pretty); } catch (e) { /* ignore */ }
+            }
             const report = rawData.attestation_report || rawData.report || rawData;
             
             if (!report.hardware_level_attestation) throw new Error("Invalid report.");

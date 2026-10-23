@@ -8,6 +8,124 @@ the real credentials live.
 
 ---
 
+## 0. LATEST — v180 cutover + v181 blob-paste cycle (2026-10-24 05:45 UTC)
+
+> §2 below is the **2026-10-20** state (its instance/image ids are STALE —
+> AGENTS.md trap "re-list first"). This §0 is current truth. Everything here
+> was verified live this session.
+
+### 0.1 Production (cn-beijing) — current inventory
+
+| Resource | ID / value | Notes |
+|---|---|---|
+| **Prod instance** | `i-2ze4tvkuf12u933nsw8a` (paypal-auth-vm-v180) | `ecs.c9i.large` spot TDX (cheapest shape, $0.012/h), holds the reserved EIP `eip-2zet05jbat6wr6rp7elrc` = 101.200.178.251; system disk **`d-2ze07r378z8o5mjiuxkc`** = 1 GiB `cloud_auto` (size verified after the v181 swap) |
+| **Deployed image** | `m-2zegh5k0gouo3xa81mtk` (paypal-tdx-esp-**v181**) | imported from `disk181.raw`; `Features.NvmeSupport=supported` set via flat-wire RPC |
+| **Rollback image** | `m-2zed3wq8aubdcddv64az` (paypal-tdx-esp-202610232004) | the v180 image — only these two images remain (9 old ones deleted this session) |
+| **Relay — THE working one** | `i-2zed9gkche63zxrzyf9s` (paypal-tdx-relay179e) | **stock Debian 12.15**, 20 GiB `cloud_auto`; stopped in economy mode; re-arm recipe §0.6 |
+| **Relay — custom image, cloud-init BROKEN** | `i-2ze19752fjlhw6rf4mpl` (oss-relay-tmp2) | OthersLinux_64 custom image (40 GiB): `user_data` does **NOT** fire even after `ReplaceSystemDisk` with its own image — do not use for transfers (see §0.6) |
+| **Deleted this session (cost cleanup, user request)** | `i-2ze686o40uawcau9vt9v` (old prod xlarge "paypal-auth-vm-1g" — Alibaba released it via the preemptible inventory email), `i-2ze7b9txw6v7c7gtrqwt` (legacy "paypal-auth-vm-2" xlarge), + **9 old images** | prod TLS was unaffected throughout |
+
+### 0.2 v181 change — the blob-paste audit fix (user-reported bug)
+
+- **Bug**: pasting the success page's "Copy encrypted report" ciphertext into
+  the auditor's report box answered `Audit Failed: Invalid report.` —
+  `runAudit()` only understood decrypted envelopes, although the documented
+  recovery flow tells users to paste the blob into a trusted auditor.
+- **Fix (verify.html v181)**: `runAudit()` detects the sealed-blob shape
+  (`ct_b64` + `iv_b64` + `enclave_ecdh_public_key_b64`, no
+  `attestation_report`) and calls new **`decryptPastedBlob()`**: refuses
+  untrusted origins first (Web Auditor Tampering), restores the session key /
+  P_enc pin / client-session binding from `pav_local_session` (fallback
+  `pav_client_jwk`), decrypts via the existing fail-closed
+  `localDecryptAndVerify` (key-continuity + S_enc signature + GCM auth), and
+  persists the plaintext so the 💾 download works. No key in this copy →
+  actionable guidance ("claim from the tab where the login started, or audit
+  the downloaded attestation-report-*.json"); wrong session / tampered →
+  wrapped fail-closed error. Never the cryptic parse error again.
+- **Tests**: harness **Test 33** (8 checks: keyed trusted copy → green audit
+  + decrypted textarea + persisted download; no key → ENCRYPTED BLOB
+  guidance AND absence of the old `Invalid report.`; enclave-origin →
+  UNTRUSTED refusal; wrong-session key → `Could not decrypt the pasted blob…`).
+  Offline: **174 passed / 0 failed**; with `REAL_REPORT=/tmp/env181.json`:
+  **182 / 0**.
+- **README digest rotated in the same change**: `verify.html` =
+  `b30d6830bafc738c8f0170195a0f8f7d1c330efd58f49ab6e4242310bc34c356`
+  (157,602 bytes).
+
+### 0.3 Build + deploy lineage (v181)
+
+| Artifact | SHA-256 | Note |
+|---|---|---|
+| `output-alibaba/disk-alibaba.raw` | `69c19ec81668b6672e41310c46b9537a22302c7e5037478e2272893552c5b60f` | rebuilt from the same commit — only the ESP's `verify.html` differs from v180 |
+| `initramfs-alibaba.img` | `5b27ec2f5596a0be00038ea89f1733db9026dd717fc854ec342d5056cb517d0b` | **UNCHANGED** — verify.html is deliberately not in the measured chain, so the fix rotated no pins |
+| binary `paypal-auth-vm` | `23053c650c4bfb88652ebe66cb79a216d66376051666662b5167400bf17a4633` | unchanged; pre-swap `/tmp/env180.json` and post-swap `/tmp/env181.json` carry the identical value |
+| `verify.html` | `b30d6830…c34c356` | == README == served file == live ESP manifest entry |
+
+**Cutover timeline (2026-10-23/24 UTC)**: build (podman, exit 0) → presigned
+PUT → HK bucket `disk181.raw` (ETag `ED9114BDD85A48984430549B036EA599` ==
+local MD5) → Debian relay cloud-init pulled + **Beijing intranet PUT 200** +
+readback md5 match (`RELAY181-SUCCESS` in the serial console) →
+`ImportImage` (flat `DiskDeviceMapping.1.Format=raw`) → NVMe flag →
+prod `StopInstance ForceStop` → `ReplaceSystemDisk --SystemDisk.Size 1`
+(verified 1 GiB `cloud_auto`) → `StartInstance` → **TLS 200/ssl=0 in ~2.5 min**.
+
+### 0.4 Verification gate — all green
+
+1. Served `https://login.airma.de/verify.html` sha256 == README digest
+   (`b30d6830…`) and the live envelope's manifest entry carries the same hash.
+2. `node scripts/check-manifest-parity.mjs https://login.airma.de/debug/envelope
+   output-alibaba/disk-alibaba.raw` → **PARITY OK** (6 same, 0 mismatched,
+   NvVars excluded by design).
+3. `REAL_REPORT=/tmp/env181.json node scripts/test-verify-security.mjs` →
+   **182/0** (fresh quote from the NEW deployment through the default Intel
+   anchor — MRTD/RTMR/pins all green).
+4. **Offline paste-audit** (user request): real Chromium, `file://` copy of
+   verify.html, saved `/tmp/claimed-report.json` pasted, button clicked →
+   PASS — enclave/tpm/firmware/github rows green, identity = the designed
+   SANDBOX warning (the report is a sandbox mint; v177 two-verdict).
+5. **Live blob-paste e2e** (the reported bug, end to end): fresh PayPal
+   sandbox login → real vault blob fetched (8 keys incl. `ct_b64`/`state`) →
+   pasted into the report box → audit button → **decrypted + full green, no
+   `Invalid report.`** (`/tmp/e2e-blob-paste.mjs`).
+
+### 0.5 Known-informational (do NOT treat as regressions)
+
+- `EXPECTED_ENCLAVE_SHA256 = 'ba1a3bfe…'` in verify.html vs live binary
+  `23053c65…`: the self-reported digest mismatch only renders an amber
+  INFORMATIONAL note (v168 design — code identity is decided exclusively by
+  the MRTD/RTMR silicon pins). Both digests resolve green in the GitHub
+  attestations API; `23053c65` is the NEWER CI run. Rotate the constant in a
+  reviewed commit when convenient — remember the README digest must rotate in
+  the same commit (harness Test 28 gates it).
+- Sandbox-minted reports show `identityCheck = warning` by design (v177).
+
+### 0.6 Relay transfer runbook — what actually works (all hit live)
+
+1. **Re-arm order matters**: `StopInstance ForceStop` → `ReplaceSystemDisk`
+   → **then** `ModifyInstanceAttribute UserData` → `StartInstance`.
+   A user_data push made BEFORE the swap is discarded with the old disk
+   (observed: `DescribeUserData` afterwards = 0 bytes).
+2. **`DescribeUserData` can read 0 right after a successful push** — a
+   negative read is NOT proof the push failed; the boot is the test.
+3. **Only the stock-Debian relay runs user_data.** The custom-image relay
+   (`oss-relay-tmp2`, OthersLinux_64) swallowed every attempt even with the
+   correct order + its own image. Use `paypal-tdx-relay179e` (stock Debian
+   12.15): its cloud-init ran the transfer script on the first try.
+4. **Marker trap (re-hit, fix is documented in AGENTS.md)**: a marker written
+   with `curl --data` sends **POST** on a PUT-signed presigned URL → 405 →
+   the marker silently lands 0-byte/absent. Markers MUST be
+   `curl -X PUT -H 'Content-Type:' --data …`. This is why every
+   `relay181-s*.txt` was empty while the transfer actually succeeded.
+5. **Ground truth when markers lie**: poll `GetInstanceConsoleOutput` WHILE
+   the instance is Running — the v181 capture shows `PUT http=200`,
+   `ETag: "ED9114BD…"`, `back md5=ed9114bd…` (== local),
+   `RELAY181-SUCCESS`. Also `aliyun oss ls oss://paypal-tdx-relay-…/` works
+   from the operator host (control-plane-ish) and shows object sizes/ETags.
+6. Generate the transfer script fresh near the run (`node /tmp/run-relay181.mjs`)
+   — the baked presigned URLs carry a 3 h expiry and the current STS token.
+
+---
+
 ## 1. Mission & threat model
 
 Run an independent end-to-end security audit of the project, of the **live
@@ -65,7 +183,7 @@ REAL_REPORT=/tmp/report-verified.json node scripts/test-verify-security.mjs   # 
 node scripts/e2e-sandbox.mjs                                # drives both OAuth flows headlessly
 ```
 
-### 2.2 Production (Alibaba, cn-beijing)
+### 2.2 Production (Alibaba, cn-beijing) — ⚠️ STALE (2026-10-20), ids superseded by §0
 
 | Resource | ID / value | Notes |
 |---|---|---|
