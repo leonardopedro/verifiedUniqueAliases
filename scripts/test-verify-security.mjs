@@ -309,8 +309,16 @@ const BINARY_SHA = EXPECTED_ENCLAVE_SHA256;
 // `paypal_user_info` and fails closed unless the declared hash matches. Fixtures
 // therefore derive the hash exactly like the enclave does; pre-login envelopes
 // must carry the documented placeholder.
-const PRELOGIN_HASH = sha256(Buffer.from('PRELOGIN_NO_USER', 'utf8')).toString('hex');
-const identityHashOf = (userInfo) => sha256(Buffer.from(JSON.stringify(userInfo), 'utf8')).toString('hex');
+const PRELOGIN_HASH = sha256(Buffer.from('PRELOGIN_NO_USER', 'utf8')).toString('hex');  // Mirror of verify.html's canonical struct-layout serialization (the enclave:
+  // serde_json::to_string of PayPalUserInfo — user_id, sub, verified_account,
+  // payer_id, nulls kept). The live report's paypal_user_info text arrives
+  // ALPHABETICALLY reordered (serde_json::json! uses a sorted map), so hashing
+  // the fixture's own key order would hide the live byte-drift bug that made
+  // every honest login fail the preimage gate (v178 live debug).
+  const identityHashOf = (userInfo) => sha256(Buffer.from(JSON.stringify({
+    user_id: userInfo.user_id, sub: userInfo.sub ?? null,
+    verified_account: userInfo.verified_account, payer_id: userInfo.payer_id ?? null,
+  }), 'utf8')).toString('hex');
 
 async function buildEnvelope({ hw, customInfo = 'wallet_test_1', corruptEnclaveSig = false, hwBuilder, binarySha = BINARY_SHA, sessionContext = {}, reportExtras = null }) {
   const enc = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -1101,6 +1109,19 @@ console.log('\nTest 26: identity preimage binding — the quote must attest the 
   });
   const g = await runAuditWith(good.envelope);
   check('honest login report passes the preimage gate', g.ok === true, `alert=${g.alert}`);
+
+  // (a2) REGRESSION (v178 live debug): the live enclave embeds
+  // paypal_user_info via serde_json::json! — ALPHABETICAL key order in the
+  // report text — while the hardware hash covers the struct layout. A carried
+  // object whose key order differs must still pass the preimage gate.
+  const shownAlpha = { payer_id: null, sub: 'shown-sub', user_id: 'U1', verified_account: 'true' };
+  const ga = await buildEnvelope({
+    hwBuilder: green,
+    reportExtras: { paypal_user_info: shownAlpha, paypal_client_id: AUDITED_APP },
+  });
+  const g2 = await runAuditWith(ga.envelope);
+  check('alphabetically-keyed paypal_user_info still matches the struct-order hash',
+    g2.ok === true, `alert=${g2.alert}`);
 
   // (b) THE ATTACK: quote binds hash H, envelope displays a different record
   const other = { user_id: 'EVIL-PAYER', sub: 'other-sub', verified_account: 'true', payer_id: null };

@@ -154,13 +154,17 @@ jobs:
       # v165 audit: verify.html's provenance row now gates the ENTIRE boot
       # chain — shim/BOOTX64.EFI and grubx64.efi actually execute the kernel,
       # so a loader swapped onto the disk by the cloud provider must surface
-      # as "not attested by CI" instead of passing unchecked.
+      # as "not attested by CI" instead of passing unchecked. v178: vmlinuz is
+      # included here because verify.html's Image Atomicity gate looks up the
+      # kernel hash too — every manifest component it queries must resolve to
+      # ONE common CI run (the GCP leg still attests the kernel separately).
       - name: Attest ESP Boot Chain
         if: matrix.platform == 'alibabacloud'
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ESP Boot Chain (${{ matrix.label }})
           subject-path: |
+            vmlinuz-${{ matrix.platform }}
             shimx64-${{ matrix.platform }}.efi
             grubx64-${{ matrix.platform }}.efi
             grub-${{ matrix.platform }}.cfg

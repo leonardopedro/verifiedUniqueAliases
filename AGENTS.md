@@ -591,6 +591,27 @@ To ensure 100% bitwise reproducibility regardless of host environment, the proje
 4. **Verification Stage**: Compares local synthesis hashes against the GitHub provenance ledger
 5. **Aliyun CLI Packaging Stage**: Downloads official release tarball, verifies sha256, builds .deb
 
+### ⚠️ Only the Docker pipeline build is the ATTESTED build (2026-10-23)
+
+A plain **host build** (`cargo build --release --features alibabacloud`, e.g.
+under Nix) is **not** bit-identical to the Docker/CI pipeline build — different
+rustc/sysroot, different binary digest. Observed live for identical source:
+host build `9ef6b729…` vs Docker/CI build `ba1a3bfe…`.
+
+Consequences (each one bit us):
+
+- GitHub attestations only ever cover **pipeline** digests, so a host-built
+  binary can never resolve in `verify.html`'s provenance row —
+  `githubCheck` stays red against the real API no matter how correct the code
+  is. Deploy only Docker-built disks.
+- `EXPECTED_ENCLAVE_SHA256` in `verify.html` tracks the **Docker/CI** binary
+  digest, never a host-build digest.
+- `bash build-alibaba-docker.sh` (rootless podman works) reproduces CI
+  bit-for-bit from the same commit — that is the only supported way to obtain
+  locally the exact bytes CI attests. `verify.html` is deliberately NOT
+  embedded in the binary or the initramfs (no `include_str!`), so auditor/pin
+  edits never perturb the measured boot chain or the attested binary digest.
+
 ### Dual-Build Matrix
 
 | Feature Flag | Target Platform | Attestation Root | Network Driver |

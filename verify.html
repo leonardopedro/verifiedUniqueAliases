@@ -666,8 +666,12 @@
     // staleness/consistency signal (surfaced as a loud warning in the
     // provenance row) and as the CI-harness fixture anchor. Rotate ONLY
     // together with the enclave source change, in the same reviewed commit.
+    // v178: this constant tracks the DOCKER/CI-PIPELINE digest — host builds
+    // (plain cargo, e.g. Nix) are NOT bit-identical to the pipeline and are
+    // never attested; see AGENTS.md "attested build" note. The value below is
+    // the digest GitHub attestations resolve for this source tree.
     // ========================================================================
-    var EXPECTED_ENCLAVE_SHA256 = '9ef6b729cf1ddbad98992234ac57e57a4a4a4b84a477c047fafe18f715d137ef';
+    var EXPECTED_ENCLAVE_SHA256 = 'ba1a3bfe71c4726a36fe53475e130864f0c57a5aa57e6af86cc65a167e1e8a8b';
 
     // ========================================================================
     // v162 (audit VULN-04): GOLDEN PCR PINS — CI-captured constants for the
@@ -871,7 +875,9 @@
             const sub = (envelope.attestation_report.paypal_user_info || {}).sub || '(unknown)';
             if (!(await runAudit())) throw new Error('Full audit FAILED on the delivered report');
             localStorage.removeItem('pav_local_session');
-            say(`✅ Decrypted + signature-verified + P_enc-pinned + full audit run. PayPal identity: ${sub}`);
+            const saved = downloadReportFile();
+            say(`✅ Decrypted + signature-verified + P_enc-pinned + full audit run. PayPal identity: ${sub}.` +
+                (saved ? ' The attestation report was saved as a JSON file — it audits offline in ANY copy of the auditor.' : ' Use the 💾 Download button below to save the JSON.'));
         } catch (e) {
             say('❌ ' + e.message);
         }
@@ -909,12 +915,12 @@
                 const jwk = sessionStorage.getItem('pav_client_jwk');
                 const nonceHex = sessionStorage.getItem('pav_client_nonce');
                 if (!jwk || !nonceHex) {
-                    say('❌ This tab has no session keys — the encrypted report can only be opened in the tab that created the key. Start the login again from this page.');
+                    say('ℹ️ This is the webservice\u2019s copy of the auditor. The decryption key exists only in the trusted copy where you started the login (your saved file:// page or the GitHub Pages copy) — go back to that tab and press \u201c2. Claim Encrypted Report\u201d: the report decrypts, audits and downloads THERE. The key never reaches this page by design.');
                 } else {
                     const pinned = sessionStorage.getItem('pav_p_enc');
                     // Fail closed: never decrypt a login report without the
                     // pre-flight-pinned P_enc to check it against.
-                    if (!pinned) throw new Error('No pre-flight pin in this tab — refusing to decrypt an unpinned report. Start the login again from this page.');
+                    if (!pinned) throw new Error('No pre-flight pin in this tab — refusing to decrypt an unpinned report. Start the login again from your trusted copy (file:// or GitHub Pages) and claim the report there.');
                     say('⏳ Decrypting your attestation report…');
                     const env = await localDecryptAndVerify(JSON.parse(raw), jwk, nonceHex, pinned);
                     try { const b = JSON.parse(raw); if (b && b.flow) sessionStorage.setItem('pav_e2ee_flow', String(b.flow)); } catch (e) { /* keep default tag */ }
@@ -1537,17 +1543,28 @@
             // hardware then attests nothing about the data on screen (a
             // config-driven or backdoored build can do this without touching
             // any measured byte). Recompute the preimage here, fail closed:
-            //   * login report  → SHA-256(JSON.stringify(paypal_user_info)),
-            //     byte-identical to the enclave's serde_json::to_string of the
-            //     minimized struct (order: user_id, sub, verified_account,
-            //     payer_id; nulls kept) — pinned by
-            //     security_tests::paypal_identity_json_layout_pinned.
+            //   * login report  → SHA-256 of the CANONICAL struct-layout
+            //     serialization rebuilt below (order: user_id, sub,
+            //     verified_account, payer_id; nulls kept) — byte-identical to
+            //     the enclave's serde_json::to_string of the minimized struct,
+            //     pinned by security_tests::paypal_identity_json_layout_pinned.
             //   * pre-login (/debug/envelope, /attest/preflight) → there is no
             //     user yet, so the documented placeholder hash is REQUIRED.
             const toHexLc = (u8) => Array.from(u8).map(b => b.toString(16).padStart(2, '0')).join('');
             const declaredPaypalHash = String(report.paypal_user_info_raw_hash || '').trim().toLowerCase();
-            const identityJson = (report.paypal_user_info && typeof report.paypal_user_info === 'object')
-                ? JSON.stringify(report.paypal_user_info)
+            // v178 fix (live-debug finding): the report embeds paypal_user_info
+            // through serde_json::json! (a sorted map), so its JSON text arrives
+            // with ALPHABETICAL key order — JSON.stringify of the parsed object
+            // reproduces that order, NOT the struct serialization the enclave
+            // hashed (serde_json::to_string of PayPalUserInfo: user_id, sub,
+            // verified_account, payer_id). That byte drift made EVERY honest
+            // login trip IDENTITY PREIMAGE VIOLATION. Rebuild the canonical
+            // struct layout explicitly so the recomputation is independent of
+            // the report's key order (and of an attacker-supplied one).
+            const pui = (report.paypal_user_info && typeof report.paypal_user_info === 'object')
+                ? report.paypal_user_info : null;
+            const identityJson = pui
+                ? JSON.stringify({ user_id: pui.user_id, sub: pui.sub ?? null, verified_account: pui.verified_account, payer_id: pui.payer_id ?? null })
                 : 'PRELOGIN_NO_USER';
             const recomputedPaypalHash = toHexLc(new Uint8Array(await crypto.subtle.digest(
                 'SHA-256', new TextEncoder().encode(identityJson))));
