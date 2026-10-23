@@ -1556,6 +1556,26 @@ console.log('\nTest 30: v179 client-session binding — report_data[32..64] = SH
   globalThis.auditorSessionBindingHex = null;
 }
 
+console.log('\nTest 31: v179 PayPal API trust-root parity — src/paypal.pem ↔ Rust pin ↔ published thumbprint');
+{
+  // The enclave's hardened TLS client trusts ONLY what is compiled into the
+  // binary (plan Phase 2), so which root that is must agree in three places:
+  // the PEM file, the Rust test's pinned fingerprint
+  // (paypal_api_root_is_digicert_g2_v179), and DigiCert's published
+  // thumbprint. Any drift in one without the others fails here — the failure
+  // mode this guards (an expired LEAF masquerading as the root) silently
+  // broke every live login in the v179 cycle.
+  const DIGICERT_G2_FP = 'cb3ccbb76031e5e0138f8dd39a23f9de47ffc35e43c1144cea27d46a5ab1cb5f';
+  const pem = readFileSync(join(repoRoot, 'src', 'paypal.pem'), 'utf8');
+  const der = Buffer.from(pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, ''), 'base64');
+  const fp = createHash('sha256').update(der).digest('hex');
+  check('src/paypal.pem IS the DigiCert Global Root G2 (published thumbprint)', fp === DIGICERT_G2_FP, fp);
+  const rust = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  check('Rust test pins the same fingerprint the PEM carries', rust.includes(`\"${DIGICERT_G2_FP}\"`), 'constant absent from src/main.rs');
+  const readme = readFileSync(join(repoRoot, 'README.md'), 'utf8');
+  check('README publishes the root fingerprint out-of-band', readme.includes('cb3ccbb7'), 'README lost the root note');
+}
+
 console.log('\nTest 28: README publishes the auditor digest (out-of-band integrity)');
 {
   // The auditor is the one component users must be able to check WITHOUT

@@ -10,6 +10,15 @@ Based on the architecture of **Intel TDX on Alibaba Cloud** (as specified in Ali
 | **Malicious Cloud Host (Alibaba)** | Controls host hypervisor, storage disks (GPT/ESP), network routing, and virtual console. | In-memory execution state, disk-stored binaries. | Prevent tampering with the running kernel, initramfs, or `/init` binary. |
 | **Collusion (Host + Owner)** | Coordinated attack: Host modifies `/init` on disk; Owner signs/approves payloads to fool the client auditor. | Unrestricted user identity exfiltration. | **Hardware-gated execution**: The client refuses to interact unless Intel TDX silicon proves the running code matches the bitwise golden build. |
 
+#### Status — v179 audit cycle (2026-10-23, live-verified on `ecs.c9i.xlarge` cn-beijing-i)
+
+| Defense | Status | Evidence |
+| :--- | :--- | :--- |
+| **Outbound TLS root pin** (Phase 2 transport half) | ✅ Fixed + rotated. `hardened_client()` disables the platform root store and trusts only `include_bytes!` pins. The embedded `src/paypal.pem` was discovered to be an **expired leaf** (`CN=api-m.paypal.com`, notAfter 2026-09-13), not a root — decorative while system roots were trusted, fail-closed breakage once they were disabled. **Rotated to DigiCert Global Root G2** (`cb3ccbb7…ab1cb5f`, cross-checked against DigiCert's published thumbprint) — the real anchor of both `api-m.paypal.com` and `api-m.sandbox.paypal.com`. | `paypal_api_root_is_digicert_g2_v179` (Rust) · harness Test 31 (PEM ↔ Rust constant ↔ README) · live sandbox token exchange green |
+| **Client-session binding** (Phase 5, hardware-bound nonce — login half) | ✅ Implemented beyond the plan formula. Preflight quote binds `P_enc ∥ code_challenge ∥ P_client ∥ Nonce_client ∥ custom_info ∥ App_ID` (v161.2, [32..64] zero); the **callback/login quote now additionally binds `SHA-256(P_client ∥ Nonce_client)` into `REPORTDATA[32..64]`**, so a report minted for another browser's session cannot be replayed at this one — the auditor fails closed on the mismatch (strict when the session is in hand, informational for paste audits). | `client_session_binding_parity_v179` (Rust ↔ JS golden vector) · harness Test 30a–d · live claimed login report shows the non-zero binding slot in the Intel-signed TD Quote v5 |
+| **Boot-chain hardware measurement** (Phase 1/4 UKI alternative) | ⚠️ UKI **deferred with live evidence** (AGENTS.md "Deviations"): GRUB 2.12's EFI CC measurement protocol extends kernel/initrd/cmdline into RTMR0–2 and the auditor hard-pins those registers. Confirmed today twice: **RTMR2 (initrd register) moved with each new binary while MRTD/RTMR0/RTMR1 held** across two rotations. | `calculate-golden-rtmr.mjs --report --update` rotations 2026-10-23 · Test 21e2 pin-gate fixture |
+| Residual (documented) | The remaining UKI gap is the hypervisor torn-read TOCTOU (clean files served to the runtime measurer while an evil kernel runs). Deferral is the plan-sanctioned option; the manifest-vs-CI provenance row covers the disk side. | AGENTS.md deviations section |
+
 ---
 
 ### Root Flaw in the Current Implementation
