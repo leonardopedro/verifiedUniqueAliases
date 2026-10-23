@@ -1,4 +1,4 @@
-# Debug Checklist: GCP Confidential VM Attestation Issues
+# Debug Checklist: Confidential VM Attestation Issues (GCP SEV-SNP + Alibaba TDX)
 
 ## 🎯 Quick Answer
 
@@ -236,3 +236,56 @@ This propagates through:
 - Attestation wheels spin forever
 
 **But you solved it!** Your architecture was correct all along. 🎉
+
+---
+
+## 🧩 Triage Pattern: the failing gate is not the failing feature (v178 incident, Alibaba TDX)
+
+**Symptom:** "I didn't get the attestation downloaded at the end of the login."
+
+**Wrong first instinct:** debug the download logic (`downloadReportFile`, the
+`?afterlogin=1` path, browser download permissions).
+
+**Right first instinct:** in this system a missing artifact is almost always a
+**symptom of a red gate** — the report download is deliberately suppressed
+unless every audit row is green. Find the first ❌ / thrown error (browser
+console + the status lines), not the downloader.
+
+**Root cause (v178):** cross-implementation JSON byte drift. The enclave
+hashed `serde_json::to_string(&minimized)` of the PayPal identity struct
+(field order `user_id, sub, verified_account, payer_id`), but the report
+embedded the same record through `serde_json::json!` — whose map reorders keys
+**alphabetically**. The auditor recomputed the hash from the report's key
+order (`JSON.stringify` of the parsed object preserves the text order), so the
+bound hash and the recomputed hash could never match and *every honest login*
+tripped `IDENTITY PREIMAGE VIOLATION`:
+
+```
+quote-bound  53dd6264…   <- struct order    {"user_id":…,"sub":…,"verified_account":…,"payer_id":null}
+recomputed   a9f5e639…   <- alphabetical    {"payer_id":null,"sub":…,"user_id":…,"verified_account":…}
+```
+
+**Diagnosis recipe (works for any hash-binding mismatch):**
+1. Reproduce in a real browser — `CHROMIUM_PATH=$(command -v chromium) node
+   scripts/e2e-login-download.mjs` — and SAVE the payload the gate rejected
+   (the script writes `/tmp/claimed-report.json`).
+2. Hash each candidate serialization offline and see which one matches the
+   bound value — that identifies the exact byte contract the other side used.
+3. Fix the side that is *supposed* to define the contract (here: the auditor
+   must reconstruct the canonical struct layout, since the report carrier may
+   reorder keys) and pin the layout with a test on the producing side
+   (`security_tests::paypal_identity_json_layout_pinned`).
+
+**Why the tests didn't catch it:** the fixtures were self-consistent — the
+report object and the expected hash both used the same key order. The
+regression fixture now carries the LIVE shape (alphabetically keyed object):
+a fixture that serializes like the producer cannot see producer/consumer drift.
+
+**Rules that generalize:**
+1. A missing output ⇒ read the gate output first; the downloader is rarely the bug.
+2. Hashing "the same JSON" across two implementations is a **byte contract**
+   (key order, null handling, whitespace). Pin it on one side, reconstruct it
+   canonically on the other.
+3. Fixtures must include the *live* serialization shape, not the pretty one.
+4. Fail-closed UX must NAME the failing gate — that is what turned this
+   incident into a one-line triage once a browser repro existed.

@@ -738,7 +738,11 @@ the order that finds bugs fastest (validated live 2026-10-23).
    enclave instance (the user_data config survives).
 3. Capture `/debug/envelope` after boot, rotate pins from that capture,
    republish the README digest, roll `verify.html` onto the ESP (mtools on the
-   extracted FAT partition). `verify.html` is in neither the binary nor the
+   extracted FAT partition). Then run
+   `node scripts/check-manifest-parity.mjs https://<enclave> <deployed-disk>.raw`
+   — the report's self-reported `disk_manifest` must match the deployed ESP
+   byte-for-byte (NvVars excluded: the firmware rewrites it every boot).
+   `verify.html` is in neither the binary nor the
    initrd and lives on the UNMEASURED ESP — editing it never moves RTMR2, so
    pin edits never feed a re-rotation loop.
 
