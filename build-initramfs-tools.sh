@@ -89,23 +89,18 @@ touch /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
 chmod 644 /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
 
 # Platform-specific hardware modules detection
-# Default: GCP AMD SEV-SNP
-PLATFORM_MODULES="sev_guest sev-guest amd_tsm tsm gve virtio_net virtio_scsi virtio_blk nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct configfs coco virt_anchor"
-
-if [[ "${BUILD_FEATURE:-}" == "alibabacloud" ]]; then
-    # Intel TDX / Alibaba Cloud: drop GCP-specific modules, add TDX support.
-    # Module names must match the actual .ko files shipped by Debian's cloud
-    # kernel: drivers/virt/coco/tdx-guest/tdx-guest.ko (CONFIG_TDX_GUEST_DRIVER=m)
-    # and drivers/virt/coco/tsm.ko (CONFIG_TSM_REPORTS=m). The old entries
-    # "tdx" (no such file) and the missing "tsm" meant neither module ever
-    # reached the initramfs — so /dev/tdx_guest and
-    # /sys/kernel/config/tsm/report were absent at runtime (live-observed
-    # 2026-10-19: TDX evidence probe found zero modules).
-    PLATFORM_MODULES="tdx-guest tsm virtio_net virtio_scsi virtio_blk nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct configfs"
-    echo "🏗️ Building initramfs for Alibaba Cloud Intel TDX"
-else
-    echo "🏗️ Building initramfs for GCP AMD SEV-SNP"
-fi
+# v180 (audit.md §3.3 — pure-play Alibaba Cloud Intel TDX): the module set is
+# now UNCONDITIONAL; all AMD/GCP modules (sev_guest, amd_tsm, gve, coco,
+# virt_anchor) are permanently removed from the initramfs.
+# Module names must match the actual .ko files shipped by Debian's cloud
+# kernel: drivers/virt/coco/tdx-guest/tdx-guest.ko (CONFIG_TDX_GUEST_DRIVER=m)
+# and drivers/virt/coco/tsm.ko (CONFIG_TSM_REPORTS=m). The old entries
+# "tdx" (no such file) and the missing "tsm" meant neither module ever
+# reached the initramfs — so /dev/tdx_guest and
+# /sys/kernel/config/tsm/report were absent at runtime (live-observed
+# 2026-10-19: TDX evidence probe found zero modules).
+PLATFORM_MODULES="tdx-guest tsm virtio_net virtio_scsi virtio_blk nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct configfs"
+echo "🏗️ Building initramfs for Alibaba Cloud Intel TDX"
 
 # Force inclusion of hardware modules
 for mod in $PLATFORM_MODULES; do

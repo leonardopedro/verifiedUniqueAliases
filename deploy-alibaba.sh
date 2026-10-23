@@ -4,11 +4,17 @@
 #
 # Launches a TDX-enabled spot instance from the custom ESP image.
 #
-# Cheapest TDX-capable shape is ecs.c9i.xlarge (4 vCPU / 8 GiB) in
-# cn-beijing-i — TDX is only offered on xlarge-and-larger, and Beijing's c9i is
-# ~40% cheaper than Hangzhou's r9i minimum. Verify current spot prices with:
+# Cheapest TDX-capable shape is ecs.c9i.large (2 vCPU / 4 GiB) in
+# cn-beijing-i, live-verified 2026-10-23: a spot c9i.large with
+# ConfidentialComputingMode=TDX booted the ESP image and produced a genuine
+# hardware-signed TD Quote (5007 B via configfs_tsm, provider=tdx_guest),
+# MRTD/RTMR1/RTMR2 byte-identical to the xlarge — only RTMR0 differs
+# (ACPI/platform config is per-shape), so a shape change rotates that one pin.
+# c9i.large spot $0.012/h < c9i.xlarge $0.024/h < c8i.large $0.013/h
+# (8th-gen is NOT cheaper in Beijing despite being older). Verify current spot
+# prices with:
 #   aliyun ecs DescribeSpotPriceHistory --RegionId cn-beijing --ZoneId cn-beijing-i \
-#     --InstanceType ecs.c9i.xlarge --NetworkType vpc
+#     --InstanceType ecs.c9i.large --NetworkType vpc
 #
 # Prerequisites:
 #   - aliyun CLI configured
@@ -34,7 +40,7 @@ echo "============================================================"
 # --- Configuration defaults: cheapest TDX-capable shape -----------------------
 ALI_REGION="${ALI_REGION:-cn-beijing}"
 ALI_ZONE="${ALI_ZONE:-cn-beijing-i}"
-ALI_INSTANCE_TYPE="${ALI_INSTANCE_TYPE:-ecs.c9i.xlarge}"   # 4 vCPU / 8 GiB, TDX-capable, $0.024/h spot
+ALI_INSTANCE_TYPE="${ALI_INSTANCE_TYPE:-ecs.c9i.large}"    # 2 vCPU / 4 GiB, TDX-verified 2026-10-23, $0.012/h spot (cheapest TDX shape in Beijing)
 ALI_INSTANCE_NAME="${ALI_INSTANCE_NAME:-paypal-auth-vm}"
 ALI_IMAGE_ID="${ALI_IMAGE_ID:-}"
 ALI_VPC_ID="${ALI_VPC_ID:-}"

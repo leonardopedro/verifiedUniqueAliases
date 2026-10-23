@@ -9,7 +9,6 @@
 # ==============================================================================
 set -eo pipefail
 
-BUILD_FEATURE="${BUILD_FEATURE:-alibabacloud}"
 BINARY="${1:-}"
 
 if [[ -z "$BINARY" ]]; then
@@ -19,7 +18,7 @@ fi
 
 if [[ ! -f "$BINARY" ]]; then
     echo "❌ Binary not found: $BINARY"
-    echo "   Build first: cargo build --release --features $BUILD_FEATURE"
+    echo "   Build first: cargo build --release --target x86_64-unknown-linux-gnu"
     exit 1
 fi
 

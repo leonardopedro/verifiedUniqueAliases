@@ -21,9 +21,19 @@
 | Cloud Provider | Architecture | Root-of-Trust | Key Driver |
 |---|---|---|---|
 | **GCP** (Confidential VM) | AMD SEV-SNP via vTPM | Google EK Cert + Session AK | Standard TPM 2.0 |
-| **Alibaba Cloud** (ECS.r9i.xlarge) | Intel TDX / AMD Rome | PCK Certificate + Standard TPM | Custom provisioning stack |
+| **Alibaba Cloud** (ECS.c9i.large) | Intel TDX | PCK Certificate (PCK chain → Intel SGX/TDX Root CA) | Custom provisioning stack |
 
-Supported build target: **feature flag `alibabacloud`** (see `[features]` in `Cargo.toml`; default = GCP SEV-SNP).
+Supported build target: **Alibaba Cloud Intel TDX, compiled unconditionally** (the `alibabacloud` cargo feature was removed in v180; GCP/OCI paths are deleted from this branch — see audit.md §3).
+
+### Login Flow (v180 — no pre-login attestation)
+
+The old **pre-flight** (`POST /attest/preflight`, one TD quote per unauthenticated click) is **removed** — it was a trivially reachable enclave resource-exhaustion surface. The flow is now:
+1. Trusted auditor copy (file:// / GitHub Pages) generates the ECDH keypair + nonce, then calls **`POST /attest/login-session`** — S_enc-signed fields only (app, scope, environment, `state`), **no quote minted, nothing stored server-side**.
+2. The browser builds the PayPal authorize URL from the audited-app allow-list (no PKCE); the client session travels inside the OAuth **`state`** token (base64url JSON `{v,p,n,f,c,r}`).
+3. After PayPal, **`/callback`** mints the hardware quote — gated behind the PayPal-verified code exchange (**PayPal is the attacker filter**) — binding `report_data[32..64] = SHA-256(P_client ∥ Nonce_client)` and returning the report E2EE'd to `P_client`.
+4. `/debug/envelope` is served from a **15-minute boot cache**; it is no longer part of any login path (kept for pin-rotation tooling only).
+
+The auditor is **Intel-TDX-only** (audit.md §5.1): reports without a hardware-signed TDX quote are rejected outright; the AMD VCEK/ASK/ARK and Google NVRAM EK verification paths are deleted.
 
 ### Hardware Roots of Trust Compared
 
@@ -43,7 +53,7 @@ The project uses a **single codebase** with conditional compilation to support b
 
 ### 🏆 Current Accomplishments
 
-- **Multi-Cloud Platform Support**: Dual-provider runtime — the single source tree supports seamless switching between GCP Confidential VMs (SEV-SNP) and Alibaba Cloud (`ecs.r9i.xlarge`) via the `--features alibabacloud` compile-time flag.
+- **Pure-Play Intel TDX** (v180): multi-cloud abstractions, the cargo feature flag, and every AMD/Google evidence path are purged from source, CI and initramfs (audit.md §3). The auditor rejects non-TDX evidence at the first gate.
 - **Correct GCP vTPM Attenuation Model** (v145): Resolved fundamental misunderstanding about two-key attestation. The enclave uses the correct model: Google EK Certificate (NVRAM `0x01c00002`, static silicon proof) is separate from the Session Signing AK (created fresh per-attestation via `tpm2_createprimary`, dynamic quote signer). Keys intentionally do not match.
 - **Full EK Certificate Retrieval**: The 1560-byte Google EK/AK CA Certificate is retrieved from NVRAM index `0x01c00002` without truncation using unbounded `tpm2 nvread`. Systematic scanning across indices `0x01c00002`, `0x01c00001`, `0x01400001`, and more.
 - **Hardened TPM Quote Verification**: Full binary parsing of `TPMS_ATTEST` in audit flow verifies the hardware-signed nonce from raw TPM quote message, neutralizing session replay and forgery attacks.
@@ -209,9 +219,9 @@ GCP Confidential VMs (n2d with AMD SEV-SNP) **do not pre-provision persistent At
      pass/fail signal, since serial console output is lost on stop.
      Verified: HK Range-GET md5 == intranet PUT 200 on the dnsfix image.
 
-### Target Instance Type: ecs.c9i.xlarge (4 vCPU / 8 GiB, Intel TDX) in cn-beijing-i
-- Live-proven 2026-10-16: spot `ecs.c9i.xlarge` (SpotAsPriceGo, no protection period) boots the ESP image end-to-end — DHCP, IMDS, `user_data` config load, NVMe ESP measurement (6 files), HTTP:80 + HTTPS:443, all green
-- Cheapest TDX shape available: Beijing quotes **$0.024/h** spot vs $0.040/h for Hangzhou's minimum (Hangzhou only offers TDX on `r9i.xlarge` and up, i.e. 32 GiB). Everything (bucket, image, instance) must live in one region
+### Target Instance Type: ecs.c9i.large (2 vCPU / 4 GiB, Intel TDX) in cn-beijing-i
+- Live-proven 2026-10-23: spot `ecs.c9i.large` (SpotAsPriceGo, SpotDuration=0 — no protection period, no minimum time) with `SecurityOptions.ConfidentialComputingMode=TDX` boots the ESP image end-to-end and produces a **genuine hardware-signed TD Quote** (5007 B via configfs_tsm, provider=tdx_guest). MRTD/RTMR1/RTMR2 byte-identical to the xlarge; **only RTMR0 differs** (ACPI/platform config is per-shape) — a shape change therefore rotates exactly the RTMR0 pin.
+- Cheapest TDX shape in Beijing (live spot 2026-10-23): **c9i.large $0.012/h** < c8i.large $0.013/h < g9i.large $0.015/h < g8i.large $0.017/h < r9i.large $0.020/h < c9i.xlarge $0.024/h (former default). 8th-gen is NOT cheaper than 9th-gen here despite the lower generation. TDX is enabled **per shape**, not per family — always probe a new shape with `/debug/envelope` before switching. Everything (bucket, image, instance) must live in one region
 - TDX is real but **unexposed to userspace**: no `/dev/tdx-guest`, no `/sys/module/tdx_guest`, no `/sys/bus/platform/drivers/tdx`. The only reliable probe is the kernel banner (`Memory Encryption Features active: Intel TDX`) read from `/dev/kmsg` — see `intel_tdx::kernel_log_reports_tdx()`. The boot log prints every probe (`TDX probe: …=false`) so the serial console diagnoses it directly
 - **Imported images must be flagged NVMe-capable or the launch is refused**: `RunInstances` fails with `The specified instance type requires NVMe but the image does not support NVMe` until `Features.NvmeSupport=supported` is set (the flag is an image attribute — the guest itself has NVMe built into Debian's cloud kernel, no module needed)
 - Alibaba Cloud does **not** expose `/dev/sev-guest` or ConfigFS TSM interfaces out of the box for Spot instances
@@ -568,7 +578,7 @@ The provisioning stack depends on the official `aliyun` CLI, shipped as a locall
 3. **Authenticate** — export `ALI_ACCESS_KEY_ID` + `ALI_ACCESS_KEY_SECRET`; `deploy-alibaba.sh` re-exports them as `ALIBABA_ACCESS_KEY_ID` / `ALIBABA_ACCESS_KEY_SECRET` (the CLI's native env names). `aliyun configure` also works.
 4. **Build image** — `bash build-alibaba-docker.sh` → `initramfs-alibaba.img` (Debian Trixie, snapshot-pinned via `Dockerfile.alibaba`; apt package pins in `packages-alibaba.txt`, incl. `tpm2-tools 5.7-1`)
 5. **Import image** — `bash import-alibaba-image.sh` (requires the aliyun CLI's built-in `oss` subcommand — **no ossutil** — plus `ALI_OSS_BUCKET`; uploads the ESP disk `output-alibaba/disk-alibaba.raw` to OSS, imports it via `ImportImage` using the flat `--DiskDeviceMapping.1.Format raw` flag — the CLI rejects `--DiskDeviceMapping.1.ImageFormat` — then polls the image `Status` until `Available` → yields `ALI_IMAGE_ID`; note `DescribeTasks` polling does NOT work with the current CLI: `--TaskId` is rejected and `--TaskIds '[...]'` returns an empty TaskSet)
-6. **Deploy** — `bash deploy-alibaba.sh` (target `ecs.c9i.xlarge`, `ALI_REGION=cn-beijing` default, spot strategy `SpotAsPriceGo`, `SecurityOptions.ConfidentialComputingMode=TDX`; enclave config delivered to `/etc/paypal-auth/config.json`)
+6. **Deploy** — `bash deploy-alibaba.sh` (target `ecs.c9i.large` — cheapest TDX shape, live-verified 2026-10-23; `ALI_REGION=cn-beijing` default, spot strategy `SpotAsPriceGo` with `SpotDuration=0` (no protection period / no minimum time), `SecurityOptions.ConfidentialComputingMode=TDX`; enclave config delivered to `/etc/paypal-auth/config.json`)
 
 The enclave image itself never contains the aliyun CLI — the CLI runs on the operator host; only the checksum-verified provisioning flow touches ECS.
 
@@ -612,7 +622,7 @@ To ensure 100% bitwise reproducibility regardless of host environment, the proje
 
 ### ⚠️ Only the Docker pipeline build is the ATTESTED build (2026-10-23)
 
-A plain **host build** (`cargo build --release --features alibabacloud`, e.g.
+A plain **host build** (`cargo build --release`, e.g.
 under Nix) is **not** bit-identical to the Docker/CI pipeline build — different
 rustc/sysroot, different binary digest. Observed live for identical source:
 host build `9ef6b729…` vs Docker/CI build `ba1a3bfe…`.
@@ -631,21 +641,23 @@ Consequences (each one bit us):
   embedded in the binary or the initramfs (no `include_str!`), so auditor/pin
   edits never perturb the measured boot chain or the attested binary digest.
 
-### Dual-Build Matrix
+### Single Build Target — Alibaba Cloud Intel TDX (v180, unconditional)
 
-| Feature Flag | Target Platform | Attestation Root | Network Driver |
-|---|---|---|---|
-| *(none / default)* | GCP Confidential VM | Google EK Cert + Session AK | virtio_net / gve |
-| `alibabacloud` | Alibaba ECS.r9i.xlarge | PCK Cert (Intel) or VCEK (AMD) | virtio_net / aliyun-net |
+| Target Platform | Attestation Root | Network Driver |
+|---|---|---|
+| Alibaba ECS `ecs.c9i.large` (cn-beijing-i) | Intel TDX quote (PCK chain → Intel SGX/TDX Root CA) | virtio_net |
 
-Build commands:
+The `alibabacloud` cargo feature was **removed** in v180 (audit.md §3.1):
+Intel TDX is compiled unconditionally, and the GCP (AMD SEV-SNP / vTPM) and
+Oracle paths are permanently deleted from the source, the CI workflow and the
+initramfs module list. Build command:
 ```bash
-# GCP (default)
 cargo build --release --target x86_64-unknown-linux-gnu
-
-# Alibaba Cloud
-cargo build --release --features alibabacloud --target x86_64-unknown-linux-gnu
 ```
+
+The former GCP/AMD material (dual-build matrix, `google_ca.pem`, GCP
+metadata IP in nftables, `Dockerfile.repro`, GCP scripts/docs) is gone from
+this branch; recover it from the `oraclecloud` archive branch only.
 
 ---
 
@@ -653,11 +665,13 @@ cargo build --release --features alibabacloud --target x86_64-unknown-linux-gnu
 
 ### Hardware-Anchored Trust Layer
 
-#### GCP (AMD SEV-SNP) Path
+#### Legacy GCP (AMD SEV-SNP) Path — REMOVED in v180
+Kept here only as context for auditing OLD saved reports; the enclave and the
+auditor no longer accept this evidence class (Intel-TDX-only gate).
 - **Google EK Certificate** (NVRAM `0x01c00002`): DER X.509 cert issued by `EK/AK CA Intermediate` under Google's CA chain. Proves instance runs on real GCP Confidential VM silicon.
 - **Session Signing AK**: Created fresh per-attestation via `tpm2_createprimary`. Signs TPM Quote containing PCR values + session nonce. Never reused.
 - **Measured Boot**: PCRs 0, 4, 8, 9, 15 provide full-stack coverage verified by TPM quote.
-- **Embedded TLS Pinning**: `google_ca.pem` and `paypal.pem` compiled directly into binary via `include_bytes!`, preventing filesystem-level tampering. **v179 fix (live-proven)**: `paypal.pem` was never a root — it was an EXPIRED LEAF (`CN=api-m.paypal.com`, notAfter 2026-09-13) that only *appeared* to pin while the rustls default roots were still trusted. Since plan Phase 2 disables system roots in `hardened_client()`, the pin must be the endpoint's real anchor: **DigiCert Global Root G2** (`cb3ccbb7…ab1cb5f`, fingerprint pinned by test `paypal_api_root_is_digicert_g2_v179`). Both `api-m.paypal.com` and `api-m.sandbox.paypal.com` chain to it (2026-10-23).
+- **Embedded TLS Pinning**: `paypal.pem` is compiled directly into the binary via `include_bytes!`, preventing filesystem-level tampering. **v179 fix (live-proven)**: `paypal.pem` was never a root — it was an EXPIRED LEAF (`CN=api-m.paypal.com`, notAfter 2026-09-13) that only *appeared* to pin while the rustls default roots were still trusted. Since plan Phase 2 disables system roots in `hardened_client()`, the pin must be the endpoint's real anchor: **DigiCert Global Root G2** (`cb3ccbb7…ab1cb5f`, fingerprint pinned by test `paypal_api_root_is_digicert_g2_v179`). Both `api-m.paypal.com` and `api-m.sandbox.paypal.com` chain to it (2026-10-23).
 
 #### Alibaba Cloud (Intel TDX / AMD Rome) Path
 - **Platform Certificate Key (PCK)**: Retrieved from Intel Online Certification Service (OCS) OR TPM NV endorsement hierarchy
@@ -710,7 +724,7 @@ the order that finds bugs fastest (validated live 2026-10-23).
   `REAL_REPORT=<envelope.json> node scripts/test-verify-security.mjs` adds
   Test 22 against a real captured report. Test 28 (README digest) is the
   canary for "you edited verify.html and forgot to republish".
-- `cargo test --release --features alibabacloud --target x86_64-unknown-linux-gnu`
+- `cargo test --release --target x86_64-unknown-linux-gnu`
   (on NixOS the host build needs `PKG_CONFIG_PATH` pointing at a nix-store
   `openssl.pc`).
 

@@ -14,9 +14,9 @@ echo "============================================================"
 echo "🏗️  Building PayPal Auth VM for Alibaba Cloud (Intel TDX)"
 echo "============================================================"
 
-echo "⏳ [1/2] Compiling Rust binary with alibabacloud feature..."
+echo "⏳ [1/2] Compiling Rust binary (Intel TDX — unconditional)..."
 
-cargo build --release --features alibabacloud --target x86_64-unknown-linux-gnu
+cargo build --release --target x86_64-unknown-linux-gnu
 
 BINARY="target/x86_64-unknown-linux-gnu/release/paypal-auth-vm"
 

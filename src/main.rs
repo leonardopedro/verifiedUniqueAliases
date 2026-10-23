@@ -5,7 +5,6 @@
 mod intel_tdx;
 mod selfreport;
 
-const GOOGLE_CA_PEM: &[u8] = include_bytes!("google_ca.pem");
 const PAYPAL_CA_PEM: &[u8] = include_bytes!("paypal.pem");
 
 mod enclave_init {
@@ -28,13 +27,10 @@ mod enclave_init {
 
         insmod_all();
 
-        #[cfg(feature = "alibabacloud")]
         {
             let _ = std::process::Command::new("/sbin/modprobe").args(["-r", "intelpsfw"]).status();
             modprobe("configfs");
             let _ = std::process::Command::new("/bin/mount").args(["-t", "configfs", "none", "/sys/kernel/config"]).status();
-            modprobe("virt_anchor");
-            modprobe("coco");
             modprobe("tsm");
             modprobe("tdx-guest");
             modprobe("tdx_guest");
@@ -77,7 +73,6 @@ mod enclave_init {
             "add rule inet filter input tcp dport { 80, 443 } accept",
             "add rule inet filter output udp dport 53 accept",
             "add rule inet filter output tcp dport 53 accept",
-            "add rule inet filter output ip daddr 169.254.169.254 accept",
             "add rule inet filter output ip daddr 100.100.100.200 accept",
             "add rule inet filter output tcp dport 443 accept",
             "add rule inet filter output tcp dport 80 accept",
@@ -200,7 +195,7 @@ mod enclave_init {
     }
 
     /// v168 (plan Phase 4.1): POST-BOOT EGRESS LOCKDOWN. The boot-time rules
-    /// keep IMDS (100.100.100.200), GCP metadata (169.254.169.254), DNS and
+    /// keep IMDS (100.100.100.200), DNS and
     /// port 80 open — necessary for user_data + ACME DNS-01 + HTTPS time
     /// sync, but afterwards they are pure exfiltration surface (DNS queries
     /// alone can leak secrets to a colluding resolver). Once the TLS cert is
@@ -704,50 +699,22 @@ impl EphemeralEnclaveIdentity {
 }
 
 // ----------------------------------------------------------------------------
-// Ephemeral In-RAM PKCE Session (Client-Bound)
+// Ephemeral In-RAM Enclave ECDH Session (per login callback)
 // ----------------------------------------------------------------------------
-pub struct PkceSession {
-    pub code_verifier: String,
-    pub code_challenge: String,
-    pub client_ecdh_pub: Vec<u8>,
-    pub client_nonce: [u8; 32],
-    pub enclave_ecdh: openssl::pkey::PKey<openssl::pkey::Private>,
-    // The user's custom_info chosen at pre-flight; the login (callback) report
-    // binds it into the SEC-02 nonce so it matches the pre-flight binding.
-    pub custom_info: String,
-    pub created_at: Instant,
-}
-
-impl PkceSession {
-    pub fn new(client_ecdh_pub: Vec<u8>, client_nonce: [u8; 32], custom_info: String) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
-        use base64::Engine as _;
-        use openssl::ec::{EcGroup, EcKey};
-        use openssl::nid::Nid;
-        use rand::Rng;
-        use sha2::{Digest, Sha256};
-
-        let mut verifier_bytes = [0u8; 64];
-        rand::thread_rng().fill(&mut verifier_bytes);
-        let code_verifier = B64URL.encode(verifier_bytes);
-
-        let challenge_hash = Sha256::digest(code_verifier.as_bytes());
-        let code_challenge = B64URL.encode(challenge_hash);
-
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
-        let ec_key = EcKey::generate(&group)?;
-        let enclave_ecdh = openssl::pkey::PKey::from_ec_key(ec_key)?;
-
-        Ok(Self {
-            code_verifier,
-            code_challenge,
-            client_ecdh_pub,
-            client_nonce,
-            enclave_ecdh,
-            custom_info,
-            created_at: Instant::now(),
-        })
-    }
+// v180 (user directive — NO pre-login attestation): the pre-login PKCE
+// handshake is gone, so the enclave no longer keeps a server-side pending
+// session. The client session (P_client ∥ nonce ∥ flow ∥ custom_info) travels
+// inside the OAuth `state` parameter, is validated at /callback, and is bound
+// into the hardware quote's report_data[32..64] — a forged state therefore
+// only produces a report that fails the local audit, never a usable blob.
+// This helper mints the fresh per-callback enclave ECDH keypair the E2EE
+// layer needs (the client's counterpart key arrives in the state token).
+fn new_enclave_ecdh() -> Result<openssl::pkey::PKey<openssl::pkey::Private>, Box<dyn std::error::Error + Send + Sync>> {
+    use openssl::ec::{EcGroup, EcKey};
+    use openssl::nid::Nid;
+    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+    let ec_key = EcKey::generate(&group)?;
+    Ok(openssl::pkey::PKey::from_ec_key(ec_key)?)
 }
 
 // ----------------------------------------------------------------------------
@@ -815,37 +782,6 @@ mod crypto_e2ee {
 }
 
 // ----------------------------------------------------------------------------
-// Client-Bound Hardware Attestation Binding Formula
-// ----------------------------------------------------------------------------
-pub fn compute_preflight_binding(
-    pubkey_der: &[u8],
-    code_challenge: &str,
-    client_pub_der: &[u8],
-    client_nonce: &[u8; 32],
-    custom_info: &str,
-    paypal_client_id: &str,
-) -> [u8; 64] {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(pubkey_der);
-    hasher.update(code_challenge.as_bytes());
-    hasher.update(client_pub_der);
-    hasher.update(client_nonce);
-    hasher.update(custom_info.as_bytes());
-    // v168 (plan Phase 3.1): the PayPal APP is hardware-bound too — a
-    // malicious owner swapping in an over-scoped PayPal client_id must
-    // change the quoted REPORTDATA and trip verify.html's EXPECTED_APPS /
-    // binding gates. Formula (byte order):
-    //   SHA-256(P_enc ∥ code_challenge ∥ P_client ∥ Nonce ∥ custom_info ∥ PayPal_Client_ID)
-    hasher.update(paypal_client_id.as_bytes());
-    let digest = hasher.finalize();
-
-    let mut report_data = [0u8; 64];
-    report_data[0..32].copy_from_slice(&digest);
-    report_data
-}
-
-// ----------------------------------------------------------------------------
 // SEC-02 / verify.html v160 — 5-component hardware-bound session nonce
 // ----------------------------------------------------------------------------
 // nonce = SHA-256 over the 160-byte concatenation:
@@ -887,7 +823,7 @@ fn sec02_nonce(
 }
 
 // Pre-login placeholder for paypal_user_info_raw_hash: there is no PayPal user
-// yet when the standalone /debug/envelope or the pre-flight POST is generated.
+// yet when the standalone /debug/envelope is generated.
 // The auditor recomputes expectedNonce from whatever value we publish here, so
 // any deterministic placeholder keeps the binding self-consistent; the real
 // user hash is bound only at the login (callback) step. Self-documenting marker.
@@ -902,7 +838,8 @@ fn prelogin_paypal_hash() -> String {
 //   SHA-256(P_client SPKI-DER ∥ Nonce_client)
 //
 // P_client/Nonce_client are generated in the user's browser and arrive with
-// the PKCE handshake (PkceSession.client_ecdh_pub / .client_nonce). The
+// the login session (v180: carried inside the OAuth `state` token, parsed by
+// /callback — no server-side pending session). The
 // auditor holds ITS OWN copy of these values (localStorage/sessionStorage
 // written when the key was created) and recomputes this digest — a report
 // minted for a different browser's session carries the wrong bytes in the
@@ -953,7 +890,6 @@ mod tpm {
         pub signature_binding_pubkey_hash: String,
         pub vcek_der_b64: Option<String>,
         pub amd_chain_b64: Option<String>,
-        pub google_ak_cert_pem: Option<String>,
         pub ak_der_sha256: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub pck_cert_pem: Option<String>,
@@ -1007,7 +943,6 @@ mod tpm {
             signature_binding_pubkey_hash: String::new(),
             vcek_der_b64: None,
             amd_chain_b64: None,
-            google_ak_cert_pem: None,
             ak_der_sha256: String::new(),
             pck_cert_pem: None,
             tdx_policy: None,
@@ -1024,8 +959,6 @@ mod tpm {
 
 const MAX_TRACKED_IPS: usize = 1000;
 const MAX_CONCURRENT_CONNECTIONS: usize = 50;
-/// Ceiling on in-flight PayPal authorization sessions (see attest_preflight).
-const MAX_PENDING_OAUTH: usize = 4096;
 /// Ceiling on sealed, not-yet-claimed E2EE reports (see callback).
 const MAX_PENDING_E2EE_BLOBS: usize = 4096;
 const GLOBAL_EGRESS_BYTES_PER_HOUR: u64 = 512 * 1024 * 1024;
@@ -1065,18 +998,31 @@ const HTML_TEMPLATE: &str = r#"
 // user can audit offline in ANY external auditor copy (GitHub Pages copy /
 // saved local copy) — the copy served by this site is only a convenience.
 // Abuse/DoS posture: NO new surface. Reports are ONLY minted after a completed
-// PayPal code exchange (this route consumes a one-time pending_oauth state);
-// nothing here generates attestations for unauthenticated callers.
+// PayPal code exchange (the exchange is a confidential-client exchange whose
+// client_secret only exists inside the enclave); nothing here generates
+// attestations for unauthenticated callers.
+//
+// v180 (user report — the "UNTRUSTED AUDITOR ORIGIN" dead-end): the old page
+// just said "go claim it in the other tab" and offered no way to hand the
+// blob over when that tab was gone — the user could not retrieve the
+// attestation at all. Now the blob is RENDERED here (copy-to-clipboard),
+// which is safe: it is ciphertext sealed to a key that never left the
+// browser that started the login. This owner-controlled page only ever sees
+// the ciphertext, so showing it leaks nothing and forges nothing.
 const CALLBACK_CONTENT: &str = r#"<h1>Authentication Succeeded</h1>
             <div class="info">
                 <h3>Hardware-Attested Delivery (Encrypted)</h3>
                 <p>Your verified PayPal status has been sealed in RAM and encrypted to your local client key. This page renders nothing — decryption happens only inside your browser tab.</p>
                 <p><a class="btn" href="/verify.html?afterlogin=1">💾 Get my attestation report &amp; run the audit</a></p>
-                <p style="font-size:14px; color:#9e9e9e;">Your tab will decrypt the report, verify its hardware signature and pre-flight key pin, run the full audit, and save the report as a JSON file. That file audits offline in <b>any</b> copy of the auditor — the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color:#64b5f6;">GitHub Pages auditor</a> or your own saved <code>verify.html</code>; the copy served by this site is only a convenience. No attestation report is ever generated without a completed PayPal login.</p>
+                <p style="font-size:14px; color:#9e9e9e;">If the tab you started the login from is still open (your saved <code>verify.html</code> or the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color:#64b5f6;">GitHub Pages auditor</a>), go back there and press “🔓 2. Claim Encrypted Report”: only that tab holds your decryption key, so the report decrypts, audits and downloads THERE. That file audits offline in <b>any</b> copy of the auditor. No attestation report is ever generated without a completed PayPal login.</p>
                 <p><a href="/verify.html" style="color:#64b5f6;">Open Local Auditor (report loads without auto-download)</a></p>
+                <h3 style="margin-top:24px;">Lost the login tab? Copy your encrypted report</h3>
+                <p style="font-size:14px; color:#9e9e9e;">The blob below is your login-bound, encrypted report (ciphertext). It is safe to copy: it is sealed to a throwaway key that only ever existed in the browser that started the login, so it is useless to anyone else — including this site. Paste it into the “Attestation JSON report” box of a trusted auditor (GitHub Pages copy or your own saved <code>verify.html</code>) and run the audit from there.</p>
+                <textarea id="e2ee-blob-view" readonly style="width:100%; height:180px; background:#0d1117; color:#9e9e9e; font-size:12px; border:1px solid #30363d; border-radius:6px; padding:10px; box-sizing:border-box;"></textarea>
+                <p><button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); t.select(); try{document.execCommand('copy');this;}catch(e){} try{navigator.clipboard.writeText(t.value);}catch(e){} this.textContent='✅ Copied — paste it into a trusted auditor';})()" style="margin-top:10px;">📋 Copy encrypted report</button></p>
             </div>
             <script type="application/json" id="e2ee-blob">__E2EE_BLOB__</script>
-            <script>try{sessionStorage.setItem('pav_e2ee_blob', document.getElementById('e2ee-blob').textContent);}catch(e){}</script>"#;
+            <script>try{var __b=document.getElementById('e2ee-blob').textContent;document.getElementById('e2ee-blob-view').value=__b;sessionStorage.setItem('pav_e2ee_blob', __b);}catch(e){}</script>"#;
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -1118,8 +1064,15 @@ struct AppState {
     last_limit_reset: Arc<RwLock<Instant>>,
     connection_semaphore: Arc<Semaphore>,
     boot_manifest: BTreeMap<String, String>,
-    pending_oauth: Arc<RwLock<std::collections::HashMap<String, (String, PkceSession)>>>,
+    // v180: per-login E2EE blob vault, keyed by the state token the client
+    // carried through PayPal. Nothing is stored BEFORE a completed PayPal
+    // code exchange, so this table cannot be grown by unauthenticated callers.
     pending_e2ee_blobs: Arc<RwLock<std::collections::HashMap<String, (serde_json::Value, Instant)>>>,
+    // v180 (user directive — no pre-login attestation / DoS surface): the
+    // standalone auditor envelope is minted ONCE per cache window and served
+    // from this cache, so no request path can trigger quote generation at
+    // line rate (each quote costs a full TDG.MR.REPORT + QGS round-trip).
+    boot_envelope: Arc<RwLock<Option<(Instant, serde_json::Value)>>>,
 }
 
 impl AppState {
@@ -1216,18 +1169,15 @@ fn hardened_client() -> reqwest::Client {
         .use_rustls_tls()
         // v179 (plan Phase 2 — outbound TLS MITM defense): the platform root
         // store (/etc/ssl/certs, webpki-roots) is DISK-ATTACKER-CONTROLLABLE
-        // and must never decide trust here. Only the two roots compiled into
-        // THIS binary (PAYPAL_CA_PEM / GOOGLE_CA_PEM via include_bytes!) are
-        // accepted — a host that swaps the CA bundle or terminates TLS with
-        // its own cert fails the handshake instead of being trusted.
+        // and must never decide trust here. Only the root compiled into
+        // THIS binary (PAYPAL_CA_PEM via include_bytes!) is accepted — a
+        // host that swaps the CA bundle or terminates TLS with its own
+        // cert fails the handshake instead of being trusted.
         .tls_built_in_root_certs(false)
         .resolve("api-m.paypal.com", std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(104, 16, 124, 74)), 443))
         .resolve("api-m.sandbox.paypal.com", std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(146, 75, 123, 1)), 443));
 
     if let Ok(cert) = Certificate::from_pem(PAYPAL_CA_PEM) {
-        builder = builder.add_root_certificate(cert);
-    }
-    if let Ok(cert) = Certificate::from_pem(GOOGLE_CA_PEM) {
         builder = builder.add_root_certificate(cert);
     }
     builder.build().unwrap()
@@ -1465,7 +1415,7 @@ fn build_in_memory_ssl_acceptor(
 // Pre-Flight Protocol & E2EE Endpoints
 // ----------------------------------------------------------------------------
 #[derive(Deserialize)]
-pub struct PreflightRequest {
+pub struct LoginSessionRequest {
     pub client_ecdh_pub_b64: String,
     pub client_nonce_hex: String,
     pub flow: Option<String>,
@@ -1532,7 +1482,11 @@ async fn serve_verify_html() -> impl IntoResponse {
     }
 }
 
-async fn preflight_cors() -> impl IntoResponse {
+// CORS preflight for the login-session POST: the trusted auditor copy runs
+// from file:// or GitHub Pages and cross-origin-POSTs this endpoint, so the
+// browser sends an OPTIONS probe first. It carries no credentials and mints
+// nothing — pure method/header advertisement.
+async fn login_session_cors() -> impl IntoResponse {
     (
         [
             (axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
@@ -1543,16 +1497,32 @@ async fn preflight_cors() -> impl IntoResponse {
     )
 }
 
-async fn attest_preflight(
+// ----------------------------------------------------------------------------
+// Login Session Endpoint (POST /attest/login-session) — NO PRE-FLIGHT QUOTE
+// ----------------------------------------------------------------------------
+// v180 (user directive): the pre-login attestation ("pre-flight") is REMOVED.
+// It minted one TD quote per unauthenticated request — a trivially reachable
+// resource-exhaustion surface (each quote costs a full TDG.MR.REPORT + QGS
+// round-trip) — and its only security contribution is duplicated (stronger)
+// by the post-login report, whose quote binds the PayPal identity AND this
+// browser's session. The completed PayPal login itself is the attacker
+// filter: /callback mints the hardware quote only AFTER a PayPal-verified
+// code exchange (verified_account gate included).
+//
+// This endpoint is pure bookkeeping: it echoes the S_enc-signed login
+// parameters (app id, scope, environment, redirect, state token) so the
+// TRUSTED auditor copy can (a) pin the enclave signing key for key-continuity
+// across the PayPal round-trip and (b) re-check the audited-app allow-list
+// before the user is sent to PayPal. No quote is minted; nothing is stored.
+async fn attest_login_session(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
-    Json(payload): Json<PreflightRequest>,
+    Json(payload): Json<LoginSessionRequest>,
 ) -> Response {
-    use base64::engine::general_purpose::STANDARD as B64STD;
+    use base64::engine::general_purpose::{STANDARD as B64STD, URL_SAFE_NO_PAD as B64URL};
     use base64::Engine as _;
-    use sha2::Digest;
 
-    if let Err(status) = state.record_egress(addr.ip(), 8192) {
+    if let Err(status) = state.record_egress(addr.ip(), 4096) {
         return status.into_response();
     }
 
@@ -1574,58 +1544,45 @@ async fn attest_preflight(
 
     let flow = payload.flow.as_deref().unwrap_or("verified");
     let (cid, _csec, scope, label) = state.get_flow_config(flow);
-
     let custom_info = payload.custom_info.as_deref().unwrap_or("NONE").trim();
     let custom_info_str = if custom_info.is_empty() { "NONE" } else { custom_info };
 
-    let pkce = match PkceSession::new(client_pub.clone(), client_nonce, custom_info_str.to_string()) {
-        Ok(p) => p,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("PKCE generation failed: {}", e)).into_response(),
-    };
-    let code_challenge = pkce.code_challenge.clone();
-
-    // Hardware binding calculated strictly in RAM
-    let report_data = compute_preflight_binding(
-        &state.enclave_identity.pubkey_der,
-        &code_challenge,
-        &client_pub,
-        &client_nonce,
-        custom_info_str,
-        &cid,
-    );
-
-    let quote_res = tpm::quote(&hex::encode(&report_data[..32]), Some(report_data));
-
-    // v168 (plan Phase 2.2): FAIL-CLOSED report minting. A report without a
-    // silicon-signed quote is unverifiable — it must never leave the enclave.
-    #[cfg(feature = "alibabacloud")]
-    if quote_res.tdx_quote_b64.is_none() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "hardware quote unavailable — attestation report refused (fail closed)",
-        )
-            .into_response();
-    }
-
+    // Self-describing state token (v180): the client session travels inside
+    // the OAuth `state` and is re-parsed by /callback after PayPal redirects
+    // back. It is UNTRUSTED input by construction — it becomes meaningful
+    // only because the callback binds it into the hardware quote
+    // (report_data[32..64] = SHA-256(P_client ∥ Nonce_client)), which the
+    // auditor compares against ITS OWN session values. `r` is client-side
+    // entropy so two logins with identical parameters never share a token.
     use rand::Rng;
-    let state_token = hex::encode(rand::thread_rng().gen::<[u8; 32]>());
-    let auth_base = if state.staging { PAYPAL_SANDBOX_AUTH } else { PAYPAL_PRODUCTION_AUTH };
-    let ecdh_pub_der = pkce.enclave_ecdh.public_key_to_der().unwrap_or_default();
+    let random = hex::encode(rand::thread_rng().gen::<[u8; 16]>());
+    let state_obj = serde_json::json!({
+        "v": 1,
+        "p": payload.client_ecdh_pub_b64.trim(),
+        "n": payload.client_nonce_hex.trim().to_ascii_lowercase(),
+        "f": label.clone(),
+        "c": custom_info_str,
+        "r": random,
+    });
+    let state_token = B64URL.encode(state_obj.to_string().as_bytes());
 
+    let auth_base = if state.staging { PAYPAL_SANDBOX_AUTH } else { PAYPAL_PRODUCTION_AUTH };
     let signed_fields = serde_json::json!({
-        "binding": "v161",
-        "code_challenge": code_challenge,
+        "binding": "v180",
         "state": state_token,
         "flow": label,
-        "paypal_client_id": cid.clone(),
-        // v169: the environment is signed (and app-pinned) at pre-flight too,
+        "paypal_client_id": cid,
+        // v169: the environment is signed (and app-pinned) at session time,
         // so a redirect into sandbox PayPal cannot be passed off as production.
         "paypal_environment": if state.staging { "sandbox" } else { "production" },
         "redirect_uri": state.redirect_uri,
         "authorize_base": auth_base,
         "scope": scope,
-        "enclave_ecdh_public_key_b64": B64STD.encode(&ecdh_pub_der),
         "custom_info": custom_info_str,
+        // Echo of the binding the callback will hardware-bind; the auditor
+        // compares it against ITS OWN recomputation (display/cross-check
+        // only — the quote bytes are the source of trust, v179 semantics).
+        "client_session_binding_hex": hex::encode(client_session_binding(&client_pub, &client_nonce)),
     });
 
     let signed_fields_str = serde_json::to_string(&signed_fields).unwrap();
@@ -1637,63 +1594,12 @@ async fn attest_preflight(
         B64STD.encode(signer.sign_to_vec().unwrap())
     };
 
-    // Bounded session table: every entry lives 600 s, but an unauthenticated
-    // caller can create them at line rate, so cap the table and fail closed
-    // (503) instead of letting the enclave's RAM be driven upward from the
-    // network. The legitimate peak is tiny (one entry per concurrent login).
-    {
-        let mut pending = state.pending_oauth.write();
-        if pending.len() >= MAX_PENDING_OAUTH {
-            pending.retain(|_, (_, p)| p.created_at.elapsed() < Duration::from_secs(600));
-            if pending.len() >= MAX_PENDING_OAUTH {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "too many pending authorization sessions — retry later",
-                )
-                    .into_response();
-            }
-        }
-        pending.insert(state_token.clone(), (label.clone(), pkce));
-    }
-
-    let binary_sha256 = hex::encode(sha2::Sha256::digest(&std::fs::read("/init").unwrap_or_default()));
-    // Pre-flight is pre-login: paypal_user_info_raw_hash carries the documented
-    // placeholder (real user hash is bound only at the login/callback step).
-    let attestation_report = serde_json::json!({
-        "custom_info": custom_info_str,
-        "paypal_user_info_raw_hash": prelogin_paypal_hash(),
-        "enclave_config": {
-            "boot_measurements": {
-                "binary_sha256": binary_sha256,
-                "disk_manifest": &state.boot_manifest,
-            }
-        },
-        "session_context": {
-            "preflight": {
-                "binding": "v161",
-                "code_challenge": code_challenge,
-                "client_pub_b64": B64STD.encode(&client_pub),
-                "client_nonce_hex": payload.client_nonce_hex,
-                "custom_info": custom_info_str,
-                "paypal_client_id": cid,
-                "flow": label,
-            }
-        },
-        "hardware_level_attestation": quote_res,
-        "timestamp_ms": chrono::Utc::now().timestamp_millis() as u64,
-    });
-    let report_sig = sign_report(&state, &attestation_report);
-
     let body = serde_json::json!({
-        "attestation_envelope": {
-            "attestation_report": attestation_report,
-            "enclave_signing_public_key": state.enclave_identity.pubkey_pem,
-            "enclave_signature_b64": report_sig,
-        },
         "enclave_signing_public_key": state.enclave_identity.pubkey_pem,
         "signed_fields": signed_fields,
-        "preflight_signature_b64": signature,
-    });    let mut resp = ([(axum::http::header::CONTENT_TYPE, "application/json")], Json(body)).into_response();
+        "login_signature_b64": signature,
+    });
+    let mut resp = ([(axum::http::header::CONTENT_TYPE, "application/json")], Json(body)).into_response();
     resp.headers_mut().insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, axum::http::HeaderValue::from_static("*"));
     with_secure_headers(resp)
 }
@@ -1702,14 +1608,16 @@ async fn attest_preflight(
 // ----------------------------------------------------------------------------
 // Standalone Auditor Envelope (GET /debug/envelope)
 // ----------------------------------------------------------------------------
-// verify.html's pre-flight button (runPreflight) fetches this path and runs
-// the full audit on a LIVE report before the user starts a login. The body
-// mirrors attest_preflight's `attestation_envelope` exactly — the same shape
-// executePreflightAndLogin audits — with an SEC-02 (v160)5-component nonce
-// bound into the TDX quote's report_data and NO client session bound (session
-// binding belongs to the login flow's POST). Pre-login there is no PayPal user,
-// so paypal_user_info_raw_hash carries a documented placeholder and the nonce
-// is self-consistent with it; the real user hash is bound only at login.
+// v180 (user directive — no pre-login attestation): this route is NO LONGER
+// part of the login flow. It exists only for (a) the golden-pin rotation
+// tooling (scripts/calculate-golden-rtmr.mjs) and (b) an operator manually
+// eyeballing a live envelope. The body carries an SEC-02 (v160) 5-component
+// nonce bound into the TDX quote's report_data with NO client session bound
+// (session binding belongs to the login flow's callback). Pre-login there is
+// no PayPal user, so paypal_user_info_raw_hash carries a documented
+// placeholder and the nonce is self-consistent with it; the real user hash is
+// bound only at login. It is served from a 15-minute cache (see handler), so
+// it cannot be used to exhaust enclave resources.
 async fn debug_envelope(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -1717,6 +1625,21 @@ async fn debug_envelope(
     use sha2::Digest;
     if let Err(status) = state.record_egress(addr.ip(), 8192) {
         return status.into_response();
+    }
+
+    // v180 (user directive — no pre-login DoS surface): the envelope is minted
+    // ONCE per cache window (15 min) and served from RAM afterwards, so no
+    // request path can ever trigger TD-quote generation at line rate (each
+    // quote costs a full TDG.MR.REPORT + QGS round-trip). The mint is kept
+    // alive for the ops/rotation workflow (calculate-golden-rtmr.mjs) and the
+    // manual auditor — the LOGIN flow never touches this route.
+    const ENVELOPE_CACHE_SECS: u64 = 900;
+    if let Some((at, cached)) = state.boot_envelope.read().clone() {
+        if at.elapsed().as_secs() < ENVELOPE_CACHE_SECS {
+            let mut resp = ([(axum::http::header::CONTENT_TYPE, "application/json")], Json(cached)).into_response();
+            resp.headers_mut().insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, axum::http::HeaderValue::from_static("*"));
+            return with_secure_headers(resp);
+        }
     }
 
     let binary_sha256 = hex::encode(sha2::Sha256::digest(&std::fs::read("/init").unwrap_or_default()));
@@ -1738,7 +1661,6 @@ async fn debug_envelope(
     let quote_res = tpm::quote(&hex::encode(nonce), Some(report_data));
 
     // v168 (plan Phase 2.2): FAIL-CLOSED report minting.
-    #[cfg(feature = "alibabacloud")]
     if quote_res.tdx_quote_b64.is_none() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1767,6 +1689,9 @@ async fn debug_envelope(
         "enclave_signing_public_key": state.enclave_identity.pubkey_pem,
         "enclave_signature_b64": signature,
     });
+
+    // Refresh the cache window with this fresh mint, then serve it.
+    *state.boot_envelope.write() = Some((Instant::now(), body.clone()));
 
     let mut resp = ([(axum::http::header::CONTENT_TYPE, "application/json")], Json(body)).into_response();
     resp.headers_mut().insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, axum::http::HeaderValue::from_static("*"));
@@ -1816,11 +1741,55 @@ async fn callback(
     let code = query.code.clone().unwrap_or_default();
     let state_param = query.state.clone().unwrap_or_default();
 
-    let pending_entry = state.pending_oauth.write().remove(&state_param);
-    let (flow, pkce) = match pending_entry {
-        Some((f, p)) if p.created_at.elapsed() < Duration::from_secs(600) => (f, p),
-        _ => return (StatusCode::FORBIDDEN, "Invalid or expired session. Start from /verify.html").into_response(),
+    // v180 (user directive — no pre-login attestation): the client session
+    // rides inside the OAuth `state` token (base64url JSON {v,p,n,f,c,r})
+    // instead of a server-side pending session, and no PKCE verifier is kept
+    // server-side any more — the exchange below is a confidential-client
+    // exchange (the client_secret only ever exists inside the enclave).
+    // Everything parsed here is UNTRUSTED by construction: its only consumer
+    // is the hardware quote below, whose report_data[32..64] binds
+    // SHA-256(P_client ∥ Nonce_client). The auditor compares that slot against
+    // the session values IT generated, so a forged state merely produces a
+    // report that fails the local audit — never a usable blob. The expensive
+    // paths (PayPal exchange + TD quote) sit behind a PayPal-verified code:
+    // PayPal is the attacker filter, so no unauthenticated caller can ever
+    // trigger quote minting (the pre-flight's DoS surface, removed).
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+    let invalid_session = || (StatusCode::FORBIDDEN, "Invalid or expired session. Start from /verify.html").into_response();
+    let state_raw = match B64URL.decode(state_param.trim()) {
+        Ok(v) => v,
+        Err(_) => return invalid_session(),
     };
+    let st: serde_json::Value = match serde_json::from_slice(&state_raw) {
+        Ok(v) => v,
+        Err(_) => return invalid_session(),
+    };
+    let flow = match st.get("f").and_then(|v| v.as_str()) {
+        Some(f @ "verified") | Some(f @ "full") => f.to_string(),
+        _ => return invalid_session(),
+    };
+    let client_pub = match st.get("p").and_then(|v| v.as_str()).map(|s| B64STD.decode(s.trim())) {
+        Some(Ok(v)) if !v.is_empty() => v,
+        _ => return invalid_session(),
+    };
+    // Panic-safe validation (same gate the old pre-flight enforced): reject a
+    // non-DER key NOW so the ECDH below cannot fail later.
+    if openssl::pkey::PKey::public_key_from_der(&client_pub).is_err() {
+        return invalid_session();
+    }
+    let client_nonce = match st.get("n").and_then(|v| v.as_str()).and_then(|s| hex::decode(s.trim()).ok()) {
+        Some(v) if v.len() == 32 => {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&v);
+            a
+        }
+        _ => return invalid_session(),
+    };
+    // Same custom_info canonicalization as the login-session endpoint
+    // (trim; empty → "NONE") so the SEC-02 nonce binds what the auditor
+    // recorded locally.
+    let custom_info = st.get("c").and_then(|v| v.as_str()).unwrap_or("NONE").trim();
+    let custom_info_str = if custom_info.is_empty() { "NONE".to_string() } else { custom_info.to_string() };
 
     let (cid, csec, _, _) = state.get_flow_config(&flow);
     let api_base = if state.staging { PAYPAL_SANDBOX_API } else { PAYPAL_PRODUCTION_API };
@@ -1831,7 +1800,6 @@ async fn callback(
             ("grant_type", "authorization_code"),
             ("code", &code),
             ("redirect_uri", &state.redirect_uri),
-            ("code_verifier", &pkce.code_verifier),
         ])
         .send().await;
 
@@ -1864,7 +1832,7 @@ async fn callback(
     let paypal_user_raw_hash = hex::encode(sha2::Sha256::digest(
         serde_json::to_string(&minimized).unwrap_or_default().as_bytes(),
     ));
-    let custom_info = pkce.custom_info.clone();
+    let custom_info = custom_info_str;
 
     let nonce = sec02_nonce(
         &paypal_user_raw_hash,
@@ -1881,11 +1849,10 @@ async fn callback(
     // session can never be replayed at this one: its hardware quote carries
     // the wrong P_client/nonce and the auditor's recomputation fails closed.
     // [0..32] stays the SEC-02 identity/code nonce (formula unchanged).
-    report_data[32..64].copy_from_slice(&client_session_binding(&pkce.client_ecdh_pub, &pkce.client_nonce));
+    report_data[32..64].copy_from_slice(&client_session_binding(&client_pub, &client_nonce));
     let quote_res = tpm::quote(&hex::encode(nonce), Some(report_data));
 
     // v168 (plan Phase 2.2): FAIL-CLOSED report minting.
-    #[cfg(feature = "alibabacloud")]
     if quote_res.tdx_quote_b64.is_none() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1931,8 +1898,8 @@ async fn callback(
             // report_data[32..64] is echoed here for transparency. The auditor
             // compares the QUOTE bytes against ITS OWN session values — this
             // echo is display/cross-check only, never the source of trust.
-            "client_pub_b64": B64STD.encode(&pkce.client_ecdh_pub),
-            "client_nonce_hex": hex::encode(&pkce.client_nonce),
+            "client_pub_b64": B64STD.encode(&client_pub),
+            "client_nonce_hex": hex::encode(&client_nonce),
         },
         "hardware_level_attestation": quote_res,
     });
@@ -1945,10 +1912,14 @@ async fn callback(
     });
 
     // Derive session key in RAM and encrypt using AES-256-GCM (AAD: client_nonce)
+    let enclave_ecdh = match new_enclave_ecdh() {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "ECDH key generation failed").into_response(),
+    };
     let mut session_key = match crypto_e2ee::derive_session_key(
-        &pkce.enclave_ecdh,
-        &pkce.client_ecdh_pub,
-        &pkce.client_nonce,
+        &enclave_ecdh,
+        &client_pub,
+        &client_nonce,
     ) {
         Ok(k) => k,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "E2EE key derivation failed").into_response(),
@@ -1957,14 +1928,14 @@ async fn callback(
         Ok(s) => s,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Envelope serialization failed").into_response(),
     };
-    let (iv, ct) = match crypto_e2ee::encrypt_envelope(&session_key, report_json.as_bytes(), &pkce.client_nonce) {
+    let (iv, ct) = match crypto_e2ee::encrypt_envelope(&session_key, report_json.as_bytes(), &client_nonce) {
         Ok(v) => v,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "E2EE encryption failed").into_response(),
     };
     // Zeroize the derived session key immediately after use (plan requirement).
     session_key.iter_mut().for_each(|b| *b = 0);
 
-    let ecdh_pub_der = pkce.enclave_ecdh.public_key_to_der().unwrap_or_default();
+    let ecdh_pub_der = enclave_ecdh.public_key_to_der().unwrap_or_default();
     let e2ee_blob = serde_json::json!({
         "alg": "AES-256-GCM+HKDF-SHA256+ECDH-P256",
         "aad": "client_nonce",
@@ -1976,7 +1947,7 @@ async fn callback(
         "flow": flow,
     });
 
-    // Save for local claim. Bounded like pending_oauth: a completed PayPal
+    // Save for local claim. Bounded: a completed PayPal
     // login is required to add one, but the table must still have a ceiling so
     // it can never grow without limit between the 60 s cleanup ticks. On
     // overflow the OLDEST entry is dropped (its owner can simply log in again).
@@ -2067,7 +2038,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // CCEL log unavailable in-guest is NOT a halt: it is recorded in the
         // probe transcript and integrity stays enforced remotely by
         // verify.html's EXPECTED_MRTD/EXPECTED_RTMR* hard pins over the quote.
-        #[cfg(feature = "alibabacloud")]
         {
             let boot_nonce = {
                 use sha2::{Digest, Sha256};
@@ -2201,8 +2171,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             last_limit_reset: Arc::new(RwLock::new(Instant::now())),
             connection_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
             boot_manifest,
-            pending_oauth: Arc::new(RwLock::new(std::collections::HashMap::new())),
             pending_e2ee_blobs: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            boot_envelope: Arc::new(RwLock::new(None)),
         });
 
         // Periodic cleanup of expired volatile sessions
@@ -2211,7 +2181,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                cleanup_state.pending_oauth.write().retain(|_, (_, p)| p.created_at.elapsed() < Duration::from_secs(600));
                 cleanup_state.pending_e2ee_blobs.write().retain(|_, (_, t)| t.elapsed() < Duration::from_secs(600));
             }
         });
@@ -2219,7 +2188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let app = Router::new()
             .route("/", get(serve_verify_html))
             .route("/verify.html", get(serve_verify_html))
-            .route("/attest/preflight", axum::routing::options(preflight_cors).post(attest_preflight))
+            .route("/attest/login-session", axum::routing::options(login_session_cors).post(attest_login_session))
             .route("/debug/envelope", get(debug_envelope))
             .route("/callback", get(callback))
             .route("/e2ee-blob", get(get_e2ee_blob))
@@ -2425,25 +2394,6 @@ mod security_tests {
     // =====================================================================
 
     #[test]
-    fn preflight_binding_parity_v168() {
-        // SHA-256(P_enc ∥ code_challenge ∥ P_client ∥ Nonce ∥ custom_info ∥ PayPal_Client_ID)
-        let rd = compute_preflight_binding(
-            b"test-enc-pub-der",
-            "E9xrX1s2qO0hAaBcDeFgHiJkLmNoPqRsTuVwXyZ012345",
-            b"test-client-pub-der",
-            &[0x7f; 32],
-            "wallet_test_1",
-            "AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p",
-        );
-        assert_eq!(
-            hex::encode(&rd[..32]),
-            "3b85617fdb4c68eeb86748dcb02572b610b4800ac6479d8760fd4e0cbde5249c",
-            "preflight REPORTDATA binding drifted — update Rust + verify.html + harness together"
-        );
-        assert_eq!(&rd[32..], &[0u8; 32][..], "report_data[32..64] must stay zero");
-    }
-
-    #[test]
     fn sec02_nonce_parity_v168() {
         use sha2::{Digest, Sha256};
         let paypal_hash = hex::encode(Sha256::digest(br#"{"sub":"user"}"#));
@@ -2544,7 +2494,7 @@ mod security_tests {
             .expect("hardened_client() body must exist");
         assert!(
             client_fn.contains(".tls_built_in_root_certs(false)"),
-            "hardened_client() must disable the built-in/system root store — only PAYPAL_CA_PEM/GOOGLE_CA_PEM may be trusted (plan Phase 2)"
+            "hardened_client() must disable the built-in/system root store — only the embedded PAYPAL_CA_PEM may be trusted (plan Phase 2)"
         );
         assert!(
             client_fn.contains("add_root_certificate"),

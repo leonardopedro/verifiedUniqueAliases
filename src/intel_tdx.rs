@@ -1,6 +1,6 @@
 //! Intel TDX (Trusted Domain Extensions) Hardware Root-of-Trust Adapter
 //!
-//! **Target Platform:** Alibaba Cloud ECS.r9i.xlarge
+//! **Target Platform:** Alibaba Cloud ECS c9i family (deploy default ecs.c9i.large — cheapest TDX shape, live-verified 2026-10-23)
 //! **Processor:** Intel Xeon Platinum 8475L (Sapphire Rapids)
 //!
 //! Intel TDX uses a standard vTPM 2.0 — attestation is simpler than AMD SEV-SNP:

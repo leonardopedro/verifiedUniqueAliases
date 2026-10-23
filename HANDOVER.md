@@ -49,7 +49,7 @@ What round 1 changed (files):
   `state = <flow>.<nonce>`, pending-flow map with TTL). Config→callback wiring
   verified: `pending.flow` holds a short token that round-trips through
   `get_flow_config(&flow)` (`"verified"`/`else → "full"`).
-- `verify.html` — MRTD/RTMR pinning, code & preflight pins, **app pins**
+- `verify.html` — MRTD/RTMR pinning, code & session pins, **app pins** (v180: no pre-login attestation — the login-session call is bookkeeping only)
   (`full = ARDDrFepkPcuh-…`, `verified = AZXkzMWMioIQ-…`), boot-chain
   provenance (shim/grub digests), injection re-sweep.
 - `.github/workflows/build-attest.yml` — attests **shim + grub** as subjects;

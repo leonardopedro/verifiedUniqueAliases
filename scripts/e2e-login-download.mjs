@@ -7,7 +7,7 @@
 // Why this exists: the download is the first casualty of any red audit row —
 // a missing file is a SYMPTOM (v178: the identity-preimage gate failed on
 // every honest login and silently suppressed the download). This script makes
-// the whole chain observable: preflight status, callback handoff, the
+// the whole chain observable: login-session status, callback handoff, the
 // ?afterlogin=1 page, the claim verdict, download events, and the claimed
 // report JSON (saved for offline inspection of the failing gate).
 //
@@ -63,10 +63,12 @@ try {
   await page.fill('#localEnclaveHost', 'https://login.airma.de');
   log('1. loaded', VERIFY, '(trusted copy)');
 
-  // Step 1 — preflight + hardware audit + client keypair.
+  // Step 1 — login session (v180: NO pre-login attestation — S_enc-signed
+  // fields only; the hardware audit runs on the post-login report) + client
+  // keypair.
   // Popup FIX (user report): the handoff is a plain link (#securePaypalUrl),
   // NOT window.open() — an async-time popup is blocked by every browser. The
-  // button runs the pre-flight and reveals the link; clicking the link
+  // button requests the login session and reveals the link; clicking the link
   // (target=_blank) is a real user gesture, so the new tab is never blocked.
   await page.click(`button:has-text("Log in with PayPal (${FLOW === 'full' ? 'Share full profile' : 'Verified account only'})")`);
   await page.waitForSelector('#securePaypalUrl', { state: 'visible', timeout: 90000 });
@@ -77,7 +79,7 @@ try {
   log('2. step-1 status:', (await page.textContent('#secureLoginStatus').catch(() => '')).slice(0, 240));
 
   const pp = popup;
-  if (!pp) throw new Error('no PayPal tab opened from the #securePaypalUrl link (preflight failed?)');
+  if (!pp) throw new Error('no PayPal tab opened from the #securePaypalUrl link (login-session failed?)');
   await pp.waitForLoadState('domcontentloaded').catch(() => {});
   log('3. popup landed:', pp.url().slice(0, 110));
   pp.on('download', (d) => { downloaded = d.suggestedFilename(); log('  [DOWNLOAD]', downloaded); });
