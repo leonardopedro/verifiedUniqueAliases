@@ -716,8 +716,11 @@ the order that finds bugs fastest (validated live 2026-10-23).
   drive the PayPal sandbox popup (test user `sb-fuobx47090577@personal.example.com`),
   land on `/callback`, then press **2. Claim Encrypted Report** on the local
   page. Success = the ✅ status line AND a `download` event carrying
-  `attestation-report-*.json`. `scripts/e2e-sandbox.mjs` drives the same flow
-  including consent-page handling.
+  `attestation-report-*.json`.
+- `scripts/e2e-login-download.mjs` automates exactly this (preflight → popup
+  → consent → claim → download assertion, exits non-zero if the file never
+  arrives, saves the claimed report to /tmp for gate triage);
+  `scripts/e2e-sandbox.mjs` is the report-capture variant.
 - Triage rule: the download is suppressed whenever ANY audit row is red —
   find the first ❌ / the thrown error in the browser console rather than
   suspecting the download logic. (That is how the v178 IDENTITY PREIMAGE bug
