@@ -681,6 +681,64 @@ The system presents a signed **Remote Attestation Report** on the OAuth callback
 
 ---
 
+## End-to-End Debugging Playbook
+
+How to debug this system end-to-end when a login, audit or deploy misbehaves —
+the order that finds bugs fastest (validated live 2026-10-23).
+
+### 1. Static checks first (minutes, before any live system)
+- `node scripts/test-verify-security.mjs` must be 0-failed;
+  `REAL_REPORT=<envelope.json> node scripts/test-verify-security.mjs` adds
+  Test 22 against a real captured report. Test 28 (README digest) is the
+  canary for "you edited verify.html and forgot to republish".
+- `cargo test --release --features alibabacloud --target x86_64-unknown-linux-gnu`
+  (on NixOS the host build needs `PKG_CONFIG_PATH` pointing at a nix-store
+  `openssl.pc`).
+
+### 2. Capture live evidence (no browser needed)
+- `curl -sk https://<enclave>/debug/envelope > envelope.json` — the full
+  attestation envelope. Extract/rotate pins with
+  `node scripts/calculate-golden-rtmr.mjs --report envelope.json` (`--update`
+  rewrites verify.html deliberately).
+- The OSS self-report sink (`boot/<env>/latest.json`) still carries boot-stage
+  markers when TLS/ACME is down — the lifeline for dark instances.
+- ECS calls are hand-signed (HMAC-SHA1 RPC). `InvalidSecurityToken.Expired`
+  ⇒ run `aliyun sts GetCallerIdentity` once to refresh. The live API traps
+  (flat `Features.NvmeSupport`, `Format` not `ImageFormat`, capital-D
+  `InstanceIdSet`) are listed in the Alibaba section above.
+
+### 3. Browser end-to-end — the only way to test login/handoff/download
+- Playwright + `CHROMIUM_PATH=<nix chromium>` on NixOS (the bundled playwright
+  chromium dies on missing distro libs, e.g. libglib).
+- Load `file:///<repo>/verify.html` — never the enclave-served copy (key
+  generation is refused there by design). Fill `#localEnclaveHost`
+  (`https://<enclave>`), click **Log in with PayPal (Verified account only)**,
+  drive the PayPal sandbox popup (test user `sb-fuobx47090577@personal.example.com`),
+  land on `/callback`, then press **2. Claim Encrypted Report** on the local
+  page. Success = the ✅ status line AND a `download` event carrying
+  `attestation-report-*.json`. `scripts/e2e-sandbox.mjs` drives the same flow
+  including consent-page handling.
+- Triage rule: the download is suppressed whenever ANY audit row is red —
+  find the first ❌ / the thrown error in the browser console rather than
+  suspecting the download logic. (That is how the v178 IDENTITY PREIMAGE bug
+  was found: the download worked, the audit gate failed.)
+
+### 4. Deploy loop for boot-chain changes
+1. `bash build-alibaba-docker.sh` (rootless podman works) — the only build CI
+   attests. Compare its digests with the CI run's annotations AND the
+   attestation lookups (`api.github.com/repos/<o>/<r>/attestations/sha256:<hex>`)
+   before deploying anything.
+2. Presigned PUT to the HK bucket → relay `user_data` transfer (HK GET →
+   Beijing intranet PUT; success powers the relay OFF) → `ImportImage`
+   (`BootMode=UEFI`, flat `DiskDeviceMapping.1.Format=raw`) →
+   `Features.NvmeSupport=supported` → Stop/`ReplaceSystemDisk`/Start on the
+   enclave instance (the user_data config survives).
+3. Capture `/debug/envelope` after boot, rotate pins from that capture,
+   republish the README digest, roll `verify.html` onto the ESP (mtools on the
+   extracted FAT partition). `verify.html` is in neither the binary nor the
+   initrd and lives on the UNMEASURED ESP — editing it never moves RTMR2, so
+   pin edits never feed a re-rotation loop.
+
 ## Known Constraints & Notes
 
 - **EK Certificate ≠ Session AK** (by design): Never compare them during any verification pass. This mismatch is expected.
