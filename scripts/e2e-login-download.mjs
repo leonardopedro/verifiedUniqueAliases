@@ -63,16 +63,21 @@ try {
   await page.fill('#localEnclaveHost', 'https://login.airma.de');
   log('1. loaded', VERIFY, '(trusted copy)');
 
-  // Step 1 — preflight + hardware audit + client keypair; PayPal opens in a popup.
+  // Step 1 — preflight + hardware audit + client keypair.
+  // Popup FIX (user report): the handoff is a plain link (#securePaypalUrl),
+  // NOT window.open() — an async-time popup is blocked by every browser. The
+  // button runs the pre-flight and reveals the link; clicking the link
+  // (target=_blank) is a real user gesture, so the new tab is never blocked.
+  await page.click(`button:has-text("Log in with PayPal (${FLOW === 'full' ? 'Share full profile' : 'Verified account only'})")`);
+  await page.waitForSelector('#securePaypalUrl', { state: 'visible', timeout: 90000 });
   const [popup] = await Promise.all([
     ctx.waitForEvent('page', { timeout: 30000 }).catch(() => null),
-    page.click(`button:has-text("Log in with PayPal (${FLOW === 'full' ? 'Share full profile' : 'Verified account only'})")`),
+    page.click('#securePaypalUrl'),
   ]);
-  await page.waitForTimeout(8000);
   log('2. step-1 status:', (await page.textContent('#secureLoginStatus').catch(() => '')).slice(0, 240));
 
   const pp = popup;
-  if (!pp) throw new Error('no PayPal popup opened (window.open blocked or preflight failed)');
+  if (!pp) throw new Error('no PayPal tab opened from the #securePaypalUrl link (preflight failed?)');
   await pp.waitForLoadState('domcontentloaded').catch(() => {});
   log('3. popup landed:', pp.url().slice(0, 110));
   pp.on('download', (d) => { downloaded = d.suggestedFilename(); log('  [DOWNLOAD]', downloaded); });

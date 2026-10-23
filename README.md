@@ -95,7 +95,7 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 169,641 bytes | `e441d46162d15fb9db3e9b7eda1b506af0635e88679ea2ba7e9d0192a7a18a4b` |
+| `verify.html` | 175,583 bytes | `128269f36bf65d54ee8ce6e85cb209763126b9ee354a85abd02f365aefbdf51b` |
 
 ```bash
 sha256sum verify.html
@@ -121,7 +121,7 @@ sha256sum verify.html
 |---|---|
 | `src/main.rs` | Rust PID 1: DHCP, TPM attestation, ACME TLS, PayPal OAuth, report signing |
 | `src/google_ca.pem` | Embedded Google Root CA (compiled into binary via `include_bytes!`) |
-| `src/paypal.pem` | Embedded PayPal Root CA (compiled into binary via `include_bytes!`) |
+| `src/paypal.pem` | Embedded TLS trust root for the pinned PayPal API endpoints — **DigiCert Global Root G2** (SHA-256 `cb3ccbb7…ab1cb5f`, fingerprint pinned by test `paypal_api_root_is_digicert_g2_v179`) |
 | `verify.html` | Browser auditor: binary TPM parser, DER cert decoder, WebCrypto, GitHub API |
 | `deploy-gcp.sh` | End-to-end deployment (EAB rotation → build → GCS → GCP VM) |
 | `Dockerfile.repro` | Multi-stage reproducible build (Debian Trixie pinned snapshots) |

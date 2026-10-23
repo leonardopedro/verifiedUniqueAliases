@@ -171,6 +171,13 @@ mod enclave_init {
         }
         // 2. sysctl hardening. A kernel built without the knob is acceptable
         // (nothing to disable); a knob that REFUSES the hardened value is not.
+        // 3. core dumps (plan Phase 4: "ulimit -c 0") — a core of the enclave
+        //    process would carry key material to a filesystem the host reads.
+        //    RLIMIT_CORE=0 kills them at the syscall layer (suid_dumpable=0
+        //    covers the setuid case; this covers the process itself).
+        let no_core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let rc = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) };
+        kmsg(&format!("  setrlimit(RLIMIT_CORE, 0) -> {}", rc));
         for (path, val, name) in [
             ("/proc/sys/kernel/kexec_load_disabled", "1", "kexec_load_disabled"),
             ("/proc/sys/fs/suid_dumpable", "0", "suid_dumpable"),
@@ -889,6 +896,26 @@ fn prelogin_paypal_hash() -> String {
     hex::encode(Sha256::digest(b"PRELOGIN_NO_USER"))
 }
 
+// v179 (plan Phase 1 — session-substitution defense): the callback quote's
+// report_data[32..64] binds the CLIENT session that initiated the login:
+//
+//   SHA-256(P_client SPKI-DER ∥ Nonce_client)
+//
+// P_client/Nonce_client are generated in the user's browser and arrive with
+// the PKCE handshake (PkceSession.client_ecdh_pub / .client_nonce). The
+// auditor holds ITS OWN copy of these values (localStorage/sessionStorage
+// written when the key was created) and recomputes this digest — a report
+// minted for a different browser's session carries the wrong bytes in the
+// hardware quote and fails closed. Byte-identical to verify.html's
+// `clientSessionBindingHex()`.
+fn client_session_binding(client_pub_der: &[u8], client_nonce: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(client_pub_der);
+    hasher.update(client_nonce);
+    hasher.finalize().into()
+}
+
 // Sign the canonical (sorted-key) JSON of an attestation_report with the
 // enclave's ephemeral RSA key. serde_json's Map is a BTreeMap (sorted), so
 // to_string() is byte-identical to verify.html's JSON.stringify(reorder(...)).
@@ -1187,6 +1214,13 @@ fn hardened_client() -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .use_rustls_tls()
+        // v179 (plan Phase 2 — outbound TLS MITM defense): the platform root
+        // store (/etc/ssl/certs, webpki-roots) is DISK-ATTACKER-CONTROLLABLE
+        // and must never decide trust here. Only the two roots compiled into
+        // THIS binary (PAYPAL_CA_PEM / GOOGLE_CA_PEM via include_bytes!) are
+        // accepted — a host that swaps the CA bundle or terminates TLS with
+        // its own cert fails the handshake instead of being trusted.
+        .tls_built_in_root_certs(false)
         .resolve("api-m.paypal.com", std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(104, 16, 124, 74)), 443))
         .resolve("api-m.sandbox.paypal.com", std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(146, 75, 123, 1)), 443));
 
@@ -1841,6 +1875,13 @@ async fn callback(
     );
     let mut report_data = [0u8; 64];
     report_data[0..32].copy_from_slice(&nonce);
+    // v179 (plan Phase 1 — session-substitution defense): the quote's SECOND
+    // report_data slot binds THIS browser's client session — SHA-256(P_client
+    // SPKI-DER ∥ Nonce_client) — so a report minted for another browser's
+    // session can never be replayed at this one: its hardware quote carries
+    // the wrong P_client/nonce and the auditor's recomputation fails closed.
+    // [0..32] stays the SEC-02 identity/code nonce (formula unchanged).
+    report_data[32..64].copy_from_slice(&client_session_binding(&pkce.client_ecdh_pub, &pkce.client_nonce));
     let quote_res = tpm::quote(&hex::encode(nonce), Some(report_data));
 
     // v168 (plan Phase 2.2): FAIL-CLOSED report minting.
@@ -1886,6 +1927,12 @@ async fn callback(
         },
         "session_context": {
             "tls_certificate_pem": state.tls_cert_pem.read().clone().unwrap_or_default(),
+            // v179 (plan Phase 1.1): the client session bound into the quote's
+            // report_data[32..64] is echoed here for transparency. The auditor
+            // compares the QUOTE bytes against ITS OWN session values — this
+            // echo is display/cross-check only, never the source of trust.
+            "client_pub_b64": B64STD.encode(&pkce.client_ecdh_pub),
+            "client_nonce_hex": hex::encode(&pkce.client_nonce),
         },
         "hardware_level_attestation": quote_res,
     });
@@ -2408,6 +2455,100 @@ mod security_tests {
             hex::encode(nonce),
             "398c2c1b18583ac9c3935ffdea04f0b2a3dfdd927140072bd50511e9f77db8f7",
             "SEC-02 session-nonce formula drifted — update Rust + verify.html + harness together"
+        );
+    }
+
+    /// v179 (plan Phase 1 — session substitution): the callback quote's
+    /// report_data[32..64] is SHA-256(P_client SPKI-DER ∥ Nonce_client).
+    /// Same golden vector as verify.html `clientSessionBindingHex()` and the
+    /// JS harness — all three implementations must agree byte-for-byte.
+    #[test]
+    fn client_session_binding_parity_v179() {
+        let binding = client_session_binding(b"test-client-pub-der", &[0x7f; 32]);
+        assert_eq!(
+            hex::encode(binding),
+            "4809a12bd741f4ecc332722e5c89dc43e2d93e2ade15a974206d0bcf1f038ddb",
+            "client-session binding formula drifted — update Rust + verify.html + harness together"
+        );
+    }
+
+    /// v179 (plan Phase 4 — host egress defense): the kernel-hardening block
+    /// must keep every protection the plan requires — swap off (fail closed),
+    /// kexec disabled, suid dumps off, core dumps off. Source-level pin in the
+    /// style of cmdline_pin_matches_build_script.
+    #[test]
+    fn kernel_hardening_covers_plan_phase4_v179() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("src/main.rs must be readable");
+        let body = src
+            .split("pub fn harden_kernel()")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub fn ").next())
+            .expect("harden_kernel() body must exist");
+        for (needle, why) in [
+            ("swapoff", "swap must be disabled (secrets may not page to the host disk)"),
+            ("kexec_load_disabled", "kexec must be disabled (an unmeasured kernel could be loaded past the RTMR pins)"),
+            ("suid_dumpable", "suid core dumps must be off"),
+            ("RLIMIT_CORE", "core dumps must be off (ulimit -c 0 equivalent)"),
+        ] {
+            assert!(body.contains(needle), "harden_kernel() lost '{}' — {}", needle, why);
+        }
+    }
+
+    /// v179 (live E2E regression, 2026-10-23): the embedded "paypal.pem" was
+    /// a stale EXPIRED LEAF (CN=api-m.paypal.com, notAfter 2026-09-13)
+    /// masquerading as a root — decorative while system roots were trusted,
+    /// then a hard fail-closed break of the PayPal token exchange the moment
+    /// plan Phase 2 disabled them. The pin must be the REAL trust anchor of
+    /// api-m.paypal.com / api-m.sandbox.paypal.com: DigiCert Global Root G2
+    /// (thumbprint cross-checked against DigiCert's published value). Root
+    /// rotation MUST update this fingerprint in the same reviewed commit.
+    #[test]
+    fn paypal_api_root_is_digicert_g2_v179() {
+        use base64::Engine as _;
+        use sha2::Digest;
+        let pem = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/paypal.pem"))
+            .expect("src/paypal.pem must be readable");
+        let b64: String = pem
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect::<String>();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .expect("paypal.pem must be valid base64 DER");
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(&der)),
+            "cb3ccbb76031e5e0138f8dd39a23f9de47ffc35e43c1144cea27d46a5ab1cb5f",
+            "src/paypal.pem is NOT the DigiCert Global Root G2 anchor of the pinned PayPal API endpoints — the hardened TLS client would fail every live token exchange"
+        );
+        assert!(
+            reqwest::Certificate::from_pem(pem.as_bytes()).is_ok(),
+            "reqwest must accept the embedded root"
+        );
+    }
+
+    /// v179 (plan Phase 2 — outbound TLS MITM defense): hardened_client()
+    /// must NOT consult the platform root store (disk-attacker-controllable);
+    /// only the two include_bytes! pins may decide trust. Source-level pin in
+    /// the style of cmdline_pin_matches_build_script — dropping the flag from
+    /// the builder breaks THIS test in the reviewed commit that would weaken
+    /// the transport.
+    #[test]
+    fn hardened_client_disables_system_roots_v179() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("src/main.rs must be readable");
+        let client_fn = src
+            .split("fn hardened_client()")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("hardened_client() body must exist");
+        assert!(
+            client_fn.contains(".tls_built_in_root_certs(false)"),
+            "hardened_client() must disable the built-in/system root store — only PAYPAL_CA_PEM/GOOGLE_CA_PEM may be trusted (plan Phase 2)"
+        );
+        assert!(
+            client_fn.contains("add_root_certificate"),
+            "hardened_client() must pin the embedded roots explicitly"
         );
     }
 

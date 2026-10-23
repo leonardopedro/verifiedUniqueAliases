@@ -220,6 +220,7 @@
             <input type="text" id="customInfoInput" maxlength="512"
                 placeholder="Optional: your public key / wallet / nonce — bound into the hardware quote and the report"
                 style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
+            <a id="securePaypalUrl" style="display:none; margin-top:10px;" class="btn" target="_blank" rel="noopener">Continue to PayPal →</a>
             <p id="secureLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
         </div>
     </div>
@@ -385,6 +386,13 @@
     // eval — top-level `let` stays in the eval scope and would be invisible
     // to scripts/test-verify-security.mjs, which drives these pins directly.)
     var preFlightPubKeyPem = null;
+    // v179 (plan Phase 1 — session-substitution defense): SHA-256(P_client
+    // SPKI-DER ∥ Nonce_client) of the client session THIS browser generated
+    // when starting the login. The callback quote binds it into report_data
+    // [32..64]; when present, the auditor enforces that slot strictly. Without
+    // it (a pasted report audited outside its session) the slot cannot be
+    // verified — [0..32] stays strictly enforced, the slot is informational.
+    var auditorSessionBindingHex = null;
     var lastAuditedPubKeyPem = null;
 
     // report_data[0..32] = SHA-256(P_enc_SPKI_DER ∥ session_nonce),
@@ -434,6 +442,20 @@
         const u = new Uint8Array(b.length);
         for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i);
         return u;
+    }
+
+    // v179 (plan Phase 1 — session substitution): SHA-256(P_client SPKI-DER ∥
+    // Nonce_client) — byte-identical to src/main.rs::client_session_binding().
+    // Golden vector pinned by security_tests::client_session_binding_parity_v179
+    // and the JS harness.
+    async function clientSessionBindingHex(clientPubDer, clientNonceHex) {
+        const nonceBytes = new Uint8Array((clientNonceHex.match(/.{1,2}/g) || []).map(m => parseInt(m, 16)));
+        const pub = new Uint8Array(clientPubDer);
+        const pre = new Uint8Array(pub.length + nonceBytes.length);
+        pre.set(pub, 0);
+        pre.set(nonceBytes, pub.length);
+        const digest = await crypto.subtle.digest('SHA-256', pre);
+        return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
     // PRE-FLIGHT (Pillar 4): run BEFORE starting the PayPal login. Fetches
@@ -582,18 +604,34 @@
             // v168 (plan Phase 3.3): the keys live in THIS trusted origin's
             // localStorage — never the enclave's storage — so the encrypted
             // report is claimed later via /e2ee-blob (step 2).
+            // v179 (plan Phase 1): keep the client-session binding with the
+            // session — the claim-time audit enforces it against the quote's
+            // report_data[32..64] (session-substitution defense).
+            auditorSessionBindingHex = await clientSessionBindingHex(new Uint8Array(pubRaw), nonceHex);
+            try { sessionStorage.setItem('pav_session_binding_hex', auditorSessionBindingHex); } catch (e) {}
             localStorage.setItem('pav_local_session', JSON.stringify({
                 host: enclaveBase, jwk: clientJwk, nonceHex, customInfo,
                 p_enc: pf.enclave_signing_public_key, state: sf.state, flow: sf.flow || flow || 'verified',
+                clientPubB64: btoa(String.fromCharCode(...new Uint8Array(pubRaw))),
+                sessionBindingHex: auditorSessionBindingHex,
             }));
 
-            say('✅ Pre-flight PASSED — hardware-bound P_enc pinned. PayPal opens in a NEW tab; after logging in, come back HERE and press “Step 2 — Claim”.');
             // Client-built authorize URL from the AUTHENTICATED fields (scope
             // arrives pre-percent-encoded from the enclave — do not re-encode).
             const url = `${sf.authorize_base}?client_id=${encodeURIComponent(sf.paypal_client_id)}` +
                 `&response_type=code&scope=${sf.scope}&redirect_uri=${encodeURIComponent(sf.redirect_uri)}` +
                 `&state=${sf.state}&code_challenge=${sf.code_challenge}&code_challenge_method=S256`;
-            try { window.open(url, '_blank'); } catch (e) { location.assign(url); }
+            // Popup FIX (user report): window.open() after the async pre-flight
+            // is NOT a user gesture any more, so every browser popup-blocker
+            // swallows it. Hand off through a plain link the user clicks (same
+            // pattern as Step 3's #localPaypalUrl) — a clicked target=_blank
+            // link is never blocked, and this page stays open for "Claim".
+            const link = document.getElementById('securePaypalUrl');
+            if (link) {
+                link.href = url;
+                link.style.display = 'inline-block';
+            }
+            say('✅ Pre-flight PASSED — hardware-bound P_enc pinned. Click “Continue to PayPal →” above (opens in a NEW tab); after logging in, come back HERE and press “Step 2 — Claim”.');
         } catch (e) {
             say('❌ ' + e.message);
         }
@@ -653,7 +691,7 @@
     // ========================================================================
     var EXPECTED_RTMR0 = 'a50078ab426e8e044b88eca0192a0fb7fec69e31f55f7575af3e0ab865611eeb6cc29a1110d99f7562af1f0d84a3338b';
     var EXPECTED_RTMR1 = '6fa0352319182f7ec8cb713223cbc1853506caf719c64d04475a26975ae8ebf72003f592dcf0aafe392cc74de33d3f90';
-    var EXPECTED_RTMR2 = 'f3d6a34f9a686f463211fee5c5f07bd380e869b805c08e84a777c94f6928a3721bea869511c0c00efdb41e5ec0ceb810';
+    var EXPECTED_RTMR2 = '28b5f3eaf1babdbc392c6fe6158fbc1ad33e60173bd08cdd9144c54d8b96fd84a3601acc2d2820c8017408b5645a1f9d';
     var EXPECTED_RTMR3 = '000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000';
 
     // ========================================================================
@@ -838,10 +876,15 @@
             if (!(await runAudit())) throw new Error('Hardware audit FAILED on the pre-flight envelope — do NOT log in.');
 
             // Keys stay in THIS file origin's storage — never the enclave's.
+            // v179 (plan Phase 1): the client-session binding travels with the
+            // session so the claim audit enforces the quote's session slot.
+            auditorSessionBindingHex = await clientSessionBindingHex(new Uint8Array(pubRaw), nonceHex);
+            try { sessionStorage.setItem('pav_session_binding_hex', auditorSessionBindingHex); } catch (e) {}
             localStorage.setItem('pav_local_session', JSON.stringify({
                 host, jwk: JSON.stringify(await crypto.subtle.exportKey('jwk', kp.privateKey)),
                 nonceHex, customInfo, p_enc: pf.enclave_signing_public_key, state: sf.state,
                 flow: sf.flow || flow || 'verified',
+                clientPubB64: pubB64, sessionBindingHex: auditorSessionBindingHex,
             }));
             const url = `${sf.authorize_base}?client_id=${encodeURIComponent(sf.paypal_client_id)}` +
                 `&response_type=code&scope=${sf.scope}&redirect_uri=${encodeURIComponent(sf.redirect_uri)}` +
@@ -863,6 +906,9 @@
             if (!trustedAuditorContext()) throw untrustedOriginError();
             const s = JSON.parse(localStorage.getItem('pav_local_session') || 'null');
             if (!s) throw new Error('no local session — run step 1 first (from a local copy of this page)');
+            // v179: restore the client-session binding so the claim-time audit
+            // enforces the quote's report_data[32..64] session slot.
+            if (s.sessionBindingHex) auditorSessionBindingHex = s.sessionBindingHex;
             say('🔓 Claiming the encrypted report from the enclave vault…');
             const resp = await fetch(`${s.host}/e2ee-blob?state=${encodeURIComponent(s.state)}`);
             if (!resp.ok) throw new Error('claim failed (HTTP ' + resp.status + ') — the blob may already be claimed or expired; redo step 1');
@@ -902,6 +948,8 @@
         try {
             const pin = sessionStorage.getItem('pav_p_enc');
             if (pin && !preFlightPubKeyPem) preFlightPubKeyPem = pin;
+            // v179: restore the client-session binding across the reload.
+            try { const sb = sessionStorage.getItem('pav_session_binding_hex'); if (sb) auditorSessionBindingHex = sb; } catch (e) {}
         } catch (e) { /* no sessionStorage (harness) — skip */ }
         const saved = sessionStorage.getItem('pav_e2ee_report');
         if (saved) {
@@ -2016,9 +2064,8 @@
                     // v161 (Pillars 2–5): pre-flight (client-bound) sessions
                     // instead bind the BROWSER's own inputs into the quote:
                     // SHA-256(P_enc ∥ code_challenge ∥ P_client ∥ client_nonce).
-                    const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2, '0')).join('');
-                    const pfCtx = report.session_context && report.session_context.preflight;
-                    let expectedBindingHex, bindingLabel;
+                    const reportDataHex = Array.from(snp.slice(80, 144)).map(b => b.toString(16).padStart(2, '0')).join('');                        const pfCtx = report.session_context && report.session_context.preflight;
+                        let expectedBindingHex, bindingLabel, bindingLoose32 = false;
                     if (pfCtx && pfCtx.binding === 'v161') {
                         // v161.2: five-element binding — pfCtx.custom_info is
                         // echoed by the enclave inside the signed report and
@@ -2031,10 +2078,27 @@
                         )).padEnd(128, '0');
                         bindingLabel = 'v161.2 client-bound (P_enc ∥ code_challenge ∥ P_client ∥ client_nonce ∥ custom_info ∥ PayPal_Client_ID)';
                     } else {
-                        expectedBindingHex = (await snpBindingHex(pubKeyBuffer, expectedNonce)).padEnd(128, '0');
-                        bindingLabel = 'v160 (P_enc ∥ session nonce)';
+                        // v179 (plan Phase 1 — session substitution): login
+                        // reports bind the CLIENT session into report_data
+                        // [32..64] — SHA-256(P_client ∥ Nonce_client). With
+                        // THIS browser's session in hand the slot is enforced
+                        // strictly (a report minted for another session fails
+                        // closed); a report audited outside its session has no
+                        // key to check against — [0..32] stays strict, the
+                        // slot is informational.
+                        const isLoginReport = !!report.paypal_user_info;
+                        if (isLoginReport && auditorSessionBindingHex) {
+                            expectedBindingHex = (await snpBindingHex(pubKeyBuffer, expectedNonce)) + auditorSessionBindingHex;
+                            bindingLabel = 'v160 (P_enc ∥ session nonce) + client-session binding (P_client ∥ Nonce_client)';
+                        } else {
+                            expectedBindingHex = (await snpBindingHex(pubKeyBuffer, expectedNonce)).padEnd(128, '0');
+                            bindingLabel = 'v160 (P_enc ∥ session nonce)';
+                        }
+                        bindingLoose32 = isLoginReport && !auditorSessionBindingHex;
                     }
-                    const snpBindingOk = (reportDataHex === expectedBindingHex);
+                    const snpBindingOk = bindingLoose32
+                        ? reportDataHex.substring(0, 64) === expectedBindingHex.substring(0, 64)
+                        : reportDataHex === expectedBindingHex;
 
                     // ECDSA P-384/SHA-384 over signed region snp[0..672]; r/s are
                     // 72-byte little-endian — take low 48 bytes, reverse to big-endian.
@@ -2191,7 +2255,7 @@
                         // Without this branch every TDX pre-flight envelope failed
                         // binding=false by construction (2026-10-21).
                         const pfCtxTdx = report.session_context && report.session_context.preflight;
-                        let expectedTdxBindingHex, tdxBindingLabel;
+                        let expectedTdxBindingHex, tdxBindingLabel, tdxBindingLoose32 = false;
                         if (pfCtxTdx && pfCtxTdx.binding === 'v161') {
                             expectedTdxBindingHex = (await preflightBindingHex(
                                 pubKeyBuffer, pfCtxTdx.code_challenge, b64ToDer(pfCtxTdx.client_pub_b64), pfCtxTdx.client_nonce_hex,
@@ -2199,11 +2263,25 @@
                             )).padEnd(128, '0');
                             tdxBindingLabel = 'v161.2 client binding (P_enc ∥ code_challenge ∥ P_client ∥ client_nonce ∥ custom_info ∥ PayPal_Client_ID)';
                         } else {
-                            expectedTdxBindingHex = expectedNonce.padEnd(128, '0');
-                            // wording pinned by the offline harness (Test 2/5)
-                            tdxBindingLabel = 'session nonce';
+                            // v179 (plan Phase 1 — session substitution): same
+                            // client-session slot as the SNP path — login
+                            // reports bind SHA-256(P_client ∥ Nonce_client)
+                            // into report_data[32..64]. Strict with the session
+                            // in hand; informational without it (paste audit).
+                            const isLoginReport = !!report.paypal_user_info;
+                            if (isLoginReport && auditorSessionBindingHex) {
+                                expectedTdxBindingHex = expectedNonce + auditorSessionBindingHex;
+                                tdxBindingLabel = 'session nonce + client-session binding (P_client ∥ Nonce_client)';
+                            } else {
+                                expectedTdxBindingHex = expectedNonce.padEnd(128, '0');
+                                // wording pinned by the offline harness (Test 2/5)
+                                tdxBindingLabel = 'session nonce';
+                            }
+                            tdxBindingLoose32 = isLoginReport && !auditorSessionBindingHex;
                         }
-                        const qBindingOk = qReportDataHex === expectedTdxBindingHex;
+                        const qBindingOk = tdxBindingLoose32
+                            ? qReportDataHex.substring(0, 64) === expectedTdxBindingHex.substring(0, 64)
+                            : qReportDataHex === expectedTdxBindingHex;
                         // MRTD (mr_td): after tee_tcb_svn16 + mr_seam48 + mr_signer_seam48
                         // + seam_attributes8 + td_attributes8 + xfam8 = offset 136.
                         const qMrtdHex = hx(qBody.subarray(136, 184));

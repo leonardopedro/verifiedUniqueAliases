@@ -1497,6 +1497,65 @@ if (process.env.REAL_REPORT) {
   }
 }
 
+console.log('\nTest 30: v179 client-session binding — report_data[32..64] = SHA-256(P_client ∥ Nonce_client) (plan Phase 1)');
+{
+  // Fixture chain: the REAL_REPORT block above may have swapped in the real
+  // Intel anchor — these synthetic fixtures need the harness anchor back
+  // (same restore discipline as Test 8).
+  globalThis.TRUSTED_INTEL_ROOTS = GOOD_ROOTS;
+  const AUDITED_APP = 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p';
+  const who = { user_id: 'U7', sub: 'sess-sub', verified_account: 'true', payer_id: null };
+  // Mirror of src/main.rs::client_session_binding and verify.html's
+  // clientSessionBindingHex(): SHA-256(P_client SPKI-DER ∥ Nonce_client).
+  // (The golden vector of the formula itself is pinned by Rust
+  // security_tests::client_session_binding_parity_v179.)
+  const bindingFor = (pubDer, nonceFill) =>
+    sha256(Buffer.concat([Buffer.from(pubDer), Buffer.alloc(32, nonceFill)])).toString('hex');
+  const myBinding = bindingFor('client-pub-der-30', 0x7f);
+  const otherBinding = bindingFor('client-pub-evil', 0x11);
+  const greenSlot = (slotHex) => async (nonce) => tdxHw({
+    quoteB64: (await buildTdxQuote({
+      version: 4, reportData: concat(fromHex(nonce), fromHex(slotHex)),
+      innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+      leafKey: goodChain.leaf.key,
+    })).b64,
+  });
+  const loginExtras = { paypal_user_info: who, paypal_client_id: AUDITED_APP, paypal_environment: 'production' };
+
+  // (a) session in hand + quote bound to THIS session → green.
+  globalThis.auditorSessionBindingHex = myBinding;
+  const mine = await buildEnvelope({ hwBuilder: greenSlot(myBinding), reportExtras: loginExtras });
+  const a = await runAuditWith(mine.envelope);
+  check('30a session-bound login passes with the matching client session', a.ok === true,
+    `ok=${JSON.stringify(a.ok)} alert=${a.alert}`);
+
+  // (b) THE ATTACK (plan Phase 1 — session substitution): a report minted for
+  //     ANOTHER browser's session replayed at this one. The hardware quote
+  //     carries the wrong P_client/nonce in report_data[32..64].
+  const theirs = await buildEnvelope({ hwBuilder: greenSlot(otherBinding), reportExtras: loginExtras });
+  const b = await runAuditWith(theirs.envelope);
+  check('30b substituted session fails closed', b.ok === false, `ok=${JSON.stringify(b.ok)}`);
+  check('30b silicon row names the client-session binding',
+    /client-session binding/.test(fwDesc()), fwDesc().slice(0, 400));
+
+  // (c) paste audit WITHOUT any local session: the slot cannot be verified
+  //     against a key this browser never had — informational only, while
+  //     report_data[0..32] (identity ∥ code) stays strictly enforced.
+  globalThis.auditorSessionBindingHex = null;
+  const c = await runAuditWith(theirs.envelope);
+  check('30c paste audit without a session still audits green (slot informational)', c.ok === true,
+    `ok=${JSON.stringify(c.ok)} alert=${c.alert}`);
+
+  // (d) an UNBOUND (zero-slot) report with a session in hand must fail: the
+  //     slot is strictly enforced whenever the auditor holds the session.
+  globalThis.auditorSessionBindingHex = myBinding;
+  const legacy = await buildEnvelope({ hwBuilder: greenSlot('00'.repeat(32)), reportExtras: loginExtras });
+  const d = await runAuditWith(legacy.envelope);
+  check('30d zero-slot (pre-binding) report fails when the session is in hand', d.ok === false,
+    `ok=${JSON.stringify(d.ok)}`);
+  globalThis.auditorSessionBindingHex = null;
+}
+
 console.log('\nTest 28: README publishes the auditor digest (out-of-band integrity)');
 {
   // The auditor is the one component users must be able to check WITHOUT

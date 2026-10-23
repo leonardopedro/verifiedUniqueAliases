@@ -398,6 +398,25 @@ ECS instance** and PUT them there over the **intranet** endpoint, addressed in
 virtual-host style (`$BUCKET.oss-cn-beijing-internal.aliyuncs.com`, path-style
 returns `SecondLevelDomainForbidden`). Verified: 46 MB in 0.5 s, ETag == local
 MD5. A custom CNAME domain is the other sanctioned route.
+- **Working recipe (v179 cycle, verified twice 2026-10-23)**: a **V1 presigned
+  PUT/GET URL via plain curl** is NOT geo-blocked — `aliyun oss cp` and any
+  CLI-authenticated data-plane call are. So local→Beijing is: (1) presigned
+  `curl -T <file>` → HK bucket (ETag == local MD5 = landed); (2) a **stock
+  Debian instance + cloud-init user_data** pulls from HK (presigned GET), PUTs
+  to the Beijing bucket over the intranet endpoint, reads back + compares MD5,
+  then `shutdown -h now` — reaching **Stopped is the success signal**, every
+  FAIL path must `while true; do sleep 3600; done` (**Running = failed**);
+  (3) `ImportImage` (flat `DiskDeviceMapping.1.Format=raw`). The custom relay
+  image (`Dockerfile.relay`) is **less reliable** than this (its runner stops
+  itself seconds after boot with no artifact — several cycles 2026-10-23);
+  prefer the stock cloud-init instance, fresh **per transfer** or re-armed via
+  `ReplaceSystemDisk` (cloud-init is once-per-disk).
+- **OSS V1 presigned URLs SIGN the Content-Type** (empty slot in the
+  string-to-sign). A marker written with `curl --data` sends **POST** (→ 405
+  on a PUT-signed URL) and with `-X PUT -H 'Content-Type: text/plain'` sends
+  a header the signature never covered (→ `SignatureDoesNotMatch`). Marker
+  writes must be `-X PUT -H 'Content-Type:'` — this bug made every relay
+  marker silently vanish and cost hours of "did the script even run?" triage.
 The standard path cannot be avoided: `CreateImage` refuses a data-disk
 snapshot (`does not contain system disk snapshot`), so an image can only be
 made from an OSS object via `ImportImage`.
@@ -638,7 +657,7 @@ cargo build --release --features alibabacloud --target x86_64-unknown-linux-gnu
 - **Google EK Certificate** (NVRAM `0x01c00002`): DER X.509 cert issued by `EK/AK CA Intermediate` under Google's CA chain. Proves instance runs on real GCP Confidential VM silicon.
 - **Session Signing AK**: Created fresh per-attestation via `tpm2_createprimary`. Signs TPM Quote containing PCR values + session nonce. Never reused.
 - **Measured Boot**: PCRs 0, 4, 8, 9, 15 provide full-stack coverage verified by TPM quote.
-- **Embedded TLS Pinning**: `google_ca.pem` and `paypal.pem` compiled directly into binary via `include_bytes!`, preventing filesystem-level tampering.
+- **Embedded TLS Pinning**: `google_ca.pem` and `paypal.pem` compiled directly into binary via `include_bytes!`, preventing filesystem-level tampering. **v179 fix (live-proven)**: `paypal.pem` was never a root — it was an EXPIRED LEAF (`CN=api-m.paypal.com`, notAfter 2026-09-13) that only *appeared* to pin while the rustls default roots were still trusted. Since plan Phase 2 disables system roots in `hardened_client()`, the pin must be the endpoint's real anchor: **DigiCert Global Root G2** (`cb3ccbb7…ab1cb5f`, fingerprint pinned by test `paypal_api_root_is_digicert_g2_v179`). Both `api-m.paypal.com` and `api-m.sandbox.paypal.com` chain to it (2026-10-23).
 
 #### Alibaba Cloud (Intel TDX / AMD Rome) Path
 - **Platform Certificate Key (PCK)**: Retrieved from Intel Online Certification Service (OCS) OR TPM NV endorsement hierarchy
