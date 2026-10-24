@@ -126,7 +126,7 @@ sha256sum verify.html
 | `verify.html` | Browser auditor: TD Quote parser, PCK chain walk to the pinned Intel root, WebCrypto, GitHub attestation lookup |
 | `build-alibaba-docker.sh` | The reproducible build (Debian Trixie pinned snapshots) |
 | `build-initramfs-tools.sh` | Initramfs construction with kernel module selection |
-| `build-alibaba-disk.sh` | ESP + GPT disk image assembly (measured boot chain) |
+| `build-alibaba-disk.sh` | **Retired (hard-fail stub)** — legacy non-bootable artifact; use `build-alibaba-docker.sh` |
 | `import-alibaba-image.sh` / `deploy-alibaba.sh` | Image import and instance deployment (cn-beijing) |
 | `.github/workflows/build-attest.yml` | Sigstore provenance + independent MRTD/RTMR golden pins |
 | `scripts/` | Security harness (`test-verify-security.mjs`), E2E flows, golden-RTMR tooling |
