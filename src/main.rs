@@ -961,6 +961,11 @@ const MAX_TRACKED_IPS: usize = 1000;
 const MAX_CONCURRENT_CONNECTIONS: usize = 50;
 /// Ceiling on sealed, not-yet-claimed E2EE reports (see callback).
 const MAX_PENDING_E2EE_BLOBS: usize = 4096;
+/// R3-1 (audit round 3 — payment-flow abuse): ceiling + TTL for the PKCE
+/// verifier table — one 43-char verifier per minted login state, held ONLY
+/// in enclave RAM until its exchange completes (see attest_login_session).
+const MAX_PENDING_PKCE: usize = 4096;
+const PKCE_TTL_SECS: u64 = 600;
 const GLOBAL_EGRESS_BYTES_PER_HOUR: u64 = 512 * 1024 * 1024;
 const IP_EGRESS_BYTES_PER_HOUR: u64 = 25 * 1024 * 1024;
 const ZEROSSL_CA_DIRECTORY: &str = "https://acme.zerossl.com/v2/DV90";
@@ -999,8 +1004,9 @@ const HTML_TEMPLATE: &str = r#"
 // saved local copy) — the copy served by this site is only a convenience.
 // Abuse/DoS posture: NO new surface. Reports are ONLY minted after a completed
 // PayPal code exchange (the exchange is a confidential-client exchange whose
-// client_secret only exists inside the enclave); nothing here generates
-// attestations for unauthenticated callers.
+// client_secret only exists inside the enclave, AND PKCE-bound: PayPal
+// refuses any exchange that does not present the enclave-held code_verifier
+// — R3-1); nothing here generates attestations for unauthenticated callers.
 //
 // v180 (user report — the "UNTRUSTED AUDITOR ORIGIN" dead-end): the old page
 // just said "go claim it in the other tab" and offered no way to hand the
@@ -1068,6 +1074,15 @@ struct AppState {
     // carried through PayPal. Nothing is stored BEFORE a completed PayPal
     // code exchange, so this table cannot be grown by unauthenticated callers.
     pending_e2ee_blobs: Arc<RwLock<std::collections::HashMap<String, (serde_json::Value, Instant)>>>,
+    // R3-1 (audit round 3 — payment-flow abuse): state → PKCE verifier. The
+    // verifier is minted with the login state, kept in TDX-encrypted RAM
+    // only, never echoed to any caller, and retired on successful exchange
+    // or TTL. Without it an adversary who holds the PayPal client secret
+    // (the webservice owner writes the config) and observes the redirect
+    // code at their own TLS endpoint could exchange the code DIRECTLY with
+    // PayPal and read the user's identity in plaintext — bypassing this
+    // enclave, the hardware gates and the E2EE layer entirely.
+    pending_pkce: Arc<RwLock<std::collections::HashMap<String, (String, Instant)>>>,
     // v180 (user directive — no pre-login attestation / DoS surface): the
     // standalone auditor envelope is minted ONCE per cache window and served
     // from this cache, so no request path can trigger quote generation at
@@ -1513,7 +1528,9 @@ async fn login_session_cors() -> impl IntoResponse {
 // parameters (app id, scope, environment, redirect, state token) so the
 // TRUSTED auditor copy can (a) pin the enclave signing key for key-continuity
 // across the PayPal round-trip and (b) re-check the audited-app allow-list
-// before the user is sent to PayPal. No quote is minted; nothing is stored.
+// before the user is sent to PayPal. No quote is minted; the ONLY thing
+// stored is this state's PKCE verifier (R3-1) — opaque to every caller,
+// never echoed, retired on successful exchange or TTL.
 async fn attest_login_session(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
@@ -1555,6 +1572,15 @@ async fn attest_login_session(
     // auditor compares against ITS OWN session values. `r` is client-side
     // entropy so two logins with identical parameters never share a token.
     use rand::Rng;
+    use sha2::Digest;
+    // R3-1: PKCE (RFC 7636, S256). The verifier is generated HERE, parked in
+    // enclave RAM keyed by the state below, and NEVER echoed in the response
+    // — only its challenge travels (signed), so an observer of the login
+    // session (or of the later PayPal redirect) learns nothing usable.
+    let mut verifier_raw = [0u8; 32];
+    rand::thread_rng().fill(&mut verifier_raw);
+    let mut code_verifier = B64URL.encode(verifier_raw);
+    let code_challenge = B64URL.encode(sha2::Sha256::digest(code_verifier.as_bytes()));
     let random = hex::encode(rand::thread_rng().gen::<[u8; 16]>());
     let state_obj = serde_json::json!({
         "v": 1,
@@ -1566,10 +1592,30 @@ async fn attest_login_session(
     });
     let state_token = B64URL.encode(state_obj.to_string().as_bytes());
 
+    // R3-1: park this state's PKCE verifier (bounded + TTL-pruned, like the
+    // E2EE vault — login-session requests are budget-charged, so the table
+    // cannot be flooded faster than the egress budget allows).
+    {
+        let mut table = state.pending_pkce.write();
+        table.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(PKCE_TTL_SECS));
+        if table.len() >= MAX_PENDING_PKCE {
+            if let Some(k) = table.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| k.clone()) {
+                table.remove(&k);
+            }
+        }
+        table.insert(state_token.clone(), (code_verifier.clone(), Instant::now()));
+    }
+    zeroize_str(&mut code_verifier);
+
     let auth_base = if state.staging { PAYPAL_SANDBOX_AUTH } else { PAYPAL_PRODUCTION_AUTH };
     let signed_fields = serde_json::json!({
         "binding": "v180",
         "state": state_token,
+        // R3-1: PKCE challenge — required by the trusted auditor BEFORE it
+        // will send the user to PayPal (downgrade defense), enforced by
+        // PayPal at exchange time (code_verifier required iff challenged).
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
         "flow": label,
         "paypal_client_id": cid,
         // v169: the environment is signed (and app-pinned) at session time,
@@ -1709,7 +1755,13 @@ struct ClaimQuery {
 async fn get_e2ee_blob(
     Query(query): Query<ClaimQuery>,
     State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
 ) -> Response {
+    // R3-2 (audit round 3): the claim used to bypass the egress budget
+    // entirely — charge it (the sealed blob answers are ~17 KB each).
+    if let Err(status) = state.record_egress(addr.ip(), 32 * 1024) {
+        return status.into_response();
+    }
     let state_token = match query.state {
         Some(s) => s,
         None => return (StatusCode::BAD_REQUEST, "Missing state").into_response(),
@@ -1738,14 +1790,43 @@ async fn callback(
     use base64::Engine as _;
     use sha2::Digest;
 
+    // R3-2 (audit round 3 — payment-flow abuse): EVERY callback forces a
+    // live PayPal token exchange, and the old code only charged the egress
+    // budget AFTER the exchange with `let _ =` (result discarded — no 429
+    // was ever returned, so spam could burn the PayPal API quota for this
+    // app/IP until the provider or PayPal throttled US). Charge and ENFORCE
+    // the budget up front: over-budget callers are refused before any
+    // outbound payment call can happen.
+    if let Err(status) = state.record_egress(addr.ip(), 24 * 1024) {
+        return status.into_response();
+    }
+
     let code = query.code.clone().unwrap_or_default();
     let state_param = query.state.clone().unwrap_or_default();
 
+    // R3-4: a denied/cancelled consent (or a bare /callback hit) is rejected
+    // BEFORE anything is exchanged or consumed — the PKCE verifier stays
+    // valid so the user can simply retry from the auditor's PayPal link.
+    if query.error.as_deref().is_some_and(|s| !s.is_empty()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "PayPal returned an error — no code was exchanged. Restart from verify.html.",
+        )
+            .into_response();
+    }
+    if code.trim().is_empty() {
+        return (StatusCode::FORBIDDEN, "Invalid or expired session. Start from /verify.html").into_response();
+    }
+
     // v180 (user directive — no pre-login attestation): the client session
     // rides inside the OAuth `state` token (base64url JSON {v,p,n,f,c,r})
-    // instead of a server-side pending session, and no PKCE verifier is kept
-    // server-side any more — the exchange below is a confidential-client
-    // exchange (the client_secret only ever exists inside the enclave).
+    // instead of a server-side pending session. R3-1 (audit round 3): the
+    // exchange below is a confidential-client exchange (the client_secret
+    // only ever exists inside the enclave) AND PKCE-bound — the client_secret
+    // assumption alone is NOT sufficient under the collusion model, because
+    // the webservice owner WRITES that secret into the config and observes
+    // the redirect code at their own TLS endpoint; the enclave-held
+    // code_verifier is the piece no adversary can obtain.
     // Everything parsed here is UNTRUSTED by construction: its only consumer
     // is the hardware quote below, whose report_data[32..64] binds
     // SHA-256(P_client ∥ Nonce_client). The auditor compares that slot against
@@ -1791,6 +1872,22 @@ async fn callback(
     let custom_info = st.get("c").and_then(|v| v.as_str()).unwrap_or("NONE").trim();
     let custom_info_str = if custom_info.is_empty() { "NONE".to_string() } else { custom_info.to_string() };
 
+    // R3-1: resolve THIS state's PKCE verifier before any PayPal call.
+    // No verifier (forged state, restarted enclave, expired TTL) ⇒ fail
+    // closed HERE — a stateless forged state can no longer even REACH the
+    // PayPal exchange. The entry is retired only on a SUCCESSFUL exchange
+    // (keep-on-failure: a raced garbage-code request must not be able to
+    // burn a victim's verifier; repeated attempts are bounded by the egress
+    // budget charged at entry + the TTL).
+    let mut code_verifier = {
+        let mut table = state.pending_pkce.write();
+        table.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(PKCE_TTL_SECS));
+        match table.get(state_param.trim()) {
+            Some((v, _)) => v.clone(),
+            None => return invalid_session(),
+        }
+    };
+
     let (cid, csec, _, _) = state.get_flow_config(&flow);
     let api_base = if state.staging { PAYPAL_SANDBOX_API } else { PAYPAL_PRODUCTION_API };
 
@@ -1800,13 +1897,43 @@ async fn callback(
             ("grant_type", "authorization_code"),
             ("code", &code),
             ("redirect_uri", &state.redirect_uri),
+            // R3-1: the PKCE verifier PayPal REQUIRES because the authorize
+            // URL carried code_challenge — an exchange without it (any
+            // observer of the redirect holding the client secret) is refused
+            // by PayPal itself.
+            ("code_verifier", &code_verifier),
         ])
         .send().await;
 
+    // R3-3 (audit round 3 — side-channel/evidence integrity): the platform
+    // clock on this deployment runs +8h off (Beijing wall time read as UTC —
+    // and the platform clock is PROVIDER-controlled, i.e. untrusted under
+    // the collusion model). The signed report timestamp therefore comes from
+    // PayPal's Date header when available: it arrives over pinned-IP,
+    // pinned-DigiCert-root TLS (a channel neither the owner nor the provider
+    // can forge), so the signed time is collusion-resistant. Platform clock
+    // is kept only as a LABELED fallback. The auditor displays this field
+    // and never gates on it.
+    let paypal_now_ms = match &token_resp {
+        Ok(r) => r
+            .headers()
+            .get(axum::http::header::DATE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| chrono::DateTime::parse_from_rfc2822(s.trim()).ok())
+            .map(|dt| dt.timestamp_millis()),
+        Err(_) => None,
+    };
+
     let mut token_obj: TokenResponse = match token_resp {
-        Ok(r) if r.status().is_success() => r.json().await.unwrap_or(TokenResponse { access_token: String::new(), id_token: None }),
+        Ok(r) if r.status().is_success() => {
+            // R3-1: single-use — the verifier retires WITH its exchange.
+            state.pending_pkce.write().remove(state_param.trim());
+            r.json().await
+                .unwrap_or(TokenResponse { access_token: String::new(), id_token: None })
+        }
         _ => return (StatusCode::INTERNAL_SERVER_ERROR, "Token exchange failed with PayPal").into_response(),
     };
+    zeroize_str(&mut code_verifier);
 
     let mut userinfo: PayPalUserInfo = match hardened_client()
         .get(format!("{}/v1/identity/oauth2/userinfo?schema=paypalv1.1", api_base))
@@ -1885,7 +2012,10 @@ async fn callback(
         // an account it controls. The auditor now requires `production` for a
         // login report and refuses `sandbox` outright.
         "paypal_environment": if state.staging { "sandbox" } else { "production" },
-        "timestamp_ms": chrono::Utc::now().timestamp_millis() as u64,
+        // R3-3: honest signing time (PayPal Date when available, platform
+        // clock only as a LABELLED fallback — see the exchange above).
+        "timestamp_ms": paypal_now_ms.unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
+        "timestamp_source": if paypal_now_ms.is_some() { "paypal_date" } else { "platform_clock" },
         "enclave_config": {
             "boot_measurements": {
                 "binary_sha256": binary_sha256,
@@ -2172,6 +2302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             connection_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
             boot_manifest,
             pending_e2ee_blobs: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            pending_pkce: Arc::new(RwLock::new(std::collections::HashMap::new())),
             boot_envelope: Arc::new(RwLock::new(None)),
         });
 
@@ -2182,6 +2313,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             loop {
                 interval.tick().await;
                 cleanup_state.pending_e2ee_blobs.write().retain(|_, (_, t)| t.elapsed() < Duration::from_secs(600));
+                cleanup_state.pending_pkce.write().retain(|_, (_, at)| at.elapsed() < Duration::from_secs(PKCE_TTL_SECS));
             }
         });
 
@@ -2192,7 +2324,21 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .route("/debug/envelope", get(debug_envelope))
             .route("/callback", get(callback))
             .route("/e2ee-blob", get(get_e2ee_blob))
-            .layer(TraceLayer::new_for_http())
+            // R3-4 (audit round 3 — side channel): the default span logs the
+            // FULL request URI — including /callback?code=…&state=… and
+            // /e2ee-blob?state=… — into /dev/kmsg, which reaches the PROVIDER
+            // in plaintext over the serial console. Path only, never query:
+            // auth codes, state tokens and custom_info stay off the console.
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(|req: &axum::extract::Request| {
+                        tracing::info_span!(
+                            "http",
+                            method = %req.method(),
+                            uri = %req.uri().path()
+                        )
+                    }),
+            )
             .with_state(state.clone());
 
         let http_listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 80))).await?;

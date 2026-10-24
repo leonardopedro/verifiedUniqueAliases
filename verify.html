@@ -550,6 +550,9 @@
             // controls (over-scoped) and still produce a valid signature, so
             // the app identifiers are pinned HERE, before any redirect.
             checkExpectedApp(pf.signed_fields);
+            // R3-1: refuse a PKCE-less (downgraded or stale) login BEFORE any
+            // session state is stored or the user is sent to PayPal.
+            requirePkceChallenge(pf.signed_fields);
 
             // The enclave must echo back exactly what this browser sent (the
             // binding it will hardware-bind at /callback, and the custom data).
@@ -580,12 +583,13 @@
 
             // Client-built authorize URL from the S_enc-signed fields (scope
             // arrives pre-percent-encoded from the enclave — do not re-encode).
-            // No PKCE: the post-login exchange is a confidential-client code
-            // exchange (the client_secret only exists inside the enclave) and
-            // the client session rides in `state` (bound into the TDX quote).
+            // R3-1: PKCE required (helper above) and carried into the
+            // authorize URL — the client session rides in `state` (bound into
+            // the TDX quote), the code_verifier stays in the enclave.
             const url = `${sf.authorize_base}?client_id=${encodeURIComponent(sf.paypal_client_id)}` +
                 `&response_type=code&scope=${sf.scope}&redirect_uri=${encodeURIComponent(sf.redirect_uri)}` +
-                `&state=${sf.state}`;
+                `&state=${sf.state}` +
+                `&code_challenge=${encodeURIComponent(sf.code_challenge)}&code_challenge_method=S256`;
             // Popup FIX (user report): window.open() after the async request
             // is NOT a user gesture any more, so every browser popup-blocker
             // swallows it. Hand off through a plain link the user clicks (a
@@ -600,6 +604,28 @@
         } catch (e) {
             say('❌ ' + e.message);
         }
+    }
+
+    // ========================================================================
+    // R3-1 (audit round 3 — payment-flow abuse): PKCE is MANDATORY. The
+    // enclave signs code_challenge (S256) into the login fields and keeps the
+    // verifier in its own RAM; PayPal then refuses any exchange without it.
+    // Without PKCE an adversary who holds the PayPal client secret (the
+    // webservice owner writes it into the enclave config) AND observes the
+    // authorization code — at their own TLS endpoint for this domain, or in
+    // the provider-visible serial console — could exchange the code directly
+    // with PayPal and read the user's identity in plaintext, bypassing the
+    // enclave, the hardware gates and the E2EE layer entirely. A missing or
+    // malformed challenge = a downgrade or a stale enclave ⇒ abort BEFORE
+    // the user is sent to PayPal.
+    // ========================================================================
+    function requirePkceChallenge(sf) {
+        const c = String((sf && sf.code_challenge) || '');
+        const m = String((sf && sf.code_challenge_method) || '');
+        if (m !== 'S256' || !/^[A-Za-z0-9_-]{43}$/.test(c)) {
+            throw new Error('PKCE MISSING OR WEAK (R3-1): the enclave did not sign a valid S256 code_challenge into the login fields (method="' + m + '"). Without PKCE the authorization code can be exchanged by anyone holding the PayPal client secret — including the webservice owner — before this enclave ever sees it. Aborting. (If the enclave is healthy, THIS auditor copy may be stale — refresh verify.html from the project GitHub.)');
+        }
+        return c;
     }
 
     // ========================================================================
@@ -656,7 +682,7 @@
     // ========================================================================
     var EXPECTED_RTMR0 = '06a32a2f92ea455dd628bc41be9bb5910c2782a2eb93c646c6a5ddebd70291839f197792d289cca528572b6d910294db';
     var EXPECTED_RTMR1 = '6fa0352319182f7ec8cb713223cbc1853506caf719c64d04475a26975ae8ebf72003f592dcf0aafe392cc74de33d3f90';
-    var EXPECTED_RTMR2 = 'b7fa8c04a4b0aa9f8a007124544a5054b2065eeb5813cb438e60c8daa0f1afda4d5b2dd02dd87c75659778c8f0550fbb';
+    var EXPECTED_RTMR2 = '61ce2879ea9f31cadf09ba6498104c7501dc0ac7969d4bf1c401ad92585386332fc5cbdb45182a2193f11f71a4a30324';
     var EXPECTED_RTMR3 = '000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000';
 
     // ========================================================================
@@ -674,13 +700,13 @@
     // never attested; see AGENTS.md "attested build" note. The value below is
     // the digest GitHub attestations resolve for this source tree.
     // ========================================================================
-    // v182 rotation (2026-10-24, audit round 2): stale pin ba1a3bfe… → the
-    // v180/v181 ATTESTED binary, live since the 2026-10-23 deploy. Verified:
-    // the GitHub attestations API resolves sha256:23053c65… green, and the
-    // pre-/post-swap envelopes (/tmp/env180.json, /tmp/env181.json) both
-    // self-report the identical digest. Rotate again with the next binary
-    // release, in the same reviewed commit (harness Test 21d/28 anchor it).
-    var EXPECTED_ENCLAVE_SHA256 = '23053c650c4bfb88652ebe66cb79a216d66376051666662b5167400bf17a4633';
+    // v183 rotation (2026-10-24, audit round 3): the R3 binary (PKCE + budget
+    // enforcement + honest timestamps + console redaction) — digest taken from
+    // the Docker/CI-pipeline build that produced the deployed disk
+    // (b9292a31…), live-confirmed by the post-swap envelope self-reporting
+    // 01c74f89… . Rotate again with the next binary release, in the same
+    // reviewed commit as the README digest (harness Test 21d/28 anchor it).
+    var EXPECTED_ENCLAVE_SHA256 = '01c74f89d64abca22a2f6ef8c1aaeeb1884c417a8eb3bac447b41e4a8809511d';
 
     // ========================================================================
     // v162 (audit VULN-04): GOLDEN PCR PINS — CI-captured constants for the
@@ -839,6 +865,9 @@
             if (!sigOk) throw new Error('LOGIN-SESSION SIGNATURE INVALID — aborting.');
             checkExpectedApp(pf.signed_fields);
             const sf = pf.signed_fields;
+            // R3-1: refuse a PKCE-less (downgraded or stale) login BEFORE any
+            // session state is stored or the user is sent to PayPal.
+            requirePkceChallenge(sf);
             const expectedBinding = await clientSessionBindingHex(new Uint8Array(pubRaw), nonceHex);
             if ((sf.custom_info || 'NONE') !== customInfo
                 || (sf.client_session_binding_hex || '').toLowerCase() !== expectedBinding) {
@@ -864,7 +893,8 @@
             }));
             const url = `${sf.authorize_base}?client_id=${encodeURIComponent(sf.paypal_client_id)}` +
                 `&response_type=code&scope=${sf.scope}&redirect_uri=${encodeURIComponent(sf.redirect_uri)}` +
-                `&state=${sf.state}`;
+                `&state=${sf.state}` +
+                `&code_challenge=${encodeURIComponent(sf.code_challenge)}&code_challenge_method=S256`;
             const link = document.getElementById('localPaypalUrl');
             link.href = url; link.style.display = 'inline-block';
             say('✅ Login session ready. Log in via the PayPal link above, then come back HERE and press “🔓 2. Claim Encrypted Report’ — the hardware audit runs on the delivered report, which decrypts, audits and downloads in THIS tab (your key never leaves it).');

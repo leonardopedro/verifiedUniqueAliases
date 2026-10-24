@@ -1599,7 +1599,8 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
   // stub of /attest/login-session that mirrors the enclave contract
   // (S_enc-signed fields + client-session binding echo). Assert the browser
   // performs NO attestation work pre-login: no quote fetch, no pre-login
-  // audit run, and an authorize URL WITHOUT PKCE (no code_challenge).
+  // audit run, and an authorize URL that CARRIES the required PKCE
+  // challenge (R3-1 — PKCE-less signed fields must be refused).
   globalThis.localStorage = (() => { const m = new Map(); return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) }; })();
   globalThis.sessionStorage = (() => { const m = new Map(); return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) }; })();
   const setLoc = (loc) => { if (loc === null) delete globalThis.location; else globalThis.location = loc; };
@@ -1607,6 +1608,10 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
 
   const enc = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const encPem = enc.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  // R3-1: the enclave contract now includes a PKCE challenge; 43-char
+  // base64url per RFC 7636. `omitPkce` lets the downgrade case be driven.
+  const PKCE_CHALLENGE = 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG'; // 43 chars
+  let omitPkce = false;
   const requests = [];
   const origFetch = globalThis.fetch;
   globalThis.fetch = async (url, opts) => {
@@ -1623,6 +1628,7 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
         authorize_base: app.authorize_base, scope: app.scope,
         custom_info: (body.custom_info || '').trim() || 'NONE',
         client_session_binding_hex: binding,
+        ...(omitPkce ? {} : { code_challenge: PKCE_CHALLENGE, code_challenge_method: 'S256' }),
       });
       const sig = createSign('sha256').update(JSON.stringify(sf)).sign(enc.privateKey).toString('base64');
       return { ok: true, status: 200, json: async () => ({
@@ -1646,11 +1652,27 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
     check('authorize link revealed', elements['securePaypalUrl'].style.display === 'inline-block',
       JSON.stringify(elements['securePaypalUrl'].style));
     check('authorize URL carries the state token', href.includes('&state=teststate-abc'), href.slice(0, 220));
-    check('authorize URL has NO PKCE code_challenge (v180)', !href.includes('code_challenge'), href.slice(0, 220));
+    check('authorize URL carries the required PKCE challenge + S256 method (R3-1)',
+      href.includes('&code_challenge=' + PKCE_CHALLENGE) && href.includes('&code_challenge_method=S256'),
+      href.slice(0, 260));
+    const chParam = (href.match(/code_challenge=([A-Za-z0-9_-]+)/) || [])[1] || '';
+    check('PKCE challenge shape is RFC 7636 base64url (43 chars)', /^[A-Za-z0-9_-]{43}$/.test(chParam), chParam);
     const sess = JSON.parse(globalThis.localStorage.getItem('pav_local_session') || 'null');
     check('local session stored with binding + pinned enclave key',
       !!sess && !!sess.sessionBindingHex && sess.p_enc === encPem && sess.state === 'teststate-abc',
       JSON.stringify(sess && { state: sess.state, hasBinding: !!sess.sessionBindingHex }));
+
+    // R3-1 downgrade defense: S_enc-signed login fields WITHOUT a PKCE
+    // challenge (stale enclave, or a relay stripping fields before signing)
+    // must be refused BEFORE the user is sent to PayPal.
+    omitPkce = true;
+    await executePreflightAndLogin('verified');
+    omitPkce = false;
+    check('PKCE-less signed login fields are refused (downgrade defense)',
+      /PKCE MISSING OR WEAK/.test(elements['secureLoginStatus'].innerText || ''),
+      (elements['secureLoginStatus'].innerText || '').slice(0, 160));
+    check('refusal made exactly one further session call and built no new link',
+      requests.length === 2, JSON.stringify(requests));
   } finally {
     globalThis.fetch = origFetch;
     setLoc(null);
@@ -1783,6 +1805,64 @@ console.log('\nTest 33: v181 pasted-ENCRYPTED-blob audit — decrypt with this c
     globalThis.auditorSessionBindingHex = null;
     elements['attestationInput'].value = '';
   }
+}
+
+console.log('\nTest 34: audit round 3 — payment-flow abuse + side-channel hardening (R3-1..R3-4)');
+{
+  const verifySrc = readFileSync(join(repoRoot, 'verify.html'), 'utf8');
+  const rustSrc = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+
+  // --- R3-1: PKCE end-to-end (owner holds the PayPal client secret AND can
+  // observe the redirect code at their own TLS endpoint — without PKCE they
+  // exchange the code directly and read the identity in plaintext,
+  // bypassing the enclave, the silicon gates and E2EE entirely).
+  check('main.rs mints verifier + S256 challenge (SHA-256 over the verifier)',
+    rustSrc.includes('let code_challenge = B64URL.encode(sha2::Sha256::digest(code_verifier.as_bytes()))'), 'challenge mint missing');
+  check('main.rs signs code_challenge + method into the login fields',
+    rustSrc.includes('"code_challenge": code_challenge') && rustSrc.includes('"code_challenge_method": "S256"'), 'signed PKCE fields missing');
+  check('main.rs never echoes the verifier to any caller',
+    !rustSrc.includes('"code_verifier":'), 'verifier appears in a json! payload');
+  check('main.rs resolves the verifier before ANY PayPal call (fail closed)',
+    /let mut code_verifier = \{[\s\S]{0,600}None => return invalid_session\(\)/.test(rustSrc), 'no fail-closed lookup');
+  check('main.rs presents code_verifier at the token exchange',
+    rustSrc.includes('("code_verifier", &code_verifier)'), 'exchange not PKCE-bound');
+  check('verifier retired only on successful exchange',
+    rustSrc.includes('state.pending_pkce.write().remove(state_param.trim())'), 'no retirement on success');
+  check('PKCE table bounded + TTL-pruned',
+    rustSrc.includes('const MAX_PENDING_PKCE: usize = 4096') && rustSrc.includes('const PKCE_TTL_SECS: u64 = 600'), 'ceiling/TTL missing');
+  check('user-cancel/empty code handled BEFORE any exchange or consumption',
+    rustSrc.includes('PayPal returned an error — no code was exchanged'), 'error-path early return missing');
+  check('auditor requires PKCE before PayPal (definition + both flows)',
+    (verifySrc.match(/requirePkceChallenge\(/g) || []).length >= 3,
+    String((verifySrc.match(/requirePkceChallenge\(/g) || []).length));
+  check('auditor carries the challenge + S256 method into the authorize URL',
+    verifySrc.includes('&code_challenge=${encodeURIComponent(sf.code_challenge)}&code_challenge_method=S256'), 'authorize URL lacks PKCE');
+
+  // --- R3-2: every route that can trigger outbound work is charged AND
+  // enforced against the per-IP/global egress budget (the callback used to
+  // charge after the exchange with the result discarded — never a 429).
+  check('callback charges/enforces the budget BEFORE the PayPal exchange',
+    /record_egress\(addr\.ip\(\), 24 \* 1024\)/.test(rustSrc)
+      && rustSrc.indexOf('record_egress(addr.ip(), 24 * 1024)') < rustSrc.indexOf('oauth2/token'),
+    'entry gate missing or after the exchange');
+  check('claim route (/e2ee-blob) charges the budget',
+    rustSrc.includes('record_egress(addr.ip(), 32 * 1024)'), 'claim unbudgeted');
+
+  // --- R3-3: the platform clock is provider-controlled and runs +8h off
+  // (observed live) — the signed timestamp comes from PayPal's Date over
+  // pinned TLS when available, labelled either way.
+  check('login report timestamp prefers PayPal Date (pinned-TLS source)',
+    rustSrc.includes('paypal_now_ms') && rustSrc.includes('"timestamp_source"'), 'honest-timestamp logic missing');
+  check('timestamp source is explicitly labelled (paypal_date | platform_clock)',
+    rustSrc.includes('"paypal_date"') && rustSrc.includes('"platform_clock"'), 'labels missing');
+
+  // --- R3-4: the default TraceLayer span logged the FULL URI (incl.
+  // /callback?code=…&state=…) into kmsg — plaintext to the provider over the
+  // serial console. Spans must carry the path only.
+  check('console spans log method + path only (query redacted)',
+    rustSrc.includes('make_span_with') && rustSrc.includes('uri = %req.uri().path()'), 'span redaction missing');
+  check('no span field logs the raw URI (query would leak code/state)',
+    !/uri = %req\.uri\(\)(?!\.path)/.test(rustSrc), 'raw URI still logged');
 }
 
 // ===========================================================================

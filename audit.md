@@ -313,3 +313,178 @@ localizing failures to the final marker only). Both active templates
   until the next image deploy (§4 workflow). By design that copy's verdict is
   meaningless anyway (auditor isolation — it refuses keys and must not be
   believed); rotated with the next deploy.
+
+---
+
+## 7. Round 3 — payment-flow abuse & side-channel lens (2026-10-24)
+
+Third pass, deliberately through a DIFFERENT lens than rounds 1–2: the
+**PayPal payment/OAuth flow** (code issuance → exchange → vault → claim) and
+**side channels** (console logging, signed timestamps, request budgets), plus
+the disposition of the independent `audit2.md` checklist and the remaining
+`plan.md` phases. Live probing: `/debug/envelope` and a real
+`/attest/login-session` round-trip against the deployed v181 enclave.
+
+### 7.1 Disposition of `audit2.md` (independent audit) + plan status
+
+| audit2.md item | Status | Disposition |
+| :--- | :--- | :--- |
+| Step 1 — enclave cleanup (remove preflight, login-session, dual-slot REPORTDATA, egress lockdown, zeroize) | ✅ already executed (v180) | Re-verified this round directly in `src/main.rs` (route table, `report_data` dual fill, `egress_lockdown()`, `zeroize_str` at token exchange + now also the PKCE verifier). |
+| Step 2 — "streamlined 4-gate verify.html" (delete `tpmCheck`/`tlsCheck`, new gate cards, auto-claim on return) | ⚠️ **deviation, justified** | The sample auditor in audit2.md is a **security regression** vs the current engine and was NOT adopted: its Gate 1 hashes the PCK leaf and declares "ECDSA Valid" **without ever verifying a signature or walking the chain to the pinned Intel root** (current code verifies quote sig → attkey→QE-report binding → QE-report sig → x509 chain walk to the pinned root); its Gate 3 only checks the client slot when a session happens to be in hand — the **exact wildcard class removed in round 2 (R2-1)**; it has no enclave-signature check, no provenance row, no MRTD-vs-RTMR split, no flow/environment gates. The 4-gate UI is presentational consolidation of checks this engine already performs as a strict superset — UX churn with zero security delta would also invalidate ~15 harness row-assertions. `tpmCheck`/`tlsCheck` stay: they are honest informational rows ("no vTPM on this platform", optional channel cross-check) pinned by Tests 5/21/… "Auto-claim on return from PayPal" is N/A by architecture: PayPal redirects to the enclave's `/callback` success page (renders the sealed blob for copy — v180 fix), and the claim happens in the key-holding tab (Test 33 covers paste-claim as the documented recovery). |
+| Step 3 — harness updates (login-session, synthetic v4/v5 quotes, foreign-quote rejection) | ✅ already executed | Tests 15/18/20/32 + synthetic v4/v5 builders confirmed; extended this round (Test 32 flipped to PKCE-required + downgrade case; new Test 34 with 16 source pins for R3-1..R3-4). |
+| Step 4 — golden pins, docs, `npm test` 100% | ✅ executed round 2 (pins `23053c65…`, README/privacy/terms TDX rewrite) + this round's redeploy rotation below. | §6, §7.7. |
+
+Plan.md phases re-checked: Phase 2 (CCEL replay) present in
+`src/intel_tdx.rs`; Phase 3 fail-closed quote minting (503) intact; Phase 4
+pins enforced; Phase 5 E2EE intact **but its PKCE half was wrongly dropped —
+see R3-1**; Phase 6 lockdown/zeroize intact; Phase 1 (UKI) remains the
+plan-sanctioned deferral (GRUB 2.12 → RTMR2 measured live, torn-read TOCTOU
+documented).
+
+### 7.2 R3-1 (CRITICAL, fixed): OAuth code theft — the owner can exchange codes directly
+
+- **Finding**: the v180 flow dropped PKCE with the justification "the
+  client_secret only exists inside the enclave". Under the STATED threat
+  model that assumption is false: **the webservice owner writes that secret
+  into the enclave config** (threat matrix §1: "Possesses PayPal Client
+  Secrets") and **controls domain TLS** — the owner can obtain a valid public
+  CA certificate for `login.airma.de` (they control DNS) and terminate the
+  victim's `GET /callback?code=…&state=…` at their own proxy; independently,
+  the colluding provider saw `code`+`state` on the serial console (R3-4).
+  Either adversary then performs `POST /v1/oauth2/token` itself with the
+  secret it holds, receives the user's access token, and reads the identity
+  from PayPal's userinfo API — **in plaintext, bypassing the enclave, every
+  silicon gate and the E2EE layer**. This defeats the core invariant (c) of
+  the collusion model. (PayPal's single-use code only prevents the *second*
+  exchange; the adversary races or pre-empts the enclave at their own
+  endpoint.)
+- **Fix (R3-1, v183)**: PKCE (RFC 7636, S256) restored, with the verifier
+  held where no adversary can reach it:
+  1. `/attest/login-session` mints a 32-byte verifier (43-char base64url),
+     parks it in `AppState.pending_pkce` keyed by the state token
+     (TTL 600 s, ceiling 4096, prune-on-insert; requests are budget-charged,
+     so the table cannot be flooded), and signs only the
+     `code_challenge`/`code_challenge_method=S256` into `signed_fields`.
+     The verifier is **never echoed** in any response (harness-pinned).
+  2. `/callback` resolves the verifier **before any PayPal call** — a forged
+     or expired state now fails closed before it can even reach the token
+     endpoint — presents it as `code_verifier` in the exchange (PayPal
+     enforces it because the authorize URL carried the challenge),
+     zeroizes it, and retires the entry **only on success** (keep-on-failure:
+     a raced garbage-code request cannot burn a victim's verifier; repeat
+     attempts are bounded by the entry budget + TTL). `?error=` (user
+     cancel) and empty-code requests return before any consumption, so a
+     cancelled consent stays retryable.
+  3. The trusted auditor **requires** a well-formed S256 challenge in the
+     signed fields (`requirePkceChallenge`) immediately after the app pin —
+     before any session state is stored or a PayPal link is built — and
+     carries `code_challenge` + `code_challenge_method=S256` into the
+     authorize URL (both login paths). A challenge-less login (stale
+     enclave or a field-stripping relay) is refused outright.
+- **Why this closes it**: every remaining secret needed for the exchange
+  (`code_verifier`) lives only in TDX-encrypted enclave RAM; the owner's
+  TLS termination and the provider's console/network views expose only
+  `code`, `state` and the public challenge. Round 1 already proved these
+  apps accept PKCE end-to-end against real PayPal (HANDOVER §2.1 T1:
+  "Round-1 CSRF cookie + PKCE exercised against real PayPal").
+- **Harness**: Test 32 flipped (`authorize URL carries the required PKCE
+  challenge + S256 method`, RFC-shape check) + new downgrade case (signed
+  fields without a challenge → `PKCE MISSING OR WEAK`, refused after
+  exactly one session call); Test 34 source-pins the enclave side (mint →
+  sign → fail-closed lookup → exchange → retire-on-success → bounded
+  table) and the auditor side.
+
+### 7.3 R3-2 (fixed): `/callback` egress budget was charged but never enforced
+
+- **Finding**: `callback` charged `html.len()` **after** the PayPal exchange
+  with `let _ = record_egress(…)` — the `Err(429)` branch was unreachable by
+  construction, so unauthenticated spam (state tokens are freely mintable
+  via login-session) could force **unlimited live PayPal token-exchange
+  calls**, burning the app/IP quota (availability attack on the payment
+  dependency — colluders need no secret for it) while also bypassing the
+  per-IP/global bandwidth budget; `/e2ee-blob` was not charged at all.
+- **Fix**: budget **checked and enforced at entry** on both routes
+  (callback 24 KiB — covers the exchange + response; claim 32 KiB — sealed
+  blobs are ~17 KB) before any outbound work; the response-side charge stays.
+  Legit cost per login ≈ 60 KB against 25 MiB/h/IP.
+
+### 7.4 R3-3 (fixed): signed timestamps ran +8 h in the future
+
+- **Finding** (live, side-channel/evidence integrity): every signed
+  `timestamp_ms` was taken from the platform clock, which reads **exactly
+  +8 h** off real UTC (Beijing wall time as UTC) — confirmed across
+  `/tmp/env180.json`, `/tmp/env181.json` (both +8 h vs their capture mtimes)
+  and the live envelope. The platform clock is **provider-controlled**, i.e.
+  untrusted under the collusion model, and no time-sync code exists in the
+  tree (the AGENTS.md "HTTPS time fetch" claim is a GCP-era leftover).
+  A signature over a false time is forged evidence and would poison any
+  future freshness check.
+- **Fix**: login reports now take `timestamp_ms` from **PayPal's `Date`
+  header on the token-exchange response** — received over pinned-IP,
+  pinned-DigiCert-root TLS, a channel neither colluder can forge — and
+  declare `timestamp_source: "paypal_date"`; the platform clock survives
+  only as the explicitly labelled `"platform_clock"` fallback. The auditor
+  displays the field and never gates on it (unchanged).
+- **Accepted residual**: `/debug/envelope` mints (no PayPal call in their
+  path) keep platform-clock time until the first login syncs nothing —
+  i.e. they stay skewed; label + docs cover them. **Justification for NOT
+  mutating `CLOCK_REALTIME`**: the ACME cert in use was *issued under the
+  skewed clock* (its `notBefore` is +8 h), so jumping the clock back at boot
+  would make the enclave's own TLS invalid for up to 8 h after every boot —
+  an availability regression far costlier than a labelled-wrong
+  informational field; and the provider can already achieve any timing
+  outcome by dropping traffic.
+
+### 7.5 R3-4 (fixed): auth codes + state tokens on the provider-visible console
+
+- **Finding**: `TraceLayer::new_for_http()`'s default span logs the **full
+  request URI** — `/callback?code=…&state=…`, `/e2ee-blob?state=…` — into
+  `/dev/kmsg`, which reaches the provider in plaintext over the serial
+  console (guest memory is encrypted; the vUART is not). Pre-R3-1 that
+  handed the provider the code it would have needed for a direct exchange;
+  post-R3-1 it still exposed `state` (claim-steal/DoS oracle) and any
+  `custom_info` travelling in URIs.
+- **Fix**: custom `make_span_with` records **method + `uri().path()` only** —
+  query strings never reach the console (harness pins both presence of the
+  redaction and absence of any raw-URI span field).
+
+### 7.6 Round-3 considerations accepted without code (justified)
+
+- **RR-4 — consent phishing (attacker-initiated session)**: an adversary can
+  mint their own login session and lure the victim through PayPal consent;
+  the resulting report decrypts in the attacker's browser, bound to the
+  attacker's session — every gate green. This is inherent to OAuth
+  consent (equivalent to the adversary registering their own app with the
+  same scopes), the PayPal consent screen is the designed control, and
+  `state` binding was never the counter for it (it counters response
+  forgery into a victim's own session). Not fixable from this codebase.
+- **RR-5 — vault claim race**: the owner (via TLS-terminating their own
+  domain cert) learns `state` and can pre-claim `/e2ee-blob` to deny the
+  report. Ciphertext is sealed to a key that never left the victim's
+  browser (disclosure impossible), R3-4 removed the provider's console
+  oracle for `state`, and an owner who can see the request can already
+  drop it — availability-only, equivalent to existing capabilities.
+- **Live deployment is sandbox/staging** (live probe: `paypal_environment:
+  "sandbox"`, sandbox `authorize_base`; `EXPECTED_APPS` has no production
+  entries yet): identity shows the loud v177 SANDBOX warning by design and
+  can never render as a production identity. Production cutover needs the
+  production PayPal apps added in a reviewed commit — a deployment step,
+  not a security hole.
+- **UKI deferral / torn-read TOCTOU** — unchanged, plan-sanctioned (§6, AGENTS
+  deviations); RTMR2 measured live across rotations.
+
+### 7.7 Verification gate — v183 (all green)
+
+| Check | Result |
+| :--- | :--- |
+| Rust unit tests | ✅ `cargo test` 20/0 (PKCE table, budget gates, timestamp logic compile + pass). |
+| Harness, offline | ✅ **196 passed / 0 failed** — incl. flipped Test 32 (PKCE carried + downgrade refusal) and new Test 34 (16 source pins for R3-1..R3-4). |
+| Harness vs live envelope (pre-swap) | ✅ **204/0** with `REAL_REPORT=/tmp/env183a.json` (new RTMR2 pin + new code pin). |
+| Harness vs live envelope (final) | ✅ **204/0** with `REAL_REPORT=/tmp/env183b.json`. |
+| Build | ✅ Docker pipeline twice: disk `b9292a31…` (first) → **`e0b47124…`** (final, pins on ESP); **binary `01c74f89…` identical across both** (source byte-identity), initramfs **`ce27d413…` unchanged by the verify.html-only rebuild → RTMR2 provably stable**. |
+| Deploy | ✅ HK presigned PUT (ETag==md5) → stock-Debian relay re-arm (Stop → ReplaceSystemDisk → UserData → Start; **console-verified**: `RELAY183-SUCCESS`/`RELAY183B-SUCCESS`, md5 round-trip both legs) → `ImportImage` (flat `Format=raw`) → `Features.NvmeSupport=supported` (flat-wire RPC) → prod `Stop → ReplaceSystemDisk --SystemDisk.Size 1 → Start` → **TLS 200/ssl in ~2.5 min** both swaps. |
+| Silicon gates on the new deployment | ✅ MRTD `e0199499…` + RTMR0 `06a32a2f…` + RTMR1 `6fa03523…` held; **RTMR2 rotated to `61ce2879…`** (new initramfs) and re-verified identical across the second rebuild; RTMR3 zero; binary self-report `01c74f89…` == pin == local Docker build. |
+| Manifest parity + served copy | ✅ `check-manifest-parity` **PARITY OK** (6 same, 0 mismatched); served `verify.html` sha256 == README == live manifest == `51320e28…`. |
+| R3-1 live smoke | ✅ `/attest/login-session` returns a 43-char base64url `code_challenge` + `S256`, and **no `verifier` string anywhere in the response**. |
+| **R3-1 full e2e vs real PayPal** | ✅ trusted `file://` copy → session → authorize URL **with PKCE** → sandbox consent → `/callback` exchange **with the enclave-held verifier** → vault blob → paste-audit **decrypted + every silicon/identity row green** (`githubCheck` red *only* because the new binary's attestation lands with this commit's CI run — expected pre-CI; identity = designed SANDBOX warning). |
+| Docs consistency | ✅ AGENTS/plan "no PKCE / nothing stored" claims corrected to the v183 reality; README digest+size rotated in the same commit (harness Test 28). |

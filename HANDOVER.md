@@ -122,6 +122,45 @@ prod `StopInstance ForceStop` → `ReplaceSystemDisk --SystemDisk.Size 1`
 6. Generate the transfer script fresh near the run (`node /tmp/run-relay181.mjs`)
    — the baked presigned URLs carry a 3 h expiry and the current STS token.
 
+### 0.7 v183 cycle — audit round 3 (payment-flow + side-channel lens, 2026-10-24)
+
+Full write-up: `audit.md` §7 (+ `audit2.md` disposition §7.1, gate evidence
+§7.7); status table in `plan.md` ("Status — v183 audit round 3").
+
+| Item | Value |
+|---|---|
+| **Prod** | same instance `i-2ze4tvkuf12u933nsw8a`, system disk **`d-2zec5a2xx1220rsyeskt`**… replaced again in cycle 2 — current disk id from `DescribeInstances` (1 GiB `cloud_auto` both swaps) |
+| **Deployed image** | **`m-2ze1bkloc2r9h98n10z6`** (`paypal-tdx-esp-v183b-*`, NVMe flag set). Rollback: `m-2zegh5k0gouo3xa81mtk` (v181) + `m-2zehcg17z0nhqmmdo8co` (v183 first pass) + `m-2zed3wq8aubdcddv64az` (v180) |
+| **disk-alibaba.raw** | **`e0b47124dffb26749478509c3427bb8a5782caedd690bd4a92263ee7b707776a`** (md5 `6362a614…`, object `paypal-auth-vm/disk183b.raw`); first pass `b9292a31…` (`disk183.raw`) |
+| **binary** | **`01c74f89d64abca22a2f6ef8c1aaeeb1884c417a8eb3bac447b41e4a8809511d`** — byte-identical in both builds; equals `EXPECTED_ENCLAVE_SHA256` (attestation lands with this commit's CI run) |
+| **initramfs** | `ce27d4134c5ead1d23a4d949db41634618cea4ce8daa50bc0ade035a8c1e7934` — CHANGED vs v181 (`5b27ec2f…`, new binary) → **RTMR2 rotated `b7fa8c04… → 61ce2879ea9f31cadf09ba6498104c7501dc0ac7969d4bf1c401ad92585386332fc5cbdb45182a2193f11f71a4a30324`**; MRTD/RTMR0/RTMR1/RTMR3 all held |
+| **verify.html** | **`51320e28ce134600ea7a10c6dd15472a4f7656ddacbc48fbc36dd04a6f01517b`** (162,081 B) == README == served == live manifest |
+
+What changed (fixes): **R3-1 PKCE restored** (enclave-held verifier — the
+owner holds the PayPal client secret and can observe the redirect code, so
+v180's no-PKCE exchange let them read identities in plaintext; auditor now
+REFUSES a challenge-less login), **R3-2** egress budget enforced at entry on
+`/callback` + `/e2ee-blob`, **R3-3** signed `timestamp_ms` from PayPal's
+`Date` (platform clock is +8 h off and provider-controlled; system clock
+left alone — justified), **R3-4** console spans log path only (no more
+`?code=`/`?state=` on the serial console). audit2.md Step-2 UI rewrite
+deviated-with-justification (sample would regress the silicon gates).
+
+Gate results: cargo 20/0 · offline harness **196/0** · live-envelope harness
+**204/0** (×2 captures) · `check-manifest-parity` PARITY OK · served==README
+· **live PKCE e2e vs real PayPal green** (authorize w/ challenge → consent →
+exchange with enclave verifier → blob decrypt → audit rows green; only
+`githubCheck` red pre-CI by design). Console-verified transfers
+(`RELAY183-SUCCESS`, `RELAY183B-SUCCESS` both with md5 round-trips).
+
+Relay notes re-hit this cycle: **ReplaceSystemDisk requires a Stopped
+relay** — a Running relay silently fails the swap while UserData+Start
+"succeed" and cloud-init never re-runs (stale console). Order must be Stop →
+Replace → UserData → Start. Marker files must be renamed per run
+(`relay-ok183b.txt`) or stale ones false-positive. `aliyun oss stat/ls` from
+the operator host now 403s (endpoint/CNAME rule) — **serial console is the
+ground truth**, as §0.6 says.
+
 ---
 
 ## 1. Mission & threat model

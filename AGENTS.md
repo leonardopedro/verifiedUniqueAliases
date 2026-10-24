@@ -25,12 +25,12 @@
 
 Supported build target: **Alibaba Cloud Intel TDX, compiled unconditionally** (the `alibabacloud` cargo feature was removed in v180; GCP/OCI paths are deleted from this branch — see audit.md §3).
 
-### Login Flow (v180 — no pre-login attestation)
+### Login Flow (v183 — no pre-login attestation, PKCE-bound)
 
 The old **pre-flight** (`POST /attest/preflight`, one TD quote per unauthenticated click) is **removed** — it was a trivially reachable enclave resource-exhaustion surface. The flow is now:
-1. Trusted auditor copy (file:// / GitHub Pages) generates the ECDH keypair + nonce, then calls **`POST /attest/login-session`** — S_enc-signed fields only (app, scope, environment, `state`), **no quote minted, nothing stored server-side**.
-2. The browser builds the PayPal authorize URL from the audited-app allow-list (no PKCE); the client session travels inside the OAuth **`state`** token (base64url JSON `{v,p,n,f,c,r}`).
-3. After PayPal, **`/callback`** mints the hardware quote — gated behind the PayPal-verified code exchange (**PayPal is the attacker filter**) — binding `report_data[32..64] = SHA-256(P_client ∥ Nonce_client)` and returning the report E2EE'd to `P_client`.
+1. Trusted auditor copy (file:// / GitHub Pages) generates the ECDH keypair + nonce, then calls **`POST /attest/login-session`** — S_enc-signed fields only (app, scope, environment, `state`, **`code_challenge`/S256**), **no quote minted**; the ONLY thing stored server-side is this login's **PKCE verifier** (bounded table, TTL 600 s, enclave-RAM-only, never echoed).
+2. The browser builds the PayPal authorize URL from the audited-app allow-list **including `code_challenge` + `code_challenge_method=S256`** (R3-1 — the auditor hard-REFUSES a challenge-less login: the owner holds the PayPal client secret and observes the redirect code, so without PKCE they could exchange the code directly and read the identity in plaintext); the client session travels inside the OAuth **`state`** token (base64url JSON `{v,p,n,f,c,r}`).
+3. After PayPal, **`/callback`** resolves the PKCE verifier for the state (fail-closed — forged/expired states never reach PayPal), exchanges the code with `code_verifier` (PayPal enforces), zeroizes it, then mints the hardware quote — gated behind the PayPal-verified code exchange (**PayPal is the attacker filter**) — binding `report_data[32..64] = SHA-256(P_client ∥ Nonce_client)` and returning the report E2EE'd to `P_client`. Signed `timestamp_ms` comes from PayPal's `Date` header when available (the platform clock is provider-controlled and runs +8 h off — R3-3).
 4. `/debug/envelope` is served from a **15-minute boot cache**; it is no longer part of any login path (kept for pin-rotation tooling only).
 
 The auditor is **Intel-TDX-only** (audit.md §5.1): reports without a hardware-signed TDX quote are rejected outright; the AMD VCEK/ASK/ARK and Google NVRAM EK verification paths are deleted.
