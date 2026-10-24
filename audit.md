@@ -488,3 +488,63 @@ documented).
 | R3-1 live smoke | ✅ `/attest/login-session` returns a 43-char base64url `code_challenge` + `S256`, and **no `verifier` string anywhere in the response**. |
 | **R3-1 full e2e vs real PayPal** | ✅ trusted `file://` copy → session → authorize URL **with PKCE** → sandbox consent → `/callback` exchange **with the enclave-held verifier** → vault blob → paste-audit **decrypted + every silicon/identity row green** (`githubCheck` red *only* because the new binary's attestation lands with this commit's CI run — expected pre-CI; identity = designed SANDBOX warning). |
 | Docs consistency | ✅ AGENTS/plan "no PKCE / nothing stored" claims corrected to the v183 reality; README digest+size rotated in the same commit (harness Test 28). |
+
+### 7.8 Round 4 — independent audit `audit3.md` (2026-10-24) + UI maximization
+
+Cross-check of `audit3.md` (GRUB 2.12 / RTMR2-anchored plan) against the
+shipped code, section by section:
+
+| audit3 section | Verdict | Evidence |
+| :--- | :--- | :--- |
+| §2/§2.1 measurement table (MRTD/RTMR0–3, GRUB→RTMR2, no-UKI) | ✅ already shipped | plan v179 live-rotation evidence; auditor pins identical (`MRTD e0199499…`, `RTMR0 06a32a2f…`, `RTMR1 6fa03523…`, `RTMR2 61ce2879…`, RTMR3 zero — audit3's constants byte-match the shipped pins) |
+| §3 pre-flight elimination + PayPal filter | ✅ shipped (v180) | `/attest/login-session` bookkeeping-only; quote gated behind PayPal-verified exchange (main.rs verified-gate precedes minting) |
+| §4 dual-slot (zero wildcards) | ✅ shipped (v161/v179/v182) | slot1 SEC-02 5-component + slot2 `SHA-256(P_client∥Nonce_client)` unconditionally; paste mode reconstructs from `session_context` |
+| §6.1 login-session spec | ✅ **superset shipped** | budget-charged at entry (4 KiB), panic-safe DER/nonce validation, TTL+bounded zeroized PKCE table, signed environment, binding echo verified by auditor before redirect (live probe confirms) |
+| §6.2 callback dual-slot minting | ✅ matches | fail-closed (`tdx_quote_b64` absent → 503), flow derived server-side |
+| §5 sample `verify.html` | ⚠️ **UI shape adopted, engine NOT replaced** | adopted: prefilled enclave input, one action card, one audit card, hidden-until-needed claim. NOT adopted: its single `EXPECTED_PAYPAL_CLIENT_ID` pin (would break the full flow and is weaker than the shipped per-flow `EXPECTED_APPS` with scope+authorize_base), its Gate row set (no enclave-signature/provenance/flow/env rows — the shipped engine remains a strict superset, as justified for audit2 Step 2) |
+| §5 "vestigial manual TLS textareas" | ✅ **adopted this round (user: maximum simplification)** | `certFile`/`certInput` UI + `tlsCheck` row + the runAudit cert block removed; `session_context.tls_certificate_pem` stays visible in the report JSON |
+| §7 workflow / §8 mitigation matrix | ✅ consistent | current runbook + shipped defenses |
+
+**UI maximization (user directive, v185)**: cards **3 → 2**, visible
+buttons **4 → 3** (+contextual claim/link). The "Strongest: own copy"
+card was a near-verbatim duplicate of the login flow (`localPreflight` ≈
+`executePreflightAndLogin`: same keypair, same checks, same
+`pav_local_session` store) — its pedagogy folded into the login card as a
+paragraph, its host input moved up (prefilled), its button dropped
+(`localPreflight()` kept as a function for the harness's untrusted-origin
+assertions; its PayPal-link write now falls back to the visible
+`#securePaypalUrl`).
+
+**New independent live probes (`/tmp/audit3-probe.mjs`) — 18/0**: session
+signature verifies; PKCE challenge present and **no other exact-43-char
+b64url value anywhere in the response (verifier never echoed)**; binding
+echo == our computation and session-specific (wrong-nonce mismatch);
+per-session state/challenge freshness; flow/scope/environment signed;
+warm call 226 ms (no quote minted); bogus `/e2ee-blob` state fail-closed
+with no vault/object detail leaked; envelope cached (same timestamp,
+fast second GET) and carries a TDX quote.
+
+**New finding — RR-6 (justified residual): session-time enclave
+authentication gap.** The `login-session` response is authenticated only
+by its own self-referential signature (P_enc is first-touch-pinned from
+the response itself). A colluding owner who MITMs `login.airma.de`
+(they control DNS and can mint a publicly-trusted cert) can serve a
+FAKE session: audited app id + auditor-passing format + THEIR OWN PKCE
+verifier, capture `/callback?code&state` at their TLS endpoint, exchange
+directly with PayPal (they write the config, so they hold the app
+secret), and learn the identity in plaintext — bypassing E2EE — while the
+victim's claim simply fails closed (no genuine report → red, nothing
+downloaded, user never sees green). **Why not fixable here**: any
+session-time authenticator is either (a) a pre-login hardware quote —
+explicitly removed by user directive as the DoS surface (and re-adding a
+rate-limited quote is exactly the surface the directive forbids), or
+(b) a key the collusion pair cannot forge — no such key exists pre-quote
+in this stack (config keys are owner-written; the vTPM is
+provider-controlled; TDX exposes nothing before `TDG.MR.REPORT`).
+**Scope already limited by shipped controls**: `EXPECTED_APPS`+scope
+pins (the verified app has no PII scopes at the provider), `state`
+forgery is useless downstream (auditor recomputes slot2 against its own
+session → red), claim fail-closed, and the trained UX ("if any step
+fails, nothing is saved"). Distinct from RR-4 (attacker-minted session
+for THEIR browser); this is the owner-as-endpoint variant. Not fixable
+with justification — recorded here rather than in code.

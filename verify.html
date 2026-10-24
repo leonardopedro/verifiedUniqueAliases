@@ -213,48 +213,33 @@
         <div class="input-card" style="grid-column: span 2; border-color: #4caf50;">
             <label>Log in with PayPal — the login IS the pre-flight check</label>
             <p style="color: var(--text-dim); font-size: 0.9rem;">There is deliberately <b>no separate pre-login hardware check</b>: it would let anyone exhaust the enclave's resources, and a completed PayPal login is itself the attacker filter. Your browser generates a throwaway encryption key that never leaves this page. Your PayPal identity comes back encrypted to that key — neither the site owner (who holds the PayPal client secret and can issue TLS certificates for this domain) nor the cloud provider (who sees all traffic leaving the machine) can read it. After PayPal verifies you, the enclave mints the hardware proof (an Intel TDX quote) bound to <i>this</i> login and your session, this page audits it, and only a fully green audit decrypts here. <b>This page</b> builds the PayPal link; the enclave never redirects you.</p>
+            <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;">The strongest setup is your own copy: take <code>verify.html</code> from the project's GitHub, save it and open it locally (<code>file://</code>, or use the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a>) — keys are then created only on your machine, anything injected on the enclave's origin only ever sees ciphertext, and this enclave-origin copy refuses key generation by design (Web Auditor Tampering defense).</p>
             <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow:</b> click a login button → finish PayPal in the new tab → return here and press “Claim Encrypted Report” below when it appears — the audit runs automatically and a fully green one saves the report to your downloads. If any step fails, nothing is saved, so you are safe to close the tab.</p>
             <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                 <button onclick="executePreflightAndLogin('verified')" style="background:#4caf50;">🔒 Log in with PayPal (Verified account only)</button>
                 <button onclick="executePreflightAndLogin('full')">🔒 Log in with PayPal (Share full profile)</button>
             </div>
+            <button id="claimBtn" onclick="localClaim()" style="display:none; margin-top:10px;">🔓 2. Claim Encrypted Report</button>
+            <input type="text" id="localEnclaveHost" placeholder="https://login.airma.de"
+                style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
             <input type="text" id="customInfoInput" maxlength="512"
                 placeholder="Optional: your public key / wallet / nonce — bound into the hardware quote and the report"
                 style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
             <a id="securePaypalUrl" style="display:none; margin-top:10px;" class="btn" target="_blank" rel="noopener">Continue to PayPal →</a>
             <p id="secureLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
-        </div>
-    </div>
-
-    <div class="grid" style="margin-top: -10px;">
-        <div class="input-card" style="grid-column: span 2;">
-            <label>Strongest: run this page from your own copy (file://)</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem;">A server owner with a TLS certificate for this domain can inject script into any page it serves — including this one. Save this page from the project's GitHub (<code>verify.html</code>), open it locally (<code>file://</code>), and use the enclave address (prefilled, editable) with the two buttons below in order. Your keys are then created on <i>your</i> machine and the encrypted report is fetched over your own channel — anything injected on the enclave's origin only ever sees ciphertext.</p>
-            <input type="text" id="localEnclaveHost" placeholder="https://login.airma.de"
-                style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
-            <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px;">
-                <button onclick="localPreflight()" style="background:#4caf50;">🔐 1. Start Secure Login</button>
-                <button id="claimBtn" onclick="localClaim()" style="display:none;">🔓 2. Claim Encrypted Report</button>
-            </div>
-            <a id="localPaypalUrl" style="display:none; margin-top:10px;" class="btn" target="_blank" rel="noopener">Continue to PayPal →</a>
-            <p id="localLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
+            <p id="localLoginStatus" style="margin: 6px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
         </div>
     </div>
 
     <div class="grid" style="margin-top: -10px;">
         <div class="input-card" style="grid-column: span 2;">
             <label>Audit a report you already have</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem;">A saved report JSON (💾 offered on the login success page, or the Download button after a passing audit) audits offline in <b>any</b> copy of this auditor, including the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a> or your own saved <code>verify.html</code>. The optional certificate field additionally binds a saved TLS certificate to the report. The audit is fail-closed: any red row — including “No valid Silicon Root of Trust” — means the evidence in the report did not verify; a common benign cause is a stale auditor page, so always take the latest <code>verify.html</code> from the project's GitHub. Only trust a report that passes every check.</p>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">A saved report JSON (💾 offered on the login success page, or the Download button after a passing audit) audits offline in <b>any</b> copy of this auditor, including the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a> or your own saved <code>verify.html</code>. The audit is fail-closed: any red row — including “No valid Silicon Root of Trust” — means the evidence in the report did not verify; a common benign cause is a stale auditor page, so always take the latest <code>verify.html</code> from the project's GitHub. Only trust a report that passes every check.</p>
             <label style="margin-top: 8px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Attestation JSON report</label>
             <div style="margin-bottom: 15px;">
                 <input type="file" id="reportFile" accept=".json" class="file-input">
             </div>
             <textarea id="attestationInput" placeholder="Paste report or use file upload above..."></textarea>
-            <label style="margin-top: 12px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Browser TLS certificate (optional)</label>
-            <div style="margin-bottom: 15px;">
-                <input type="file" id="certFile" class="file-input">
-            </div>
-            <textarea id="certInput" placeholder="Paste .pem or use file upload above..."></textarea>
             <button onclick="runAudit()" style="margin-top: 15px;">Perform Cryptographic Audit</button>
         </div>
     </div>
@@ -302,13 +287,6 @@
                 </div>
             </div>
 
-            <div id="tlsCheck" class="check-item">
-                <div class="check-icon">🔒</div>
-                <div class="check-text">
-                    <h4>TLS Certificate Binding</h4>
-                    <p id="tlsDesc">Proves your current browser connection is the one documented in the report.</p>
-                </div>
-            </div>
         </div>
     </div>
 </div>
@@ -899,8 +877,8 @@
                 `&response_type=code&scope=${sf.scope}&redirect_uri=${encodeURIComponent(sf.redirect_uri)}` +
                 `&state=${sf.state}` +
                 `&code_challenge=${encodeURIComponent(sf.code_challenge)}&code_challenge_method=S256`;
-            const link = document.getElementById('localPaypalUrl');
-            link.href = url; link.style.display = 'inline-block';
+            const link = document.getElementById('localPaypalUrl') || document.getElementById('securePaypalUrl');
+            if (link) { link.href = url; link.style.display = 'inline-block'; }
             say('✅ Login session ready. Log in via the PayPal link above, then come back HERE and press “🔓 2. Claim Encrypted Report’ — the hardware audit runs on the delivered report, which decrypts, audits and downloads in THIS tab (your key never leaves it).');
             return url;
         } catch (e) {
@@ -2349,18 +2327,11 @@
                 throw new Error("CRITICAL: No valid Silicon Root of Trust (Intel TDX) found in report. If you believe this enclave is genuine, this copy of the auditor may be out of date — download the latest verify.html from the project's GitHub and re-run.");
             }
 
-            // 6. TLS Binding
-            const certInput = document.getElementById('certInput').value;
-            if (certInput) {
-                const userLeaf = getLeafCert(certInput);
-                const reportLeaf = getLeafCert(report.session_context.tls_certificate_pem);
-                updateStatus('tlsCheck', userLeaf === reportLeaf, userLeaf === reportLeaf ? "TLS channel bound." : "TLS mismatch!");
-            } else {
-                // v184 (visual review): without the optional certificate the row
-                // must say so explicitly — a bare placeholder with no state reads
-                // like an unfinished or silently-passed check.
-                updateStatus('tlsCheck', 'warning', "ℹ️ Optional channel cross-check not requested — paste your browser's TLS certificate (field above) to bind this report to the live connection. Every other row does not depend on it.");
-            }
+            // 6. TLS channel cross-check — REMOVED (audit3 §5: the manual TLS
+            // certificate textareas were vestigial; the report's
+            // session_context.tls_certificate_pem stays visible in the JSON and
+            // the tlsCheck row is gone from the markup — updateStatus() null-
+            // guards absent rows, so no call is made here any more).
 
             // v177: SANDBOX deployments pass the INTEGRITY audit (silicon
             // root + MRTD/RTMR pins + every binding verified) but must never

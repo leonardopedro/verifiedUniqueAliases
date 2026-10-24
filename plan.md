@@ -72,6 +72,18 @@ Based on the architecture of **Intel TDX on Alibaba Cloud** (as specified in Ali
 
 ---
 
+#### Status — v185 audit round 4 (2026-10-24, independent audit `audit3.md` + user directives: maximum UI simplification)
+
+| Item | Status | Evidence / rationale |
+| :--- | :--- | :--- |
+| **audit3.md cross-check (all sections)** | ✅ §2/§2.1 measurement+no-UKI, §3 pre-flight elimination, §4 dual-slot, §6.1/§6.2 enclave spec, §7 workflow, §8 matrix = **already shipped** (audit3's pin constants byte-match the shipped MRTD/RTMR pins). §5's sample `verify.html` **UI shape adopted, engine not replaced**: its single `EXPECTED_PAYPAL_CLIENT_ID` pin would break the full flow and is weaker than the shipped per-flow `EXPECTED_APPS` (client_id+scope+authorize_base); its gate rows lack the enclave-signature/provenance/flow/env gates the shipped engine keeps. §5's "vestigial manual TLS textareas" **adopted**. | audit.md §7.8 disposition table |
+| **Maximum UI simplification (user directive)** | ✅ Cards **3 → 2** (login / audit), visible buttons **4 → 3** (+contextual claim & PayPal link). The "Strongest: own copy" card duplicated the login flow verbatim (`localPreflight` ≈ `executePreflightAndLogin` — same keypair, same checks, same session store): pedagogy folded into the login card (own-copy paragraph), host input moved up (prefilled), button dropped. `localPreflight()` kept for the harness's untrusted-origin assertions; its link write falls back to `#securePaypalUrl`. TLS cert inputs + `tlsCheck` row + runAudit cert block removed (informational-only, never gated; report JSON keeps `tls_certificate_pem`). | screenshots (2-card + 4-row results) · harness **196/0** · cargo 20/0 |
+| **New live probes (independent)** | ✅ **18/0** (`/tmp/audit3-probe.mjs`): session signature, PKCE challenge present with verifier-never-echoed (exact-value scan), binding echo == our computation + session-specific, per-session freshness, signed flow/scope/environment, warm 226 ms (no quote), bogus-state vault fail-closed with no leak, envelope cached + quote present. | probe run 2026-10-24 |
+| **NEW: RR-6 — session-time enclave authentication gap** | ⚠️ **Justified residual (cannot be fixed without violating the no-pre-login-quote directive)**: the login-session response authenticates only via its own first-touch P_enc signature; an owner who MITMs the domain (DNS + publicly-trusted cert) can serve a fake session with the audited app + THEIR PKCE verifier, capture `/callback`, exchange directly (they hold the app secret) and learn identity in plaintext — E2EE bypassed — while the victim's claim fails closed (red, nothing saved, never green). No collusion-proof pre-quote authenticator exists (config keys owner-written, vTPM provider-controlled, TDX silent before `TDG.MR.REPORT`; a pre-login quote is the exact DoS surface the user directive removed). Scope limited by shipped controls: `EXPECTED_APPS`+scope pins, session-bound slot2 (forged state → red), claim fail-closed, trained UX. Distinct from RR-4 (owner-as-endpoint variant). | audit.md §7.8 RR-6 |
+| **v185 gates** | ✅ offline **196/0**, cargo **20/0**, README digest rotated (`verify.html` 161,473 B, `d9a91a16…`); live gates + e2e recorded in HANDOVER §0.9 after deploy. | this cycle |
+
+---
+
 ### Root Flaw in the Current Implementation
 
 In the current repository (`verify.html` and `src/main.rs`):

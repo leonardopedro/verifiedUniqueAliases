@@ -212,6 +212,22 @@ served == README (`c40d22e204f5ba91c94a461387d804e3347a50044fdd8260fa3b4264f5bca
 
 ---
 
+### 0.9 v185 cycle — independent audit `audit3.md` + maximum UI simplification (2026-10-24)
+
+Full write-up: `audit.md` §7.8 (disposition table + probes + RR-6);
+status table in `plan.md` ("Status — v185 audit round 4").
+
+| Item | Value |
+|---|---|
+| **audit3.md** | Cross-checked section by section: §2/§2.1 (GRUB 2.12 → RTMR2, no-UKI), §3 (pre-flight elimination), §4 (dual-slot zero-wildcard), §6.1/§6.2 (login-session + callback specs), §7 workflow, §8 matrix = **already shipped**; audit3's pin constants byte-match the shipped MRTD/RTMR pins. §5's sample `verify.html` **UI shape adopted, engine NOT replaced** (its single-ID `EXPECTED_PAYPAL_CLIENT_ID` pin would break the full flow and is weaker than the shipped per-flow `EXPECTED_APPS` client_id+scope+authorize_base; its gate rows lack the enclave-signature/provenance/flow/env gates). Its "vestigial manual TLS textareas" **adopted**. |
+| **UI (v185)** | Cards **3 → 2** (login / audit), visible buttons **4 → 3** (+contextual claim + PayPal link). The "Strongest: own copy" card duplicated the login flow verbatim (`localPreflight` ≈ `executePreflightAndLogin`): pedagogy folded into the login card, host input moved up (prefilled), button dropped (`localPreflight()` kept — the harness asserts its untrusted-origin refusal; its link write falls back to `#securePaypalUrl`). TLS cert inputs + `tlsCheck` row + runAudit cert block removed; report JSON keeps `tls_certificate_pem`. Results table now **4 rows**. |
+| **New live probes** | ✅ **18/0** (`/tmp/audit3-probe.mjs`): S_enc signature, PKCE challenge present, verifier-never-echoed (exact-43-char value scan outside the key/signature blobs), binding echo == our computation + session-specific, per-session state/challenge freshness, signed flow/scope/environment, warm 226 ms (no quote), bogus-state `/e2ee-blob` fail-closed with no leak, envelope cached + TDX quote present. |
+| **NEW RR-6 (justified residual)** | Session-time enclave authentication gap: the login-session response authenticates only via its own first-touch P_enc signature; an owner who MITMs the domain can serve a fake session (audited app + THEIR PKCE verifier), capture `/callback`, exchange directly with PayPal and learn identity in plaintext — while the victim's claim fails closed (red, never green). Not fixable without a pre-login hardware quote (the exact DoS surface the user directive removed) and no collusion-proof pre-quote key exists (config keys owner-written, vTPM provider-controlled, TDX silent before `TDG.MR.REPORT`). Scope limited by `EXPECTED_APPS`+scope pins, session-bound slot2, fail-closed claim. | audit.md §7.8 RR-6 |
+| **v185 deploy** | disk **`ff5c2dc8…`** (md5 `08e1c084…`, object `paypal-auth-vm/disk185b.raw`, image **`m-2ze9uedflocs2rks2ini`**, NVMe flag set); binary+initramfs unchanged (`ce27d413…`) → **no pin rotation**. Relay: **STS lesson re-hit** — presigned URLs embed the STS token from `~/.aliyun/config.json`, which rotates/expires (~1 h): a script generated ~15 min earlier failed with `SecurityTokenExpired` (relay hangs by design; md5 "mismatch" bodies were 403 XML — their md5 differs per RequestId). **Fix: regenerate the relay script (fresh presigns) immediately before the re-arm**, and check marker files with fresh `oss-url.mjs … GET` URLs (the `GET` verb arg is required — the tool defaults to PUT and yields `SignatureDoesNotMatch`); serial console can lag minutes behind — markers/HK are ground truth. `RELAY185C-SUCCESS` equivalent: markers s1→s2(hk-get-md5-ok)→s3(bj-put-200)→s4(readback-ok)→`relay-ok185c.txt`, fail marker 404. |
+| **v185 gates** | ✅ offline **196/0** · live-envelope **204/0** · cargo 20/0 · `check-manifest-parity` **PARITY OK** · served == README == `d9a91a16985e1df30a5849df22d289aa1fbab39b4e96dc451c79b6b270522091` · **live PayPal sandbox e2e PASS on the merged 2-card UI** (login → consent → callback → claim → green → downloaded). |
+
+---
+
 ## 1. Mission & threat model
 
 Run an independent end-to-end security audit of the project, of the **live
