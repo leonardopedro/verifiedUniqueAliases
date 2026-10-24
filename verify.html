@@ -214,7 +214,7 @@
             <label>Log in with PayPal — the login IS the pre-flight check</label>
             <p style="color: var(--text-dim); font-size: 0.9rem;">There is deliberately <b>no separate pre-login hardware check</b>: it would let anyone exhaust the enclave's resources, and a completed PayPal login is itself the attacker filter. Your browser generates a throwaway encryption key that never leaves this page. Your PayPal identity comes back encrypted to that key — neither the site owner (who holds the PayPal client secret and can issue TLS certificates for this domain) nor the cloud provider (who sees all traffic leaving the machine) can read it. After PayPal verifies you, the enclave mints the hardware proof (an Intel TDX quote) bound to <i>this</i> login and your session, this page audits it, and only a fully green audit decrypts here. <b>This page</b> builds the PayPal link; the enclave never redirects you.</p>
             <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;">The strongest setup is your own copy: take <code>verify.html</code> from the project's GitHub, save it and open it locally (<code>file://</code>, or use the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a>) — keys are then created only on your machine, anything injected on the enclave's origin only ever sees ciphertext, and this enclave-origin copy refuses key generation by design (Web Auditor Tampering defense).</p>
-            <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow:</b> click a login button → finish PayPal in the new tab → return here and press “Claim Encrypted Report” below when it appears — the audit runs automatically and a fully green one saves the report to your downloads. If any step fails, nothing is saved, so you are safe to close the tab.</p>
+            <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow:</b> click a login button → finish PayPal in the new tab → return here and press “Claim Encrypted Report” below when it appears — it fetches your still-ENCRYPTED report from the enclave's vault using the throwaway key that exists only in this browser, then decrypts, audits and downloads it in one step (nobody else — not even the site owner — can open it). If any step fails, nothing is saved, so you are safe to close the tab.</p>
             <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                 <button onclick="executePreflightAndLogin('verified')" style="background:#4caf50;">🔒 Log in with PayPal (Verified account only)</button>
                 <button onclick="executePreflightAndLogin('full')">🔒 Log in with PayPal (Share full profile)</button>
@@ -234,12 +234,17 @@
     <div class="grid" style="margin-top: -10px;">
         <div class="input-card" style="grid-column: span 2;">
             <label>Audit a report you already have</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem;">A saved report JSON (💾 offered on the login success page, or the Download button after a passing audit) audits offline in <b>any</b> copy of this auditor, including the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a> or your own saved <code>verify.html</code>. The audit is fail-closed: any red row — including “No valid Silicon Root of Trust” — means the evidence in the report did not verify; a common benign cause is a stale auditor page, so always take the latest <code>verify.html</code> from the project's GitHub. Only trust a report that passes every check.</p>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">A saved report JSON (💾 offered on the login success page, or the Download button after a passing audit) audits offline in <b>any</b> copy of this auditor, including the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a> or your own saved <code>verify.html</code>. The optional certificate field additionally binds a saved TLS certificate to the report (extra safety). The audit is fail-closed: any red row — including “No valid Silicon Root of Trust” — means the evidence in the report did not verify; a common benign cause is a stale auditor page, so always take the latest <code>verify.html</code> from the project's GitHub. Only trust a report that passes every check.</p>
             <label style="margin-top: 8px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Attestation JSON report</label>
             <div style="margin-bottom: 15px;">
                 <input type="file" id="reportFile" accept=".json" class="file-input">
             </div>
             <textarea id="attestationInput" placeholder="Paste report or use file upload above..."></textarea>
+            <label style="margin-top: 12px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Browser TLS certificate (optional — extra safety)</label>
+            <div style="margin-bottom: 15px;">
+                <input type="file" id="certFile" class="file-input">
+            </div>
+            <textarea id="certInput" placeholder="Paste .pem or use file upload above..."></textarea>
             <button onclick="runAudit()" style="margin-top: 15px;">Perform Cryptographic Audit</button>
         </div>
     </div>
@@ -282,11 +287,17 @@
             <div id="githubCheck" class="check-item">
                 <div class="check-icon">🐙</div>
                 <div class="check-text">
-                    <h4>GitHub Build Provenance</h4>
-                    <p id="githubDesc">Proves the binary running was built by GitHub Actions and matches hardware PCR 15.</p>
+                    <h4>GitHub Build Provenance</h4>                    <p id="githubDesc">Proves the binary running was built by GitHub Actions and matches hardware PCR 15.</p>
                 </div>
             </div>
 
+            <div id="tlsCheck" class="check-item">
+                <div class="check-icon">🔒</div>
+                <div class="check-text">
+                    <h4>TLS Certificate Binding</h4>
+                    <p id="tlsDesc">Proves your current browser connection is the one documented in the report.</p>
+                </div>
+            </div>
         </div>
     </div>
 </div>
@@ -2327,11 +2338,19 @@
                 throw new Error("CRITICAL: No valid Silicon Root of Trust (Intel TDX) found in report. If you believe this enclave is genuine, this copy of the auditor may be out of date — download the latest verify.html from the project's GitHub and re-run.");
             }
 
-            // 6. TLS channel cross-check — REMOVED (audit3 §5: the manual TLS
-            // certificate textareas were vestigial; the report's
-            // session_context.tls_certificate_pem stays visible in the JSON and
-            // the tlsCheck row is gone from the markup — updateStatus() null-
-            // guards absent rows, so no call is made here any more).
+            // 6. TLS Binding — RESTORED per user directive (v185.1): audit3
+            // called the manual PEM certificate textareas vestigial and they
+            // were removed, but the user overrode that — the optional leaf
+            // cross-check stays as EXTRA SAFETY. Without a certificate the row
+            // renders an explicit amber skip, never a bare placeholder.
+            const certInput = document.getElementById('certInput').value;
+            if (certInput) {
+                const userLeaf = getLeafCert(certInput);
+                const reportLeaf = getLeafCert(report.session_context.tls_certificate_pem);
+                updateStatus('tlsCheck', userLeaf === reportLeaf, userLeaf === reportLeaf ? "TLS channel bound." : "TLS mismatch!");
+            } else {
+                updateStatus('tlsCheck', 'warning', "ℹ️ Optional channel cross-check not requested — paste your browser's TLS certificate (field above) to bind this report to the live connection. Every other row does not depend on it.");
+            }
 
             // v177: SANDBOX deployments pass the INTEGRITY audit (silicon
             // root + MRTD/RTMR pins + every binding verified) but must never

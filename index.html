@@ -3,141 +3,2413 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Verified Unique Aliases - Transparency Hub</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <title>Enclave Audit | Confidential Attestation Verifier</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <!-- v169 (independent audit finding): the auditor's only third-party
+         dependency is PINNED BY SUBRESOURCE INTEGRITY. forge parses the X.509
+         certificates that anchor the TDX/AMD trust chains, so a substituted
+         build (compromised CDN, mirror, or TLS mis-issuance) could make
+         x509SignedBy() accept any chain and green-light a forged report. The
+         hash below was computed from node-forge@1.3.1/dist/forge.min.js (the
+         exact bytes the security harness evaluates) and is drift-guarded by
+         Test 1. Offline audits that cannot load the CDN now fail closed
+         instead of silently running without certificate parsing. -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/forge/1.3.1/forge.min.js"
+            integrity="sha384-xE6n3RBMZWgwAhyzoIMfY7HN3oDBa/+HBwFFNyxsdY8kseup7C4Blx1yDzprEESV"
+            crossorigin="anonymous"></script>
     <style>
         :root {
-            --bg: #0d1117;
-            --container-bg: #161b22;
+            --bg: #0a0c10;
+            --card: #161b22;
+            --primary: #58a6ff;
+            --success: #3fb950;
+            --error: #f85149;
+            --warning: #d29922;
             --text: #c9d1d9;
             --text-dim: #8b949e;
-            --primary: #58a6ff;
-            --accent: #238636;
-            --border: #30363d;
+            --accent: #1f6feb;
         }
 
+        * { box-sizing: border-box; }
         body {
             background: var(--bg);
             color: var(--text);
-            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            font-family: 'Outfit', sans-serif;
             margin: 0;
+            padding: 40px 20px;
             display: flex;
             justify-content: center;
-            min-height: 100vh;
+            line-height: 1.6;
         }
 
         .container {
-            max-width: 800px;
+            max-width: 900px;
             width: 100%;
-            margin: 40px 20px;
-            background: var(--container-bg);
-            padding: 40px;
-            border-radius: 12px;
-            border: 1px solid var(--border);
-            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
         }
 
-        .header {
+        header {
             text-align: center;
-            margin-bottom: 40px;
+            margin-bottom: 50px;
         }
 
-        .logo {
-            font-size: 3rem;
-            margin-bottom: 10px;
+        h1 {
+            font-size: 2.5rem;
+            margin: 0;
+            background: linear-gradient(135deg, #fff 0%, #58a6ff 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 600;
         }
 
-        h1 { color: #fff; font-size: 2rem; margin-top: 0; }
-        p { line-height: 1.6; color: var(--text-dim); font-size: 1.1rem; }
+        p.subtitle {
+            color: var(--text-dim);
+            font-size: 1.1rem;
+            margin-top: 10px;
+        }
 
-        .links-grid {
+        .grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 20px;
-            margin-top: 40px;
+            margin-bottom: 30px;
         }
 
-        .card {
-            background: rgba(255,255,255,0.02);
+        .input-card {
+            background: var(--card);
+            border: 1px solid #30363d;
+            border-radius: 16px;
             padding: 24px;
-            border-radius: 8px;
-            border: 1px solid var(--border);
-            transition: transform 0.2s, border-color 0.2s;
-            text-decoration: none;
+            transition: transform 0.2s;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 12px;
+            font-weight: 600;
             color: var(--text);
         }
 
-        .card:hover {
-            transform: translateY(-4px);
-            border-color: var(--primary);
+        textarea {
+            width: 100%;
+            height: 200px;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            color: #58a6ff;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            padding: 12px;
+            resize: none;
+            outline: none;
         }
 
-        .card h3 {
-            margin: 0 0 10px 0;
-            color: var(--primary);
+        button {
+            grid-column: span 2;
+            padding: 16px;
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: filter 0.2s, transform 0.1s;
         }
 
-        .card p {
-            margin: 0;
-            font-size: 0.9rem;
+        button:hover { filter: brightness(1.2); }
+        button:active { transform: scale(0.98); }
+
+        /* v184 (user report): anchors had NO explicit style in this page, so the
+           enclave-signed “Continue to PayPal” link (and every other link) fell
+           back to the browser default link blue/purple — practically invisible
+           on the dark background. Make every anchor bright, underlined, legible. */
+        a { color: #58a6ff; text-decoration: underline; font-weight: 600; }
+        a:hover { color: #90caf9; }
+
+        .results {
+            margin-top: 40px;
+            display: none;
         }
 
-        .footer {
-            margin-top: 60px;
+        .status-card {
+            background: rgba(88, 166, 255, 0.05);
+            border: 1px solid rgba(88, 166, 255, 0.2);
+            border-radius: 16px;
+            padding: 24px;
+        }
+
+        .check-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 16px;
+            padding: 12px;
+            background: rgba(255, 255, 255, 0.02);
+            border-radius: 8px;
+        }
+
+        .check-icon {
+            font-size: 1.5rem;
+            margin-right: 16px;
+            width: 32px;
             text-align: center;
+        }
+
+        .check-text h4 { margin: 0; font-size: 1rem; }
+        .check-text p { margin: 2px 0 0; font-size: 0.9rem; color: var(--text-dim); }
+
+        .verified { border-left: 4px solid var(--success); }
+        .failed { border-left: 4px solid var(--error); }
+        .warning { border-left: 4px solid var(--warning); }
+        .verified .check-icon { color: var(--success); }
+        .failed .check-icon { color: var(--error); }
+        .warning .check-icon { color: var(--warning); }
+
+        .timestamp-box {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 15px;
+            border-bottom: 1px solid #30363d;
+        }
+
+        .timestamp-box span {
+            color: var(--primary);
+            font-weight: 600;
+            font-size: 1.2rem;
+        }
+
+        .file-input {
+            width: 100%;
+            background: #0d1117;
+            border: 1px dashed #30363d;
+            padding: 10px;
+            border-radius: 8px;
             color: var(--text-dim);
-            font-size: 0.9rem;
-            border-top: 1px solid var(--border);
-            padding-top: 20px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+        .file-input:hover { border-color: var(--primary); }
+        .file-input::-webkit-file-upload-button {
+            background: var(--accent);
+            border: none;
+            color: white;
+            padding: 4px 12px;
+            border-radius: 4px;
+            margin-right: 12px;
+            cursor: pointer;
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <div class="logo">🛡️</div>
-            <h1>Transparency Hub</h1>
-            <p>Verifiable, Hardware-Attested PayPal Identities</p>
-        </div>
 
-        <div class="content">
-            <p>This project provides a cryptographically verifiable bridge for PayPal OAuth identities, anchored in confidential computing (Intel TDX on Alibaba Cloud, AMD SEV-SNP on GCP/OCI). All frontend logic and auditing tools are hosted here for maximum transparency.</p>
-        </div>
+<div class="container">
+    <header>
+        <a href="https://leonardopedro.github.io/verifiedUniqueAliases/" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Project Hub (source code, privacy, terms)</a>
+        <h1>Hardware-Attested PayPal Login</h1>
+        <p class="subtitle">Prove the machine handling your PayPal login is genuine confidential-computing hardware — then log in.</p>
+    </header>
 
-        <div class="links-grid">
-            <div class="card" style="grid-column: 1 / -1; border-color: var(--accent);">
-                <h3>✅ Hardware Auditor (Recommended: Local Execution)</h3>
-                <p>For maximum security and to avoid any remote execution risks, it is highly recommended to download the auditor to your local machine and open it in your browser.</p>
-                <div style="margin-top: 15px;">
-                    <a href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/refs/heads/alibabacloud/verify.html" class="btn" target="_blank" style="display:inline-block; padding: 8px 16px; background:var(--accent); color:white; text-decoration:none; border-radius:4px; font-weight:bold;">Download verify.html</a>
-                    <span style="font-size: 0.85rem; color: var(--text-dim); margin-left: 10px;">(Right-click link and choose "Save Link As...", then open the file locally)</span>
+    <div class="grid" style="margin-top: -10px;">
+        <div class="input-card" style="grid-column: span 2; border-color: #4caf50;">
+            <label>Log in with PayPal — the login IS the pre-flight check</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">There is deliberately <b>no separate pre-login hardware check</b>: it would let anyone exhaust the enclave's resources, and a completed PayPal login is itself the attacker filter. Your browser generates a throwaway encryption key that never leaves this page. Your PayPal identity comes back encrypted to that key — neither the site owner (who holds the PayPal client secret and can issue TLS certificates for this domain) nor the cloud provider (who sees all traffic leaving the machine) can read it. After PayPal verifies you, the enclave mints the hardware proof (an Intel TDX quote) bound to <i>this</i> login and your session, this page audits it, and only a fully green audit decrypts here. <b>This page</b> builds the PayPal link; the enclave never redirects you.</p>
+            <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;">The strongest setup is your own copy: take <code>verify.html</code> from the project's GitHub, save it and open it locally (<code>file://</code>, or use the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a>) — keys are then created only on your machine, anything injected on the enclave's origin only ever sees ciphertext, and this enclave-origin copy refuses key generation by design (Web Auditor Tampering defense).</p>
+            <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow:</b> click a login button → finish PayPal in the new tab → return here and press “Claim Encrypted Report” below when it appears — it fetches your still-ENCRYPTED report from the enclave's vault using the throwaway key that exists only in this browser, then decrypts, audits and downloads it in one step (nobody else — not even the site owner — can open it). If any step fails, nothing is saved, so you are safe to close the tab.</p>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                <button onclick="executePreflightAndLogin('verified')" style="background:#4caf50;">🔒 Log in with PayPal (Verified account only)</button>
+                <button onclick="executePreflightAndLogin('full')">🔒 Log in with PayPal (Share full profile)</button>
+            </div>
+            <button id="claimBtn" onclick="localClaim()" style="display:none; margin-top:10px;">🔓 2. Claim Encrypted Report</button>
+            <input type="text" id="localEnclaveHost" placeholder="https://login.airma.de"
+                style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
+            <input type="text" id="customInfoInput" maxlength="512"
+                placeholder="Optional: your public key / wallet / nonce — bound into the hardware quote and the report"
+                style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
+            <a id="securePaypalUrl" style="display:none; margin-top:10px;" class="btn" target="_blank" rel="noopener">Continue to PayPal →</a>
+            <p id="secureLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
+            <p id="localLoginStatus" style="margin: 6px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
+        </div>
+    </div>
+
+    <div class="grid" style="margin-top: -10px;">
+        <div class="input-card" style="grid-column: span 2;">
+            <label>Audit a report you already have</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">A saved report JSON (💾 offered on the login success page, or the Download button after a passing audit) audits offline in <b>any</b> copy of this auditor, including the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a> or your own saved <code>verify.html</code>. The optional certificate field additionally binds a saved TLS certificate to the report (extra safety). The audit is fail-closed: any red row — including “No valid Silicon Root of Trust” — means the evidence in the report did not verify; a common benign cause is a stale auditor page, so always take the latest <code>verify.html</code> from the project's GitHub. Only trust a report that passes every check.</p>
+            <label style="margin-top: 8px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Attestation JSON report</label>
+            <div style="margin-bottom: 15px;">
+                <input type="file" id="reportFile" accept=".json" class="file-input">
+            </div>
+            <textarea id="attestationInput" placeholder="Paste report or use file upload above..."></textarea>
+            <label style="margin-top: 12px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Browser TLS certificate (optional — extra safety)</label>
+            <div style="margin-bottom: 15px;">
+                <input type="file" id="certFile" class="file-input">
+            </div>
+            <textarea id="certInput" placeholder="Paste .pem or use file upload above..."></textarea>
+            <button onclick="runAudit()" style="margin-top: 15px;">Perform Cryptographic Audit</button>
+        </div>
+    </div>
+
+    <div id="resultsArea" class="results">
+        <div class="status-card">
+            <!-- v164: unlocked only by a fully green audit — the saved JSON is
+                 the user's portable evidence, auditable OFFLINE in any copy of
+                 the auditor (external GitHub Pages copy / saved local copy). -->
+            <button id="reportDownloadBtn" onclick="downloadReportFile()" style="display:none; width:100%; margin-bottom:18px;">💾 Download Attestation Report (JSON)</button>
+            <div class="timestamp-box">
+                Account Security Bound at:<br>
+                <span id="signTime">Not verified</span>
+            </div>
+
+            <div id="enclaveCheck" class="check-item">
+                <div class="check-icon">🛡️</div>
+                <div class="check-text">
+                    <h4>Enclave Identity Signature</h4>
+                    <p id="enclaveDesc">Proves report originated from an untampered Confidential VM.</p>
                 </div>
             </div>
 
-            <a href="verify.html" class="card" style="border-color: #d29922;">
-                <h3 style="color: #d29922;">⚠️ Web Auditor (Less Safe)</h3>
-                <p>Run the auditor directly on GitHub Pages. Note: Execution on a hosted domain is theoretically susceptible to XSS or DNS hijacking.</p>
-            </a>
-            
-            <a href="https://github.com/leonardopedro/verifiedUniqueAliases" target="_blank" class="card">
-                <h3>🐙 Source Code</h3>
-                <p>Inspect the bitwise-reproducible Rust enclave and synthesis engine.</p>
-            </a>
-            <a href="privacy.html" class="card">
-                <h3>⚖️ Privacy Policy</h3>
-                <p>Understand how your data is handled within the encrypted RAM enclave.</p>
-            </a>
-            <a href="terms.html" class="card">
-                <h3>📜 User Agreement</h3>
-                <p>Terms and conditions for using this experimental service.</p>
-            </a>
-        </div>
+            <div id="identityCheck" class="check-item">
+                <div class="check-icon">👤</div>
+                <div class="check-text">
+                    <h4>PayPal Identity Binding</h4>
+                    <p id="identityDesc">Proves the user profile matches the signed evidence.</p>
+                </div>
+            </div>
 
-        <div class="footer">
-            &copy; 2026 Verified Unique Aliases | Powered by confidential-computing hardware (Intel TDX / AMD SEV-SNP)
+            <div id="firmwareCheck" class="check-item">
+                <div class="check-icon">💎</div>
+                <div class="check-text">
+                    <h4>Silicon Root of Trust (Intel TDX)</h4>
+                    <p id="firmwareDesc">Proves the platform is genuine confidential-compute silicon (AMD SEV-SNP or Intel TDX) with untampered measurements.</p>
+                </div>
+            </div>
+
+            <div id="githubCheck" class="check-item">
+                <div class="check-icon">🐙</div>
+                <div class="check-text">
+                    <h4>GitHub Build Provenance</h4>                    <p id="githubDesc">Proves the binary running was built by GitHub Actions and matches hardware PCR 15.</p>
+                </div>
+            </div>
+
+            <div id="tlsCheck" class="check-item">
+                <div class="check-icon">🔒</div>
+                <div class="check-text">
+                    <h4>TLS Certificate Binding</h4>
+                    <p id="tlsDesc">Proves your current browser connection is the one documented in the report.</p>
+                </div>
+            </div>
         </div>
     </div>
+</div>
+
+<script>
+    // v184 (user request): pre-fill the enclave address so the flow works with
+    // zero typing (the field stays fully editable). A copy served over http(s)
+    // — i.e. by the enclave itself — gets its own origin; a trusted local
+    // (file://) or GitHub Pages copy defaults to the production enclave. Runs
+    // synchronously at script start, before any DOMContentLoaded auto-login.
+    (function () {
+        try {
+            var hi = document.getElementById('localEnclaveHost');
+            if (hi && !hi.value) {
+                var fromOrigin = (typeof location !== 'undefined' && (location.protocol === 'https:' || location.protocol === 'http:') && location.origin && location.origin !== 'null') ? location.origin : '';
+                hi.value = fromOrigin || 'https://login.airma.de';
+            }
+        } catch (e) { /* harness without DOM — skip */ }
+    })();
+
+    // v169: fail closed (with an actionable message) if the SRI-pinned forge
+    // bundle did not load — a missing certificate parser must never degrade
+    // into "chain not checked, but green anyway".
+    if (typeof forge === 'undefined' && typeof window !== 'undefined') {
+        const warn = () => { try { alert('AUDITOR DEPENDENCY MISSING: node-forge (SRI-pinned) did not load. Certificate-chain verification cannot run, so no report can be trusted. Re-download verify.html, or run this page online once so the CDN copy caches.'); } catch (e) {} };
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', warn); else warn();
+    }
+
+    // 1. Utility: Canonicalize JSON
+    function reorder(obj) {
+        if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
+            return Array.isArray(obj) ? obj.map(reorder) : obj;
+        }
+        const newObj = {};
+        Object.keys(obj).sort().forEach(k => { newObj[k] = reorder(obj[k]); });
+        return newObj;
+    }
+
+    // 2. Utilities: decode PEM / raw base64
+    //    pemToBytes    → Uint8Array  (for WebCrypto importKey / verify)
+    //    pemToBinaryStr→ forge binary string (for forge.asn1.fromDer / createBuffer)
+    //    pemToBuffer   → alias for pemToBytes (legacy callers)
+    function pemToBytes(pem) {
+        const b64 = pem
+            .replace(/-----(BEGIN|END).*?-----|[\s\r\n]/g, '')
+            .replace(/-/g, '+').replace(/_/g, '/');          // handle base64url
+        const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+        return Uint8Array.from(atob(padded), c => c.charCodeAt(0));
+    }
+    function pemToBinaryStr(pem) {
+        const b64 = pem
+            .replace(/-----(BEGIN|END).*?-----|[\s\r\n]/g, '')
+            .replace(/-/g, '+').replace(/_/g, '/');
+        const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+        return atob(padded);
+    }
+    const pemToBuffer = pemToBytes; // backward compat
+
+    // ── v160: P_enc binding + pre-flight (Pillars 2 & 4) ──────────────────
+    // Pre-flight state: P_enc pinned by the FIRST (pre-login) audit of the
+    // live enclave. Any later audit of the post-login report must carry the
+    // same key or it fails — closing the verify-after-login race.
+    // (var, not let: the audit harness evaluates this script via indirect
+    // eval — top-level `let` stays in the eval scope and would be invisible
+    // to scripts/test-verify-security.mjs, which drives these pins directly.)
+    var preFlightPubKeyPem = null;
+    // v179 (plan Phase 1 — session-substitution defense): SHA-256(P_client
+    // SPKI-DER ∥ Nonce_client) of the client session THIS browser generated
+    // when starting the login. The callback quote binds it into report_data
+    // [32..64]; when present, the auditor enforces that slot strictly. Without
+    // it (a pasted report audited outside its session) the slot cannot be
+    // verified — [0..32] stays strictly enforced, the slot is informational.
+    var auditorSessionBindingHex = null;
+    var lastAuditedPubKeyPem = null;
+
+    // report_data[0..32] = SHA-256(P_enc_SPKI_DER ∥ session_nonce),
+    // [32..64] zero — the v160 SNP binding formula. REMOVED in v180 (audit.md
+    // §5.1: the AMD SEV-SNP path is gone); kept as a named constant only in
+    // git history.
+
+    // v161 (plan Pillars 2–5): CLIENT-BOUND report_data binding —
+    //   SHA-256(P_enc_SPKI_DER ∥ code_challenge ∥ P_client_SPKI_DER ∥ client_nonce ∥ custom_info)
+    // [32..64] zero. v161.2 folds the user's optional custom_info (public
+    // key / wallet / nonce; "NONE" when absent) into the quote so the
+    // hardware commits to the user's own entropy.
+    // v168 (plan Phase 3.1 — Malicious PayPal App defense) folds the PayPal
+    // APP id in as the SIXTH element, so a colluding owner swapping in an
+    // over-scoped PayPal client_id must change the quoted REPORTDATA:
+    //   SHA-256(P_enc ∥ code_challenge ∥ P_client ∥ client_nonce ∥ custom_info ∥ PayPal_Client_ID)
+    // Mirrors the enclave's LEGACY pre-flight formula (the enclave no longer
+    // mints pre-flight reports — v180); kept so pre-v180 saved reports still
+    // audit correctly. harness Test 6c pins the bytes.
+    async function preflightBindingHex(pubKeyDer, codeChallenge, clientPubDer, clientNonceHex, customInfo, paypalClientId) {
+        const enc = new TextEncoder();
+        const nonceBytes = new Uint8Array((clientNonceHex.match(/.{1,2}/g) || []).map(m => parseInt(m, 16)));
+        const ch = enc.encode(codeChallenge);
+        const ci = enc.encode(customInfo || 'NONE');
+        const app = enc.encode(paypalClientId || '');
+        const pre = new Uint8Array(pubKeyDer.length + ch.length + clientPubDer.length + nonceBytes.length + ci.length + app.length);
+        pre.set(pubKeyDer, 0);
+        pre.set(ch, pubKeyDer.length);
+        pre.set(clientPubDer, pubKeyDer.length + ch.length);
+        pre.set(nonceBytes, pubKeyDer.length + ch.length + clientPubDer.length);
+        pre.set(ci, pubKeyDer.length + ch.length + clientPubDer.length + nonceBytes.length);
+        pre.set(app, pubKeyDer.length + ch.length + clientPubDer.length + nonceBytes.length + ci.length);
+        const digest = await crypto.subtle.digest('SHA-256', pre);
+        return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function b64ToDer(b64) {
+        const b = atob(b64.replace(/-/g, '+').replace(/_/g, '/'));
+        const u = new Uint8Array(b.length);
+        for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i);
+        return u;
+    }
+
+    // v179 (plan Phase 1 — session substitution): SHA-256(P_client SPKI-DER ∥
+    // Nonce_client) — byte-identical to src/main.rs::client_session_binding().
+    // Golden vector pinned by security_tests::client_session_binding_parity_v179
+    // and the JS harness.
+    async function clientSessionBindingHex(clientPubDer, clientNonceHex) {
+        const nonceBytes = new Uint8Array((clientNonceHex.match(/.{1,2}/g) || []).map(m => parseInt(m, 16)));
+        const pub = new Uint8Array(clientPubDer);
+        const pre = new Uint8Array(pub.length + nonceBytes.length);
+        pre.set(pub, 0);
+        pre.set(nonceBytes, pub.length);
+        const digest = await crypto.subtle.digest('SHA-256', pre);
+        return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // PRE-FLIGHT CARD REMOVED (v180 — user directive): the "audit the
+    // enclave before logging in" card and its standalone-envelope fetch are gone.
+    // That route minted a TD quote per unauthenticated request — the exact
+    // pre-login resource-exhaustion surface the user eliminated. The login
+    // flow's hardware audit runs on the POST-LOGIN report instead, which a
+    // PayPal-verified code exchange gates. The standalone envelope route now serves a
+    // boot-time CACHED envelope (≥15 min) for the ops/rotation tooling only.
+
+    // ========================================================================
+    // v168 (plan Phase 3.3): AUDITOR ISOLATION. The copy of this page served
+    // by the enclave's own origin is UNTRUSTED under the collusion threat
+    // model: the domain owner can rewrite this script at will (and the ESP
+    // copy is unmeasured), so any key generated here would be exposed to
+    // hostile script (Web Auditor Tampering). Key generation, the secure
+    // login and decryption therefore run ONLY in a TRUSTED auditor context:
+    // a saved local copy (file://) or the pinned GitHub Pages copy.
+    // Paste-report offline auditing needs no keys and stays available
+    // everywhere. (var — the offline harness drives these directly.)
+    // ========================================================================
+    var TRUSTED_AUDITOR_HOSTS = ['leonardopedro.github.io'];
+    function trustedAuditorContext() {
+        if (typeof location === 'undefined') return true; // headless harness
+        if (location.protocol === 'file:') return true;
+        return TRUSTED_AUDITOR_HOSTS.indexOf(location.host) !== -1;
+    }
+    function untrustedOriginError() {
+        return new Error('UNTRUSTED AUDITOR ORIGIN: this page is served by the enclave\'s own webserver — its owner can rewrite this script at will, so keys generated here would be exposed (Web Auditor Tampering defense). Key generation and logins are REFUSED here. Download verify.html from the project GitHub (or use the GitHub Pages copy) and open it as a local file (file://) to run the secure login. Paste-report auditing on this copy is still safe.');
+    }
+
+    // ========================================================================
+    // v180 (user directive — NO PRE-LOGIN ATTESTATION): SECURE LOGIN —
+    // cheap login-session → client-built PayPal URL → post-login hardware
+    // audit → E2EE identity delivery. The pre-login TD quote ("pre-flight")
+    // was removed: one quote per unauthenticated click is a trivially
+    // reachable enclave resource-exhaustion surface, and the completed PayPal
+    // login is itself the attacker filter. Flow:
+    //   1. THIS browser generates an ephemeral ECDH keypair (S_client/P_client)
+    //      and a 32-byte nonce; S_client NEVER leaves the browser.
+    //   2. POST /attest/login-session returns S_enc-signed fields (app, scope,
+    //      environment, state) — NO quote is minted, nothing is stored
+    //      server-side. The client session rides inside the OAuth `state`.
+    //   3. The app allow-list is enforced HERE before any redirect.
+    //   4. The authorize URL is built THIS page from the signed fields
+    //      (the enclave never redirects — plan §6 step 7).
+    //   5. After PayPal login, /callback mints the HARDWARE quote (gated
+    //      behind the PayPal-verified code exchange — the attacker filter)
+    //      binding the PayPal identity AND this browser's session, and
+    //      returns the report encrypted to P_client; only this browser can
+    //      open it (same-origin sessionStorage / local session).
+    // ========================================================================
+    async function executePreflightAndLogin(flow) {
+        const log = document.getElementById('secureLoginStatus');
+        const say = m => { if (log) log.innerText = m; };
+        try {
+            // v168 (plan Phase 3.3): keys only ever exist in a TRUSTED auditor
+            // context (file:// / GitHub Pages), never in the enclave-served copy.
+            if (!trustedAuditorContext()) throw untrustedOriginError();
+            rememberSelectedFlow(flow);
+            const enclaveBase = ((document.getElementById('localEnclaveHost') || {}).value
+                || (document.getElementById('preflightUrl') || {}).value || '').trim().replace(/\/+$/, ''); // preflightUrl: legacy field, kept for old saved copies
+            if (!/^https:\/\/[^\/]+/.test(enclaveBase)) {
+                throw new Error('Enter the enclave origin (https://<enclave>) in the "enclave address" field first.');
+            }
+            say('⏳ Generating client session keypair (ECDH P-256) + nonce…');
+            const kp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+            const pubRaw = await crypto.subtle.exportKey('spki', kp.publicKey);
+            const pubB64 = btoa(String.fromCharCode(...new Uint8Array(pubRaw)));
+            const clientNonce = new Uint8Array(32);
+            crypto.getRandomValues(clientNonce);
+            const nonceHex = Array.from(clientNonce).map(b => b.toString(16).padStart(2, '0')).join('');
+            const clientJwk = JSON.stringify(await crypto.subtle.exportKey('jwk', kp.privateKey));
+            // v161.2: optional user data (public key / wallet / nonce) that
+            // gets bound into the HARDWARE quote (report_data) and the
+            // session nonce — not just the software signature. Canonicalized
+            // identically to the enclave (trim; empty → 'NONE').
+            const customInfoRaw = (document.getElementById('customInfoInput') || {}).value || '';
+            const customInfo = customInfoRaw.trim() || 'NONE';
+            if (customInfo !== 'NONE' && customInfo.length > 512) {
+                throw new Error('custom data exceeds 512 characters — shorten it (e.g. hash your key first)');
+            }
+            sessionStorage.setItem('pav_custom_info', customInfo);
+
+            say('🔐 Requesting login session (no pre-login attestation — the PayPal login IS the filter)…');
+            // v180 (user directive — no pre-login attestation): the enclave no
+            // longer mints a TD quote before login. An unauthenticated quote
+            // per click is a trivially reachable resource-exhaustion surface
+            // (each quote costs a full TDG.MR.REPORT + QGS round-trip). The
+            // hardware audit now runs ONLY on the post-login report, whose
+            // quote binds the PayPal identity AND this browser's session —
+            // and which is unreachable until a PayPal-verified code exchange
+            // completes. This call is pure bookkeeping (S_enc-signed fields),
+            // so it cannot be used to burn enclave resources.
+            const resp = await fetch(enclaveBase + '/attest/login-session', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ client_ecdh_pub_b64: pubB64, client_nonce_hex: nonceHex, flow: flow || 'verified', custom_info: customInfo === 'NONE' ? '' : customInfo })
+            });
+            if (!resp.ok) throw new Error('login-session request rejected (HTTP ' + resp.status + ')' + (resp.status === 404 ? ' — this deployment still exposes the old pre-flight endpoint; refresh this page from the project GitHub' : ''));
+            const pf = await resp.json();
+
+            say('🔏 Verifying enclave signature over the login fields…');
+            const sigKey = await crypto.subtle.importKey('spki', pemToBuffer(pf.enclave_signing_public_key), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+            const sigOk = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', sigKey, pemToBuffer(pf.login_signature_b64),
+                new TextEncoder().encode(JSON.stringify(reorder(pf.signed_fields))));
+            if (!sigOk) throw new Error('LOGIN-SESSION SIGNATURE INVALID — the login fields were tampered in transit. Aborting.');
+
+            // v162 (audit VULN-03): the S_enc signature proves the ENCLAVE
+            // said it — it does not prove the app is the audited one. A
+            // malicious owner can point the enclave at any PayPal app it
+            // controls (over-scoped) and still produce a valid signature, so
+            // the app identifiers are pinned HERE, before any redirect.
+            checkExpectedApp(pf.signed_fields);
+            // R3-1: refuse a PKCE-less (downgraded or stale) login BEFORE any
+            // session state is stored or the user is sent to PayPal.
+            requirePkceChallenge(pf.signed_fields);
+
+            // The enclave must echo back exactly what this browser sent (the
+            // binding it will hardware-bind at /callback, and the custom data).
+            // A mismatch means the enclave or the transport substituted the
+            // session — abort before the user is sent to PayPal.
+            const sf = pf.signed_fields;
+            const expectedBinding = await clientSessionBindingHex(new Uint8Array(pubRaw), nonceHex);
+            if ((sf.custom_info || 'NONE') !== customInfo
+                || (sf.client_session_binding_hex || '').toLowerCase() !== expectedBinding) {
+                throw new Error('Session fields do NOT match what this browser generated — the enclave or the transport lied. Aborting.');
+            }
+
+            // Pin the enclave signing key for KEY-CONTINUITY across the PayPal
+            // round-trip: the post-login report must be signed by THIS key.
+            // (There is no pre-login hardware quote any more — the hardware
+            // proof is the post-login TDX quote, gated behind PayPal.)
+            preFlightPubKeyPem = pf.enclave_signing_public_key;
+            try { sessionStorage.setItem('pav_p_enc', pf.enclave_signing_public_key); } catch (e) {}
+
+            auditorSessionBindingHex = expectedBinding;
+            try { sessionStorage.setItem('pav_session_binding_hex', auditorSessionBindingHex); } catch (e) {}
+            localStorage.setItem('pav_local_session', JSON.stringify({
+                host: enclaveBase, jwk: clientJwk, nonceHex, customInfo,
+                p_enc: pf.enclave_signing_public_key, state: sf.state,
+                flow: sf.flow || flow || 'verified',
+                clientPubB64: pubB64, sessionBindingHex: auditorSessionBindingHex,
+            }));
+
+            // Client-built authorize URL from the S_enc-signed fields (scope
+            // arrives pre-percent-encoded from the enclave — do not re-encode).
+            // R3-1: PKCE required (helper above) and carried into the
+            // authorize URL — the client session rides in `state` (bound into
+            // the TDX quote), the code_verifier stays in the enclave.
+            const url = `${sf.authorize_base}?client_id=${encodeURIComponent(sf.paypal_client_id)}` +
+                `&response_type=code&scope=${sf.scope}&redirect_uri=${encodeURIComponent(sf.redirect_uri)}` +
+                `&state=${sf.state}` +
+                `&code_challenge=${encodeURIComponent(sf.code_challenge)}&code_challenge_method=S256`;
+            // Popup FIX (user report): window.open() after the async request
+            // is NOT a user gesture any more, so every browser popup-blocker
+            // swallows it. Hand off through a plain link the user clicks (a
+            // clicked target=_blank link is never blocked, and this page stays
+            // open for "Claim").
+            const link = document.getElementById('securePaypalUrl');
+            if (link) {
+                link.href = url;
+                link.style.display = 'inline-block';
+            }
+            say('✅ Login session ready — no hardware attestation happens until AFTER PayPal verifies you. Click “Continue to PayPal →” above (opens in a NEW tab); after logging in, come back to THIS tab and press “🔓 2. Claim Encrypted Report” below — that is where your key lives, so the report decrypts, audits and downloads HERE.');
+            // v184: surface the claim action once a client session/key exists
+            // (the button is hidden by default to keep the page minimal).
+            try { const cb = document.getElementById('claimBtn'); if (cb) cb.style.display = 'inline-block'; } catch (e) {}
+        } catch (e) {
+            say('❌ ' + e.message);
+        }
+    }
+
+    // ========================================================================
+    // R3-1 (audit round 3 — payment-flow abuse): PKCE is MANDATORY. The
+    // enclave signs code_challenge (S256) into the login fields and keeps the
+    // verifier in its own RAM; PayPal then refuses any exchange without it.
+    // Without PKCE an adversary who holds the PayPal client secret (the
+    // webservice owner writes it into the enclave config) AND observes the
+    // authorization code — at their own TLS endpoint for this domain, or in
+    // the provider-visible serial console — could exchange the code directly
+    // with PayPal and read the user's identity in plaintext, bypassing the
+    // enclave, the hardware gates and the E2EE layer entirely. A missing or
+    // malformed challenge = a downgrade or a stale enclave ⇒ abort BEFORE
+    // the user is sent to PayPal.
+    // ========================================================================
+    function requirePkceChallenge(sf) {
+        const c = String((sf && sf.code_challenge) || '');
+        const m = String((sf && sf.code_challenge_method) || '');
+        if (m !== 'S256' || !/^[A-Za-z0-9_-]{43}$/.test(c)) {
+            throw new Error('PKCE MISSING OR WEAK (R3-1): the enclave did not sign a valid S256 code_challenge into the login fields (method="' + m + '"). Without PKCE the authorization code can be exchanged by anyone holding the PayPal client secret — including the webservice owner — before this enclave ever sees it. Aborting. (If the enclave is healthy, THIS auditor copy may be stale — refresh verify.html from the project GitHub.)');
+        }
+        return c;
+    }
+
+    // ========================================================================
+    // v162 (audit VULN-03): APP PIN — the audited PayPal applications.
+    // The S_enc signature only proves the enclave said "use this app"; a
+    // malicious owner controls the enclave's config and could swap in its
+    // own over-scoped PayPal app. These constants are the audited allow-list
+    // (flow, client_id, authorize_base, scope) — anything else aborts
+    // BEFORE the user is sent to PayPal. Rotate them DELIBERATELY (commit
+    // + audit) when the app legitimately changes.
+    // ========================================================================
+    var EXPECTED_APPS = [
+        // Sandbox (staging deployment — live-captured 2026-10-14)
+        // App pairing (2026-10-19): the verified flow uses the REST app that
+        // has NO PII scopes enabled (profile/email/address are rejected at the
+        // app level), so minimal disclosure is structurally enforced by PayPal,
+        // not just by the requested scope. The full flow uses the PII-capable
+        // app. Swapping these back will break the full flow with "invalid scope".
+        { flow: 'verified', client_id: 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
+        { flow: 'full', client_id: 'ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address%20profile%20email%20https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
+        // Production entries: add here at cutover (www.paypal.com authorize_base).
+    ];
+
+    // ========================================================================
+    // v165 AUDIT (threat model: cloud provider + webservice owner COLUDE):
+    // MRTD PIN — the TDX launch measurement (quote body mr_td @136..184),
+    // byte-identical across two independent live quotes. Ghost-enclave guard:
+    // a valid Intel-signed quote proves silicon; this pin proves the silicon
+    // launched the AUDITED boot chain. SCOPE (honest): on this platform no
+    // hardware measurement covers the running image (RTMR[0] is all zeros,
+    // no vTPM) — MRTD covers the launch chain only, so running-code identity
+    // is enforced by EXPECTED_ENCLAVE_SHA256 + the CI attestation rows.
+    // Rotate DELIBERATELY, in a reviewed commit, when the boot chain changes.
+    // ========================================================================
+    var EXPECTED_MRTD = 'e0199499baacb2e4f4bc73046f25bedf674d42defbe4e854242bd6554a9d155edf7f3bff8e6202e63ed230e59ab2568a';
+
+    // ========================================================================
+    // v166 AUDIT (plan.md Phase 4): GOLDEN RTMR PINS — HARD silicon gates.
+    // The four Runtime Measurement Registers inside the Intel-signed quote
+    // body (TDREPORT10 offsets 328..520). Live evidence (2026-10-21): RTMR0/1/2
+    // are non-zero, byte-identical across independent instances AND reboots of
+    // the same image, and changed when the initramfs content changed — i.e.
+    // the boot chain IS hardware-measured on this platform (the old "RTMR[0]
+    // all zeros, no vTPM" comment above is superseded). RTMR3 stays zero
+    // (nothing extends it) and is pinned as zeros so ANY extension trips the
+    // gate. With owner+cloud collusion both this file and the deployment are
+    // attacker-controlled — but an independent auditor copy pins THESE bytes:
+    // a modified /init or swapped image produces different RTMRs → hard fail.
+    // NOTE: verify.html now ships on the UNMEASURED ESP (R1-R3), so editing a
+    // pin does NOT feed back into RTMR2 — pins rotate only with real boot-chain
+    // changes, in a reviewed commit, recaptured via a golden boot:
+    //     node scripts/capture-golden-pcrs.mjs <host> --update   (GCP path)
+    //     TDX: parse a live quote body @328..520 (see scripts/e2e-sandbox.mjs)
+    // ========================================================================
+    var EXPECTED_RTMR0 = '06a32a2f92ea455dd628bc41be9bb5910c2782a2eb93c646c6a5ddebd70291839f197792d289cca528572b6d910294db';
+    var EXPECTED_RTMR1 = '6fa0352319182f7ec8cb713223cbc1853506caf719c64d04475a26975ae8ebf72003f592dcf0aafe392cc74de33d3f90';
+    var EXPECTED_RTMR2 = '61ce2879ea9f31cadf09ba6498104c7501dc0ac7969d4bf1c401ad92585386332fc5cbdb45182a2193f11f71a4a30324';
+    var EXPECTED_RTMR3 = '000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000';
+
+    // ========================================================================
+    // v168 AUDIT (plan Phase 1.2): ENCLAVE CODE DIGEST PIN — INFORMATIONAL,
+    // NOT a gate. The digest below is SELF-REPORTED by the very binary under
+    // suspicion (/init hashes itself from its own filesystem), so a backdoored
+    // /init simply claims the audited value — the "self-measurement fallacy".
+    // Pass/fail for code identity is decided EXCLUSIVELY by the MRTD/RTMR
+    // silicon pins over the Intel-signed quote. This constant remains as a
+    // staleness/consistency signal (surfaced as a loud warning in the
+    // provenance row) and as the CI-harness fixture anchor. Rotate ONLY
+    // together with the enclave source change, in the same reviewed commit.
+    // v178: this constant tracks the DOCKER/CI-PIPELINE digest — host builds
+    // (plain cargo, e.g. Nix) are NOT bit-identical to the pipeline and are
+    // never attested; see AGENTS.md "attested build" note. The value below is
+    // the digest GitHub attestations resolve for this source tree.
+    // ========================================================================
+    // v183 rotation (2026-10-24, audit round 3): the R3 binary (PKCE + budget
+    // enforcement + honest timestamps + console redaction) — digest taken from
+    // the Docker/CI-pipeline build that produced the deployed disk
+    // (b9292a31…), live-confirmed by the post-swap envelope self-reporting
+    // 01c74f89… . Rotate again with the next binary release, in the same
+    // reviewed commit as the README digest (harness Test 21d/28 anchor it).
+    var EXPECTED_ENCLAVE_SHA256 = '01c74f89d64abca22a2f6ef8c1aaeeb1884c417a8eb3bac447b41e4a8809511d';
+
+    // ========================================================================
+    // v162 (audit VULN-04): GOLDEN PCR PINS — CI-captured constants for the
+    // boot-chain PCRs on the GCP/vTPM path. The signed composite digest only
+    // proves the quote is self-consistent: a tampered kernel yields a
+    // self-consistent composite over ITS OWN PCRs. When a pin below is set,
+    // the quoted value MUST equal it (mismatch = hard fail). PCR 15 stays
+    // dynamic (computed from the report's manifest); 0/4/8/9 are the fixed
+    // boot chain and get pinned here.
+    //
+    // Capture (only from a deployment whose provenance gate passed):
+    //     node scripts/capture-golden-pcrs.mjs <https://host> --update
+    // then commit verify.html so the pin enters the audited history.
+    // ========================================================================
+    var GOLDEN_PCRS = {
+        pcr_0: null, // firmware          — capture from a known-good GCP boot
+        pcr_4: null, // bootloader        — shim/grub/UKI as measured at boot
+        pcr_8: null, // kernel cmdline
+        pcr_9: null, // kernel + initramfs payload
+    };
+    // ========================================================================
+    // Intel SGX trust anchors for the TDX path (Alibaba ECS). Same discipline
+    // as GOLDEN_PCRS and TRUSTED_AMD_ARKS: a PCK issuer *regex* is spoofable
+    // (anyone can mint a CA called "Intel SGX PCK …"), so the chain MUST
+    // terminate in a root whose DER sha256 is pinned here AND whose PEM (the
+    // cert the walk appends when the quote's chain stops short) is the very
+    // same certificate:
+    //   https://certificates.trustedservices.intel.com/Intel_SGX_Provisioning_Certification_RootCA.cer
+    // SHA-256 corroborated against Intel's dcap-qvl reference crate (which
+    // bundles the same DER) and independent published verifiers.
+    // `var` — like GOLDEN_PCRS — so the offline harness can substitute its
+    // synthetic root for positive-path fixtures; scripts/test-verify-security.mjs
+    // asserts the DEFAULT entry (pem sha256 == pinned sha256 == Intel root)
+    // and must fail if it ever drifts.
+    // ========================================================================
+    var TRUSTED_INTEL_ROOTS = [{
+        sha256: '44a0196b2b99f889b8e149e95b807a350e7424964399e885a7cbb8ccfab674d3',
+        pem: [
+            '-----BEGIN CERTIFICATE-----',
+            'MIICjzCCAjSgAwIBAgIUImUM1lqdNInzg7SVUr9QGzknBqwwCgYIKoZIzj0EAwIw',
+            'aDEaMBgGA1UEAwwRSW50ZWwgU0dYIFJvb3QgQ0ExGjAYBgNVBAoMEUludGVsIENv',
+            'cnBvcmF0aW9uMRQwEgYDVQQHDAtTYW50YSBDbGFyYTELMAkGA1UECAwCQ0ExCzAJ',
+            'BgNVBAYTAlVTMB4XDTE4MDUyMTEwNDUxMFoXDTQ5MTIzMTIzNTk1OVowaDEaMBgG',
+            'A1UEAwwRSW50ZWwgU0dYIFJvb3QgQ0ExGjAYBgNVBAoMEUludGVsIENvcnBvcmF0',
+            'aW9uMRQwEgYDVQQHDAtTYW50YSBDbGFyYTELMAkGA1UECAwCQ0ExCzAJBgNVBAYT',
+            'AlVTMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEC6nEwMDIYZOj/iPWsCzaEKi7',
+            '1OiOSLRFhWGjbnBVJfVnkY4u3IjkDYYL0MxO4mqsyYjlBalTVYxFP2sJBK5zlKOB',
+            'uzCBuDAfBgNVHSMEGDAWgBQiZQzWWp00ifODtJVSv1AbOScGrDBSBgNVHR8ESzBJ',
+            'MEegRaBDhkFodHRwczovL2NlcnRpZmljYXRlcy50cnVzdGVkc2VydmljZXMuaW50',
+            'ZWwuY29tL0ludGVsU0dYUm9vdENBLmRlcjAdBgNVHQ4EFgQUImUM1lqdNInzg7SV',
+            'Ur9QGzknBqwwDgYDVR0PAQH/BAQDAgEGMBIGA1UdEwEB/wQIMAYBAf8CAQEwCgYI',
+            'KoZIzj0EAwIDSQAwRgIhAOW/5QkR+S9CiSDcNoowLuPRLsWGf/Yi7GSX94BgwTwg',
+            'AiEA4J0lrHoMs+Xo5o/sX6O9QWxHRAvZUGOdRQ7cvqRXaqI=',
+            '-----END CERTIFICATE-----'
+        ].join('\n'),
+    }];
+    // v169 (audit finding — FLOW / MINIMAL-DISCLOSURE BINDING): the browser
+    // records WHICH app the user chose (minimal-scope "verified" vs PII
+    // "full") before the pre-flight, and the post-login audit requires the
+    // sealed report to have been minted by exactly that flow. Without this,
+    // an enclave could ignore the user's minimal-disclosure choice and mint
+    // the report through the over-scoped app: every other pin still passes
+    // (both apps are audited), so only this binds INTENT.
+    var selectedFlow = null;
+    function rememberSelectedFlow(flow) {
+        selectedFlow = (String(flow || 'verified') === 'full') ? 'full' : 'verified';
+        try { sessionStorage.setItem('pav_selected_flow', selectedFlow); } catch (e) { /* no storage (harness/offline) */ }
+    }
+    function selectedFlowNow() {
+        let stored = null;
+        try { stored = sessionStorage.getItem('pav_selected_flow'); } catch (e) { /* ignore */ }
+        return stored || selectedFlow;
+    }
+
+    function checkExpectedApp(sf) {
+        const hit = EXPECTED_APPS.find(a => a.flow === sf.flow && a.client_id === sf.paypal_client_id
+            && a.authorize_base === sf.authorize_base && a.scope === sf.scope);
+        if (!hit) {
+            throw new Error('APP PIN VIOLATION: the enclave presented a PayPal app/scope NOT in the audited allow-list — a swapped or over-scoped app would let the domain owner harvest your data directly from PayPal. Aborting. (Auditors: EXPECTED_APPS may be rotated only via a deliberate, reviewed commit.)');
+        }
+        return hit;
+    }
+
+    // ========================================================================
+    // v162 (audit VULN-02): LOCAL AUDITOR MODE — origin-independent delivery.
+    // Run this page from a trusted local copy (file://); the login session,
+    // authorize-URL construction, AND the final decryption all happen in the
+    // LOCAL context. S_client never exists on the enclave origin, so a
+    // TLS-terminating owner injecting script into any enclave-served page
+    // gains nothing: it sees ciphertext only. Trust anchors are unchanged —
+    // the TDX quote's report_data binds this browser's P_client + nonce at
+    // the callback (session slot [32..64]), the SEC-02 slot [0..32] binds the
+    // PayPal identity, and the claimed blob must carry a valid S_enc
+    // signature (a substituted blob fails closed). The optional pinned P_enc
+    // adds key-continuity with the login session when one is in hand.
+    // ========================================================================
+    async function localDecryptAndVerify(blob, jwkStr, nonceHex, pinnedPem) {
+        const b64d = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+        const jwk = JSON.parse(jwkStr);
+        const nonceBytes = Uint8Array.from(nonceHex.match(/.{2}/g) || [], h => parseInt(h, 16));
+        if (nonceBytes.length !== 32) throw new Error('stored client nonce is malformed');
+        const priv = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+        const peer = await crypto.subtle.importKey('spki', b64d(blob.enclave_ecdh_public_key_b64), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+        const bits = await crypto.subtle.deriveBits({ name: 'ECDH', public: peer }, priv, 256);
+        const base = await crypto.subtle.importKey('raw', bits, 'HKDF', false, ['deriveKey']);
+        const key = await crypto.subtle.deriveKey(
+            { name: 'HKDF', hash: 'SHA-256', salt: nonceBytes, info: new TextEncoder().encode('paypal-auth-vm/e2ee/v1') },
+            base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+        const pt = await crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv: b64d(blob.iv_b64), additionalData: nonceBytes }, key, b64d(blob.ct_b64));
+        const envelope = JSON.parse(new TextDecoder().decode(pt));
+        const reportPem = envelope.enclave_signing_public_key;
+        if (pinnedPem && reportPem !== pinnedPem) throw new Error('KEY-CONTINUITY VIOLATION: report key ≠ pinned P_enc — the enclave was swapped across the login. Do NOT trust this payload.');
+        const k = await crypto.subtle.importKey('spki', pemToBuffer(reportPem), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+        const ok = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', k, pemToBuffer(envelope.enclave_signature_b64),
+            new TextEncoder().encode(JSON.stringify(reorder(envelope.attestation_report))));
+        if (!ok) throw new Error('S_enc report signature INVALID — forged or substituted blob');
+        return envelope;
+    }
+
+    async function localPreflight(flow) {
+        const log = document.getElementById('localLoginStatus');
+        const say = m => { if (log) log.innerText = m; };
+        try {
+            // v168 (plan Phase 3.3): keys only in a TRUSTED auditor context.
+            if (!trustedAuditorContext()) throw untrustedOriginError();
+            rememberSelectedFlow(flow || 'verified');
+            const host = (document.getElementById('localEnclaveHost').value || '').trim().replace(/\/$/, '');
+            if (!/^https:\/\//.test(host)) throw new Error('Enter the enclave origin, e.g. https://login.airma.de');
+            say('⏳ Generating LOCAL session keypair (ECDH P-256) + nonce…');
+            const kp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+            const pubRaw = await crypto.subtle.exportKey('spki', kp.publicKey);
+            const pubB64 = btoa(String.fromCharCode(...new Uint8Array(pubRaw)));
+            const clientNonce = crypto.getRandomValues(new Uint8Array(32));
+            const nonceHex = Array.from(clientNonce).map(b => b.toString(16).padStart(2, '0')).join('');
+            const customInfoRaw = (document.getElementById('customInfoInput') || {}).value || '';
+            const customInfo = customInfoRaw.trim() || 'NONE';
+            if (customInfo !== 'NONE' && customInfo.length > 512) throw new Error('custom data exceeds 512 characters');
+
+            say('🔐 Requesting login session (no pre-login attestation — the PayPal login IS the filter)…');
+            // v180 (user directive — no pre-login attestation): same flow as
+            // Step 1 — S_enc-signed fields only, NO hardware quote, and the
+            // full hardware audit deferred to the POST-login report (which a
+            // PayPal-verified code exchange gates).
+            const resp = await fetch(host + '/attest/login-session', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ client_ecdh_pub_b64: pubB64, client_nonce_hex: nonceHex, flow: flow || 'verified', custom_info: customInfo === 'NONE' ? '' : customInfo })
+            });
+            if (!resp.ok) throw new Error('login-session request rejected (HTTP ' + resp.status + ')' + (resp.status === 404 ? ' — this deployment still exposes the old pre-flight endpoint; refresh this page from the project GitHub' : ''));
+            const pf = await resp.json();
+
+            say('🔏 Verifying S_enc signature + app pin…');
+            const sigKey = await crypto.subtle.importKey('spki', pemToBuffer(pf.enclave_signing_public_key), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+            const sigOk = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', sigKey, pemToBuffer(pf.login_signature_b64),
+                new TextEncoder().encode(JSON.stringify(reorder(pf.signed_fields))));
+            if (!sigOk) throw new Error('LOGIN-SESSION SIGNATURE INVALID — aborting.');
+            checkExpectedApp(pf.signed_fields);
+            const sf = pf.signed_fields;
+            // R3-1: refuse a PKCE-less (downgraded or stale) login BEFORE any
+            // session state is stored or the user is sent to PayPal.
+            requirePkceChallenge(sf);
+            const expectedBinding = await clientSessionBindingHex(new Uint8Array(pubRaw), nonceHex);
+            if ((sf.custom_info || 'NONE') !== customInfo
+                || (sf.client_session_binding_hex || '').toLowerCase() !== expectedBinding) {
+                throw new Error('Session fields do NOT match what this browser generated — aborting.');
+            }
+
+            // Key-continuity pin: the post-login report must be signed by THIS
+            // enclave key (no pre-login quote exists to audit any more — the
+            // hardware proof is the post-login TDX quote itself).
+            preFlightPubKeyPem = pf.enclave_signing_public_key;
+            try { sessionStorage.setItem('pav_p_enc', pf.enclave_signing_public_key); } catch (e) {}
+
+            // Keys stay in THIS file origin's storage — never the enclave's.
+            // v179 (plan Phase 1): the client-session binding travels with the
+            // session so the claim audit enforces the quote's session slot.
+            auditorSessionBindingHex = expectedBinding;
+            try { sessionStorage.setItem('pav_session_binding_hex', auditorSessionBindingHex); } catch (e) {}
+            localStorage.setItem('pav_local_session', JSON.stringify({
+                host, jwk: JSON.stringify(await crypto.subtle.exportKey('jwk', kp.privateKey)),
+                nonceHex, customInfo, p_enc: pf.enclave_signing_public_key, state: sf.state,
+                flow: sf.flow || flow || 'verified',
+                clientPubB64: pubB64, sessionBindingHex: auditorSessionBindingHex,
+            }));
+            const url = `${sf.authorize_base}?client_id=${encodeURIComponent(sf.paypal_client_id)}` +
+                `&response_type=code&scope=${sf.scope}&redirect_uri=${encodeURIComponent(sf.redirect_uri)}` +
+                `&state=${sf.state}` +
+                `&code_challenge=${encodeURIComponent(sf.code_challenge)}&code_challenge_method=S256`;
+            const link = document.getElementById('localPaypalUrl') || document.getElementById('securePaypalUrl');
+            if (link) { link.href = url; link.style.display = 'inline-block'; }
+            say('✅ Login session ready. Log in via the PayPal link above, then come back HERE and press “🔓 2. Claim Encrypted Report’ — the hardware audit runs on the delivered report, which decrypts, audits and downloads in THIS tab (your key never leaves it).');
+            return url;
+        } catch (e) {
+            say('❌ ' + e.message);
+        }
+    }
+
+    async function localClaim() {
+        const log = document.getElementById('localLoginStatus');
+        const say = m => { if (log) log.innerText = m; };
+        try { const cb = document.getElementById('claimBtn'); if (cb) cb.style.display = 'none'; } catch (e) {}
+        try {
+            // v168 (plan Phase 3.3): decryption only in a TRUSTED auditor context.
+            if (!trustedAuditorContext()) {
+                // Post-login hint (v179 user report): pressing Claim on the
+                // enclave-served copy after a completed login is the classic
+                // dead-end — point at the tab that actually holds the key.
+                throw new Error('UNTRUSTED AUDITOR ORIGIN: this page is served by the enclave\'s own webserver — its owner can rewrite this script at will, so keys generated here would be exposed (Web Auditor Tampering defense). Key generation and logins are REFUSED here. Download verify.html from the project GitHub (or use the GitHub Pages copy) and open it as a local file (file://) to run the secure login. Paste-report auditing on this copy is still safe. IF YOU JUST LOGGED IN: your encrypted report is waiting in the enclave\'s vault — go back to the SUCCESS PAGE (the “Authentication Succeeded” tab) and press “📋 Copy encrypted report”, then paste it into the “Attestation JSON report” box of a trusted auditor (GitHub Pages copy or your saved file:// verify.html) and run the audit there. If the tab where you started the login is still open, press “🔓 2. Claim Encrypted Report” THERE instead — only that tab holds your key, so the report can never be claimed from this page.');
+            }
+            const s = JSON.parse(localStorage.getItem('pav_local_session') || 'null');
+            if (!s) throw new Error('no local session — run step 1 first (from a local copy of this page)');
+            // v179: restore the client-session binding so the claim-time audit
+            // enforces the quote's report_data[32..64] session slot.
+            if (s.sessionBindingHex) auditorSessionBindingHex = s.sessionBindingHex;
+            say('🔓 Claiming the encrypted report from the enclave vault…');
+            const resp = await fetch(`${s.host}/e2ee-blob?state=${encodeURIComponent(s.state)}`);
+            if (!resp.ok) throw new Error('claim failed (HTTP ' + resp.status + ') — the blob may already be claimed or expired; redo step 1');
+            const blob = await resp.json();
+            say('🔐 Decrypting + verifying against the pinned P_enc…');
+            const envelope = await localDecryptAndVerify(blob, s.jwk, s.nonceHex, s.p_enc || null);
+            preFlightPubKeyPem = s.p_enc || null;
+            sessionStorage.setItem('pav_e2ee_report', JSON.stringify(envelope, null, 2));
+            document.getElementById('attestationInput').value = JSON.stringify(envelope, null, 2);
+            const sub = (envelope.attestation_report.paypal_user_info || {}).sub || '(unknown)';
+            if (!(await runAudit())) throw new Error('Full audit FAILED on the delivered report');
+            localStorage.removeItem('pav_local_session');
+            const saved = downloadReportFile();
+            say(`✅ Decrypted + signature-verified + hardware-audited (silicon root + MRTD/RTMR pins + session binding). PayPal identity: ${sub}.` +
+                (saved ? ' The attestation report was saved as a JSON file — it audits offline in ANY copy of the auditor.' : ' Use the 💾 Download button below to save the JSON.'));
+        } catch (e) {
+            say('❌ ' + e.message);
+        }
+    }
+
+    // On load: restore a decrypted E2EE report handed over by /callback
+    // (same origin) and auto-start the secure login from the homepage links.
+    // v164 — the /callback handoff: the enclave's success page performs NO
+    // crypto of its own; it only stashes the LOGIN-BOUND ciphertext blob in
+    // this origin's sessionStorage (`pav_e2ee_blob`). The decrypt + S_enc
+    // signature check + pre-flight P_enc pin + full audit ALL happen here, so
+    // a tampered blob or a swapped enclave fails closed and nothing is ever
+    // downloaded. After a login the report is auto-downloaded (?afterlogin=1)
+    // so the user holds a portable JSON they can audit OFFLINE in ANY copy of
+    // the auditor (GitHub Pages copy / saved local copy) — the copy served by
+    // the webservice is a convenience, never the only auditor.
+    // (typeof guard: the node security harness evals this script headless.)
+    if (typeof window !== 'undefined') window.addEventListener('DOMContentLoaded', async () => {
+        const say = m => { try { const el = document.getElementById('secureLoginStatus'); if (el) el.innerText = m; } catch (e) {} };
+        // Restore the pre-flight-pinned P_enc (survives the PayPal round-trip
+        // via sessionStorage) so the post-login audit still enforces the pin.
+        try {
+            const pin = sessionStorage.getItem('pav_p_enc');
+            if (pin && !preFlightPubKeyPem) preFlightPubKeyPem = pin;
+            // v179: restore the client-session binding across the reload.
+            try { const sb = sessionStorage.getItem('pav_session_binding_hex'); if (sb) auditorSessionBindingHex = sb; } catch (e) {}
+        } catch (e) { /* no sessionStorage (harness) — skip */ }
+        const saved = sessionStorage.getItem('pav_e2ee_report');
+        if (saved) {
+            const el = document.getElementById('attestationInput');
+            if (el && !el.value) el.value = saved;
+        }
+        // Login handoff: decrypt the blob stashed by /callback in THIS tab.
+        try {
+            const raw = sessionStorage.getItem('pav_e2ee_blob');
+            if (raw) {
+                const jwk = sessionStorage.getItem('pav_client_jwk');
+                const nonceHex = sessionStorage.getItem('pav_client_nonce');
+                if (!jwk || !nonceHex) {
+                    say('ℹ️ This is the webservice\u2019s copy of the auditor. The decryption key exists only in the trusted copy where you started the login (your saved file:// page or the GitHub Pages copy) — go back to that tab and press \u201c2. Claim Encrypted Report\u201d: the report decrypts, audits and downloads THERE. The key never reaches this page by design.');
+                } else {
+                    const pinned = sessionStorage.getItem('pav_p_enc');
+                    // v180: the pre-login hardware audit is gone (user
+                    // directive), so the P_enc pin is CONTINUITY, not a hard
+                    // precondition: without it the audit still enforces the
+                    // Intel-signed quote (silicon root + MRTD/RTMR pins), the
+                    // client-session binding slot [32..64] against THIS
+                    // tab's own key/nonce, the SEC-02 identity binding and
+                    // the S_enc signature — a swapped or forged blob fails
+                    // closed on every one of those. The pin (when present)
+                    // additionally rejects a report signed by a DIFFERENT
+                    // enclave key than the one this session talked to.
+                    say('⏳ Decrypting your attestation report…');
+                    const env = await localDecryptAndVerify(JSON.parse(raw), jwk, nonceHex, pinned);
+                    try { const b = JSON.parse(raw); if (b && b.flow) sessionStorage.setItem('pav_e2ee_flow', String(b.flow)); } catch (e) { /* keep default tag */ }
+                    const pretty = JSON.stringify(env, null, 2);
+                    sessionStorage.setItem('pav_e2ee_report', pretty);
+                    const el = document.getElementById('attestationInput');
+                    if (el) el.value = pretty;
+                    if (await runAudit()) {
+                        if (location.search.indexOf('afterlogin=1') !== -1 && downloadReportFile()) {
+                            say('✅ Report decrypted, audited, and saved as a JSON file. You can audit it offline in ANY copy of the auditor (GitHub Pages copy or your own saved verify.html) — this site is only a convenience.');
+                        } else {
+                            say('✅ Report decrypted and fully audited — use the 💾 Download button in the results below to save the JSON.');
+                        }
+                    } else {
+                        say('❌ Audit FAILED — nothing was downloaded. See the results below.');
+                    }
+                }
+            }
+        } catch (e) {
+            say('❌ ' + e.message);
+        }
+        // v168 (plan Phase 3.3): untrusted-copy banner. On a copy served by
+        // the enclave's own origin every key-generating flow is REFUSED —
+        // say so immediately and loudly (no silent failure at click time).
+        try {
+            if (!trustedAuditorContext()) {
+                // v179 (user report): do NOT clobber the post-login handoff
+                // guidance above with the generic banner — a user landing here
+                // after a completed login needs to know WHERE to claim, not
+                // to re-download the auditor.
+                let postLogin = false;
+                try { postLogin = !!sessionStorage.getItem('pav_e2ee_blob') || location.search.indexOf('afterlogin=1') !== -1; } catch (e) {}
+                if (postLogin) {
+                    say('✅ Your PayPal login COMPLETED — the encrypted report is in the enclave\'s vault. Two ways to retrieve it: (1) go back to the SUCCESS PAGE (“Authentication Succeeded”) and press “📋 Copy encrypted report”, then paste it into the “Attestation JSON report” box of a TRUSTED auditor (GitHub Pages copy or your saved file:// verify.html) and run the audit there; or (2) if the tab where you started the login is still open, press “🔓 2. Claim Encrypted Report” THERE — only that tab holds your key, so the report decrypts, audits and downloads on THAT page. Claiming from this owner-controlled copy is refused by design (Web Auditor Tampering defense).');
+                    const l = document.getElementById('localLoginStatus');
+                    if (l) l.innerText = '✅ Login done — copy the encrypted report from the success page (or claim it on your trusted login tab) and audit it in a trusted copy. This copy cannot hold your key.';
+                } else {
+                    say('⚠️ UNTRUSTED AUDITOR COPY — this page is served by the enclave\'s own webserver, which its owner controls. The secure login and key generation are DISABLED here (Web Auditor Tampering defense). Save this file from the project GitHub and open it locally (file://) — or use the GitHub Pages copy — to log in. Paste-report auditing below still works on this copy.');
+                    const l = document.getElementById('localLoginStatus');
+                    if (l) l.innerText = '⚠️ Use a trusted copy (file:// or GitHub Pages) for the secure login — this copy cannot generate keys.';
+                }
+            }
+        } catch (e) { /* no location (harness) — skip */ }
+        // v184: a stored session means the throwaway key still exists in this
+        // browser's storage — surface the claim action so the flow stays
+        // discoverable after a reload (the button is otherwise hidden).
+        try { if (localStorage.getItem('pav_local_session')) { const cb = document.getElementById('claimBtn'); if (cb) cb.style.display = 'inline-block'; } } catch (e) {}
+        if (location.hash === '#login-verified') executePreflightAndLogin('verified');
+        if (location.hash === '#login-full') executePreflightAndLogin('full');
+    });
+
+    // Robust cert parser (handles PEM, base64-DER, base64-PEM)
+    function parseAnyCertToForge(certInput, name) {
+        try {
+            let decoded = '';
+            try {
+                const b64 = certInput.replace(/-/g, '+').replace(/_/g, '/');
+                const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+                decoded = atob(padded);
+            } catch (e) {
+                decoded = certInput;
+            }
+
+            if (decoded.includes('-----BEGIN')) {
+                return forge.pki.certificateFromPem(decoded);
+            }
+            if (certInput.includes('-----BEGIN')) {
+                return forge.pki.certificateFromPem(certInput);
+            }
+            // Greedy Parse: If strict parsing fails, we try to extract just the first ASN.1 sequence
+            try {
+                return forge.pki.certificateFromAsn1(forge.asn1.fromDer(decoded, false));
+            } catch (e) {
+                if (e.message.includes("Unparsed")) {
+                    // This often means there's a certificate chain in the blob. 
+                    // We just need the first one (the VCEK).
+                    return forge.pki.certificateFromAsn1(forge.asn1.fromDer(decoded, false));
+                }
+                throw e;
+            }
+        } catch (e) {
+            throw new Error(`Failed to parse ${name} Certificate: ` + e.message);
+        }
+    }
+
+    // ── EC-capable X.509 helpers ─────────────────────────────────────────────
+    // node-forge's pki.certificateFromPem/Asn1 only parses RSA
+    // SubjectPublicKeyInfo and throws "OID is not RSA" on the AMD ECDSA P-384
+    // VCEK/ASK/ARK certificates, which silently failed the entire silicon block
+    // for OCI reports ("CRITICAL: No valid Silicon Root of Trust"). These
+    // helpers parse raw ASN.1 (algorithm-agnostic) and verify signatures with
+    // WebCrypto — the same primitive already used for the SNP report signature.
+    function derBytesToBinary(u8) {
+        let s = '';
+        for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));
+        return s;
+    }
+    function binaryToBytes(bin) {
+        // forge may hand back a Uint8Array (e.g. INTEGER values) or a binary
+        // STRING whose char codes can exceed 0xFF — naive charCodeAt(0) would
+        // corrupt those bytes (that bug produced 512-byte garbage signatures).
+        if (bin instanceof Uint8Array) return bin;
+        return Uint8Array.from(bin, c => c.charCodeAt(0) & 0xff);
+    }
+    // forge exposes OID node .value as raw DER bytes (NOT a dotted string).
+    // Decode base-128 OID bytes → dotted-decimal for sigAlg / SPKI / curve lookups.
+    function oidBytesToDotted(bin) {
+        const bytes = binaryToBytes(bin);
+        let out = [], val = 0, first = true;
+        for (const b of bytes) {
+            val = (val * 128) + (b & 0x7f);
+            if (!(b & 0x80)) {
+                if (first) { out.push(Math.floor(val / 40), val % 40); first = false; }
+                else out.push(val);
+                val = 0;
+            }
+        }
+        return out.join('.');
+    }
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+    function x509NodesFromDerBin(bin) {
+        const cert = forge.asn1.fromDer(bin);
+        if (cert.type !== forge.asn1.Type.SEQUENCE || cert.value.length !== 3) {
+            throw new Error("Not an X.509 certificate");
+        }
+        return {
+            tbs: cert.value[0],
+            sigAlg: cert.value[1],
+            sigAlgOid: oidBytesToDotted(cert.value[1].value[0].value),
+            sigBits: cert.value[2]
+        };
+    }
+    // TBSCertificate: locate subjectPublicKeyInfo = SEQUENCE { SEQUENCE { OID, ... }, BIT STRING }
+    function x509FindSpki(tbsNode) {
+        for (const child of tbsNode.value) {
+            if (child.type === forge.asn1.Type.SEQUENCE && Array.isArray(child.value) && child.value.length === 2
+                && child.value[0] && child.value[0].type === forge.asn1.Type.SEQUENCE
+                && child.value[0].value && child.value[0].value[0] && child.value[0].value[0].type === forge.asn1.Type.OID
+                && child.value[1] && child.value[1].type === forge.asn1.Type.BITSTRING) {
+                return child;
+            }
+        }
+        throw new Error("subjectPublicKeyInfo not found");
+    }
+    // Accepts PEM, base64-DER, or binary DER; returns raw nodes + SPKI DER bytes.
+    function x509ParseAny(certInput, name) {
+        try {
+            let decoded;
+            if (certInput.includes('-----BEGIN')) {
+                const m = certInput.match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);
+                if (!m) throw new Error("Malformed PEM");
+                decoded = atob(m[1].replace(/\s+/g, ''));
+            } else {
+                const b64 = certInput.replace(/-/g, '+').replace(/_/g, '/');
+                decoded = atob(b64 + '='.repeat((4 - b64.length % 4) % 4));
+            }
+            const nodes = x509NodesFromDerBin(decoded);
+            return {
+                nodes: nodes,
+                spkiDer: binaryToBytes(forge.asn1.toDer(x509FindSpki(nodes.tbs)).getBytes())
+            };
+        } catch (e) {
+            throw new Error(`Failed to parse ${name} Certificate: ` + e.message);
+        }
+    }
+    // ---- EC-safe X.509 DN extraction ---------------------------------------
+    // forge's pki.certificateFrom* is RSA-only (it throws "OID is not RSA" on
+    // EC certificates like the Intel PCK and AMD VCEK leaves), and its
+    // attribute API needs a fully parsed cert. These helpers work straight on
+    // the ASN.1 nodes, so issuer/subject extraction works for RSA and EC alike.
+    const DN_ATTR_NAMES = {
+        '2.5.4.3': 'CN', '2.5.4.6': 'C', '2.5.4.7': 'L', '2.5.4.8': 'ST',
+        '2.5.4.10': 'O', '2.5.4.11': 'OU', '2.5.4.5': 'serialNumber',
+        '2.5.4.4': 'SN', '2.5.4.9': 'street', '1.2.840.113549.1.9.1': 'email',
+    };
+    function dnFromNode(seqNode) {
+        const parts = [];
+        for (const setNode of (seqNode && seqNode.value) || []) {
+            const attr = (setNode && Array.isArray(setNode.value)) ? setNode.value[0] : null;
+            if (!attr || !Array.isArray(attr.value) || attr.value.length < 2) continue;
+            const oid = oidBytesToDotted(attr.value[0].value);
+            let v = attr.value[1].value;
+            if (v instanceof Uint8Array) v = String.fromCharCode.apply(null, Array.from(v));
+            else if (Array.isArray(v)) v = String(v);
+            parts.push((DN_ATTR_NAMES[oid] || oid) + '=' + v);
+        }
+        return parts.join(', ');
+    }
+    function x509NamesFromTbs(tbs) {
+        const kids = (tbs && tbs.value) || [];
+        let i = 0;
+        while (i < kids.length && kids[i].tagClass !== forge.asn1.Class.UNIVERSAL) i++; // skip [0] version
+        i += 2; // serialNumber + signatureAlgorithm
+        return {
+            issuer: dnFromNode(kids[i]),      // issuer  Name
+            subject: dnFromNode(kids[i + 2]), // subject Name (validity sits between)
+        };
+    }
+    function x509Names(parsedCert) { return x509NamesFromTbs(parsedCert.nodes.tbs); }
+    // Raw SEC1 P-256 point (X||Y, 64 bytes) → SubjectPublicKeyInfo DER so
+    // WebCrypto can import Intel quote attestation keys (raw points, no SPKI).
+    function p256SpkiFromRaw(rawXY) {
+        if (!rawXY || rawXY.length !== 64) throw new Error('attestation key is not a raw P-256 point (64 bytes)');
+        const der = new Uint8Array(26 + 65);
+        der.set([0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+                 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00], 0);
+        der[26] = 0x04; // uncompressed point
+        der.set(rawXY, 27);
+        return der;
+    }
+    // ECDSA AlgorithmIdentifier → WebCrypto curve params (AMD uses P-384).
+    function ecCurveParams(spkiDer) {
+        const spki = forge.asn1.fromDer(derBytesToBinary(spkiDer));
+        const algSeq = spki.value[0].value;
+        if (oidBytesToDotted(algSeq[0].value) !== '1.2.840.10045.2.1') throw new Error('Not an EC public key');
+        const curves = {
+            '1.3.132.0.34': 'P-384', '1.3.132.0.35': 'P-521',
+            '1.3.132.0.33': 'P-256', '1.2.840.10045.3.1.7': 'P-256'
+        };
+        const curveOid = oidBytesToDotted(algSeq[1].value);
+        const named = curves[curveOid];
+        if (!named) throw new Error('Unsupported EC curve ' + curveOid);
+        return { name: 'ECDSA', namedCurve: named };
+    }
+    function x509HashForOid(oid) {
+        const map = {
+            '1.2.840.10045.4.3.2': 'SHA-256',  // ecdsa-with-SHA256
+            '1.2.840.10045.4.3.3': 'SHA-384',  // ecdsa-with-SHA384 (AMD KDS VCEK)
+            '1.2.840.10045.4.3.4': 'SHA-512',  // ecdsa-with-SHA512
+            '1.2.840.113549.1.1.11': 'SHA-256', // sha256WithRSAEncryption
+            '1.2.840.113549.1.1.12': 'SHA-384', // sha384WithRSAEncryption
+            '1.2.840.113549.1.1.13': 'SHA-512', // sha512WithRSAEncryption
+            '1.2.840.113549.1.1.10': 'PSS'      // RSASSA-PSS (AMD ASK/ARK) — hash parsed from params
+        };
+        if (!map[oid]) throw new Error('Unsupported signature algorithm ' + oid);
+        return map[oid];
+    }
+    // Extract RSA public key (modulus n, exponent e) as BigInts from an SPKI DER.
+    // Convert a forge node's .value to a Uint8Array regardless of whether forge
+    // returned a flat binary string, a Uint8Array, or a nested parsed node.
+    function forgeValueToBytes(v) {
+        if (v instanceof Uint8Array) return v;
+        if (typeof v === 'string') return binaryToBytes(v);
+        // forge sometimes wraps the real node in a 1-element Array — unwrap it.
+        let node = v;
+        while (Array.isArray(node)) node = node[0];
+        // Re-encode the parsed ASN.1 node back to DER bytes.
+        return binaryToBytes(forge.asn1.toDer(node).getBytes());
+    }
+    function rsaPubKeyFromSpki(spkiDer) {
+        const spki = forge.asn1.fromDer(derBytesToBinary(spkiDer));
+        // SPKI = SEQUENCE { AlgId, BIT STRING }. forge may return the BIT STRING
+        // .value as a flat binary string OR as a nested parsed node (Array).
+        // For the nested form the raw key bytes live at SEQUENCE→INTEGER→string.
+        const keyBits = spki.value[1];
+        let rawKeyBytes;
+        if (Array.isArray(keyBits.value)) {
+            const seq = keyBits.value[0];                       // inner SEQUENCE
+            const modulusStr = seq.value[0].value;              // INTEGER n (binary string)
+            const exponentStr = seq.value[1].value;             // INTEGER e (binary string)
+            rawKeyBytes = binaryToBytes(modulusStr);
+            var exponentBytes = binaryToBytes(exponentStr);
+        } else {
+            const raw = forgeValueToBytes(keyBits.value);
+            rawKeyBytes = (raw.length > 0 && raw[0] === 0) ? raw.slice(1) : raw;
+            const pubAsn = forge.asn1.fromDer(derBytesToBinary(rawKeyBytes));
+            var exponentBytes = binaryToBytes(pubAsn.value[1].value);
+            rawKeyBytes = binaryToBytes(pubAsn.value[0].value);
+        }
+        // DER INTEGERs carry a leading 0x00 when the high bit is set — strip it
+        // so the modulus is a clean 512-byte (4096-bit) value.
+        while (rawKeyBytes.length > 1 && rawKeyBytes[0] === 0) rawKeyBytes = rawKeyBytes.slice(1);
+        const bytesToBig = (b) => { let x = 0n; for (const byte of b) x = (x << 8n) | BigInt(byte); return x; };
+        return {
+            n: bytesToBig(rawKeyBytes),
+            e: bytesToBig(exponentBytes),
+            k: rawKeyBytes.length
+        };
+    }
+    // RSA public operation m = s^e mod n (square-and-multiply).
+    function rsaPublicOp(s, e, n) {
+        let m = 1n, base = s % n, exp = e;
+        while (exp > 0n) { if (exp & 1n) m = (m * base) % n; base = (base * base) % n; exp >>= 1n; }
+        return m;
+    }
+    // forge's RSA key.verify uses OAEP unpadding → breaks on raw PKCS#1 sigs. Implement
+    // EMSA-PKCS1-v1_5 encoding check (RFC 8017 §9.2) ourselves, as the WebCrypto spec does.
+    async function rsaVerifyPkcs1(parentSpkiDer, hashName, tbsDer, sigBytes) {
+        const hLen = { 'SHA-256': 32, 'SHA-384': 48, 'SHA-512': 64 }[hashName];
+        if (!hLen) throw new Error('PKCS1 hash unsupported: ' + hashName);
+        const { n, e, k } = rsaPubKeyFromSpki(parentSpkiDer);
+        // Build expected EM = 0x00 || 0x01 || PS(0xFF) || 0x00 || DigestInfo
+        const hBytes = new Uint8Array(await crypto.subtle.digest(hashName, tbsDer));
+        const prefixes = {
+            'SHA-256': '3031300d060960864801650304020105000420',
+            'SHA-384': '3041300d060960864801650304020205000430',
+            'SHA-512': '3051300d060960864801650304020305000440'
+        };
+        const diPrefix = forge.util.hexToBytes(prefixes[hashName]);
+        const digestInfo = diPrefix + derBytesToBinary(hBytes);
+        const tLen = 3 + digestInfo.length; // 0x00 0x01 <PS> 0x00 <DI>
+        if (k < tLen) return false;
+        const psLen = k - tLen;
+        let em = '\x00\x01';
+        for (let i = 0; i < psLen; i++) em += '\xff';
+        em += '\x00' + digestInfo;
+        const s = bytesToBigLocal(sigBytes);
+        const m = rsaPublicOp(s, e, n);
+        // m → fixed-width k bytes, constant-time compare with expected EM.
+        let mBytes = m.toString(16); if (mBytes.length % 2) mBytes = '0' + mBytes;
+        let mBin = forge.util.hexToBytes(mBytes);
+        while (mBin.length < k) mBin = '\x00' + mBin;
+        if (mBin.length !== k) return false;
+        let diff = 0;
+        for (let i = 0; i < k; i++) diff |= mBin.charCodeAt(i) ^ em.charCodeAt(i);
+        return diff === 0;
+    }
+    function bytesToBigLocal(b) { let x = 0n; for (const byte of b) x = (x << 8n) | BigInt(byte); return x; }
+    // RSASSA-PSS verification (RFC 8017 §9.1). AMD signs the VCEK→ASK→ARK chain
+    // with PSS: hash/MGF1 and salt length are read from the AlgorithmIdentifier
+    // params (AMD's current KDS chain uses SHA-384 + MGF1-SHA-384 + saltLen 48;
+    // older chains used SHA-256/salt 32). emBits = modBits - 1, so the unused
+    // high bits of maskedDB/DB must be masked — omitting that step fails
+    // verifications ~50% of the time (whenever signer-side bit 0 is set).
+    async function rsaVerifyPss(parentSpkiDer, hashName, tbsDer, sigBytes, saltLen) {
+        const hLen = { 'SHA-256': 32, 'SHA-384': 48, 'SHA-512': 64 }[hashName];
+        if (!hLen) throw new Error('PSS hash unsupported: ' + hashName);
+        if (saltLen == null) saltLen = hLen;
+        const { n, e } = rsaPubKeyFromSpki(parentSpkiDer);
+        const modBits = n.toString(2).length;
+        const emBits = modBits - 1;
+        const emLen = Math.ceil(emBits / 8);
+        const unusedBits = 8 * emLen - emBits;
+        if (emLen < hLen + saltLen + 2) return false;
+        const s = bytesToBigLocal(sigBytes);
+        const m = rsaPublicOp(s, e, n);
+        // EM = maskedDB || H || 0xbc
+        let emBytes = m.toString(16); if (emBytes.length % 2) emBytes = '0' + emBytes;
+        let emBin = forge.util.hexToBytes(emBytes);
+        while (emBin.length < emLen) emBin = '\x00' + emBin;
+        if (emBin.length !== emLen) return false;
+        const em = binaryToBytes(emBin);
+        if (em[emLen - 1] !== 0xbc) return false;
+        const dbLen = emLen - hLen - 1;
+        const maskedDB = em.slice(0, dbLen);
+        const h = em.slice(dbLen, dbLen + hLen);
+        // Step 9: the leftmost 8*emLen - emBits bits of maskedDB MUST be zero.
+        if (unusedBits > 0 && (maskedDB[0] & (0xff << (8 - unusedBits) & 0xff)) !== 0) return false;
+        // MGF1 unmask of maskedDB
+        const db = new Uint8Array(dbLen);
+        let counter = 0, offset = 0;
+        while (offset < dbLen) {
+            const ctr = new Uint8Array([(counter >>> 24) & 0xff, (counter >>> 16) & 0xff, (counter >>> 8) & 0xff, counter & 0xff]);
+            const seed = new Uint8Array(h.length + 4); seed.set(h, 0); seed.set(ctr, h.length);
+            const digest = new Uint8Array(await crypto.subtle.digest(hashName, seed));
+            for (let i = 0; i < digest.length && offset < dbLen; i++, offset++) db[offset] = maskedDB[offset] ^ digest[i];
+            counter++;
+        }
+        // Step 12: clear the unused high bits of DB after unmasking.
+        if (unusedBits > 0) db[0] &= 0xff >> unusedBits;
+        // db = PS || 0x01 || salt
+        const salt = db.slice(dbLen - saltLen);
+        const padLen = dbLen - saltLen - 1;
+        for (let i = 0; i < padLen; i++) if (db[i] !== 0) return false;
+        if (db[padLen] !== 0x01) return false;
+        // mPrime = 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 || mHash || salt
+        const mHash = new Uint8Array(await crypto.subtle.digest(hashName, tbsDer));
+        const mPrime = new Uint8Array(8 + hLen + saltLen);
+        mPrime.set(mHash, 8); mPrime.set(salt, 8 + hLen);
+        const hPrime = new Uint8Array(await crypto.subtle.digest(hashName, mPrime));
+        let diff = 0;
+        for (let i = 0; i < hLen; i++) diff |= h[i] ^ hPrime[i];
+        return diff === 0;
+    }
+    // Cryptographic chain link: was `child` signed by `parent`'s public key?
+    async function x509SignedBy(child, parent) {
+        try {
+            const hash = x509HashForOid(child.nodes.sigAlgOid);
+            const sigBin = child.nodes.sigBits.value;
+            const tbsDer = binaryToBytes(forge.asn1.toDer(child.nodes.tbs).getBytes());
+            const sigAlgOid = child.nodes.sigAlgOid;
+
+            // BIT STRING: [unused-bits byte] || raw signature. forge 1.3.x
+            // (the CDN-pinned build) returns this as a binary string; forge
+            // 1.4.x returns a parsed node array — forgeValueToBytes accepts
+            // both, so chain links keep verifying across either representation.
+            const sigRawBytes = forgeValueToBytes(sigBin);
+            const rsaSigBytes = (sigRawBytes.length > 0 && sigRawBytes[0] === 0) ? sigRawBytes.slice(1) : sigRawBytes;
+
+            // RSASSA-PSS (AMD ASK/ARK chain): hash/MGF1/salt parsed from the
+            // AlgorithmIdentifier params. Defaults: SHA-256, saltLen = hLen.
+            if (sigAlgOid === '1.2.840.113549.1.1.10') {
+                let pssHash = 'SHA-256', saltLen = null;
+                try {
+                    const algSeq = child.nodes.sigAlg;
+                    const params = algSeq && algSeq.value && algSeq.value[1];
+                    if (params && params.type === 16 && Array.isArray(params.value)) {
+                        // ctx[0] = hash algorithm; ctx[0].value[0] = AlgorithmIdentifier
+                        const hashAlgSeq = params.value.find(p => p.type === 0);
+                        if (hashAlgSeq && Array.isArray(hashAlgSeq.value) && hashAlgSeq.value[0]) {
+                            const hOid = oidBytesToDotted(hashAlgSeq.value[0].value[0].value);
+                            const hMap = { '2.16.840.1.101.3.4.2.1': 'SHA-256', '2.16.840.1.101.3.4.2.2': 'SHA-384', '2.16.840.1.101.3.4.2.3': 'SHA-512' };
+                            if (hMap[hOid]) pssHash = hMap[hOid];
+                        }
+                        // ctx[2] = salt length (INTEGER)
+                        const saltAlg = params.value.find(p => p.type === 2 && Array.isArray(p.value) && p.value[0] && p.value[0].type === 2);
+                        if (saltAlg) { const sv = binaryToBytes(saltAlg.value[0].value); let sl = 0; for (const b of sv) sl = (sl << 8) | b; saltLen = sl; }
+                    }
+                } catch (e) { /* fall back to SHA-256 defaults */ }
+                return await rsaVerifyPss(parent.spkiDer, pssHash, tbsDer, rsaSigBytes, saltLen);
+            }
+
+            // RSA PKCS#1 v1.5 (AMD ASK/ARK chain): RSASSA-PKCS1-v1_5 with sha*WithRSAEncryption.
+            if (sigAlgOid === '1.2.840.113549.1.1.11' || sigAlgOid === '1.2.840.113549.1.1.12' || sigAlgOid === '1.2.840.113549.1.1.13') {
+                return await rsaVerifyPkcs1(parent.spkiDer, hash, tbsDer, rsaSigBytes);
+            }
+
+            // ECDSA path (VCEK/PCK leaves): BIT STRING = DER SEQUENCE { r, s }
+            const content = (sigRawBytes.length > 0 && sigRawBytes[0] === 0) ? sigRawBytes.slice(1) : sigRawBytes;
+            const seq = forge.asn1.fromDer(derBytesToBinary(content));
+            const toInt = (n) => {
+                let b = binaryToBytes(n.value);
+                let i = 0;
+                while (i < b.length - 1 && b[i] === 0) i++;
+                return b.slice(i);
+            };
+            const r = toInt(seq.value[0]), s = toInt(seq.value[1]);
+            const half = Math.max(r.length, s.length);
+            const raw = new Uint8Array(half * 2);
+            raw.set(r, half - r.length);
+            raw.set(s, half * 2 - s.length);
+            const key = await crypto.subtle.importKey('spki', parent.spkiDer, ecCurveParams(parent.spkiDer), false, ['verify']);
+            return await crypto.subtle.verify({ name: 'ECDSA', hash: hash }, key, raw, tbsDer);
+        } catch (e) {
+            console.error('x509SignedBy failed:', e);
+            return false;
+        }
+    }
+
+    function getLeafCert(pem) {
+        if (!pem) return "";
+        const match = pem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/);
+        if (!match) return pem.replace(/[\s\r\n]/g, '');
+        return match[0].replace(/-----(BEGIN|END) CERTIFICATE-----|[\s\r\n]/g, '');
+    }
+
+    function loadFile(input, targetId) {
+        if (!input.files || !input.files[0]) return;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            const target = document.getElementById(targetId);
+            if (target) {
+                target.value = e.target.result;
+                const card = input.closest('.input-card');
+                if (card) {
+                    const label = card.querySelector('label');
+                    if (label) {
+                        const original = label.innerText.replace("✅ ", "");
+                        label.innerText = "✅ " + original;
+                        setTimeout(() => { label.innerText = original; }, 2000);
+                    }
+                }
+            }
+        };
+        reader.readAsText(input.files[0]);
+    }
+
+    // Initialize Event Listeners (Restored for functionality)
+    document.addEventListener('DOMContentLoaded', () => {
+        const reportInput = document.getElementById('reportFile');
+        const certInput = document.getElementById('certFile');
+        if (reportInput) reportInput.addEventListener('change', (e) => loadFile(e.target, 'attestationInput'));
+        if (certInput) certInput.addEventListener('change', (e) => loadFile(e.target, 'certInput'));
+    });
+
+    // SECURITY (audit 2026-10-19, VULN follow-up): the report under audit is
+    // UNTRUSTED input. updateStatus() renders `desc` with innerHTML, so every
+    // report-derived fragment interpolated into a description must pass through
+    // esc() first — otherwise a forged report (even one that fails every
+    // cryptographic gate) can inject markup into the auditor's own verdict DOM
+    // and fake green checks or exfiltrate the pre-flight-pinned key.
+    function esc(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+            { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+        ));
+    }
+
+    // v163 (audit VULN-04 follow-up): TRI-STATE status. Booleans keep their
+    // meaning (true = verified, false = failed); the string 'warning' renders
+    // the amber DEGRADED state — a check that could only verify what it had
+    // (e.g. a self-consistent TPM quote over UNPINNED boot-chain PCRs) must
+    // never look like a full green pass.
+    function updateStatus(id, state, desc) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        let statusClass = 'failed';
+        if (state === true || state === 'verified') statusClass = 'verified';
+        else if (state === 'warning') statusClass = 'warning';
+        el.className = 'check-item ' + statusClass;
+        if (desc) {
+            const p = el.querySelector('p');
+            if (p) p.innerHTML = desc;
+        }
+    }
+
+    async function getProvenance(hash, name) {
+        const repo = "leonardopedro/verifiedUniqueAliases";
+        // v153: fail closed without a hash — an empty disk_manifest (older
+        // OCI reports) used to fetch "sha256:undefined" and burn an API call.
+        // `reason` lets runAudit explain WHY a lookup failed instead of a
+        // bare ❌: 'missing' | 'unattested' | 'network' | 'api<status>'.
+        if (!hash || typeof hash !== 'string') {
+            return { success: false, name, runIds: [], reason: 'missing' };
+        }
+        const url = `https://api.github.com/repos/${repo}/attestations/sha256:${hash}`;
+        try {
+            const resp = await fetch(url, { headers: { 'Accept': 'application/vnd.github+json' } });
+            if (resp.status === 404) return { success: false, name, runIds: [], reason: 'unattested' };
+            if (!resp.ok) return { success: false, name, runIds: [], reason: `api${resp.status}` };
+            const data = await resp.json();
+            if (!data.attestations || data.attestations.length === 0) return { success: false, name, runIds: [], reason: 'unattested' };
+            const runIds = data.attestations.map(att => {
+                const bundle = att.bundle;
+                const payload = JSON.parse(atob(bundle.dsseEnvelope ? bundle.dsseEnvelope.payload : bundle.payload));
+                let runId = (payload.predicate?.runDetails?.metadata?.invocationId) || (payload.invocation?.metadata?.id) || (payload.invocation?.uri) || (payload.buildConfig?.env?.GITHUB_RUN_ID) || "External";
+                if (typeof runId === 'string' && runId.includes('/')) runId = runId.split('/').pop();
+                return String(runId);
+            });
+            return { success: true, name, runIds };
+        } catch (e) { return { success: false, name, runIds: [], reason: 'network' }; }
+    }
+
+    // 🔴 CRITICAL FIX: Binary Parser for TPMS_ATTEST
+    function parseTpmsAttest(msgArray) {
+        const view = new DataView(msgArray.buffer);
+        let offset = 0;
+        
+        const magic = view.getUint32(offset); offset += 4;
+        if (magic !== 0xFF544347) throw new Error("Invalid TPM Magic");
+        
+        const type = view.getUint16(offset); offset += 2;
+        if (type !== 0x8018) throw new Error("Not a TPM Quote (0x8018)");
+        
+        const qSignerSize = view.getUint16(offset); offset += 2;
+        offset += qSignerSize; // skip qualifiedSigner
+        
+        const extraDataSize = view.getUint16(offset); offset += 2;
+        const extraData = msgArray.slice(offset, offset + extraDataSize); offset += extraDataSize;
+        
+        offset += 17; // skip clockInfo
+        offset += 8;  // skip firmwareVersion
+        
+        // TPMS_QUOTE_INFO
+        const pcrSelectCount = view.getUint32(offset); offset += 4;
+        for (let i = 0; i < pcrSelectCount; i++) {
+            offset += 2; // hash alg
+            const size = view.getUint8(offset); offset += 1;
+            offset += size; // pcr selection array
+        }
+        
+        const pcrDigestSize = view.getUint16(offset); offset += 2;
+        const pcrDigest = msgArray.slice(offset, offset + pcrDigestSize);
+        
+        return {
+            extraDataHex: Array.from(extraData).map(b => b.toString(16).padStart(2, '0')).join(''),
+            pcrDigestHex: Array.from(pcrDigest).map(b => b.toString(16).padStart(2, '0')).join('')
+        };
+    }
+
+    // 🔴 CRITICAL FIX: Calculate standard TPM PCR Composite Digest
+    async function calculatePcrCompositeDigest(pcrValues) {
+        // The enclave quotes PCRs 0, 4, 8, 9, 15. We must concatenate them in order.
+        const pcrList = [0, 4, 8, 9, 15];
+        let combined = new Uint8Array(32 * pcrList.length);
+        for (let i = 0; i < pcrList.length; i++) {
+            let hex = pcrValues["pcr_" + pcrList[i]];
+            if (!hex) throw new Error("Missing PCR " + pcrList[i] + " from report.");
+            hex = hex.replace(/^0x/, '');
+            let bytes = new Uint8Array(hex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+            combined.set(bytes, i * 32);
+        }
+        const hashBuffer = await crypto.subtle.digest('SHA-256', combined);
+        return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    async function calculatePcr15(boot_manifest) {
+        const sorted = Object.keys(boot_manifest).sort().map(k => [k, boot_manifest[k]]);
+        const data = new TextEncoder().encode(JSON.stringify(sorted));
+        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+        
+        const pcrOld = new Uint8Array(32); 
+        const combined = new Uint8Array(64);
+        combined.set(pcrOld);
+        combined.set(new Uint8Array(hashBuffer), 32); 
+        const finalHashBuffer = await crypto.subtle.digest('SHA-256', combined);
+        return Array.from(new Uint8Array(finalHashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // ========================================================================
+    // v181 (user report 2026-10-23): PASTED-ENCRYPTED-BLOB path. The success
+    // page's "Copy encrypted report" hands out ciphertext sealed to a
+    // throwaway ECDH key (S_client) that only ever existed in the browser
+    // where the login started — and the documented recovery flow says to
+    // paste that blob into a TRUSTED auditor and audit there. Before v181
+    // runAudit() only understood decrypted reports and answered the pasted
+    // ciphertext with a cryptic "Invalid report.". Now it detects the sealed
+    // blob shape and decrypts it HERE with the same session key material as
+    // localClaim(); all of localDecryptAndVerify's fail-closed checks (P_enc
+    // key-continuity, S_enc report signature, AES-GCM auth, session-binding
+    // restore) apply unchanged. No key in this copy → fail closed with
+    // instructions; on the enclave-served copy → refuse outright
+    // (Web Auditor Tampering defense — decryption never runs there).
+    // ========================================================================
+    async function decryptPastedBlob(blob) {
+        if (!trustedAuditorContext()) throw untrustedOriginError();
+        let sess = null;
+        try { sess = JSON.parse(localStorage.getItem('pav_local_session') || 'null'); } catch (e) { /* ignore */ }
+        let jwk = (sess && sess.jwk) || null;
+        let nonceHex = (sess && sess.nonceHex) || null;
+        let pinned = (sess && sess.p_enc) || null;
+        if (!jwk || !nonceHex) {
+            // v164 same-origin callback handoff keys, as a fallback source.
+            try {
+                jwk = jwk || sessionStorage.getItem('pav_client_jwk');
+                nonceHex = nonceHex || sessionStorage.getItem('pav_client_nonce');
+                pinned = pinned || sessionStorage.getItem('pav_p_enc');
+            } catch (e) { /* ignore */ }
+        }
+        if (!jwk || !nonceHex) {
+            throw new Error('ENCRYPTED BLOB pasted (ciphertext, not a decrypted report): this browser copy holds NO decryption key for it — the throwaway key only ever existed in the copy where the PayPal login started. Go back to that tab and press “🔓 2. Claim Encrypted Report”, or audit the plain attestation-report-*.json you downloaded after the login (that file audits in ANY copy of the auditor, no keys needed).');
+        }
+        try { const sb = sessionStorage.getItem('pav_session_binding_hex'); if (sb) auditorSessionBindingHex = sb; } catch (e) { /* ignore */ }
+        if (sess && sess.sessionBindingHex) auditorSessionBindingHex = sess.sessionBindingHex;
+        if (pinned) preFlightPubKeyPem = pinned;
+        if (blob.flow) { try { sessionStorage.setItem('pav_e2ee_flow', String(blob.flow)); } catch (e) { /* ignore */ } }
+        try {
+            return await localDecryptAndVerify(blob, jwk, nonceHex, pinned);
+        } catch (e) {
+            // Wrong session's blob, tampered ciphertext or a swapped enclave
+            // key — every one is a fail-closed outcome; make the paste-audit
+            // UX say what to do next instead of surfacing a raw crypto error.
+            throw new Error('Could not decrypt the pasted blob with THIS copy\'s session key (' + e.message + '). Either it was sealed to a DIFFERENT login session or it was tampered with — in both cases, fail closed: claim it from the tab where that login started, or audit that session\'s downloaded attestation-report-*.json instead.');
+        }
+    }
+
+    async function runAudit() {
+        try {
+            const inputVal = document.getElementById('attestationInput').value;
+            if (!inputVal) throw new Error("Please provide an attestation report.");
+            
+            let rawData = JSON.parse(inputVal);
+            // v181: pasted ENCRYPTED blob → decrypt in this trusted copy
+            // (key material + fail-closed checks in decryptPastedBlob above),
+            // then audit the plaintext envelope like any other report.
+            if (rawData && !rawData.attestation_report && !rawData.report
+                && rawData.ct_b64 && rawData.iv_b64 && rawData.enclave_ecdh_public_key_b64) {
+                rawData = await decryptPastedBlob(rawData);
+                // Persist the plaintext (same convention as localClaim) so
+                // the 💾 download button and a re-audit use the envelope.
+                const pretty = JSON.stringify(rawData, null, 2);
+                document.getElementById('attestationInput').value = pretty;
+                try { sessionStorage.setItem('pav_e2ee_report', pretty); } catch (e) { /* ignore */ }
+            }
+            const report = rawData.attestation_report || rawData.report || rawData;
+            
+            if (!report.hardware_level_attestation) throw new Error("Invalid report.");
+            const hw = report.hardware_level_attestation;
+            const boot = report.enclave_config.boot_measurements;
+            // v177: two-verdict model — an explicitly-declared SANDBOX
+            // deployment keeps the integrity verdict green but downgrades the
+            // IDENTITY verdict (see the environment gate below).
+            let sandboxDeployment = false;
+            
+            document.getElementById('resultsArea').style.display = 'block';
+            document.getElementById('signTime').innerText = new Date(report.timestamp_ms).toLocaleString();
+
+            // 1. Identity Binding (Nonce Generation)
+            const pubKeyPem = (rawData.enclave_signing_public_key || report.public_key_pem || "");
+            const pubKeyBuffer = pemToBuffer(pubKeyPem);
+            // v160 (Pillar 4): pre-flight enforcement — if a pre-flight pinned
+            // the live enclave's P_enc, this report MUST be signed by that
+            // exact key. Checked FIRST so a swapped enclave fails
+            // deterministically, before any other verdict.
+            lastAuditedPubKeyPem = pubKeyPem;
+            if (preFlightPubKeyPem && pubKeyPem !== preFlightPubKeyPem) {
+                throw new Error("PRE-FLIGHT VIOLATION: this report's enclave key does NOT match the P_enc pinned when this login session started — the enclave was swapped mid-login. Close this tab, reload the page and log in again from the beginning.");
+            }
+            const pubKeyHash = await crypto.subtle.digest('SHA-256', pubKeyBuffer);
+
+            // v169 (independent audit finding — IDENTITY PREIMAGE BINDING):
+            // the hash folded into the hardware nonce must be the hash of the
+            // identity this report ACTUALLY shows. Trusting the report's own
+            // `paypal_user_info_raw_hash` field meant a quote could attest hash
+            // H while the envelope displayed a DIFFERENT user's record — the
+            // hardware then attests nothing about the data on screen (a
+            // config-driven or backdoored build can do this without touching
+            // any measured byte). Recompute the preimage here, fail closed:
+            //   * login report  → SHA-256 of the CANONICAL struct-layout
+            //     serialization rebuilt below (order: user_id, sub,
+            //     verified_account, payer_id; nulls kept) — byte-identical to
+            //     the enclave's serde_json::to_string of the minimized struct,
+            //     pinned by security_tests::paypal_identity_json_layout_pinned.
+            //   * pre-login (standalone envelope / pre-flight POST) → there is no
+            //     user yet, so the documented placeholder hash is REQUIRED.
+            const toHexLc = (u8) => Array.from(u8).map(b => b.toString(16).padStart(2, '0')).join('');
+            const declaredPaypalHash = String(report.paypal_user_info_raw_hash || '').trim().toLowerCase();
+            // v178 fix (live-debug finding): the report embeds paypal_user_info
+            // through serde_json::json! (a sorted map), so its JSON text arrives
+            // with ALPHABETICAL key order — JSON.stringify of the parsed object
+            // reproduces that order, NOT the struct serialization the enclave
+            // hashed (serde_json::to_string of PayPalUserInfo: user_id, sub,
+            // verified_account, payer_id). That byte drift made EVERY honest
+            // login trip IDENTITY PREIMAGE VIOLATION. Rebuild the canonical
+            // struct layout explicitly so the recomputation is independent of
+            // the report's key order (and of an attacker-supplied one).
+            const pui = (report.paypal_user_info && typeof report.paypal_user_info === 'object')
+                ? report.paypal_user_info : null;
+            const identityJson = pui
+                ? JSON.stringify({ user_id: pui.user_id, sub: pui.sub ?? null, verified_account: pui.verified_account, payer_id: pui.payer_id ?? null })
+                : 'PRELOGIN_NO_USER';
+            const recomputedPaypalHash = toHexLc(new Uint8Array(await crypto.subtle.digest(
+                'SHA-256', new TextEncoder().encode(identityJson))));
+            if (!/^[0-9a-f]{64}$/.test(declaredPaypalHash)) {
+                throw new Error("Report is missing a valid paypal_user_info_raw_hash — the hardware-bound nonce cannot be reconstructed. Malformed report, failing closed.");
+            }
+            if (declaredPaypalHash !== recomputedPaypalHash) {
+                throw new Error("IDENTITY PREIMAGE VIOLATION: the hash bound into the hardware quote (" +
+                    declaredPaypalHash.slice(0, 16) + "…) is NOT the hash of the identity carried by this report (" +
+                    recomputedPaypalHash.slice(0, 16) + "…). The quote therefore attests nothing about the user data " +
+                    "shown — one record could be displayed while another is hardware-signed. Failing closed.");
+            }
+            const paypalHash = new Uint8Array(recomputedPaypalHash.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+
+            // v152: The nonce also binds the user's custom_info into the
+            // hardware quote.
+            // v155 (SEC-02): it additionally commits to the EXACT code
+            // identity — the measured binary_sha256 + the canonical
+            // disk-manifest composite. On OCI the SEV-SNP launch digest is
+            // fleet-constant (it covers only Oracle's OVMF firmware), so
+            // this fusion is what makes the silicon quote attest the code
+            // actually running: nonce = SHA-256(paypal ∥ pubkey ∥ custom_info
+            // ∥ binary_sha256 ∥ SHA256(canonical manifest)). The Sigstore
+            // provenance check below then proves those same hashes are
+            // CI-built (defense-in-depth Layers 2+3).
+            // "NONE" is the enclave's canonical value for an absent custom_info.
+            const customInfoStr = report.custom_info || "NONE";
+            const customInfoHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(customInfoStr));
+
+            // Canonical manifest: sorted [path, sha256] pairs, compact JSON —
+            // byte-identical to the enclave's canonical_manifest_json.
+            const diskManifest = boot.disk_manifest || {};
+            const sortedManifest = Object.keys(diskManifest).sort().map(k => [k, diskManifest[k]]);
+            const manifestHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(sortedManifest)));
+            if (!/^[0-9a-f]{64}$/i.test(boot.binary_sha256 || "")) {
+                throw new Error("Report is missing a valid enclave binary_sha256 — cannot reconstruct the hardware-bound nonce (SEC-02 code binding). The report is malformed or from a pre-SEC-02 enclave.");
+            }
+            const binaryHashBytes = new Uint8Array((boot.binary_sha256.match(/.{1,2}/g) || []).map(byte => parseInt(byte, 16)));
+
+            const combined = new Uint8Array(160);
+            combined.set(paypalHash);
+            combined.set(new Uint8Array(pubKeyHash), 32);
+            combined.set(new Uint8Array(customInfoHash), 64);
+            combined.set(binaryHashBytes, 96);
+            combined.set(new Uint8Array(manifestHash), 128);
+            const combinedHash = await crypto.subtle.digest('SHA-256', combined);
+            const expectedNonce = Array.from(new Uint8Array(combinedHash)).map(b => b.toString(16).padStart(2, '0')).join('');
+            
+            // Note: The JSON nonce_hex is entirely untrusted. We use expectedNonce moving forward.
+            updateStatus('identityCheck', true, "Identity cryptographically hashed." + (preFlightPubKeyPem ? " 🔒 P_enc matches the login-session pin." : " ℹ️ No enclave-key pin in this session — the hardware audit above IS the gate (silicon root + MRTD/RTMR pins + client-session binding)."));
+
+            // 2. Enclave Signature Validation
+            const sig = pemToBuffer(rawData.enclave_signature_b64 || report.signature_b64);
+            const enclaveKey = await crypto.subtle.importKey('spki', pubKeyBuffer, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+            const payload = new TextEncoder().encode(JSON.stringify(reorder(report)));
+            const sigOk = await crypto.subtle.verify({ name: 'RSASSA-PKCS1-v1_5' }, enclaveKey, sig, payload);
+            updateStatus('enclaveCheck', sigOk, sigOk ? "Report mathematically verified." : "Signature invalid!");
+            // v164: fail closed. A report whose enclave signature does not
+            // verify is UNAUTHENTICATED — continuing to green sub-checks would
+            // let a fabricated report render mostly-verified rows.
+            if (!sigOk) throw new Error("CRITICAL: the enclave signature over this report is INVALID — the report content is unauthenticated (tampered or fabricated). Failing closed.");
+
+            // 3. TPM Hardware Audit — REMOVED (v180, audit.md §5.1): the GCP
+            // vTPM path (quote signature, session nonce, PCR digests, golden
+            // pins) and the Google AK root were deleted with the AMD SEV-SNP
+            // path; v184 also removed the now-empty row itself — hardware
+            // trust is decided by the Silicon Root row.
+
+
+            // v168 (plan Phase 1.2): the self-reported binary digest does NOT
+            // gate the verdict (it is attacker-controllable in the threat
+            // model) — see EXPECTED_ENCLAVE_SHA256 for the full rationale.
+            // Only its FORMAT is enforced (auditor integrity).
+            const CODE_PIN = (typeof EXPECTED_ENCLAVE_SHA256 === 'string') ? EXPECTED_ENCLAVE_SHA256 : '';
+            if (!/^[0-9a-f]{64}$/.test(CODE_PIN)) {
+                throw new Error('AUDITOR INTEGRITY FAILURE: EXPECTED_ENCLAVE_SHA256 is not a valid pinned digest — this copy of the auditor is incomplete or tampered. Aborting.');
+            }
+            let codePinNote = '🔏 Self-reported binary digest matches the audited build pin (INFORMATIONAL only — code identity is decided by the MRTD/RTMR silicon pins, never by this self-report)';
+            if (boot.binary_sha256 !== CODE_PIN) {
+                codePinNote = '⚠️ <b>SELF-REPORTED CODE DIGEST MISMATCH (informational, NOT a gate):</b> this report claims binary sha256 ' + esc(String(boot.binary_sha256 || 'absent').slice(0, 20)) + '… but this auditor copy pins ' + CODE_PIN.slice(0, 20) + '…. The self-report is unmeasured and proves nothing either way — code identity is decided EXCLUSIVELY by the MRTD/RTMR silicon pins above/below. Mismatch with green RTMR pins ⇒ either this auditor copy is stale (rotate pins in a reviewed commit) or the report is internally inconsistent.';
+            }
+
+            // v168 (plan Phase 3 — Malicious PayPal App defense): WHICH PayPal
+            // app minted (or will mint) the identity is inside the SIGNED
+            // report — and at pre-flight it is HARDWARE-BOUND into report_data
+            // (see preflightBindingHex). A swapped or over-scoped app fails
+            // closed here even though every signature verifies.
+            {
+                const pfCtxApp = report.session_context && report.session_context.preflight;
+                const appChecks = [];
+                if (report.paypal_user_info) {
+                    appChecks.push(['login report', report.paypal_client_id || '']);
+                }
+                if (pfCtxApp) {
+                    appChecks.push(['pre-flight', pfCtxApp.paypal_client_id || '']);
+                }
+                for (const [where, appId] of appChecks) {
+                    if (!EXPECTED_APPS.some(a => a.client_id === appId)) {
+                        throw new Error('APP PIN VIOLATION (' + where + '): this report was produced with PayPal app "' + String(appId).slice(0, 24) + '…" (or none) that is NOT in the audited allow-list — a swapped or over-scoped app would let the domain owner harvest your data directly from PayPal. Failing closed.');
+                    }
+                }
+            }
+
+            // v169 (independent audit finding — ENVIRONMENT BINDING): a SANDBOX
+            // login is a genuine hardware attestation of a SYNTHETIC identity —
+            // `verified_account: true` there is asserted by PayPal's sandbox for
+            // any account the enclosure's owner creates. Every signature, pin
+            // and binding can be perfectly green while the "verified PayPal
+            // user" you are looking at belongs to the operator. A login report
+            // must therefore declare `paypal_environment: "production"`; the
+            // field is inside the signed report, so a sandbox deployment cannot
+            // claim otherwise without breaking the enclave signature.
+            if (report.paypal_user_info) {
+                // v169 (audit finding — FLOW BINDING): the flow a report was
+                // minted under must be explicit, consistent with the PayPal app
+                // that produced it, and equal to what THIS tab asked for.
+                const repFlow = String(report.flow || '');
+                if (repFlow !== 'verified' && repFlow !== 'full') {
+                    throw new Error('FLOW BINDING MISSING: this login report does not declare which flow minted it ' +
+                        '(flow="' + repFlow + '"). Without it the auditor cannot tell whether the minimal-scope ' +
+                        '(\"verified\") or the PII (\"full\") app was used — failing closed. Re-login against a v169 enclave.');
+                }
+                const appEntry = EXPECTED_APPS.find(a => a.client_id === report.paypal_client_id);
+                if (appEntry && appEntry.flow !== repFlow) {
+                    throw new Error('FLOW/APP MISMATCH: the report claims flow "' + repFlow + '" but its PayPal app is the ' +
+                        'audited "' + appEntry.flow + '" app. A report minted through one app cannot honestly claim another flow. Failing closed.');
+                }
+                const wanted = selectedFlowNow();
+                if (wanted && wanted !== repFlow) {
+                    throw new Error('FLOW ESCALATION: this tab started the "' + wanted + '" flow, but the sealed report was ' +
+                        'minted by "' + repFlow + '". You asked for ' + (wanted === 'verified' ? 'minimal disclosure' : 'the full profile') +
+                        ' and the enclave returned a different scope. Failing closed — do not use this report.');
+                }
+
+                // v169 (audit finding): the service's whole claim is "VERIFIED
+                // PayPal account". The enclave enforces this server-side, but
+                // the auditor must not take the displayed status on faith from
+                // the same party that benefits from asserting it — check the
+                // signed field itself.
+                if (String(report.paypal_user_info.verified_account || '') !== 'true') {
+                    throw new Error('UNVERIFIED ACCOUNT REFUSED: this report carries a PayPal identity whose ' +
+                        'verified_account flag is "' + String(report.paypal_user_info.verified_account) + '", not "true". ' +
+                        'The enclave promises verified-only identities; a green report on an unverified account would be a lie. Failing closed.');
+                }
+                const env = String(report.paypal_environment || '').toLowerCase();
+                if (!env) {
+                    throw new Error('PAYPAL ENVIRONMENT UNDECLARED: this report does not state which PayPal ' +
+                        'environment produced the identity (paypal_environment absent). A pre-v169 report cannot ' +
+                        'prove it is not a sandbox account — failing closed. Re-login against a v169+ enclave.');
+                }
+                if (env !== 'production' && env !== 'sandbox') {
+                    throw new Error('PAYPAL ENVIRONMENT UNKNOWN: the report declares paypal_environment="' +
+                        esc(env) + '" but only "production" and "sandbox" are defined — failing closed.');
+                }
+                if (env === 'sandbox') {
+                    // v177 (audit follow-up — two-verdict model): a sandbox
+                    // login is a GENUINE hardware attestation of a SYNTHETIC
+                    // identity (`verified_account: true` is asserted by PayPal\'s
+                    // sandbox for any account the owner creates). The hard
+                    // refusal made every honest sandbox deployment UNAUDITABLE,
+                    // which pushes operators to skip the auditor entirely. The
+                    // integrity verdict (silicon root, MRTD/RTMR pins, bindings)
+                    // is unaffected by which PayPal environment was used — so
+                    // it stays green, while the IDENTITY verdict becomes a
+                    // loud, non-green SANDBOX state below. A sandbox report can
+                    // never render as a verified production identity: the
+                    // environment field is INSIDE the enclave-signed report and
+                    // the code that fills it is pinned by MRTD/RTMR.
+                    sandboxDeployment = true;
+                }
+            }
+
+            // 4. Software Provenance (Hardware-Anchored PCR 15)
+            // v161 (plan Pillar 1): the OCI ESP ships the MONOLITHIC UKI as
+            // EFI/BOOT/BOOTX64.EFI (no shim/GRUB loose files) — its hash is
+            // attested by CI as "Enclave UKI". The legacy chain-boot layout
+            // (vmlinuz + initrd.img + grub.cfg on the ESP) is still audited
+            // when present (GCP image / pre-v161 OCI images).
+            const ukiLayout = !(diskManifest["EFI/BOOT/vmlinuz"] || diskManifest["vmlinuz"])
+                && !!(diskManifest["EFI/BOOT/BOOTX64.EFI"] || diskManifest["BOOTX64.EFI"]);
+            // v165 AUDIT (threat model: owner+cloud collusion): the ENTIRE
+            // loaded boot chain must be CI-attested, not just kernel/initrd/
+            // cmdline. BOOTX64.EFI (shim/UKI) and grubx64.efi are what actually
+            // execute the kernel — previously a backdoored shim/grub swapped
+            // onto the disk by the cloud provider yielded a self-consistent
+            // manifest that NOTHING compared to CI. NvVars is deliberately
+            // NEVER looked up: the firmware rewrites it at runtime (observed:
+            // a different hash on every boot), so it cannot be pinned.
+            const [bin, ker, init, cfg, uki, grubBin] = await Promise.all([
+                getProvenance(boot.binary_sha256, "Enclave Binary"),
+                getProvenance(boot.disk_manifest["EFI/BOOT/vmlinuz"] || boot.disk_manifest["vmlinuz"], "Linux Kernel"),
+                getProvenance(boot.disk_manifest["EFI/BOOT/initrd.img"] || boot.disk_manifest["initrd.img"], "Initramfs"),
+                getProvenance(boot.disk_manifest["EFI/BOOT/grub.cfg"] || boot.disk_manifest["grub.cfg"], "Boot Config (grub.cfg)"),
+                getProvenance(boot.disk_manifest["EFI/BOOT/BOOTX64.EFI"] || diskManifest["BOOTX64.EFI"], "EFI Boot Chain (BOOTX64.EFI: shim/UKI)"),
+                getProvenance(boot.disk_manifest["EFI/BOOT/grubx64.efi"] || boot.disk_manifest["grubx64.efi"], "EFI Bootloader (grubx64.efi)")
+            ]);
+            const imageComponents = ukiLayout ? [bin, uki] : [ker, init, cfg, uki, grubBin];
+            const provenanceComponents = ukiLayout ? [uki] : [ker, init, cfg, uki, grubBin];
+            
+            const expectedPcr15 = await calculatePcr15(boot.disk_manifest);
+            const hasPcr15 = !!(hw.pcr_values && hw.pcr_values["pcr_15"]);
+            const actualPcr15 = ((hw.pcr_values && hw.pcr_values["pcr_15"]) || "").replace(/^0x/i, '').toLowerCase();
+            // PCR 15 exists only when a TPM extended it (historical GCP
+            // path — removed in v180). Intel TDX reports have no TPM, so the
+            // binding is vacuous there; GitHub provenance checks above still
+            // apply, and hardware trust is decided by the MRTD/RTMR pins.
+            const pcr15Ok = hasPcr15 ? (actualPcr15 === expectedPcr15) : true;
+
+            let commonRuns = null;
+            for (const c of [bin, ...imageComponents]) {
+                if (!c.success) continue;
+                const s = new Set(c.runIds);
+                commonRuns = (commonRuns === null) ? s : new Set([...commonRuns].filter(x => s.has(x)));
+            }
+            const atomic = commonRuns && commonRuns.size > 0;
+            // v153: explain WHY a provenance lookup failed (audit follow-up —
+            // "❌ Binary" alone sent users hunting in the wrong direction).
+            const provReasons = {
+                missing: 'not in this report (empty disk_manifest — the enclave that produced it could not measure the ESP; rebuild with the v153 initramfs/enclave)',
+                unattested: 'NO GitHub attestation exists for this exact SHA-256 — the artifact was built outside CI or from uncommitted source. Deploy a build produced from a pushed commit (or the CI-built artifact) so the same hash is attested',
+                network: 'GitHub API unreachable (offline auditor or rate limit) — retry',
+            };
+            // runIds are strings from the GitHub API payload — treat them as
+            // untrusted for innerHTML (esc), same as report-controlled data.
+            const provLine = (c) => c.success
+                ? `✅ ${c.name} (#${esc(c.runIds.join(','))})`
+                : `❌ ${c.name} — ${esc(provReasons[c.reason] || 'not attested')}`;
+            const atomicFail = imageComponents.some(c => c.reason === 'missing')
+                ? provReasons.missing
+                : (commonRuns === null
+                    ? provReasons.unattested
+                    : 'component hashes were attested by DIFFERENT CI runs — not one atomic image build');
+            const provResults =[
+                codePinNote,
+                provLine(bin),
+                ...provenanceComponents.map(provLine),
+                atomic ? `✅ Image Atomicity (Run #${esc([...commonRuns][0])})` : `❌ Image Atomicity — ${esc(atomicFail)}`,
+                hasPcr15
+                    ? (pcr15Ok ? `✅ PCR 15 hardware binding mathematically verified` : `❌ PCR 15 Software Mismatch`)
+                    : (hw.tdx_quote_b64
+                        ? `ℹ️ PCR 15 not applicable (no TPM) — but a hardware-signed TDX quote IS present: report_data binds THIS session (verified in the Silicon Root row above). Disk/boot-chain integrity rests on the CI attestation lines above; code identity on the MRTD/RTMR silicon pins (the self-reported binary digest is informational only)`
+                        : `ℹ️ PCR 15 not applicable (no TPM in this report) — hardware trust is decided by the Silicon Root row above`)
+            ];
+            // NOTE (v169 independent audit): this row is deliberately
+            // ADVISORY, never a gate. Every digest it checks is SELF-REPORTED
+            // by the enclave (binary_sha256 / disk_manifest), so gating on it
+            // would resurrect the very self-measurement fallacy v168 removed —
+            // a backdoored /init would simply print the CI-attested digests.
+            // Code identity is decided ONLY by the MRTD/RTMR silicon pins in
+            // the Silicon Root row. This row is the supply-chain cross-check
+            // that makes a pin rotation to a self-built image visible, and it
+            // must stay usable offline (a hard gate would brick air-gapped
+            // audits whenever GitHub is unreachable).
+            const anyApiBlocked = [bin, ker, init, cfg, uki, grubBin].some(c => (c.reason || '').startsWith('api') || c.reason === 'network');
+            updateStatus('githubCheck', bin.success && atomic && pcr15Ok,
+                provResults.join('<br>') + (anyApiBlocked ? '<br>⚠️ GitHub API problems detected (rate limit is 60 req/h unauthenticated) — results above may be incomplete.' : ''));
+
+            // 5. Silicon Root of Trust (v180 — audit.md §5.1: INTEL TDX ONLY)
+            // The multi-root dispatch (AMD SEV-SNP / Google AK / Intel TDX) and
+            // every AMD VCEK→ASK→ARK and Google NVRAM EK code path are PERMANENTLY
+            // REMOVED. This auditor verifies exactly one hardware root: an
+            // Intel-signed TDX quote (v4/v5) whose PCK chain anchors to the
+            // pinned Intel SGX/TDX Root CA, with MRTD/RTMR hard pins over the
+            // quote body. A report carrying no TDX evidence — including a
+            // cross-cloud quote substitution (e.g. a valid AMD SEV-SNP report
+            // from a hostile cloud) — is rejected outright below.
+            let siliconOk = false;
+            let tdxVerified = false;
+            let siliconMsg = "";
+
+
+            // 5c. Intel TDX Root (Alibaba Cloud ECS confidential instances).
+            //
+            // The enclave publishes `tdx_quote_b64` ONLY when the platform
+            // actually produced a hardware-signed TD Quote (Intel quote ABI
+            // v4/v5, ECDSA P-256 by the Quoting Enclave). The auditor follows
+            // Intel's reference DCAP verification order (dcap-qvl verify.rs):
+            //   1. header: version 4|5, tee_type 0x81, Intel QE vendor id,
+            //      att_key_type 2 (ECDSA P-256). Signed scope =
+            //      header (+v5 6-byte body preamble) || TDREPORT body —
+            //      dcap-qvl Quote::signed_length().
+            //   2. session binding: TDREPORT10.report_data @520..584 holds
+            //      [nonce || zeros] (TDREPORT15 appends its two extra fields
+            //      AFTER report_data, so "last 64 bytes" would be wrong).
+            //   3. QUOTE signature: raw r||s (64 B) ECDSA P-256/SHA-256 over
+            //      the signed scope, verified with the quote's OWN attestation
+            //      key (raw X||Y) — NOT with the PCK key.
+            //   4. attestation-key binding: SHA-256(attkey || qe_auth_data)
+            //      == QE-report.report_data[0..32], and the QE report (384 B)
+            //      is itself signed by the PCK leaf — this is what anchors the
+            //      ephemeral attestation key to Intel's provisioning chain.
+            //   5. PCK leaf → … → Intel SGX Root CA, whose DER sha256 is
+            //      pinned below (an issuer regex alone is spoofable — same
+            //      class of bug as the unpinned AMD ARK).
+            //   6. MRTD (mr_td @136..184 of the body) surfaced for display.
+            // A bare TDREPORT (tdx_td_report_b64) is generated INSIDE the
+            // guest and is UNSIGNED — it can NEVER satisfy the silicon root.
+            const claimsTdx = !!(hw.tdx_quote_b64 || hw.tdx_td_report_b64 || hw.pck_cert_pem
+                || hw.tdx_evidence_marker // TPM-less Alibaba build: the marker is the report's
+                    // only TDX-class claim — route it into the TDX branch below so the
+                    // auditor gets the PRECISE no-hardware-signed-evidence diagnosis
+                    // (incl. the enclave's own probe transcript) instead of the generic
+                    // "no evidence present" message. The marker can never make this pass:
+                    // with no tdx_quote_b64 the branch ends at tdxVerified=false.
+                || (hw.platform_type || '').indexOf('TDX') !== -1);
+            if (claimsTdx) {
+                if (hw.tdx_quote_b64) {
+                    try {
+                        const quote = Uint8Array.from(atob(hw.tdx_quote_b64), c => c.charCodeAt(0));
+                        const hx = (u8) => Array.from(u8).map(b => b.toString(16).padStart(2, '0')).join('');
+                        const le16 = (a, o) => a[o] | (a[o + 1] << 8);
+                        const le32u = (a, o) => a[o] + a[o + 1] * 256 + a[o + 2] * 65536 + a[o + 3] * 16777216;
+                        if (quote.length < 48 + 584 + 4 + 64 + 64 + 6) throw new Error(`quote truncated (${quote.length} bytes)`);
+                        // ---- header (48 B): version u16@0, att_key_type u16@2,
+                        // tee_type u32@4, qe_svn@8, pce_svn@10, vendor id@12 ----
+                        const qVersion = le16(quote, 0);
+                        const qAttKeyType = le16(quote, 2);
+                        const qTeeType = le32u(quote, 4);
+                        const qVendorHex = hx(quote.subarray(12, 28));
+                        if (qTeeType !== 0x81) throw new Error(`tee_type 0x${qTeeType.toString(16)} is not TDX (expected 0x81)`);
+                        if (qVersion !== 4 && qVersion !== 5) throw new Error(`unsupported quote version ${qVersion} — TDX quotes are v4 or v5`);
+                        if (qVendorHex !== '939a7233f79c4ca9940a0db3957f0607') {
+                            throw new Error(`unknown QE vendor id ${qVendorHex} — quote not produced by Intel's Quoting Enclave`);
+                        }
+                        if (qAttKeyType !== 2) throw new Error(`attestation key type ${qAttKeyType} unsupported — Intel TDX quotes use ECDSA P-256 (type 2)`);
+                        // ---- body: v4 carries TDREPORT10 inline (fixed 584 B);
+                        // v5 adds a 6-byte preamble (body_type u16 + body_size u32 LE) ----
+                        let bodyOff = 48, bodyLen = 584, bodyType = null;
+                        if (qVersion === 5) {
+                            bodyType = le16(quote, 48);
+                            bodyLen = le32u(quote, 50);
+                            const expectLen = bodyType === 2 ? 584 : bodyType === 3 ? 648 : null;
+                            if (expectLen === null) throw new Error(`unsupported v5 body type ${bodyType} (2 = TDREPORT10, 3 = TDREPORT15)`);
+                            if (bodyLen !== expectLen) throw new Error(`v5 body_type ${bodyType} implies ${expectLen} bytes, size field says ${bodyLen}`);
+                            bodyOff = 54;
+                        }
+                        const signedLen = bodyOff + bodyLen; // == dcap-qvl Quote::signed_length()
+                        if (quote.length < signedLen + 4 + 64 + 64 + 6) throw new Error('quote truncated before auth data');
+                        const signedRegion = quote.subarray(0, signedLen);
+                        const qBody = quote.subarray(bodyOff, signedLen);
+                        // ---- session binding: TDREPORT10.report_data @520..584 ----
+                        if (qBody.length < 584) throw new Error(`TDREPORT body ${qBody.length} bytes < 584`);
+                        const qReportDataHex = hx(qBody.subarray(520, 584));
+                        // v161 (Pillars 2–5) — same branch as the SNP path:
+                        // pre-flight (client-bound) envelopes bind the BROWSER's
+                        // own inputs into the quote — SHA-256(P_enc ∥ code_challenge
+                        // ∥ P_client ∥ client_nonce ∥ custom_info), [32..64] zero —
+                        // NOT the SEC-02 session nonce (there is no PayPal user yet
+                        // at pre-flight). Login/callback envelopes keep SEC-02.
+                        // Without this branch every TDX pre-flight envelope failed
+                        // binding=false by construction (2026-10-21).
+                        const pfCtxTdx = report.session_context && report.session_context.preflight;
+                        let expectedTdxBindingHex, tdxBindingLabel;
+                        // v182 (audit.md Step 4 — no wildcard slots): the
+                        // client-session slot note carried to the success row.
+                        let tdxClientSlotNote = '[32..64] zero';
+                        if (pfCtxTdx && pfCtxTdx.binding === 'v161') {
+                            expectedTdxBindingHex = (await preflightBindingHex(
+                                pubKeyBuffer, pfCtxTdx.code_challenge, b64ToDer(pfCtxTdx.client_pub_b64), pfCtxTdx.client_nonce_hex,
+                                pfCtxTdx.custom_info || 'NONE', pfCtxTdx.paypal_client_id || ''
+                            )).padEnd(128, '0');
+                            tdxBindingLabel = 'v161.2 client binding (P_enc ∥ code_challenge ∥ P_client ∥ client_nonce ∥ custom_info ∥ PayPal_Client_ID)';
+                        } else {
+                            // v179 (plan Phase 1 — session substitution): login
+                            // reports bind SHA-256(P_client ∥ Nonce_client) into
+                            // report_data[32..64].
+                            // v182 (audit.md Step 4 — NO wildcard slots): BOTH
+                            // 32-byte slots are enforced in EVERY audit mode.
+                            // Session in hand → compare against THIS tab's own
+                            // P_client/nonce. Paste audit (no session) →
+                            // RECOMPUTE the slot from the report's own
+                            // session_context.client_pub_b64/client_nonce_hex
+                            // and require the match. The v179 "informational"
+                            // [32..64] wildcard is GONE: a quote minted for a
+                            // different session — or a legacy v173-era loose
+                            // slot — now fails closed instead of passing with
+                            // a warning (collusion model: an authentic-but-
+                            // stale report must not replay as green).
+                            const isLoginReport = !!report.paypal_user_info;
+                            const scLogin = report.session_context || {};
+                            if (isLoginReport && auditorSessionBindingHex) {
+                                expectedTdxBindingHex = expectedNonce + auditorSessionBindingHex;
+                                tdxBindingLabel = 'session nonce + client-session binding (P_client ∥ Nonce_client)';
+                                tdxClientSlotNote = '[32..64] == client-session binding — both slots bound ✓';
+                            } else if (isLoginReport && scLogin.client_pub_b64 && /^[0-9a-f]{64}$/i.test(String(scLogin.client_nonce_hex || ''))) {
+                                expectedTdxBindingHex = expectedNonce + await clientSessionBindingHex(b64ToDer(scLogin.client_pub_b64), scLogin.client_nonce_hex);
+                                tdxBindingLabel = 'session nonce + client-session binding recomputed from the report\'s own session_context (paste audit)';
+                                tdxClientSlotNote = '[32..64] == client-session binding (recomputed from the report\'s own session_context) — both slots bound ✓';
+                            } else {
+                                // Non-login envelope (no PayPal identity): the
+                                // SEC-02 nonce alone is the binding; [32..64]
+                                // is zero by construction — strictly compared.
+                                expectedTdxBindingHex = expectedNonce.padEnd(128, '0');
+                                // wording pinned by the offline harness (Test 2/5)
+                                tdxBindingLabel = 'session nonce';
+                            }
+                        }
+                        const qBindingOk = qReportDataHex === expectedTdxBindingHex;
+                        // MRTD (mr_td): after tee_tcb_svn16 + mr_seam48 + mr_signer_seam48
+                        // + seam_attributes8 + td_attributes8 + xfam8 = offset 136.
+                        const qMrtdHex = hx(qBody.subarray(136, 184));
+                        // RTMR0..3: mr_config/mr_owner don't apply — the four
+                        // runtime registers sit at 328..520 (48 B each, SHA-384),
+                        // directly before report_data @520. Same offsets the
+                        // in-guest CCEL replay uses (src/intel_tdx.rs).
+                        const qRtmrHex = [328, 376, 424, 472].map(o => hx(qBody.subarray(o, o + 48)));
+                        if (qRtmrHex.some(h => h.length !== 96)) throw new Error('RTMR registers truncated in quote body');
+                        // ---- auth data (v4/v5 AuthDataV4):
+                        //   u32 LE len | sig64 (raw r||s) | attkey64 (raw X||Y)
+                        //   | cert_type u16 | cert_len u32 | cert body ----
+                        const authLen = le32u(quote, signedLen);
+                        if (signedLen + 4 + authLen > quote.length) throw new Error('auth data length exceeds quote size');
+                        const auth = quote.subarray(signedLen + 4, signedLen + 4 + authLen);
+                        if (auth.length < 64 + 64 + 6) throw new Error('auth data truncated');
+                        const qSigRaw = auth.subarray(0, 64);      // ECDSA P-256 raw r||s
+                        const attKeyRaw = auth.subarray(64, 128);  // attestation key raw X||Y
+                        const certType = le16(auth, 128);
+                        const certLen = le32u(auth, 130);
+                        const certBody = auth.subarray(134, 134 + certLen);
+                        if (certBody.length !== certLen) throw new Error('certification data truncated');
+                        // cert_type 6 = QE-report certification data:
+                        //   qe_report384 | qe_report_sig64 | auth_len u16 | auth32
+                        //   | inner cert_type u16 | inner_len u32 | PCK chain (PEM)
+                        if (certType !== 6) {
+                            throw new Error(`certification data type ${certType} unsupported — type 6 (QE-report cert) is required to bind the attestation key to the PCK chain`);
+                        }
+                        if (certBody.length < 384 + 64 + 2 + 32 + 6) throw new Error('QE report certification data truncated');
+                        const qeReport = certBody.subarray(0, 384);
+                        const qeReportSig = certBody.subarray(384, 448);
+                        const qeAuthLen = le16(certBody, 448);
+                        if (qeAuthLen !== 32) throw new Error(`QE auth data length ${qeAuthLen}, expected 32`);
+                        const qeAuthData = certBody.subarray(450, 482);
+                        const innerType = le16(certBody, 482);
+                        const innerLen = le32u(certBody, 484);
+                        const innerBody = certBody.subarray(488, 488 + innerLen);
+                        if (innerBody.length !== innerLen) throw new Error('inner certification data truncated');
+                        if (innerType !== 5 && innerType !== 4) {
+                            throw new Error(`inner certification type ${innerType} unsupported (5 = PCK cert chain, 4 = PCK leaf)`);
+                        }
+                        // ---- certificate material: quote-carried chain first,
+                        // then the enclave-published hw.pck_cert_pem ----
+                        let innerText = '';
+                        for (let i = 0; i < innerBody.length; i += 0x8000) {
+                            innerText += String.fromCharCode.apply(null, innerBody.subarray(i, i + 0x8000));
+                        }
+                        if (innerText.indexOf('-----BEGIN') === -1) {
+                            // type-4 style raw DER blob → wrap as one PEM block
+                            innerText = '-----BEGIN CERTIFICATE-----\n' + btoa(innerText).replace(/(.{64})/g, '$1\n') + '\n-----END CERTIFICATE-----';
+                        }
+                        const pemRe = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
+                        const parseAll = async (text, label) => {
+                            const pems = (text || '').match(pemRe) || [];
+                            const out = [];
+                            for (let i = 0; i < pems.length; i++) {
+                                const o = x509ParseAny(pems[i], label + '[' + i + ']');
+                                const m = pems[i].match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);
+                                o.pem = pems[i];
+                                o.derBytes = Uint8Array.from(atob(m[1].replace(/\s+/g, '')), c => c.charCodeAt(0));
+                                o.derHex = hx(o.derBytes); // identity (dedupe)
+                                o.derSha256 = hx(new Uint8Array(await crypto.subtle.digest('SHA-256', o.derBytes))); // pin compare
+                                out.push(o);
+                            }
+                            return out;
+                        };
+                        const parsedQuote = await parseAll(innerText, 'quote PCK');
+                        const parsedPub = await parseAll(hw.pck_cert_pem, 'published PCK');
+                        if (!parsedQuote.length && !parsedPub.length) {
+                            throw new Error('no PCK certificate in the quote or the report — chain cannot be verified');
+                        }
+                        // Candidate chains, hardware-quoted first. Same-leaf
+                        // published certs complete a leaf-only quote chain.
+                        const groups = [];
+                        if (parsedQuote.length) {
+                            let g = parsedQuote;
+                            if (parsedPub.length && parsedPub[0].derHex === parsedQuote[0].derHex && parsedPub.length > 1) {
+                                // same leaf: extend with published intermediates (deduped —
+                                // a cert must never follow itself in the walk)
+                                const have = new Set(parsedQuote.map(c => c.derHex));
+                                g = parsedQuote.concat(parsedPub.slice(1).filter(c => !have.has(c.derHex)));
+                            }
+                            groups.push(g);
+                        }
+                        if (parsedPub.length && (!parsedQuote.length || parsedPub[0].derHex !== parsedQuote[0].derHex)) {
+                            groups.push(parsedPub);
+                        }
+                        // ---- 4a. QE report signature: signed by the PCK LEAF
+                        // (Intel: PCK cert signs the QE report; the QE report
+                        // then binds the attestation key) ----
+                        let qeRepSigOk = false, usedGroup = null;
+                        for (const g of groups) {
+                            try {
+                                const leafKey = await crypto.subtle.importKey('spki', g[0].spkiDer, ecCurveParams(g[0].spkiDer), false, ['verify']);
+                                if (await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, leafKey, qeReportSig, qeReport)) {
+                                    qeRepSigOk = true; usedGroup = g; break;
+                                }
+                            } catch (e) { /* try next candidate */ }
+                        }
+                        const pckLeafParsed = usedGroup ? usedGroup[0] : (groups[0] && groups[0][0]) || null;
+                        let pckIssuer = '', pckSubject = '';
+                        if (pckLeafParsed) {
+                            const names = x509Names(pckLeafParsed);
+                            pckIssuer = names.issuer; pckSubject = names.subject;
+                        }
+                        const issuerIntelOk = /Intel/i.test(pckIssuer) && /PCK/i.test(pckIssuer);
+                        // ---- 4b. Chain walk to the PINNED roots (root PEMs
+                        // travel with the code, never with the quote) ----
+                        let chainOk = false, chainLabel = 'no usable PCK chain in this report';
+                        if (qeRepSigOk && usedGroup) {
+                            const roots = (Array.isArray(TRUSTED_INTEL_ROOTS) ? TRUSTED_INTEL_ROOTS : [])
+                                .map(r => ({ sha256: String((r && r.sha256) || '').toLowerCase(), pem: (r && r.pem) || '' }))
+                                .filter(r => /^[0-9a-f]{64}$/.test(r.sha256) && r.pem.indexOf('-----BEGIN CERTIFICATE-----') !== -1);
+                            const pins = roots.map(r => r.sha256);
+                            const chain = usedGroup.slice();
+                            // append every pinned root the chain doesn't already carry
+                            for (const rt of roots) {
+                                const m = rt.pem.match(/-----BEGIN CERTIFICATE-----([\s\S]*?)-----END CERTIFICATE-----/);
+                                if (!m) continue;
+                                const rp = x509ParseAny(rt.pem, 'pinned Intel root');
+                                rp.pem = rt.pem;
+                                rp.derBytes = Uint8Array.from(atob(m[1].replace(/\s+/g, '')), c => c.charCodeAt(0));
+                                rp.derSha256 = hx(new Uint8Array(await crypto.subtle.digest('SHA-256', rp.derBytes)));
+                                if (chain.some(c => c.derSha256 === rp.derSha256)) continue;
+                                chain.push(rp);
+                            }
+                            let links = 0;
+                            for (let i = 0; i < chain.length; i++) {
+                                const cur = chain[i];
+                                if (i > 0 && pins.includes(cur.derSha256)) { chainOk = true; break; }
+                                if (i + 1 >= chain.length) break;
+                                if (!(await x509SignedBy(cur, chain[i + 1]))) break;
+                                links++;
+                            }
+                            chainLabel = chainOk
+                                ? `${links + 1} certs, leaf → Intel SGX Root CA pinned (${pins[0] ? pins[0].substring(0, 16) : '?'}…)`
+                                : `chain does NOT reach a pinned Intel root (walked ${links} link(s))`;
+                        }
+                        // ---- 3. QUOTE signature: attestation key over header+body ----
+                        const attKey = await crypto.subtle.importKey('spki', p256SpkiFromRaw(attKeyRaw),
+                            { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+                        const qSigOk = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, attKey, qSigRaw, signedRegion);
+                        // ---- 4c. attestation key bound into the QE report:
+                        // SHA-256(attkey || qe_auth_data) == report_data[0..32] ----
+                        const qePreimage = new Uint8Array(64 + 32);
+                        qePreimage.set(attKeyRaw, 0);
+                        qePreimage.set(qeAuthData, 64);
+                        const qeHash = new Uint8Array(await crypto.subtle.digest('SHA-256', qePreimage));
+                        const qeReportData = qeReport.subarray(320, 384); // EnclaveReport.report_data @320
+                        const attKeyBound = hx(qeHash) === hx(qeReportData.subarray(0, 32));
+                        // v165 MRTD PIN (ghost-enclave guard): an Intel-signed
+                        // quote proves silicon; the pin proves the audited
+                        // launch chain booted it. Fail-closed if EXPECTED_MRTD
+                        // is unset. Scope/rotation: see the EXPECTED_MRTD block.
+                        const mrtdPin = (typeof EXPECTED_MRTD === 'string' && EXPECTED_MRTD) ? EXPECTED_MRTD : '';
+                        const mrtdOk = !!mrtdPin && qMrtdHex === mrtdPin;
+                        // v166 RTMR HARD PINS (plan Phase 4): every register
+                        // must equal its golden pin — fail-closed if a pin is
+                        // missing/malformed, same contract as EXPECTED_MRTD.
+                        const rtPins = [EXPECTED_RTMR0, EXPECTED_RTMR1, EXPECTED_RTMR2, EXPECTED_RTMR3]
+                            .map(p => (typeof p === 'string' && /^[0-9a-f]{96}$/.test(p)) ? p : '');
+                        const rtMismatch = rtPins.map((p, i) => (p && qRtmrHex[i] !== p) ? i : -1).filter(i => i >= 0);
+                        const rtmrPinPresent = rtPins.every(p => !!p);
+                        const rtmrOk = rtmrPinPresent && rtMismatch.length === 0;
+                        tdxVerified = qBindingOk && qSigOk && attKeyBound && qeRepSigOk && issuerIntelOk && chainOk && mrtdOk && rtmrOk;
+                        if (tdxVerified) {
+                            siliconMsg = `✅ <b>Intel TDX Silicon Root Verified</b><br>` +
+                                `🔏 Quote signature ECDSA P-256/SHA-256 by its attestation key over header+TDREPORT (v${qVersion}${bodyType ? ', body type ' + bodyType : ''}) valid<br>` +
+                                `⛓️ Attestation key bound into the QE report (SHA-256) and the QE report signed by the PCK leaf ✓<br>` +
+                                `⛓️ PCK chain: ${chainLabel}<br>` +
+                                `📜 PCK leaf "${esc(pckSubject)}" issued by: ${esc(pckIssuer)}<br>` +
+                                `🔐 ${pfCtxTdx && pfCtxTdx.binding === 'v161'
+                                    ? 'report_data == v161.2 client binding (P_enc ∥ code_challenge ∥ P_client ∥ client_nonce ∥ custom_info ∥ PayPal_Client_ID), [32..64] zero — bound ✓'
+                                    : `report_data[0..32] == this session's combined nonce, ${tdxClientSlotNote}`}<br>` +
+                                `📏 MRTD: ${qMrtdHex.substring(0, 32)}… pinned ✓ (launch-chain ghost guard; source: ${esc(hw.tdx_evidence_source || 'unknown')})<br>` +
+                                `📏 RTMR0–3 hard pins: ${qRtmrHex.map((h, i) => 'RTMR' + i + ' ' + h.substring(0, 12) + '…').join(', ')} ✓ — running-code measurements match the audited golden build`;
+                        } else {
+                            siliconMsg = `❌ <b>Intel TDX quote present but verification FAILED</b> ` +
+                                `(binding=${qBindingOk}, quote_sig=${qSigOk}, attkey_bind=${attKeyBound}, qe_report_sig=${qeRepSigOk}, issuer_intel=${issuerIntelOk}, root_chain=${chainOk}, mrtd_pin=${mrtdOk}, rtmr_pin=${rtmrOk})<br>` +
+                                (!mrtdOk ? `⚠️ MRTD pin mismatch: quoted launch measurement ${esc(qMrtdHex.slice(0, 32))}… ≠ the pinned audited chain — a DIFFERENT launch image (ghost enclave). Do NOT trust.<br>` : '') +
+                                (!rtmrPinPresent ? `⚠️ RTMR pins incomplete in THIS auditor copy — fail-closed (a tampered/stale verifier cannot pass).<br>` : '') +
+                                (!rtmrOk && rtmrPinPresent ? `⚠️ RTMR HARDWARE PIN VIOLATION on register(s) ${rtMismatch.map(i => 'RTMR' + i).join(', ')}: quoted value(s) ${rtMismatch.map(i => esc(qRtmrHex[i].slice(0, 16)) + '…').join(', ')} ≠ golden pin(s) ${rtMismatch.map(i => esc(rtPins[i].slice(0, 16)) + '…').join(', ')} — the MEASURED running code differs from the audited build (tampered kernel/initrd//init or boot config). Do NOT trust.<br>` : '') +
+                                `⚠️ PCK issuer was: "${esc(pckIssuer || 'n/a')}" — do NOT trust this report.<br>` +
+                                `⛓️ ${chainLabel}` +
+                                (!qBindingOk
+                                    ? `<br>ℹ️ quote report_data[0..32] = ${qReportDataHex.slice(0, 32)}…, expected ${tdxBindingLabel} = ${expectedTdxBindingHex.slice(0, 32)}…`
+                                    : '');
+                        }
+                    } catch (err) {
+                        tdxVerified = false;
+                        siliconMsg = `❌ <b>Intel TDX verification error:</b> ${esc(err.message)}`;
+                    }
+                } else {
+                    // No signed quote. A TDREPORT is generated inside the TD and
+                    // is UNSIGNED; MRTD/RTMRs from sysfs are guest-internal.
+                    // Neither can anchor a silicon root — say so precisely
+                    // (honest verdict, no generic abort) and surface the
+                    // enclave's own probe transcript for diagnosis.
+                    const marker = hw.tdx_evidence_marker || {};
+                    const probe = hw.tdx_evidence_probe || {};
+                    const notes = Array.isArray(probe.notes) ? probe.notes.slice(0, 10) : [];
+                    siliconMsg = `❌ <b>No hardware-signed TDX evidence in this report.</b><br>` +
+                        ((marker.tdx_td_report_present || hw.tdx_td_report_b64)
+                            ? `⚠️ A bare TDREPORT (1024 B) is generated inside the guest and is UNSIGNED; sysfs MRTD/RTMRs are guest-internal self-reports. Neither is a silicon root.<br>`
+                            : `⚠️ The platform exposed no TDX guest device, so the enclave obtained neither a TD Quote nor a TDREPORT — there is nothing hardware-signed to verify.<br>`) +
+                        `ℹ️ Enclave marker: hardware_signed_tdx_quote=${marker.hardware_signed_tdx_quote ? 'true' : 'false'}, status=${esc(marker.tdx_quote_status || 'n/a')}, source=${esc(hw.tdx_evidence_source || 'none')}${marker.tdx_td_report_present ? ', td_report_present=true' : ''}.` +
+                        (marker.auditor_note ? `<br>ℹ️ Enclave's own note: ${esc(marker.auditor_note)}` : '') +
+                        (notes.length ? `<br>ℹ️ Probe transcript:<br>ℹ️ ${notes.map(esc).join('<br>ℹ️ ')}` : '');
+                }
+            }
+            // v180 (audit.md §5.1 — INTEL TDX ONLY): the v153 multi-root
+            // dispatch (claimsOci / claimsGcp / claimsTdx, mixed → BOTH) is
+            // PERMANENTLY REMOVED together with every AMD SEV-SNP and Google
+            // vTPM verification path. A cross-cloud quote substitution — a
+            // valid AMD SEV-SNP report from a hostile cloud, a Google EK-cert
+            // spoof, a TPM quote from any 2.0 machine — is now rejected at
+            // this gate before any other silicon logic can run.
+            if (!claimsTdx) {
+                updateStatus('firmwareCheck', false,
+                    '❌ <b>No Intel TDX evidence in report</b> — this service exclusively verifies Alibaba Cloud Intel TDX attestation; AMD SEV-SNP / Google vTPM evidence is rejected outright, never substituted.');
+                throw new Error('REJECTED: Report contains no hardware-signed Intel TDX Quote. This service exclusively supports Alibaba Cloud Intel TDX.');
+            }
+            // Intel TDX reports are ONLY trusted through the quote path.
+            siliconOk = tdxVerified;
+            if (!tdxVerified && siliconMsg.indexOf('❌') === -1) {
+                siliconMsg += `<br>❌ <b>Intel TDX evidence did not verify</b> — a TDX report is only trusted when the Quoting Enclave's ECDSA signature, the PCK issuer chain, and the session-nonce binding all verify.`;
+            }
+
+            // Surface the detailed verdict BEFORE any throw so a failure always
+            // shows WHICH sub-check failed (binding / sig / chain / ark pin).
+            updateStatus('firmwareCheck', siliconOk, siliconMsg || (siliconOk
+                ? "✅ Silicon root verified"
+                : "❌ No Intel TDX evidence present in report"));
+
+            if (!siliconOk) {
+                // Harness pins /No valid Silicon Root/ (Test 8/14/15) — the
+                // appended hint keeps that substring intact.
+                throw new Error("CRITICAL: No valid Silicon Root of Trust (Intel TDX) found in report. If you believe this enclave is genuine, this copy of the auditor may be out of date — download the latest verify.html from the project's GitHub and re-run.");
+            }
+
+            // 6. TLS Binding — RESTORED per user directive (v185.1): audit3
+            // called the manual PEM certificate textareas vestigial and they
+            // were removed, but the user overrode that — the optional leaf
+            // cross-check stays as EXTRA SAFETY. Without a certificate the row
+            // renders an explicit amber skip, never a bare placeholder.
+            const certInput = document.getElementById('certInput').value;
+            if (certInput) {
+                const userLeaf = getLeafCert(certInput);
+                const reportLeaf = getLeafCert(report.session_context.tls_certificate_pem);
+                updateStatus('tlsCheck', userLeaf === reportLeaf, userLeaf === reportLeaf ? "TLS channel bound." : "TLS mismatch!");
+            } else {
+                updateStatus('tlsCheck', 'warning', "ℹ️ Optional channel cross-check not requested — paste your browser's TLS certificate (field above) to bind this report to the live connection. Every other row does not depend on it.");
+            }
+
+            // v177: SANDBOX deployments pass the INTEGRITY audit (silicon
+            // root + MRTD/RTMR pins + every binding verified) but must never
+            // render as a verified PRODUCTION identity. The identity row is
+            // downgraded to a loud warning and runAudit returns 'sandbox'
+            // (truthy — the flow works) instead of true.
+            if (sandboxDeployment) {
+                updateStatus('identityCheck', 'warning',
+                    '⚠️ <b>SANDBOX IDENTITY — NOT a production PayPal user.</b> Every integrity check above is ' +
+                    'green: this is a genuine Intel TDX attestation of the audited code. But the PayPal identity ' +
+                    'in this report was minted by PayPal\'s <b>sandbox</b>, where the service owner can create ' +
+                    'and verify accounts at will — it proves the enclave, not the person. Use this deployment ' +
+                    'for evaluation only; demand <code>paypal_environment="production"</code> before trusting ' +
+                    'an identity.');
+            }
+            // v164: a fully green audit unlocks the report download — the
+            // saved JSON is what the user audits offline in ANY external
+            // auditor copy; this page is only a convenience.
+            try { document.getElementById('reportDownloadBtn').style.display = 'block'; } catch (e) { /* stub-safe */ }
+            return sandboxDeployment ? 'sandbox' : true;
+        } catch (e) { 
+            console.error(e); 
+            alert("Audit Failed: " + e.message);
+            return false; 
+        }
+    }
+
+    // v164: download the DECRYPTED report currently under audit. Triggered by
+    // the unlocked results button or the post-login handoff (?afterlogin=1).
+    // The file is the user's portable evidence — auditable offline in any
+    // external auditor copy. The filename's flow tag is sanitized (report
+    // content is untrusted until the audit above has passed).
+    function downloadReportFile() {
+        let env = null;
+        try {
+            const ta = document.getElementById('attestationInput');
+            env = JSON.parse((ta && ta.value) ? ta.value : 'null');
+        } catch (e) { env = null; }
+        if (!env || !env.attestation_report) {
+            alert('No decrypted report to download yet — complete the login (Step 1/3) or paste a report (Step 4) first.');
+            return false;
+        }
+        let flowTag = 'report';
+        try {
+            flowTag = String(env.flow || sessionStorage.getItem('pav_e2ee_flow') || 'report')
+                .replace(/[^a-z0-9_-]/gi, '').slice(0, 24) || 'report';
+        } catch (e) { /* no sessionStorage (harness) — keep default */ }
+        const blob = new Blob([JSON.stringify(env, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'attestation-report-' + flowTag + '-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 5000);
+        return true;
+    }
+</script>
+
 </body>
 </html>

@@ -15,6 +15,10 @@
 //   * `NvVars` is EXCLUDED by design — the firmware rewrites it on every boot
 //     (the same reason verify.html's provenance row never looks it up), so the
 //     deployed image's copy can never match a post-boot manifest.
+//   * `boot-probe.log` is EXCLUDED by design — the enclave appends to it at
+//     runtime (`/boot/efi/boot-probe.log`, src/main.rs) after measurement, so
+//     a cold-built image never contains it while every post-boot manifest
+//     does. It is an output transcript, never a measured input.
 //   * Exit code 0 = exact parity (every compared entry SAME). Any DIFF or
 //     MISSING entry exits 1.
 import { execFileSync } from 'node:child_process';
@@ -80,15 +84,19 @@ const mtype = (path) => execFileSync('mtype', [`x:/${path}`], {
 const sha256Hex = (b) => createHash('sha256').update(b).digest('hex');
 
 // ---- 3. compare every manifest entry -------------------------------------
-// NvVars: firmware-rewritten every boot — can never match an image copy.
-const SKIP = new Set(['NvVars']);
+// Uncomparable-by-design entries → why. NvVars: firmware-rewritten every
+// boot. boot-probe.log: written by the enclave at runtime, post-measurement.
+const SKIP = new Map([
+  ['NvVars', 'firmware rewrites it every boot'],
+  ['boot-probe.log', 'enclave-written at runtime, post-measurement'],
+]);
 let diff = 0, same = 0, excluded = 0;
 console.log(`report      : ${reportSrc}`);
 console.log(`disk image  : ${diskPath} (ESP @ LBA ${firstLba}..${lastLba})`);
 for (const [path, expected] of Object.entries(manifest).sort()) {
   if (SKIP.has(path)) {
     excluded++;
-    console.log(`EXCLUDED ${path} — firmware rewrites it every boot (uncomparable by design)`);
+    console.log(`EXCLUDED ${path} — ${SKIP.get(path)} (uncomparable by design)`);
     continue;
   }
   let actual;

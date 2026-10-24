@@ -96,11 +96,11 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 161,473 bytes | `d9a91a16985e1df30a5849df22d289aa1fbab39b4e96dc451c79b6b270522091` |
+| `verify.html` | 163,150 bytes | `14a54222d693988a638e252ce18d6abaf4950d31add2d2ae415334e2fae845c2` |
 
 ```bash
 sha256sum verify.html
-# 51320e28ce134600ea7a10c6dd15472a4f7656ddacbc48fbc36dd04a6f01517b  verify.html
+# 14a54222d693988a638e252ce18d6abaf4950d31add2d2ae415334e2fae845c2  verify.html
 ```
 
 - Rotate this hash in the **same reviewed commit** that changes `verify.html`;
@@ -157,4 +157,5 @@ sha256sum verify.html
 ✅ Enclave Identity Signature   — Report signature verified.
 ✅ PayPal Identity Binding      — Identity cryptographically hashed and environment-pinned (production).
 ✅ GitHub Build Provenance      — Binary + disk attested; silicon pins decide code identity.
+✅ TLS Certificate Binding      — TLS channel bound.
 ```

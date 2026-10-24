@@ -84,6 +84,19 @@ Based on the architecture of **Intel TDX on Alibaba Cloud** (as specified in Ali
 
 ---
 
+#### Status — v185.1 deploy + gates (2026-10-24/25, user directive: TLS binding restored)
+
+| Item | Status | Evidence / rationale |
+| :--- | :--- | :--- |
+| **TLS Certificate Binding RESTORED** (user directive, overriding audit3 §5's "vestigial" adoption in v185) | ✅ The audit card regains the optional PEM textarea + file input; `runAudit()` leaf-compares the pasted cert against `report.session_context.tls_certificate_pem` (equal → green "TLS channel bound.", unequal → red); with no certificate the row renders the explicit amber "cross-check not requested" state — informational, never gates. README sample output + digest rotated the **same commit**: 163,150 B, `14a54222d693988a638e252ce18d6abaf4950d31add2d2ae415334e2fae845c2`. | verify.html v185.1 · harness offline **196/0** |
+| **index.html mirrors verify.html** | ✅ Byte-identical copy (`cmp` clean, 163,150 B) so the GitHub Pages root serves the auditor directly. | this cycle |
+| **v185d build + prod swap** | ✅ disk sha256 `75ef77dc…` / md5 `a87f73f58b78f805ec2bc0fa47480dc6` → HK `disk185d.raw` → relay185e green (s1→s4 markers + `relay-ok185e.txt`, readback md5 match) → Beijing intranet `paypal-auth-vm/disk185d.raw` → `ImportImage` (flat `.Format=raw`) → image **`m-2ze5hs6tgv7pwfzcuryu`** + `Features.NvmeSupport=supported` → prod `Stop ForceStop` → `ReplaceSystemDisk --SystemDisk.Size 1` (`d-2zef7xhigzn43mn4l15n`, 1 GiB `cloud_auto`) → Start. binary `01c74f89…` + initramfs `ce27d413…` unchanged → **no pin rotation** (live RTMR0/1/2 identical to pinned values). | HANDOVER §0.10 |
+| **ZeroSSL route incident (ACME dark ≈18:45–19:49 UTC)** | ⚠️ Route-dependent `acme.zerossl.com` trouble — black-holed from the operator host, undecodable poll bodies from Beijing, HTTP 200 from a third network — NOT the enclave or its config. The retry ladder (15 s → 300 s) recovered it without intervention: cert reissued by `ZeroSSL RSA DV SSL CA 2` (valid → 2027-01-22), HTTPS 200 at 19:49:58 UTC. The designed no-EAB Let's Encrypt fallback was deliberately not triggered (no config change). | serial-console capture (`GetInstanceConsoleOutput`) + openssl s_client issuer/dates |
+| **Tooling** | ✅ `check-manifest-parity.mjs` SKIP gains **`boot-probe.log`** (enclave-written to `/boot/efi` at runtime, post-measurement — a cold-built image can never contain it while every post-boot manifest does; same class as `NvVars`) → first parity run against a live post-boot envelope now reports **PARITY OK** (6 SAME, 2 excluded, 0 mismatched). Local cargo gate documented: `PKG_CONFIG_PATH=/nix/store/7l09089ahshxjx4js3zswqk6azhx6ccq-openssl-3.6.5-dev/lib/pkgconfig cargo test`. | scripts/check-manifest-parity.mjs · /tmp/cargo-debug2.log |
+| **v185.1 gates** | ✅ offline **196/0** · live-envelope **204/0** · cargo **20/0** · PARITY OK · served == README == `14a54222…` (https + http/IP) · **live sandbox e2e PASS ×2** (verified 19:56:43 + full 19:57:31 UTC: login → consent → callback → claim → green → downloaded). | this cycle · HANDOVER §0.10 |
+
+---
+
 ### Root Flaw in the Current Implementation
 
 In the current repository (`verify.html` and `src/main.rs`):
