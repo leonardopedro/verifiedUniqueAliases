@@ -548,3 +548,15 @@ session → red), claim fail-closed, and the trained UX ("if any step
 fails, nothing is saved"). Distinct from RR-4 (attacker-minted session
 for THEIR browser); this is the owner-as-endpoint variant. Not fixable
 with justification — recorded here rather than in code.
+
+  **RR-6 scope-limit live probe (2026-10-24, `/tmp/rr6-scope-probe.mjs`)**:
+  the provider-side limit is CONFIRMED — authorize with the audited
+  **verified** app + PII scopes (`openid profile email address …`)
+  answers a bare `200 "Sorry about that"` error page **before any login**
+  (no consent form), while all three controls (verified+minimal,
+  full+PII, full+minimal) redirect normally to the login form. So for the
+  DEFAULT (verified) button, RR-6's identity exposure is provider-limited
+  to the minimal-scope identity (no email/profile/address is obtainable
+  with the audited app); PII exposure under RR-6 exists only through the
+  explicit "Share full profile" button, whose app carries those scopes by
+  design — that is exactly what the user consents to there.
