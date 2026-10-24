@@ -57,6 +57,20 @@ Based on the architecture of **Intel TDX on Alibaba Cloud** (as specified in Ali
 
 ---
 
+#### Status — v184 UI simplification (2026-10-24, user directives: no pre-flight surface, minimal UI)
+
+| Item | Status | Evidence / rationale |
+| :--- | :--- | :--- |
+| **Pre-flight surface REMOVED** | ✅ The user's directive: *the completed PayPal (verified-scope) login IS the pre-flight check* — it uses PayPal itself as the attacker filter, so a separate pre-login hardware-check surface only adds a free resource-exhaustion vector. The audit2.md "Step 3 — Verify WITHOUT login" card (fetch silicon cert / audit chain buttons) and the green "Most visitors" explainer card are deleted; the login card's label now states this explicitly ("the login IS the pre-flight check"). The engine functions (`preflightBindingHex`, P_enc pin, dual-slot enforcement, PKCE) are untouched — only the surface is gone; a pre-v184 saved report with a pinned P_enc still audits fail-closed against a swapped enclave. | harness 196/0 (incl. Test 30a–30d session-binding suite, Test 32 PKCE, P_enc-pin violation path) |
+| **UI collapsed to the minimum** | ✅ 4 input cards + help card → **2 input cards** (login / audit) + results table; buttons 8 → 5 (3 of them hidden by default); `tpmCheck` row deleted (no TPM evidence exists on this platform — an informational row that never gates is noise); the "Need help?" card and the "Seeing No valid Silicon Root of Trust?" card are folded into one fail-closed sentence in the audit card. Prose kept: throwaway-key model, owner+provider collusion threat, enclave-never-redirects, file:// strongest setup, fail-closed reading of rows. | verify.html v184; harness pins row removal (tpmCheck absent) |
+| **Webservice URL prefilled** | ✅ `localEnclaveHost` is pre-filled synchronously at script start: an enclave-served copy gets `location.origin`; a file:// or GitHub Pages copy defaults to the production `https://login.airma.de`. Field stays fully editable; e2e `page.fill` overrides cleanly. | harness (stub DOM prefill path), e2e-login-download.mjs L63 fill |
+| **Login-link contrast fixed** | ✅ Anchors had NO explicit style → browser default link blue/purple was near-invisible on the dark background (user report: the enclave-signed "Continue to PayPal →" link was indistinguishable from the page). Global `a { color:#58a6ff; underline; 600 }` + hover. | verify.html CSS v184 |
+| **Claim-button lifecycle** | ✅ `claimBtn` hidden by default (minimal UI), surfaced when a client session/key exists (login success + reload with stored `pav_local_session`), hidden again while claiming. | harness 196/0 |
+| **audit2.md Gate 1/Gate 3 corrections** | ✅ Confirmed already-implemented in the shipped engine — audit2.md's *plan draft* had those defects (Gate 1: bare PCK hash, no signature walk; Gate 3: `activeSession`-gated slot skip = the R2-1 wildcard). Shipped verify.html verifies the ECDSA quote signature over `header||body`, the QE `report_data` commitment, the QE-report signature under the PCK leaf, and the chain link-by-link to the pinned Intel root (`44a0196b…`); both report_data slots are enforced unconditionally, paste mode reconstructs slot 2 from `session_context`, missing fields fail closed. | verify.html L2205–2254; harness Test 2/3/30a–30d; audit.md §6.2 R2-1 |
+| **Offline gates** | ✅ `node scripts/test-verify-security.mjs` → **196/0** (README digest+size rotated same commit: `verify.html` 162,478 bytes, `8606cd10…`). | this cycle |
+
+---
+
 ### Root Flaw in the Current Implementation
 
 In the current repository (`verify.html` and `src/main.rs`):

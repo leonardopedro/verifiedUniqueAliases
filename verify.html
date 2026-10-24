@@ -119,6 +119,13 @@
         button:hover { filter: brightness(1.2); }
         button:active { transform: scale(0.98); }
 
+        /* v184 (user report): anchors had NO explicit style in this page, so the
+           enclave-signed “Continue to PayPal” link (and every other link) fell
+           back to the browser default link blue/purple — practically invisible
+           on the dark background. Make every anchor bright, underlined, legible. */
+        a { color: #58a6ff; text-decoration: underline; font-weight: 600; }
+        a:hover { color: #90caf9; }
+
         .results {
             margin-top: 40px;
             display: none;
@@ -202,17 +209,10 @@
         <p class="subtitle">Prove the machine handling your PayPal login is genuine confidential-computing hardware — then log in.</p>
     </header>
 
-    <div class="grid">
-        <div class="input-card" style="grid-column: span 2; border-color: #4caf50; background: rgba(76, 175, 80, 0.05);">
-            <label style="color: #4caf50;">⭐ Most visitors only need this: click “Log in with PayPal” in Step 1</label>
-            <p style="color: var(--text-dim); font-size: 0.95rem; margin: 0;">There is deliberately <b>no pre-login check</b>: asking the enclave for a hardware proof before you log in would let anyone exhaust its resources, and the completed PayPal login is itself the attacker filter. After PayPal verifies you, the enclave's live hardware proof (an Intel TDX quote) comes back bound to your login, this page audits it in your browser, and only then is your report decrypted and saved. If any check fails, nothing is downloaded.</p>
-        </div>
-    </div>
-
     <div class="grid" style="margin-top: -10px;">
         <div class="input-card" style="grid-column: span 2; border-color: #4caf50;">
-            <label>Step 1 — Log in with PayPal (recommended)</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem;">Your browser generates a throwaway encryption key that never leaves this page. Your PayPal identity comes back encrypted to that key — neither the site owner (who holds the PayPal client secret and can issue TLS certificates for this domain) nor the cloud provider (who sees all traffic leaving the machine) can read it. After PayPal verifies you, the enclave mints the hardware proof (an Intel TDX quote) bound to <i>this</i> login and your session, this page audits it, and only then does the report decrypt here. <b>This page</b> builds the PayPal link; the enclave never redirects you.</p>
+            <label>Log in with PayPal — the login IS the pre-flight check</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">There is deliberately <b>no separate pre-login hardware check</b>: it would let anyone exhaust the enclave's resources, and a completed PayPal login is itself the attacker filter. Your browser generates a throwaway encryption key that never leaves this page. Your PayPal identity comes back encrypted to that key — neither the site owner (who holds the PayPal client secret and can issue TLS certificates for this domain) nor the cloud provider (who sees all traffic leaving the machine) can read it. After PayPal verifies you, the enclave mints the hardware proof (an Intel TDX quote) bound to <i>this</i> login and your session, this page audits it, and only a fully green audit decrypts here. <b>This page</b> builds the PayPal link; the enclave never redirects you.</p>
             <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                 <button onclick="executePreflightAndLogin('verified')" style="background:#4caf50;">🔒 Log in with PayPal (Verified account only)</button>
                 <button onclick="executePreflightAndLogin('full')">🔒 Log in with PayPal (Share full profile)</button>
@@ -227,13 +227,13 @@
 
     <div class="grid" style="margin-top: -10px;">
         <div class="input-card" style="grid-column: span 2;">
-            <label>Step 2 — Advanced: run this page from your own copy (strongest)</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem;">A server owner with a TLS certificate for this domain can inject script into any page it serves — including this one. To remove that trust entirely: save this page from the project's GitHub (<code>verify.html</code>), open the saved file locally (<code>file://</code>), and use the enclave address field + the two buttons below in order. Your keys are then created on <i>your</i> machine and the encrypted report is fetched over your own channel — anything injected on the enclave's origin only ever sees ciphertext.</p>
+            <label>Strongest: run this page from your own copy (file://)</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">A server owner with a TLS certificate for this domain can inject script into any page it serves — including this one. Save this page from the project's GitHub (<code>verify.html</code>), open it locally (<code>file://</code>), and use the enclave address (prefilled, editable) with the two buttons below in order. Your keys are then created on <i>your</i> machine and the encrypted report is fetched over your own channel — anything injected on the enclave's origin only ever sees ciphertext.</p>
             <input type="text" id="localEnclaveHost" placeholder="https://login.airma.de"
                 style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
             <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px;">
                 <button onclick="localPreflight()" style="background:#4caf50;">🔐 1. Start Secure Login</button>
-                <button onclick="localClaim()">🔓 2. Claim Encrypted Report</button>
+                <button id="claimBtn" onclick="localClaim()" style="display:none;">🔓 2. Claim Encrypted Report</button>
             </div>
             <a id="localPaypalUrl" style="display:none; margin-top:10px;" class="btn" target="_blank" rel="noopener">Continue to PayPal →</a>
             <p id="localLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
@@ -242,8 +242,8 @@
 
     <div class="grid" style="margin-top: -10px;">
         <div class="input-card" style="grid-column: span 2;">
-            <label>Step 3 — Manual audit: verify a report you already have</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem;">Have a saved report JSON (💾 offered on the login success page, or the Download button that appears after any passing audit)? Upload or paste it below to audit it offline — the saved file works with <b>any</b> copy of the auditor, including the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color: #64b5f6;">GitHub Pages copy</a> or your own saved <code>verify.html</code>. The optional certificate field additionally binds a saved TLS certificate to the report.</p>
+            <label>Audit a report you already have</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">A saved report JSON (💾 offered on the login success page, or the Download button after a passing audit) audits offline in <b>any</b> copy of this auditor, including the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a> or your own saved <code>verify.html</code>. The optional certificate field additionally binds a saved TLS certificate to the report. The audit is fail-closed: any red row — including “No valid Silicon Root of Trust” — means the evidence in the report did not verify; a common benign cause is a stale auditor page, so always take the latest <code>verify.html</code> from the project's GitHub. Only trust a report that passes every check.</p>
             <label style="margin-top: 8px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Attestation JSON report</label>
             <div style="margin-bottom: 15px;">
                 <input type="file" id="reportFile" accept=".json" class="file-input">
@@ -255,13 +255,6 @@
             </div>
             <textarea id="certInput" placeholder="Paste .pem or use file upload above..."></textarea>
             <button onclick="runAudit()" style="margin-top: 15px;">Perform Cryptographic Audit</button>
-        </div>
-    </div>
-
-    <div class="grid" style="margin-top: -10px;">
-        <div class="input-card" style="grid-column: span 2;">
-            <label>Seeing “No valid Silicon Root of Trust”?</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem; margin: 0;">The audit is fail-closed: that alert means the hardware evidence in the report did not verify. The two common benign causes are (1) <b>this auditor page is out of date</b> — always take the latest <code>verify.html</code> from the project's GitHub rather than a cached copy — and (2) the report came from an older enclave build. Only trust a report that passes every check here.</p>
         </div>
     </div>
 
@@ -289,14 +282,6 @@
                 <div class="check-text">
                     <h4>PayPal Identity Binding</h4>
                     <p id="identityDesc">Proves the user profile matches the signed evidence.</p>
-                </div>
-            </div>
-
-            <div id="tpmCheck" class="check-item">
-                <div class="check-icon">🏗️</div>
-                <div class="check-text">
-                    <h4>TPM Hardware Proof</h4>
-                    <p id="tpmDesc">Proves the session is anchored to Google's physical vTPM.</p>
                 </div>
             </div>
 
@@ -328,6 +313,21 @@
 </div>
 
 <script>
+    // v184 (user request): pre-fill the enclave address so the flow works with
+    // zero typing (the field stays fully editable). A copy served over http(s)
+    // — i.e. by the enclave itself — gets its own origin; a trusted local
+    // (file://) or GitHub Pages copy defaults to the production enclave. Runs
+    // synchronously at script start, before any DOMContentLoaded auto-login.
+    (function () {
+        try {
+            var hi = document.getElementById('localEnclaveHost');
+            if (hi && !hi.value) {
+                var fromOrigin = (typeof location !== 'undefined' && (location.protocol === 'https:' || location.protocol === 'http:') && location.origin && location.origin !== 'null') ? location.origin : '';
+                hi.value = fromOrigin || 'https://login.airma.de';
+            }
+        } catch (e) { /* harness without DOM — skip */ }
+    })();
+
     // v169: fail closed (with an actionable message) if the SRI-pinned forge
     // bundle did not load — a missing certificate parser must never degrade
     // into "chain not checked, but green anyway".
@@ -600,7 +600,10 @@
                 link.href = url;
                 link.style.display = 'inline-block';
             }
-            say('✅ Login session ready — no hardware attestation happens until AFTER PayPal verifies you. Click “Continue to PayPal →” above (opens in a NEW tab); after logging in, come back to THIS tab and press “🔓 2. Claim Encrypted Report” in the Step 3 card below — that is where your key lives, so the report decrypts, audits and downloads HERE.');
+            say('✅ Login session ready — no hardware attestation happens until AFTER PayPal verifies you. Click “Continue to PayPal →” above (opens in a NEW tab); after logging in, come back to THIS tab and press “🔓 2. Claim Encrypted Report” below — that is where your key lives, so the report decrypts, audits and downloads HERE.');
+            // v184: surface the claim action once a client session/key exists
+            // (the button is hidden by default to keep the page minimal).
+            try { const cb = document.getElementById('claimBtn'); if (cb) cb.style.display = 'inline-block'; } catch (e) {}
         } catch (e) {
             say('❌ ' + e.message);
         }
@@ -907,6 +910,7 @@
     async function localClaim() {
         const log = document.getElementById('localLoginStatus');
         const say = m => { if (log) log.innerText = m; };
+        try { const cb = document.getElementById('claimBtn'); if (cb) cb.style.display = 'none'; } catch (e) {}
         try {
             // v168 (plan Phase 3.3): decryption only in a TRUSTED auditor context.
             if (!trustedAuditorContext()) {
@@ -1030,6 +1034,10 @@
                 }
             }
         } catch (e) { /* no location (harness) — skip */ }
+        // v184: a stored session means the throwaway key still exists in this
+        // browser's storage — surface the claim action so the flow stays
+        // discoverable after a reload (the button is otherwise hidden).
+        try { if (localStorage.getItem('pav_local_session')) { const cb = document.getElementById('claimBtn'); if (cb) cb.style.display = 'inline-block'; } } catch (e) {}
         if (location.hash === '#login-verified') executePreflightAndLogin('verified');
         if (location.hash === '#login-full') executePreflightAndLogin('full');
     });
@@ -1668,7 +1676,7 @@
             // deterministically, before any other verdict.
             lastAuditedPubKeyPem = pubKeyPem;
             if (preFlightPubKeyPem && pubKeyPem !== preFlightPubKeyPem) {
-                throw new Error("PRE-FLIGHT VIOLATION: this report's enclave key does NOT match the P_enc pinned by the pre-flight check — the enclave was swapped between pre-flight and login. Restart from the pre-flight step.");
+                throw new Error("PRE-FLIGHT VIOLATION: this report's enclave key does NOT match the P_enc pinned when this login session started — the enclave was swapped mid-login. Close this tab, reload the page and log in again from the beginning.");
             }
             const pubKeyHash = await crypto.subtle.digest('SHA-256', pubKeyBuffer);
 
@@ -1765,12 +1773,10 @@
             if (!sigOk) throw new Error("CRITICAL: the enclave signature over this report is INVALID — the report content is unauthenticated (tampered or fabricated). Failing closed.");
 
             // 3. TPM Hardware Audit — REMOVED (v180, audit.md §5.1): the GCP
-            // vTPM verification path (AK quote signature, session nonce, PCR
-            // digest, golden-PCR pins) and the Google AK root are deleted
-            // together with the AMD SEV-SNP path. This platform (Alibaba Cloud
-            // ECS Intel TDX) has no vTPM; the row states that plainly and
-            // hardware trust is decided by the Silicon Root row below.
-            updateStatus('tpmCheck', true, "No TPM evidence in report — expected on Intel TDX (no vTPM on this platform). Hardware trust is decided by the Silicon Root row below.");
+            // vTPM path (quote signature, session nonce, PCR digests, golden
+            // pins) and the Google AK root were deleted with the AMD SEV-SNP
+            // path; v184 also removed the now-empty row itself — hardware
+            // trust is decided by the Silicon Root row below.
 
 
             // v168 (plan Phase 1.2): the self-reported binary digest does NOT

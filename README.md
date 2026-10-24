@@ -96,7 +96,7 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 162,081 bytes | `51320e28ce134600ea7a10c6dd15472a4f7656ddacbc48fbc36dd04a6f01517b` |
+| `verify.html` | 162,478 bytes | `8606cd10db9687687736d91cc2d9f7ce88d806fe7ffbfd957981d316460c3b95` |
 
 ```bash
 sha256sum verify.html

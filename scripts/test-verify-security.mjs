@@ -451,7 +451,7 @@ let v4Envelope;
   check('chain pinned (leaf → Intel root)', /leaf → Intel SGX Root CA pinned/.test(fw), fw.slice(0, 900));
   check('MRTD read at mr_td @136 equals pinned EXPECTED_MRTD', fw.includes(EXPECTED_MRTD.slice(0, 32)) && !fw.includes('22'.repeat(16)), fw.match(/MRTD: [0-9a-f]+…/)?.[0]);
   check('session binding stated', fw.includes("report_data[0..32] == this session's combined nonce"));
-  check('tpmCheck green (TPM-less platform)', row('tpmCheck').cls === 'check-item verified', row('tpmCheck').cls);
+  check('tpmCheck row removed (v184 — no TPM evidence exists on this platform; blank rows are not evidence)', row('tpmCheck').cls === '', 'cls=' + row('tpmCheck').cls);
   check('githubCheck green (attested provenance)', row('githubCheck').cls === 'check-item verified', row('githubCheck').cls);
   check('enclaveCheck green', row('enclaveCheck').cls === 'check-item verified', row('enclaveCheck').cls);
 }
@@ -913,9 +913,7 @@ console.log('\nTest 20: fully self-consistent GCP report → REJECTED (cross-clo
     /REJECTED: Report contains no hardware-signed Intel TDX Quote/.test(alert || ''), alert);
   check('silicon row states the Intel-only policy',
     fwDesc().includes('No Intel TDX evidence in report'), fwDesc().slice(0, 200));
-  check('tpmCheck row states no-vTPM expectation (TPM path removed)',
-    row('tpmCheck').cls !== 'check-item failed' && /no vTPM on this platform/.test(row('tpmCheck').desc),
-    row('tpmCheck').cls + ' — ' + row('tpmCheck').desc.slice(0, 120));
+  check('tpmCheck row absent (v184 — TPM row removed entirely)', row('tpmCheck').cls === '', 'cls=' + row('tpmCheck').cls);
 }
 
 console.log('\nTest 21: nonce formula parity (SEC-02 reference vector)');
@@ -1449,7 +1447,7 @@ if (process.env.REAL_REPORT) {
     check('live RTMR hard pins all four enforced', /RTMR0–3 hard pins/.test(fw), fw.slice(fw.indexOf('RTMR0–3'), fw.indexOf('RTMR0–3') + 260));
     check('live provenance row green', row('githubCheck').cls === 'check-item verified',
       row('githubCheck').cls + ' — ' + row('githubCheck').desc.slice(0, 300));
-    check('live tpmCheck green (TPM-less TDX)', row('tpmCheck').cls === 'check-item verified', row('tpmCheck').cls);
+    check('live tpmCheck row absent (v184 — TPM row removed entirely)', row('tpmCheck').cls === '', row('tpmCheck').cls);
   }
 }
 

@@ -161,6 +161,37 @@ Replace → UserData → Start. Marker files must be renamed per run
 the operator host now 403s (endpoint/CNAME rule) — **serial console is the
 ground truth**, as §0.6 says.
 
+### 0.8 v184 cycle — UI simplification (user directives, 2026-10-24)
+
+Status table: `plan.md` ("Status — v184 UI simplification").
+
+User directives: (1) **no pre-flight surface** — the verified-scope PayPal
+login itself is the attacker filter; a pre-login hardware-check button only
+adds a free VM-resource-exhaustion vector; (2) **verify.html minimal** —
+fewest buttons/sections without losing functionality or pedagogy; (3) the
+webservice URL field **prefilled** (still editable); (4) the enclave-signed
+"Continue to PayPal" link was **invisible** (unstyled anchors → browser
+default blue on the dark theme) — fixed with a global anchor style.
+
+What changed in `verify.html` (UI only — engine untouched):
+
+- Deleted: green "Most visitors" explainer card, the "Verify WITHOUT login"
+card (fetch-silicon-cert / audit-chain buttons — pre-flight surface), the
+"Need help?" card, the "Seeing No valid Silicon Root of Trust?" card (folded
+into one fail-closed sentence), and the `tpmCheck` row (no TPM evidence
+exists on this TDX platform; informational-only rows are noise).
+- Cards 4 → 2 (login / audit); buttons 8 → 5 (claim hidden until a session
+  key exists). Labels de-jargonized; "the login IS the pre-flight check".
+- `localEnclaveHost` prefilled synchronously at script start (enclave-served
+copy → `location.origin`; file:// → production `https://login.airma.de`).
+- `claimBtn` lifecycle: hidden → shown on login success / stored session →
+  hidden while claiming.
+- Harness: tpmCheck assertions flipped to pin the row's *absence*; all other
+  security assertions untouched → **196/0**.
+
+Gate: offline harness 196/0; README digest rotated (`verify.html` 162,478 B,
+`8606cd10db9687687736d91cc2d9f7ce88d806fe7ffbfd957981d316460c3b95`).
+
 ---
 
 ## 1. Mission & threat model
