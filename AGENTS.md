@@ -4,7 +4,7 @@
 
 | Branch | Status | Contents |
 |---|---|---|
-| **`alibabacloud`** (default branch) | ✅ Active line of work | Alibaba Cloud / **aliyun CLI** stack: `Dockerfile.alibaba`, `build-alibaba-docker.sh` (the build; wraps `build-alibaba-image.sh` + `build-initramfs-tools.sh`), `deploy-alibaba.sh`, `import-alibaba-image.sh`, `build-scripts/create-alien-deb.sh`. **Legacy (do not use for deploys)**: `build-alibaba.sh` and `build-alibaba-disk.sh` are retired hard-fail stubs (v184 — they produced non-bootable artifacts); `build-alibaba-simple.sh` is an unused legacy ext4 builder of the same wrong class |
+| **`alibabacloud`** (default branch) | ✅ Active line of work | Alibaba Cloud / **aliyun CLI** stack: `Dockerfile.alibaba`, `build-alibaba-docker.sh` (the build; wraps `build-alibaba-image.sh` + `build-initramfs-tools.sh`), `deploy-alibaba.sh`, `import-alibaba-image.sh`, `build-scripts/create-alien-deb.sh`. **Legacy (do not use for deploys)**: `build-alibaba.sh`, `build-alibaba-disk.sh` and `build-alibaba-simple.sh` are retired hard-fail stubs (v184/v185 — they produced non-bootable/unused artifacts) |
 | `oraclecloud` | 🧊 Archive — do not develop here | Former `main`: Oracle OCI stack (`Dockerfile.oci`, `build-oci-*.sh`, `deploy-oci.sh`, `import-oci-image.sh`), the v161–v162 security hardenings, and the `oasis/` Sapphire + SEV-SNP sub-project |
 | `origin/main` | 🧊 Archive ref — unchanged on GitHub | `oraclecloud` content minus the final `capture-golden-pcrs.mjs` commit |
 
