@@ -1,45 +1,23 @@
 #!/bin/bash
-# ==============================================================================
-# build-alibaba.sh - Full build pipeline for Alibaba Cloud Confidential VM
+# =============================================================================
+# build-alibaba.sh — RETIRED (v184), fail-fast stub.
 #
-# This script:
-#   1. Builds the Rust binary with --features alibabacloud
-#   2. Packages it into a format ready for disk image creation
+# This wrapper used to: (1) cargo build WITHOUT the `alibabacloud` feature
+# flag the deployment image needs, then (2) chain into the retired
+# build-alibaba-disk.sh, which produced output-alibaba/disk-alibaba.tar.gz —
+# a plain ext4 image with no GPT/ESP/UKI measured-boot chain that cannot
+# boot the enclave.
 #
-# Usage: bash build-alibaba.sh
-# ==============================================================================
-set -eo pipefail
-
-echo "============================================================"
-echo "🏗️  Building PayPal Auth VM for Alibaba Cloud (Intel TDX)"
-echo "============================================================"
-
-echo "⏳ [1/2] Compiling Rust binary (Intel TDX — unconditional)..."
-
-cargo build --release --target x86_64-unknown-linux-gnu
-
-BINARY="target/x86_64-unknown-linux-gnu/release/paypal-auth-vm"
-
-if [[ ! -f "$BINARY" ]]; then
-    echo "❌ Build failed - binary not found"
-    exit 1
-fi
-
-BINARY_SHA=$(sha256sum "$BINARY" | cut -d' ' -f1)
-
-echo "✅ Binary built: $BINARY"
-echo "   Size: $(du -h "$BINARY" | cut -f1)"
-echo "   SHA256: $BINARY_SHA"
-echo ""
-echo "⏳ [2/2] Creating disk image for Alibaba Cloud..."
-
-bash "$(dirname "$0")/build-alibaba-disk.sh" "$BINARY"
-
-echo ""
-echo "============================================================"
-echo "🎉 Alibaba Cloud build complete!"
-echo "============================================================"
-echo "   Binary  : $BINARY"
-echo "   Disk    : output-alibaba/disk-alibaba.tar.gz"
-echo "   Deploy  : bash deploy-alibaba.sh"
-echo "============================================================"
+# The real build is the multi-stage Docker synthesis (snapshot-pinned Debian
+# Trixie, correct feature flag, measured ESP disk):
+#
+#     bash build-alibaba-docker.sh
+#
+# which produces output-alibaba/disk-alibaba.raw — the artifact
+# import-alibaba-image.sh uploads and check-manifest-parity.mjs verifies.
+# =============================================================================
+echo "❌ build-alibaba.sh is retired — it built the wrong artifact (no measured boot chain)." >&2
+echo "   Use the real reproducible builder instead:" >&2
+echo "       bash build-alibaba-docker.sh" >&2
+echo "   (produces output-alibaba/disk-alibaba.raw — the image import-alibaba-image.sh uploads)" >&2
+exit 1
