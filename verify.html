@@ -213,6 +213,7 @@
         <div class="input-card" style="grid-column: span 2; border-color: #4caf50;">
             <label>Log in with PayPal — the login IS the pre-flight check</label>
             <p style="color: var(--text-dim); font-size: 0.9rem;">There is deliberately <b>no separate pre-login hardware check</b>: it would let anyone exhaust the enclave's resources, and a completed PayPal login is itself the attacker filter. Your browser generates a throwaway encryption key that never leaves this page. Your PayPal identity comes back encrypted to that key — neither the site owner (who holds the PayPal client secret and can issue TLS certificates for this domain) nor the cloud provider (who sees all traffic leaving the machine) can read it. After PayPal verifies you, the enclave mints the hardware proof (an Intel TDX quote) bound to <i>this</i> login and your session, this page audits it, and only a fully green audit decrypts here. <b>This page</b> builds the PayPal link; the enclave never redirects you.</p>
+            <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow:</b> click a login button → finish PayPal in the new tab → return here and press “Claim Encrypted Report” below when it appears — the audit runs automatically and a fully green one saves the report to your downloads. If any step fails, nothing is saved, so you are safe to close the tab.</p>
             <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                 <button onclick="executePreflightAndLogin('verified')" style="background:#4caf50;">🔒 Log in with PayPal (Verified account only)</button>
                 <button onclick="executePreflightAndLogin('full')">🔒 Log in with PayPal (Share full profile)</button>
@@ -288,7 +289,7 @@
             <div id="firmwareCheck" class="check-item">
                 <div class="check-icon">💎</div>
                 <div class="check-text">
-                    <h4>Silicon Root of Trust (AMD SEV-SNP / Intel TDX)</h4>
+                    <h4>Silicon Root of Trust (Intel TDX)</h4>
                     <p id="firmwareDesc">Proves the platform is genuine confidential-compute silicon (AMD SEV-SNP or Intel TDX) with untampered measurements.</p>
                 </div>
             </div>
@@ -1776,7 +1777,7 @@
             // vTPM path (quote signature, session nonce, PCR digests, golden
             // pins) and the Google AK root were deleted with the AMD SEV-SNP
             // path; v184 also removed the now-empty row itself — hardware
-            // trust is decided by the Silicon Root row below.
+            // trust is decided by the Silicon Root row.
 
 
             // v168 (plan Phase 1.2): the self-reported binary digest does NOT
@@ -1950,8 +1951,8 @@
                 hasPcr15
                     ? (pcr15Ok ? `✅ PCR 15 hardware binding mathematically verified` : `❌ PCR 15 Software Mismatch`)
                     : (hw.tdx_quote_b64
-                        ? `ℹ️ PCR 15 not applicable (no TPM) — but a hardware-signed TDX quote IS present: report_data binds THIS session (verified in the Silicon Root row below). Disk/boot-chain integrity rests on the CI attestation lines above; code identity on the MRTD/RTMR silicon pins (the self-reported binary digest is informational only)`
-                        : `ℹ️ PCR 15 not applicable (no TPM in this report) — hardware trust is decided by the Silicon Root row below`)
+                        ? `ℹ️ PCR 15 not applicable (no TPM) — but a hardware-signed TDX quote IS present: report_data binds THIS session (verified in the Silicon Root row above). Disk/boot-chain integrity rests on the CI attestation lines above; code identity on the MRTD/RTMR silicon pins (the self-reported binary digest is informational only)`
+                        : `ℹ️ PCR 15 not applicable (no TPM in this report) — hardware trust is decided by the Silicon Root row above`)
             ];
             // NOTE (v169 independent audit): this row is deliberately
             // ADVISORY, never a gate. Every digest it checks is SELF-REPORTED
@@ -2354,6 +2355,11 @@
                 const userLeaf = getLeafCert(certInput);
                 const reportLeaf = getLeafCert(report.session_context.tls_certificate_pem);
                 updateStatus('tlsCheck', userLeaf === reportLeaf, userLeaf === reportLeaf ? "TLS channel bound." : "TLS mismatch!");
+            } else {
+                // v184 (visual review): without the optional certificate the row
+                // must say so explicitly — a bare placeholder with no state reads
+                // like an unfinished or silently-passed check.
+                updateStatus('tlsCheck', 'warning', "ℹ️ Optional channel cross-check not requested — paste your browser's TLS certificate (field above) to bind this report to the live connection. Every other row does not depend on it.");
             }
 
             // v177: SANDBOX deployments pass the INTEGRITY audit (silicon

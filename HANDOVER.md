@@ -189,8 +189,26 @@ copy → `location.origin`; file:// → production `https://login.airma.de`).
 - Harness: tpmCheck assertions flipped to pin the row's *absence*; all other
   security assertions untouched → **196/0**.
 
-Gate: offline harness 196/0; README digest rotated (`verify.html` 162,478 B,
-`8606cd10db9687687736d91cc2d9f7ce88d806fe7ffbfd957981d316460c3b95`).
+Visual-review pass (real Chromium, file:// + full audit with the live claimed
+report): the operational walkthrough + fail-safe line lost with the "Need
+help?" card was restored as its own scannable **Flow:** paragraph in the
+login card; the `tlsCheck` row now renders an explicit amber "optional
+cross-check not requested" state instead of a bare state-less placeholder
+after paste audits; GitHub row's "Silicon Root row below" → "above" (the
+silicon row sits above it); silicon row header lost the removed AMD path →
+"Silicon Root of Trust (Intel TDX)". audit.md §7.1 got a v184 footnote (its
+round-3 note still said `tpmCheck` stays).
+
+Deployed in TWO passes: `4ec52485…` then **`de52934e…`** (final; md5
+`257598d4…`, object `paypal-auth-vm/disk184b.raw`, image
+`m-2ze4c305t483i9b5275c`, NVMe flag set) — binary+initramfs unchanged both
+times → no pin rotation. Relay legs console-verified (`RELAY184-SUCCESS`,
+`RELAY184B-SUCCESS`, md5 round-trips both).
+
+Gates: offline harness **196/0**, live-envelope **204/0**, cargo 20/0,
+served == README (`c40d22e204f5ba91c94a461387d804e3347a50044fdd8260fa3b4264f5bca082`),
+`check-manifest-parity` PARITY OK, **live PayPal sandbox e2e PASS ×2**
+(login → consent → callback → claim → audit green → report downloaded).
 
 ---
 
