@@ -59,6 +59,14 @@ echo "   Bucket  : oss://$ALI_OSS_BUCKET/$OSS_OBJECT"
 echo ""
 
 # Step 1: Upload to OSS (aliyun CLI built-in; no ossutil needed)
+# Relay path (the normal case from outside mainland): OSS data-plane calls
+# are geo-blocked from the operator host AND these buckets refuse the public
+# endpoint entirely, so the bytes are staged with the relay legs instead
+# (presigned PUT -> HK bucket -> relay pull -> Beijing INTRANET PUT, verified
+# ETag==MD5 on both hops). Set SKIP_OSS_UPLOAD=1 to reuse that staging.
+if [[ "${SKIP_OSS_UPLOAD:-0}" == "1" ]]; then
+    echo "⏭️  [1/3] SKIP_OSS_UPLOAD=1 — object already staged at oss://$ALI_OSS_BUCKET/$OSS_OBJECT (relay legs, ETag==MD5 verified)"
+else
 echo "⏳ [1/3] Uploading to OSS..."
 aliyun oss cp "$DISK_FILE" "oss://$ALI_OSS_BUCKET/$OSS_OBJECT" >/dev/null
 echo "✅ Uploaded"
@@ -83,6 +91,7 @@ if [[ -n "$REMOTE_ETAG" && "$REMOTE_ETAG" != *-* && "$REMOTE_ETAG" != "$LOCAL_MD
     exit 1
 fi
 echo "✅ Upload verified (size=$LOCAL_SIZE bytes, etag=${REMOTE_ETAG:-n/a})"
+fi
 
 # Step 2: Import as custom UEFI image
 echo "⏳ [2/3] Starting ImportImage (BootMode=UEFI, format=raw)..."
