@@ -1993,6 +1993,30 @@ console.log('\nTest 36: single workflow button (v187 — one morphing control dr
   }
 }
 
+console.log('\nTest 37: /callback landing page offers a real download, not just copy (v187)');
+{
+  const rustSrc2 = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  check('callback page has the encrypted-report download button',
+    rustSrc2.includes('💾 Download encrypted report (.json)'), 'button label missing');
+  check('download saves the blob as a .json file via Blob + anchor click',
+    rustSrc2.includes("a.download='encrypted-attestation-report.json'")
+      && rustSrc2.includes("new Blob([t.value],{type:'application/json'})"),
+    'download plumbing missing');
+  check('download reads the SAME rendered ciphertext textarea as copy',
+    rustSrc2.includes("getElementById('e2ee-blob-view'); var blob=new Blob"),
+    'download does not read the rendered blob');
+  check('copy button kept (Test 33 pinned fallback)',
+    rustSrc2.includes('📋 Copy encrypted report'), 'copy fallback removed');
+  const cbStart = rustSrc2.indexOf('const CALLBACK_CONTENT');
+  const cbEnd = rustSrc2.indexOf('"#;', cbStart);
+  const cbContent = cbStart >= 0 && cbEnd > cbStart ? rustSrc2.slice(cbStart, cbEnd) : '';
+  check('callback content still carries ONLY the __E2EE_BLOB__ ciphertext (no plaintext field introduced)',
+    !!cbContent && cbContent.includes('__E2EE_BLOB__') && !cbContent.includes('paypal_user_info'),
+    'callback content shape changed');
+  check('heading advertises copy-or-download',
+    rustSrc2.includes('Copy or download your encrypted report'), 'heading not updated');
+}
+
 rmSync(dir, { recursive: true, force: true });;
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

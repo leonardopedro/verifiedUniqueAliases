@@ -1,8 +1,9 @@
 // Browser end-to-end for the login → claim → DOWNLOAD flow (the AGENTS.md
 // debugging playbook's browser step). Runs the REAL secure login from a
 // trusted file:// copy of verify.html against the live enclave, drives the
-// PayPal sandbox consent, presses "2. Claim Encrypted Report", and FAILS
-// unless the attestation report is actually downloaded.
+// PayPal sandbox consent, presses "Claim Encrypted Report" (the v187 single
+// workflow button's claim state), and FAILS unless the attestation report is
+// actually downloaded.
 //
 // Why this exists: the download is the first casualty of any red audit row —
 // a missing file is a SYMPTOM (v178: the identity-preimage gate failed on
@@ -59,9 +60,11 @@ page.on('console', (m) => {
 });
 
 try {
-  await page.goto(VERIFY, { waitUntil: 'domcontentloaded' });
+  // v187: for the full round, land WITH the hash so the DOMContentLoaded
+  // auto-login starts it (a later hash-only goto would not re-fire load).
+  await page.goto(VERIFY + (FLOW === 'full' ? '#login-full' : ''), { waitUntil: 'domcontentloaded' });
   await page.fill('#localEnclaveHost', 'https://login.airma.de');
-  log('1. loaded', VERIFY, '(trusted copy)');
+  log('1. loaded', VERIFY, '(trusted copy)', FLOW === 'full' ? '#login-full' : '');
 
   // Step 1 — login session (v180: NO pre-login attestation — S_enc-signed
   // fields only; the hardware audit runs on the post-login report) + client
@@ -70,7 +73,12 @@ try {
   // NOT window.open() — an async-time popup is blocked by every browser. The
   // button requests the login session and reveals the link; clicking the link
   // (target=_blank) is a real user gesture, so the new tab is never blocked.
-  await page.click(`button:has-text("Log in with PayPal (${FLOW === 'full' ? 'Share full profile' : 'Verified account only'})")`);
+  // v187 (single workflow button): only ONE login button is visible at a
+  // time — the verified button on a fresh page; `#login-full` (used above)
+  // auto-started the full round, so no click is needed there.
+  if (FLOW !== 'full') {
+    await page.click('button:has-text("Log in with PayPal (Verified account only)")');
+  }
   await page.waitForSelector('#securePaypalUrl', { state: 'visible', timeout: 90000 });
   const [popup] = await Promise.all([
     ctx.waitForEvent('page', { timeout: 30000 }).catch(() => null),
