@@ -58,3 +58,12 @@ node_modules/
 
 # Operator tooling installed locally (ossutil etc. — never vendored)
 build-scripts/bin/
+
+# ZK proving artifacts — intermediate build state (committed: zk/*.wasm,
+# zk/*_vkey.json, and the SPLIT proving key zk/*.zkey.part*; F5: GitHub
+# refuses objects >100 MB, so the assembled 105 MB zkey is regenerated
+# locally with `cat zk/identity_escrow_final.zkey.part* > zk/identity_escrow_final.zkey`)
+zk/build/
+zk/work/
+*.ptau
+zk/identity_escrow_final.zkey

@@ -321,7 +321,7 @@ const PRELOGIN_HASH = sha256(Buffer.from('PRELOGIN_NO_USER', 'utf8')).toString('
     verified_account: userInfo.verified_account, payer_id: userInfo.payer_id ?? null,
   }), 'utf8')).toString('hex');
 
-async function buildEnvelope({ hw, customInfo = 'wallet_test_1', corruptEnclaveSig = false, hwBuilder, binarySha = BINARY_SHA, sessionContext = {}, reportExtras = null }) {
+async function buildEnvelope({ hw, customInfo = 'wallet_test_1', corruptEnclaveSig = false, hwBuilder, binarySha = BINARY_SHA, sessionContext = {}, reportExtras = null, noClientSession = false }) {
   const enc = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const encPem = enc.publicKey.export({ type: 'spki', format: 'pem' }).toString();
   // An explicit value in reportExtras wins (negative tests need to lie).
@@ -354,6 +354,22 @@ async function buildEnvelope({ hw, customInfo = 'wallet_test_1', corruptEnclaveS
   );
   // hwBuilder(nonce, pEncDer): the second arg lets pre-flight fixtures build
   // the v161 client-binding hash over THIS envelope's real P_enc.
+  // F1: model the honest enclave's login shape — when the report carries a
+  // PayPal identity and no client session fields, inject the fixture session
+  // and quote its binding (unless the test opts out with noClientSession).
+  HARNESS_SLOT = '00'.repeat(32);
+  if (report.paypal_user_info && !noClientSession) {
+    const sc = report.session_context || {};
+    if (!sc.client_pub_b64) {
+      report.session_context = Object.assign({}, sc, {
+        client_pub_b64: FIXTURE_CLIENT_PUB_B64,
+        client_nonce_hex: FIXTURE_CLIENT_NONCE_HEX,
+      });
+      HARNESS_SLOT = clientBindingFor(FIXTURE_CLIENT_PUB_B64, FIXTURE_CLIENT_NONCE_HEX);
+    } else {
+      HARNESS_SLOT = clientBindingFor(sc.client_pub_b64, sc.client_nonce_hex || '00'.repeat(32));
+    }
+  }
   if (hwBuilder) report.hardware_level_attestation = await hwBuilder(nonce, pemToDer(encPem));
   const payload = JSON.stringify(reorder(report));
   let sig = rsaSign('sha256', Buffer.from(payload), enc.privateKey);
@@ -381,7 +397,20 @@ function tdxHw({ quoteB64, chain = goodChain, markerOverrides = {}, probeNotes =
     platform_type: 'Intel TDX',
   };
 }
-const reportDataFor = (nonce) => concat(fromHex(nonce), new Uint8Array(32)); // nonce || zeros
+const reportDataFor = (nonce) => concat(fromHex(nonce), fromHex(HARNESS_SLOT));
+// F1 (v182 hardening): the honest enclave ALWAYS binds login reports into
+// BOTH report_data slots (src/main.rs: report_data[32..64] =
+// client_session_binding + echoed session_context fields). buildEnvelope
+// auto-injects that shape for login fixtures below, and sets HARNESS_SLOT so
+// every green hwBuilder built on reportDataFor quotes the matching slot.
+// Non-login fixtures keep [32..64] zero (pre-login/pre-flight shape).
+let HARNESS_SLOT = '00'.repeat(32);
+const FIXTURE_CLIENT_PUB_B64 = Buffer.from('client-pub-der-30').toString('base64');
+const FIXTURE_CLIENT_NONCE_HEX = '7f'.repeat(32);
+// Mirror of verify.html clientSessionBindingHex / src/main.rs
+// client_session_binding: SHA-256(P_client SPKI-DER ∥ Nonce_client).
+const clientBindingFor = (pubB64, nonceHex) =>
+  sha256(Buffer.concat([Buffer.from(pubB64, 'base64'), Buffer.from(nonceHex, 'hex')])).toString('hex');
 
 // ===========================================================================
 console.log('Test 0: extracted script passes node --check');
@@ -1406,14 +1435,17 @@ console.log('\nTest 24: auditor isolation — key generation refused outside fil
   check('secure-login refuses on the enclave origin',
     /UNTRUSTED AUDITOR ORIGIN/.test(el('secureLoginStatus').innerText),
     el('secureLoginStatus').innerText.slice(0, 140));
-  // v186: localPreflight() was deleted from the auditor — it was a dead
-  // duplicate of executePreflightAndLogin (no UI caller ever reached it),
-  // part of the max-simplification pass. The claim path is the second
-  // remaining entry point and must refuse here too (single status element).
-  await localClaim();
-  check('claim refuses on the enclave origin',
-    /UNTRUSTED AUDITOR ORIGIN/.test(el('secureLoginStatus').innerText),
-    el('secureLoginStatus').innerText.slice(0, 140));
+  // v188: localClaim() was deleted together with the claim button — the
+  // render-time key generator (ensureThrowawayKey) is now the second
+  // key-generating entry point besides executePreflightAndLogin and must
+  // refuse here too, with the on-page notice saying so.
+  let keygenRefused = false;
+  try { await ensureThrowawayKey(); } catch (e) { keygenRefused = /UNTRUSTED AUDITOR ORIGIN/.test(e.message); }
+  check('render-time key generation refuses on the enclave origin',
+    keygenRefused, 'ensureThrowawayKey did not refuse on login.airma.de');
+  renderKeyNotice('refused');
+  check('key notice announces the refusal on-page',
+    /NO KEY GENERATED HERE/.test(el('keyNotice').innerText), el('keyNotice').innerText.slice(0, 120));
   setLoc({ protocol: 'file:', host: '', origin: 'null' });
   check('file:// copy is trusted', trustedAuditorContext() === true);
   setLoc({ protocol: 'https:', host: 'leonardopedro.github.io', origin: 'https://leonardopedro.github.io' });
@@ -1500,13 +1532,17 @@ console.log('\nTest 30: v179 client-session binding — report_data[32..64] = SH
     /client-session binding/.test(fwDesc()), fwDesc().slice(0, 400));
 
   // (c) paste audit WITHOUT any local session and WITHOUT reconstructible
-  //     client session fields (legacy/pre-v179 report): the slot cannot be
-  //     verified, so it must FAIL CLOSED — the v179 "informational slot"
-  //     wildcard is gone (audit.md Step 4: no unverified quote slots).
-  //     Under the collusion model an authentic-but-stale report must not
-  //     replay as green through the paste path.
+  //     client session fields (legacy/pre-v179 report): built with
+  //     noClientSession so the report carries NO session_context fields —
+  //     the slot cannot be verified, so it must FAIL CLOSED — the v179
+  //     "informational slot" wildcard is gone (audit.md Step 4: no unverified
+  //     quote slots). Under the collusion model an authentic-but-stale report
+  //     must not replay as green through the paste path.
   globalThis.auditorSessionBindingHex = null;
-  const c = await runAuditWith(theirs.envelope);
+  const theirsNoSC = await buildEnvelope({
+    hwBuilder: greenSlot(otherBinding), reportExtras: loginExtras, noClientSession: true,
+  });
+  const c = await runAuditWith(theirsNoSC.envelope);
   check('30c paste audit without session fields fails closed (no wildcard slot)', c.ok === false,
     `ok=${JSON.stringify(c.ok)}`);
 
@@ -1540,6 +1576,32 @@ console.log('\nTest 30: v179 client-session binding — report_data[32..64] = SH
   check('30d zero-slot (pre-binding) report fails when the session is in hand', d.ok === false,
     `ok=${JSON.stringify(d.ok)}`);
   globalThis.auditorSessionBindingHex = null;
+
+  // (e) THE F1 GAP: a LOGIN report whose quote carries a ZERO [32..64] slot,
+  //     no local session, and no session_context fields. Pre-fix this fell
+  //     through to the NON-LOGIN branch ("session nonce" expected, zeros
+  //     matched) and passed GREEN — an owner-crafted pre-v179-shaped report
+  //     replayed through the paste path. The honest enclave never mints this
+  //     shape (src/main.rs always binds the slot + echoes the fields), so it
+  //     must now be REJECTED (v182: no wildcard slots in EVERY audit mode).
+  const f1 = await buildEnvelope({
+    hwBuilder: greenSlot('00'.repeat(32)), reportExtras: loginExtras, noClientSession: true,
+  });
+  const e = await runAuditWith(f1.envelope);
+  check('30e zero-slot login report fails closed without any session (F1)', e.ok === false,
+    `ok=${JSON.stringify(e.ok)}`);
+  check('30e silicon row names the rejected missing binding',
+    /WITHOUT any client session binding — REJECTED/.test(fwDesc()), fwDesc().slice(0, 400));
+
+  // (e2) over-block guard: the honest PRE-LOGIN envelope (no PayPal identity,
+  //      session_context {}, zero slot) must still pass — F1 must only gate
+  //      LOGIN reports.
+  const prelogin = await buildEnvelope({
+    hwBuilder: greenSlot('00'.repeat(32)),
+  });
+  const e2 = await runAuditWith(prelogin.envelope);
+  check('30e2 pre-login zero-slot envelope still green (F1 gates login only)',
+    e2.ok === true, `ok=${JSON.stringify(e2.ok)} alert=${e2.alert}`);
 }
 
 console.log('\nTest 31: v179 PayPal API trust-root parity — src/paypal.pem ↔ Rust pin ↔ published thumbprint');
@@ -1578,6 +1640,15 @@ console.log('\nTest 28: README publishes the auditor digest (out-of-band integri
   check('published size matches the file',
     !!sizeLine && parseInt(sizeLine[1].replace(/,/g, ''), 10) === verifyBytes.length,
     `readme=${sizeLine && sizeLine[1]} file=${verifyBytes.length}`);
+
+  // R2 finding (F3 — collusion model): without HSTS a colluding network
+  // can keep a victim on plaintext http:// forever after the first HTTPS
+  // visit. Every response passes through with_secure_headers(), so the
+  // header must be pinned here or a refactor can silently drop it.
+  const rustSrc = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  check('src/main.rs serves HSTS (strict-transport-security max-age=31536000) — F3',
+    rustSrc.includes('strict-transport-security') && rustSrc.includes('max-age=31536000'),
+    'HSTS header missing from with_secure_headers');
 }
 
 console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no quote minting (user directive)');
@@ -1658,9 +1729,10 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
       requests.length === 1 && requests[0].endsWith('/attest/login-session'), JSON.stringify(requests));
     check('no pre-login audit ran (report textarea untouched)',
       elements['attestationInput'].value === '', elements['attestationInput'].value.slice(0, 60));
-    const href = elements['securePaypalUrl'].href || '';
-    check('authorize link revealed', elements['securePaypalUrl'].style.display === 'inline-block',
-      JSON.stringify(elements['securePaypalUrl'].style));
+    const href = elements['loginVerifiedLink'].href || '';
+    check('flow link becomes the authorize handoff (v188 two explicit links)',
+      typeof href === 'string' && href.startsWith('https://www.sandbox.paypal.com'),
+      String(href).slice(0, 140));
     check('authorize URL carries the state token', href.includes('&state=teststate-abc'), href.slice(0, 220));
     check('authorize URL carries the required PKCE challenge + S256 method (R3-1)',
       href.includes('&code_challenge=' + PKCE_CHALLENGE) && href.includes('&code_challenge_method=S256'),
@@ -1689,7 +1761,7 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
     // fully-valid signed response for the WRONG app — app pin and PKCE both
     // pass — so the auditor must compare the signed flow against the one THIS
     // tab requested, before any authorize link exists.
-    elements['securePaypalUrl'].style.display = 'none'; // hide the happy-path link
+    elements['loginVerifiedLink'].href = ''; // clear the happy-path href
     substituteFlow = true;
     await executePreflightAndLogin('verified');
     substituteFlow = false;
@@ -1697,8 +1769,8 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
       /FLOW SUBSTITUTION/.test(elements['secureLoginStatus'].innerText || ''),
       (elements['secureLoginStatus'].innerText || '').slice(0, 200));
     check('flow substitution built no authorize link',
-      requests.length === 3 && elements['securePaypalUrl'].style.display === 'none',
-      JSON.stringify({ requests: requests.length, display: elements['securePaypalUrl'].style.display }));
+      requests.length === 3 && !elements['loginVerifiedLink'].href,
+      JSON.stringify({ requests: requests.length, href: elements['loginVerifiedLink'].href }));
 
     // v186: the client-side custom_info cap counts BYTES (TextEncoder),
     // matching the enclave's new server-side 512-byte rejection. 257 two-byte
@@ -1756,10 +1828,18 @@ console.log('\nTest 33: v181 pasted-ENCRYPTED-blob audit — decrypt with this c
       return tdxHw({ quoteB64: q.b64 });
     },
     // A genuine login report (paypal_user_info present) — the shape the
-    // enclave mints post-PayPal and the shape the user actually pasted.
+    // enclave mints post-PayPal and the shape the user actually pasted. The
+    // session_context echoes THIS test's client session (honest enclave
+    // behavior) so the auditor's paste-path recomputation matches the quote
+    // slot bound above (F1: a login report with no client session is now
+    // rejected outright).
     reportExtras: {
       paypal_user_info: { user_id: 'U1', sub: 'paste-sub', verified_account: 'true', payer_id: null },
       paypal_client_id: 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p',
+      session_context: {
+        client_pub_b64: Buffer.from(clientPubDer).toString('base64'),
+        client_nonce_hex: clientNonceHex,
+      },
     },
   });
 
@@ -1816,7 +1896,7 @@ console.log('\nTest 33: v181 pasted-ENCRYPTED-blob audit — decrypt with this c
     globalThis.localStorage.removeItem('pav_local_session');
     r = await auditBlob(clone(blobBase));
     check('no key: fails closed with ENCRYPTED BLOB guidance',
-      r.ok === false && /ENCRYPTED BLOB/.test(r.alert) && /Claim Encrypted Report/.test(r.alert), String(r.alert).slice(0, 220));
+      r.ok === false && /ENCRYPTED BLOB/.test(r.alert) && /encrypted-attestation-report\.json/.test(r.alert), String(r.alert).slice(0, 220));
     check('no key: the old cryptic error is gone', !/Invalid report\./.test(r.alert), String(r.alert).slice(0, 120));
 
     // (c) enclave-served copy → decryption refused outright even WITH a key
@@ -1936,85 +2016,468 @@ console.log('\nTest 35: deploy-alibaba.sh keeps the self-report sink (v186 — a
     'secret appears in an echo line');
 }
 
-console.log('\nTest 36: single workflow button (v187 — one morphing control drives the whole login flow)');
+console.log('\nTest 36: two explicit login links + key auto-generated on render (v188 — workflow button and claim step removed)');
 {
   const verifySrc2 = readFileSync(join(repoRoot, 'verify.html'), 'utf8');
-  // Structure: ONE control slot — a morphing button + the PayPal link that
-  // replaces it; the old separate login/claim buttons are gone, and the link
-  // itself swaps in the claim button when clicked.
-  check('page has one workflow button and no leftover claim/login buttons',
-    verifySrc2.includes('id="workflowBtn"')
-      && !verifySrc2.includes('id="claimBtn"')
-      && (verifySrc2.match(/onclick="executePreflightAndLogin\(/g) || []).length === 0,
-    'workflowBtn/claimBtn/inline login handlers out of sync');
-  check('PayPal link replaces the button AND swaps in the next button on click',
-    verifySrc2.includes('onclick="setWorkflow(\'claim\')"'),
-    'link click handler missing');
+  // Structure: the v187 morphing workflow button and the whole claim state
+  // machine are GONE; both login flows are explicit links from page load and
+  // the throwaway key is created at RENDER with an on-page record of it.
+  check('page has both explicit login links with inline flow handlers',
+    verifySrc2.includes('id="loginVerifiedLink"')
+      && verifySrc2.includes('id="loginFullLink"')
+      && verifySrc2.includes("onclick=\"executePreflightAndLogin('verified')\"")
+      && verifySrc2.includes("onclick=\"executePreflightAndLogin('full')\""),
+    'explicit login links missing');
+  check('initial workflow button is suppressed (removed entirely)',
+    !verifySrc2.includes('id="workflowBtn"') && !verifySrc2.includes('workflowClick'),
+    'workflow button still present');
+  check('claim button and claim function are gone',
+    !verifySrc2.includes('localClaim') && !verifySrc2.includes('Claim Encrypted Report')
+      && !verifySrc2.includes('setWorkflow') && !verifySrc2.includes('applyWorkflowState'),
+    'claim/workflow machinery still present');
+  check('key-notice element exists for the on-page keygen record',
+    verifySrc2.includes('id="keyNotice"'), 'keyNotice missing');
+  check('key is generated on DOMContentLoaded (trusted copies only)',
+    /if \(trustedAuditorContext\(\)\) \{\s*\n\s*const k = await ensureThrowawayKey\(\)/.test(verifySrc2),
+    'render-time keygen hook missing');
 
-  // State machine: render swaps the slot, storage derives the resume point.
-  setWorkflow('to-paypal');
-  check('to-paypal state: button hidden, link revealed (harness pin target)',
-    elements['workflowBtn'].style.display === 'none'
-      && elements['securePaypalUrl'].style.display === 'inline-block',
-    JSON.stringify({ btn: elements['workflowBtn'].style.display, link: elements['securePaypalUrl'].style.display }));
-  workflowClick(); // no-op: the link is the control in this state
-  check('workflowClick is inert while the link owns the slot',
-    elements['workflowBtn'].style.display === 'none', elements['workflowBtn'].style.display);
-  setWorkflow('start-verified');
-  check('start state: button back, link hidden, login text shown',
-    elements['workflowBtn'].style.display === 'inline-block'
-      && elements['securePaypalUrl'].style.display === 'none'
-      && /Log in with PayPal \(Verified account only\)/.test(elements['workflowBtn'].textContent),
-    elements['workflowBtn'].textContent);
-
-  globalThis.localStorage = (() => { const m = new Map(); return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: k => m.delete(k) }; })();
+  globalThis.sessionStorage = (() => { const m = new Map(); return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: k => m.delete(k) }; })();
   try {
-    applyWorkflowState();
-    check('fresh storage → starts round 1 (verified)',
-      /Verified account only/.test(elements['workflowBtn'].textContent), elements['workflowBtn'].textContent);
-    localStorage.setItem('pav_local_session', '{"state":"s1","flow":"verified"}');
-    applyWorkflowState();
-    check('stored session → claim button',
-      /Claim Encrypted Report/.test(elements['workflowBtn'].textContent), elements['workflowBtn'].textContent);
-    localStorage.removeItem('pav_local_session');
-    localStorage.setItem('pav_wf_stage', 'full-pending');
-    applyWorkflowState();
-    check('round 1 done → full-profile round offered',
-      /Share full profile/.test(elements['workflowBtn'].textContent), elements['workflowBtn'].textContent);
-    localStorage.setItem('pav_wf_stage', 'complete');
-    elements['attestationInput'].value = '{"attestation_report":{}}';
-    applyWorkflowState();
-    check('both rounds done + report present → download button',
-      /Download Attestation Report/.test(elements['workflowBtn'].textContent), elements['workflowBtn'].textContent);
+    // render → key generated automatically + notice rendered on the page
+    const k1 = await ensureThrowawayKey();
+    check('key is generated on render (fresh) and stored in this tab',
+      k1.fresh === true && !!k1.at && !!globalThis.sessionStorage.getItem('pav_client_jwk'),
+      JSON.stringify({ fresh: k1.fresh, at: k1.at }));
+    check('public half is a valid P-256 SPKI (91 bytes)',
+      k1.pubRaw instanceof Uint8Array && k1.pubRaw.length === 91, String(k1.pubRaw && k1.pubRaw.length));
+    renderKeyNotice(k1.fresh ? 'generated' : 'restored', k1.at);
+    check('page announces the automatic key generation',
+      /GENERATED AUTOMATICALLY when this page loaded/.test(elements['keyNotice'].innerText),
+      elements['keyNotice'].innerText.slice(0, 140));
+    const k2 = await ensureThrowawayKey();
+    check('second call REUSES the stored key (no silent regeneration)',
+      k2.fresh === false && k2.jwkStr === k1.jwkStr, JSON.stringify({ fresh: k2.fresh }));
+    renderKeyNotice(k2.fresh ? 'generated' : 'restored', k2.at);
+    check('reload path announces the restored key',
+      /RESTORED from this tab/.test(elements['keyNotice'].innerText), elements['keyNotice'].innerText.slice(0, 140));
   } finally {
-    delete globalThis.localStorage;
-    elements['attestationInput'].value = '';
-    setWorkflow('start-verified');
+    delete globalThis.sessionStorage;
+    document.getElementById('loginVerifiedLink').href = '';
+    document.getElementById('loginVerifiedLink').textContent = '';
+    document.getElementById('loginFullLink').textContent = '';
+    document.getElementById('keyNotice').innerText = '';
   }
 }
 
-console.log('\nTest 37: /callback landing page offers a real download, not just copy (v187)');
+console.log('\nTest 37: /callback AUTO-DOWNLOADS the attestation, no landing page (v188)');
 {
   const rustSrc2 = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
-  check('callback page has the encrypted-report download button',
-    rustSrc2.includes('💾 Download encrypted report (.json)'), 'button label missing');
-  check('download saves the blob as a .json file via Blob + anchor click',
-    rustSrc2.includes("a.download='encrypted-attestation-report.json'")
-      && rustSrc2.includes("new Blob([t.value],{type:'application/json'})"),
-    'download plumbing missing');
-  check('download reads the SAME rendered ciphertext textarea as copy',
-    rustSrc2.includes("getElementById('e2ee-blob-view'); var blob=new Blob"),
-    'download does not read the rendered blob');
-  check('copy button kept (Test 33 pinned fallback)',
-    rustSrc2.includes('📋 Copy encrypted report'), 'copy fallback removed');
   const cbStart = rustSrc2.indexOf('const CALLBACK_CONTENT');
   const cbEnd = rustSrc2.indexOf('"#;', cbStart);
   const cbContent = cbStart >= 0 && cbEnd > cbStart ? rustSrc2.slice(cbStart, cbEnd) : '';
-  check('callback content still carries ONLY the __E2EE_BLOB__ ciphertext (no plaintext field introduced)',
-    !!cbContent && cbContent.includes('__E2EE_BLOB__') && !cbContent.includes('paypal_user_info'),
+  check('callback content present', !!cbContent, 'CALLBACK_CONTENT not found');
+  check('page auto-downloads the encrypted attestation on load (no click)',
+    cbContent.includes("URL.createObjectURL(new Blob([__b],{type:'application/json'})")
+      && cbContent.includes("__a.download='encrypted-attestation-report.json'")
+      && cbContent.includes('__a.click()'),
+    'auto-download plumbing missing');
+  check('auto-download and the rendered textarea read the SAME blob source',
+    cbContent.includes('var __b=')
+      && cbContent.includes("document.getElementById('e2ee-blob-view').value=__b;"),
+    'sources diverged');
+  check('no landing page: the tab tries to close itself after the download',
+    cbContent.includes('window.close()'), 'auto-close missing');
+  check('fallback keeps copy + re-download on the SAME ciphertext textarea',
+    cbContent.includes('📋 Copy encrypted report')
+      && cbContent.includes("a.download='encrypted-attestation-report.json'")
+      && cbContent.includes("getElementById('e2ee-blob-view'); var blob=new Blob"),
+    'fallback buttons missing');
+  check('no claim reference on the callback page',
+    !cbContent.includes('Claim Encrypted'), 'claim wording still present');
+  check('callback content carries ONLY the __E2EE_BLOB__ ciphertext (no plaintext field introduced)',
+    cbContent.includes('__E2EE_BLOB__') && !cbContent.includes('paypal_user_info'),
     'callback content shape changed');
-  check('heading advertises copy-or-download',
-    rustSrc2.includes('Copy or download your encrypted report'), 'heading not updated');
+  check('heading advertises the automatic download',
+    cbContent.includes('Your encrypted attestation is downloading automatically'),
+    'heading not updated');
+}
+
+console.log('\nTest 39: ZK escrow credential card — prove/verify wiring (v188, circom.md §5)');
+{
+  // ---- (0) pin sanity: constants must match the artifacts on disk --------
+  const wasmSha = createHash('sha256').update(readFileSync(join(repoRoot, 'zk/identity_escrow.wasm'))).digest('hex');
+  check('ZK_WASM_SHA256 pin matches zk/identity_escrow.wasm', globalThis.ZK_WASM_SHA256 === wasmSha,
+    `pin=${globalThis.ZK_WASM_SHA256} file=${wasmSha}`);
+  // F5: the assembled zkey (>100 MB) can never be pushed to GitHub, so CI
+  // and fresh clones only carry the SPLIT parts — the pin is verified over
+  // the concatenation, exactly like zkFetchZkey() does in the browser.
+  check('ZK_ZKEY_PARTS names the two split parts',
+    Array.isArray(globalThis.ZK_ZKEY_PARTS) && globalThis.ZK_ZKEY_PARTS.length === 2
+      && globalThis.ZK_ZKEY_PARTS.every((p) => /^identity_escrow_final\.zkey\.part\d$/.test(p)),
+    JSON.stringify(globalThis.ZK_ZKEY_PARTS));
+  const partBufs = (globalThis.ZK_ZKEY_PARTS || []).map((p) => readFileSync(join(repoRoot, 'zk', p)));
+  check('every zkey part exists and is under GitHub\'s 100 MB object limit',
+    partBufs.length === 2 && partBufs.every((b) => b.length > 0 && b.length < 100 * 1024 * 1024),
+    partBufs.map((b) => b && b.length).join(' + '));
+  check('split zkey parts are TRACKED by git (not ignored)',
+    partBufs.length === 2 && spawnSync('git', ['check-ignore', ...globalThis.ZK_ZKEY_PARTS.map((p) => join(repoRoot, 'zk', p))], { encoding: 'utf8', cwd: repoRoot }).status === 1,
+    'a part is gitignored — Pages could never serve it');
+  const zkeySha = createHash('sha256').update(Buffer.concat(partBufs)).digest('hex');
+  check('ZK_ZKEY_SHA256 pin matches the ASSEMBLED split parts (browser fetch order)',
+    globalThis.ZK_ZKEY_SHA256 === zkeySha,
+    `pin=${globalThis.ZK_ZKEY_SHA256} assembled=${zkeySha}`);
+  {
+    // if the local (gitignored) assembled file exists, it must agree too
+    let disk = '';
+    try { disk = createHash('sha256').update(readFileSync(join(repoRoot, 'zk/identity_escrow_final.zkey'))).digest('hex'); } catch (e) { disk = 'absent'; }
+    check('assembled-on-disk zkey agrees with the parts (or is absent)',
+      disk === 'absent' || disk === zkeySha, `disk=${disk.slice(0, 24)}`);
+  }
+  const snarkSha = 'sha384-' + createHash('sha384').update(readFileSync(join(repoRoot, 'node_modules/snarkjs/build/snarkjs.min.js'))).digest('base64');
+  check('snarkjs SRI pin matches the installed 0.7.5 bundle bytes', globalThis.ZK_SNARKJS_SRI === snarkSha,
+    `pin=${globalThis.ZK_SNARKJS_SRI} file=${snarkSha}`);
+  const vkeyFile = JSON.parse(readFileSync(join(repoRoot, 'zk/identity_escrow_vkey.json'), 'utf8'));
+  check('embedded vkey is byte-identical to zk/identity_escrow_vkey.json',
+    JSON.stringify(globalThis.zkCredVkey) === JSON.stringify(vkeyFile));
+  check('zkParseVkey() accepts the embedded key (protocol/curve/nPublic guards)',
+    (() => { try { const v = zkParseVkey(); return v.nPublic === 271; } catch (e) { return false; } })());
+  check('example escrow key constants present (77-digit decimals)',
+    /^\d{70,80}$/.test(globalThis.ZK_EXAMPLE_ESCROW_X) && /^\d{70,80}$/.test(globalThis.ZK_EXAMPLE_ESCROW_Y));
+
+  // ---- (1) green login audit stashes the canonical identity + reveals card
+  const greenQ = async (nonce) => tdxHw({
+    quoteB64: (await buildTdxQuote({
+      version: 4, reportData: reportDataFor(nonce),
+      innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+      leafKey: goodChain.leaf.key,
+    })).b64,
+  });
+  const AUDITED_APP = 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p';
+  // Realistic-length identity: the circuit band is msg_len ∈ [248, 300] bytes
+  // (circom.md §1) — the fixture must exercise that band, not a 70-byte toy.
+  const who = {
+    user_id: 'U' + '7'.repeat(60),
+    sub: 'zk-sub-' + 'a'.repeat(120),
+    verified_account: 'true',
+    payer_id: 'P' + '9'.repeat(40),
+  };
+  const canonicalId = JSON.stringify({
+    user_id: who.user_id, sub: who.sub, verified_account: who.verified_account, payer_id: who.payer_id,
+  });
+  check('fixture identity lands inside the circuit band [248,300]',
+    canonicalId.length >= 248 && canonicalId.length <= 300, `len=${canonicalId.length}`);
+  const built = await buildEnvelope({
+    hwBuilder: greenQ,
+    reportExtras: { paypal_user_info: who, paypal_client_id: AUDITED_APP },
+  });
+  const res = await runAuditWith(built.envelope);
+  check('green login audit passes', res.ok === true, `alert=${res.alert}`);
+  const zkCard = document.getElementById('zkCard');
+  check('zkCard revealed by the green login audit', zkCard.style.display === 'block');
+  check('stash === the canonical preimage bytes the gate hashed',
+    globalThis.zkIdentityJson === canonicalId,
+    `stashLen=${globalThis.zkIdentityJson && globalThis.zkIdentityJson.length} wantLen=${canonicalId.length}`);
+  check('stash hash === identityHashOf(fixture) (one-serializer guarantee)',
+    globalThis.zkIdentityHashHex === identityHashOf(who),
+    `stash=${globalThis.zkIdentityHashHex && globalThis.zkIdentityHashHex.slice(0, 16)}`);
+
+  // ---- (2) a FAILING audit must not overwrite a prior green stash --------
+  const other = { user_id: 'EVIL', sub: 'other', verified_account: 'true', payer_id: null };
+  const spoof = await buildEnvelope({
+    hwBuilder: greenQ,
+    reportExtras: {
+      paypal_user_info: other,
+      paypal_user_info_raw_hash: identityHashOf(who),
+      paypal_client_id: AUDITED_APP,
+    },
+  });
+  const s = await runAuditWith(spoof.envelope);
+  check('spoofed identity audit fails', s.ok === false);
+  check('failed audit does NOT overwrite the stashed identity',
+    globalThis.zkIdentityJson === canonicalId, 'stash was clobbered by a failed audit');
+  // restore a green envelope in the textarea for the prove step
+  await runAuditWith(built.envelope);
+
+  // ---- (3) generate: mocked snarkjs, REAL artifact fetch+pin verification --
+  const realFetch = globalThis.fetch;
+  let fetchTamper = false;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes('/zk/')) {
+      const name = u.split('/zk/')[1].split('?')[0];
+      let buf = readFileSync(join(repoRoot, 'zk', name));
+      if (fetchTamper) { const b = Buffer.from(buf); b[0] ^= 0xff; buf = b; }
+      return {
+        ok: true, status: 200,
+        arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
+      };
+    }
+    return realFetch(url);
+  };
+  // URL/document stubs for the download step
+  const capturedBlobs = [];
+  const realCreateURL = URL.createObjectURL, realRevokeURL = URL.revokeObjectURL;
+  URL.createObjectURL = (b) => { capturedBlobs.push(b); return 'blob:test'; };
+  URL.revokeObjectURL = () => {};
+  const realCreateEl = document.createElement, realBody = document.body;
+  document.createElement = () => ({ click() {}, remove() {}, style: {}, href: '', download: '' });
+  document.body = { appendChild() {}, removeChild() {} };
+
+  let proveInput = null, verifyCall = null, verifyResult = true;
+  globalThis.zkSnarkjsModule = {
+    groth16: {
+      fullProve: async (input, wasmBuf, zkeyBuf) => {
+        proveInput = input;
+        // the buffers reaching the prover MUST be the pin-verified real bytes
+        check('prover receives the real pinned wasm bytes',
+          createHash('sha256').update(Buffer.from(wasmBuf)).digest('hex') === wasmSha);
+        check('prover receives the real pinned zkey bytes',
+          createHash('sha256').update(Buffer.from(zkeyBuf)).digest('hex') === zkeySha);
+        // public signal layout: [R.x, R.y, verified, C0..C9, hashBits(256), ex, ey]
+        const bits = [];
+        for (let i = 0; i < input.identity_hash_bits.length; i++) bits.push(String(input.identity_hash_bits[i]));
+        const ps = [
+          '1556631486497778477605397274746159966306848378885429798549421757913197467405',
+          '16893061115786568867716241603005123395306176793643233966794415383620167560086',
+          '1',
+          ...Array.from({ length: 10 }, (_, i) => String(1000 + i)),
+          ...bits,
+          globalThis.ZK_EXAMPLE_ESCROW_X,
+          globalThis.ZK_EXAMPLE_ESCROW_Y,
+        ];
+        if (ps.length !== 271) throw new Error('fixture layout bug: ' + ps.length);
+        return { proof: { pi_a: ['1', '2', '1'], pi_b: [['1', '2'], ['1', '2'], ['1', '1']], pi_c: ['1', '2', '1'], protocol: 'groth16', curve: 'bn128' }, publicSignals: ps };
+      },
+      verify: async (vkey, ps, proof) => {
+        verifyCall = { vkey, ps, proof };
+        return verifyResult;
+      },
+    },
+  };
+
+  const pg = zkGenerateCredential();
+  if (pg) await pg;
+  const proveStatus = document.getElementById('zkProveStatus').innerText;
+  check('credential generated + self-verified (status ✅)', proveStatus.startsWith('✅'), proveStatus.slice(0, 260));
+  check('prover got the stashed identity bytes with msg_len in band',
+    proveInput && proveInput.msg_len === String(canonicalId.length)
+      && Buffer.from(Uint8Array.from(proveInput.raw_json_bytes.slice(0, canonicalId.length))).toString('utf8') === canonicalId,
+    `msg_len=${proveInput && proveInput.msg_len}`);
+  check('prover got msg_len ∈ [248,300] and a 300-byte padded buffer',
+    proveInput && proveInput.raw_json_bytes.length === 300
+      && Number(proveInput.msg_len) >= 248 && Number(proveInput.msg_len) <= 300);
+  {
+    // identity_hash_bits: 256 bits MSB-first of the stash hash
+    const expectBits = [];
+    for (let i = 0; i < globalThis.zkIdentityHashHex.length; i += 2) {
+      const b = parseInt(globalThis.zkIdentityHashHex.substr(i, 2), 16);
+      for (let t = 7; t >= 0; t--) expectBits.push((b >> t) & 1);
+    }
+    check('identity_hash_bits = 256 MSB-first bits of the audited hash',
+      JSON.stringify(proveInput && proveInput.identity_hash_bits) === JSON.stringify(expectBits));
+  }
+  check('escrow defaults to the example key when inputs are empty',
+    proveInput && proveInput.escrow_pubkey_x === globalThis.ZK_EXAMPLE_ESCROW_X
+      && proveInput.escrow_pubkey_y === globalThis.ZK_EXAMPLE_ESCROW_Y);
+  check('ephemeral key is a 256-bit scalar string',
+    proveInput && /^\d{70,80}$/.test(proveInput.ephemeral_private_key));
+  check('verification ran against the EMBEDDED vkey',
+    verifyCall && JSON.stringify(verifyCall.vkey) === JSON.stringify(globalThis.zkCredVkey));
+  check('a credential blob was downloaded', capturedBlobs.length === 1);
+  let cred = null;
+  if (capturedBlobs.length === 1) cred = JSON.parse(await capturedBlobs[0].text());
+  check('credential parses as JSON', !!cred);
+  check('credential schema + 271 raw signals + verified bit',
+    cred && cred.schema === 'pav-circom-escrow/v1'
+      && Array.isArray(cred.public_signals.raw) && cred.public_signals.raw.length === 271
+      && cred.public_signals.verified_account_bit === 1,
+    cred && `raw=${cred.public_signals.raw && cred.public_signals.raw.length}`);
+  check('credential identity hash === audited hash (explicit + raw[13..269] bits)',
+    cred && cred.public_signals.identity_hash_hex === globalThis.zkIdentityHashHex
+      && cred.public_signals.raw.slice(13, 269).join('') ===
+        (globalThis.zkIdentityHashHex.match(/./g).map(h => parseInt(h, 16).toString(2).padStart(4, '0')).join('')));
+  {
+    // report_sha256 must bind the SAME canonical bytes the download button uses
+    const text = reportFileText();
+    const wantSha = createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+    check('report_sha256 === sha256(reportFileText()) (one canonical serialization)',
+      cred && cred.report_sha256 === wantSha,
+      `cred=${cred && cred.report_sha256.slice(0, 16)} want=${wantSha.slice(0, 16)}`);
+    const dl = downloadReportFile();
+    const dlText = capturedBlobs.length ? await capturedBlobs[capturedBlobs.length - 1].text() : '';
+    check('downloadReportFile emits the same canonical bytes it hashes',
+      dl === true && dlText === text);
+  }
+  check('proving refuses a verify=false self-check (fail closed)', await (async () => {
+    verifyResult = false;
+    capturedBlobs.length = 0;
+    const p2 = zkGenerateCredential();
+    if (p2) { try { await p2; } catch (e) { /* expected */ } }
+    verifyResult = true;
+    const st = document.getElementById('zkProveStatus').innerText;
+    document.getElementById('zkProveStatus').innerText = '';
+    return st.includes('self-verification FAILED') && capturedBlobs.length === 0;
+  })());
+
+  // ---- (4) verify path: green, then every fail-closed branch --------------
+  const vs = () => document.getElementById('zkVerifyStatus').innerText;
+  document.getElementById('zkVerifyStatus').innerText = '';
+  let vp = zkVerifyCredential(cred);
+  if (vp) await vp;
+  check('credential verifies green with BOTH cross-checks (identity hash + report sha)',
+    vs().startsWith('✅') && vs().includes('identity-hash ↔ audited report ✓')
+      && vs().includes('report_sha256 ↔ audited file bytes ✓'), vs().slice(0, 300));
+
+  document.getElementById('zkVerifyStatus').innerText = '';
+  const tampered = JSON.parse(JSON.stringify(cred));
+  tampered.public_signals.identity_hash_hex = 'ab'.repeat(32);
+  vp = zkVerifyCredential(tampered);
+  if (vp) await vp;
+  check('identity-hash mismatch fails closed (MISMATCH named)',
+    vs().includes('IDENTITY HASH MISMATCH'), vs().slice(0, 240));
+
+  document.getElementById('zkVerifyStatus').innerText = '';
+  const wrongReport = JSON.parse(JSON.stringify(cred));
+  wrongReport.report_sha256 = '00'.repeat(32);
+  vp = zkVerifyCredential(wrongReport);
+  if (vp) await vp;
+  check('report_sha256 mismatch fails closed (REPORT BINDING named)',
+    vs().includes('REPORT BINDING MISMATCH'), vs().slice(0, 240));
+
+  document.getElementById('zkVerifyStatus').innerText = '';
+  const wrongSchema = JSON.parse(JSON.stringify(cred));
+  wrongSchema.schema = 'something/else';
+  vp = zkVerifyCredential(wrongSchema);
+  if (vp) await vp;
+  check('foreign schema rejected', vs().includes('not a pav-circom-escrow/v1 credential'));
+
+  // ---- F4 (R2 finding): every summary field must be bound to the PROVEN
+  // signals. A valid proof over DIFFERENT raw[] values must never be
+  // displayed as the audited identity / verified bit / escrow recipient.
+  document.getElementById('zkVerifyStatus').innerText = '';
+  const f4Bits = JSON.parse(JSON.stringify(cred));
+  f4Bits.public_signals.raw[13] = f4Bits.public_signals.raw[13] === '0' ? '1' : '0'; // flip first hash bit
+  vp = zkVerifyCredential(f4Bits);
+  if (vp) await vp;
+  check('F4: forged summary hash vs proven raw[] bits → IDENTITY HASH MISMATCH (proven-signals wording)',
+    vs().includes('IDENTITY HASH MISMATCH') && vs().includes('PROVEN signals'), vs().slice(0, 240));
+
+  document.getElementById('zkVerifyStatus').innerText = '';
+  const f4Bit = JSON.parse(JSON.stringify(cred));
+  f4Bit.public_signals.raw[2] = '0';               // proof constrains verified=0…
+  f4Bit.public_signals.verified_account_bit = 1;   // …summary claims 1
+  vp = zkVerifyCredential(f4Bit);
+  if (vp) await vp;
+  check('F4: forged verified_account_bit → VERIFIED-BIT MISMATCH',
+    vs().includes('VERIFIED-BIT MISMATCH'), vs().slice(0, 240));
+
+  document.getElementById('zkVerifyStatus').innerText = '';
+  const f4Escrow = JSON.parse(JSON.stringify(cred));
+  f4Escrow.public_signals.escrow_pubkey = ['12345', '67890'];
+  vp = zkVerifyCredential(f4Escrow);
+  if (vp) await vp;
+  check('F4: forged escrow_pubkey → ESCROW KEY MISMATCH',
+    vs().includes('ESCROW KEY MISMATCH'), vs().slice(0, 240));
+
+  document.getElementById('zkVerifyStatus').innerText = '';
+  const f4Ct = JSON.parse(JSON.stringify(cred));
+  f4Ct.public_signals.ciphertext = f4Ct.public_signals.ciphertext.map(() => '999');
+  vp = zkVerifyCredential(f4Ct);
+  if (vp) await vp;
+  check('F4: forged ciphertext → CIPHERTEXT MISMATCH',
+    vs().includes('CIPHERTEXT MISMATCH'), vs().slice(0, 240));
+
+  document.getElementById('zkVerifyStatus').innerText = '';
+  const f4Eph = JSON.parse(JSON.stringify(cred));
+  f4Eph.public_signals.ephemeral_pubkey = ['42', '43'];
+  vp = zkVerifyCredential(f4Eph);
+  if (vp) await vp;
+  check('F4: forged ephemeral_pubkey → EPHEMERAL KEY MISMATCH',
+    vs().includes('EPHEMERAL KEY MISMATCH'), vs().slice(0, 240));
+
+  document.getElementById('zkVerifyStatus').innerText = '';
+  const f4Mal = JSON.parse(JSON.stringify(cred));
+  f4Mal.public_signals.raw[13] = '7'; // not a bit
+  vp = zkVerifyCredential(f4Mal);
+  if (vp) await vp;
+  check('F4: non-bit raw signal → PROVEN SIGNAL MALFORMED',
+    vs().includes('PROVEN SIGNAL MALFORMED'), vs().slice(0, 240));
+
+  document.getElementById('zkVerifyStatus').innerText = '';
+  const shortSignals = JSON.parse(JSON.stringify(cred));
+  shortSignals.public_signals.raw = ['1', '2'];
+  vp = zkVerifyCredential(shortSignals);
+  if (vp) await vp;
+  check('signal-count mismatch rejected (271 enforced)', vs().includes('271 raw public signals'));
+
+  document.getElementById('zkVerifyStatus').innerText = '';
+  verifyResult = false;
+  vp = zkVerifyCredential(cred);
+  if (vp) await vp;
+  check('Groth16 verify=false fails closed', vs().includes('Groth16 verification FAILED'), vs().slice(0, 200));
+  verifyResult = true;
+
+  // ---- (5) artifact integrity: tampered fetch must refuse to prove --------
+  fetchTamper = true;
+  globalThis.zkAssetCache = {};
+  document.getElementById('zkProveStatus').innerText = '';
+  let threw = false;
+  try {
+    const p3 = zkGenerateCredential();
+    if (p3) await p3;
+  } catch (e) { threw = /INTEGRITY FAILURE/.test(e.message); }
+  const tamperStatus = document.getElementById('zkProveStatus').innerText;
+  check('tampered wasm fetch refuses to prove (INTEGRITY FAILURE)',
+    threw || tamperStatus.includes('INTEGRITY FAILURE'), `${tamperStatus.slice(0, 240)}`);
+  fetchTamper = false;
+
+  // ---- (6) no-audit guard: generate without a stash fails closed ----------
+  document.getElementById('zkProveStatus').innerText = '';
+  const savedId = globalThis.zkIdentityJson, savedHash = globalThis.zkIdentityHashHex;
+  globalThis.zkIdentityJson = null; globalThis.zkIdentityHashHex = null;
+  const p4 = zkGenerateCredential();
+  if (p4) await p4;
+  check('generate without a green audit fails closed',
+    document.getElementById('zkProveStatus').innerText.includes('run a GREEN audit first'));
+  globalThis.zkIdentityJson = savedId; globalThis.zkIdentityHashHex = savedHash;
+
+  // ---- restore everything ----------------------------------------------
+  globalThis.fetch = realFetch;
+  URL.createObjectURL = realCreateURL; URL.revokeObjectURL = realRevokeURL;
+  document.createElement = realCreateEl; document.body = realBody;
+  globalThis.zkSnarkjsModule = null;
+  globalThis.zkAssetCache = {};
+}
+
+console.log('\nTest 40: index.html ↔ verify.html auditor parity (F2 — no stale duplicate verifier)');
+{
+  // index.html (the GitHub Pages ROOT and login app) embeds the SAME auditor
+  // script. Two copies of security-critical verification logic drift silently
+  // (F2 finding: they had already diverged when verify.html gained the ZK
+  // layer). This gate makes ANY drift fail the suite until the copies are
+  // re-synced — the script is the verifier; the HTML bodies may differ.
+  const idxHtml = readFileSync(join(repoRoot, 'index.html'), 'utf8');
+  const grab = (s, name) => {
+    const m = s.match(/<script>([\s\S]*)<\/script>/);
+    if (!m) throw new Error('no inline auditor script in ' + name);
+    return m[1];
+  };
+  const vScript = grab(html, 'verify.html');
+  const iScript = grab(idxHtml, 'index.html');
+  check('auditor scripts are byte-identical (index.html ↔ verify.html)',
+    vScript === iScript,
+    `verify=${vScript.length}B index=${iScript.length}B` +
+      (vScript === iScript ? '' : ' — RE-SYNC index.html from verify.html'));
+  check('both copies carry the ZK card markup (id="zkCard")',
+    html.includes('id="zkCard"') && idxHtml.includes('id="zkCard"'));
+  check('both copies carry the embedded credential verification key',
+    html.includes('var zkCredVkey = {') && idxHtml.includes('var zkCredVkey = {'));
+  check('index.html inline script passes node --check', (() => {
+    const tmp = join(dir, 'index-script.js');
+    writeFileSync(tmp, iScript);
+    const r = spawnSync(process.execPath, ['--check', tmp], { encoding: 'utf8' });
+    return r.status === 0;
+  })());
 }
 
 rmSync(dir, { recursive: true, force: true });;

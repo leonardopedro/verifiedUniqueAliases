@@ -1044,40 +1044,50 @@ const HTML_TEMPLATE: &str = r#"
 <body><div class="container">{{CONTENT}}</div></body></html>
 "#;
 
-// The post-login success page. SECURITY (v164): this page performs NO crypto
+// The post-login handoff page. SECURITY (v164): this page performs NO crypto
 // and renders NO plaintext — it hands the LOGIN-BOUND encrypted blob to the
-// visitor's browser tab (sessionStorage on this origin); verify.html (same
-// origin) then decrypts it fail-closed (S_enc signature + pre-flight P_enc
-// pin), runs the full audit, and offers the report as a downloadable JSON the
-// user can audit offline in ANY external auditor copy (GitHub Pages copy /
-// saved local copy) — the copy served by this site is only a convenience.
+// visitor's browser as a FILE: v188 (user directive) the ciphertext
+// downloads AUTOMATICALLY on page load — no button, no landing page (the
+// tab then tries to close itself; if the browser refuses, what remains is
+// ONLY the attestation ciphertext, with copy / re-download fallbacks).
+// Decryption, the full audit and the plain-JSON download all happen in the
+// trusted copy of verify.html that generated the throwaway key (file picker
+// → decryptPastedBlob → runAudit) — never here.
 // Abuse/DoS posture: NO new surface. Reports are ONLY minted after a completed
 // PayPal code exchange (the exchange is a confidential-client exchange whose
 // client_secret only exists inside the enclave, AND PKCE-bound: PayPal
 // refuses any exchange that does not present the enclave-held code_verifier
 // — R3-1); nothing here generates attestations for unauthenticated callers.
 //
-// v180 (user report — the "UNTRUSTED AUDITOR ORIGIN" dead-end): the old page
-// just said "go claim it in the other tab" and offered no way to hand the
-// blob over when that tab was gone — the user could not retrieve the
-// attestation at all. Now the blob is RENDERED here (copy-to-clipboard),
-// which is safe: it is ciphertext sealed to a key that never left the
-// browser that started the login. This owner-controlled page only ever sees
-// the ciphertext, so showing it leaks nothing and forges nothing.
+// v180 (user report — the "UNTRUSTED AUDITOR ORIGIN" dead-end): the blob is
+// RENDERED here as a fallback, which is safe: it is ciphertext sealed to a
+// key that never left the browser that started the login. This
+// owner-controlled page only ever sees the ciphertext, so showing it leaks
+// nothing and forges nothing.
 const CALLBACK_CONTENT: &str = r#"<h1>Authentication Succeeded</h1>
             <div class="info">
-                <h3>Hardware-Attested Delivery (Encrypted)</h3>
-                <p>Your verified PayPal status has been sealed in RAM and encrypted to your local client key. This page renders nothing — decryption happens only inside your browser tab.</p>
-                <p><a class="btn" href="/verify.html?afterlogin=1">💾 Get my attestation report &amp; run the audit</a></p>
-                <p style="font-size:14px; color:#9e9e9e;">If the tab you started the login from is still open (your saved <code>verify.html</code> or the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color:#64b5f6;">GitHub Pages auditor</a>), go back there and press “🔓 2. Claim Encrypted Report”: only that tab holds your decryption key, so the report decrypts, audits and downloads THERE. That file audits offline in <b>any</b> copy of the auditor. No attestation report is ever generated without a completed PayPal login.</p>
-                <p><a href="/verify.html" style="color:#64b5f6;">Open Local Auditor (report loads without auto-download)</a></p>
-                <h3 style="margin-top:24px;">Lost the login tab? Copy or download your encrypted report</h3>
-                <p style="font-size:14px; color:#9e9e9e;">The blob below is your login-bound, encrypted report (ciphertext). It is safe to copy or download: it is sealed to a throwaway key that only ever existed in the browser that started the login, so it is useless to anyone else — including this site. Paste it into the “Attestation JSON report” box of a trusted auditor (GitHub Pages copy or your own saved <code>verify.html</code>) — or download it as a .json file and load it with that box's file picker — and run the audit from there.</p>
+                <h3>Your encrypted attestation is downloading automatically</h3>
+                <p><code>encrypted-attestation-report.json</code> was saved by this page on load — no button needed. It is CIPHERTEXT, sealed to a throwaway key that only ever existed in the browser tab where you started the login, so it is useless to anyone else (including this site). Load it with the “Attestation JSON report” file picker of a trusted auditor (your saved <code>verify.html</code> or the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color:#64b5f6;">GitHub Pages auditor</a>) to decrypt, audit, and get the plain JSON. This tab holds nothing else and will try to close itself.</p>
                 <textarea id="e2ee-blob-view" readonly style="width:100%; height:180px; background:#0d1117; color:#9e9e9e; font-size:12px; border:1px solid #30363d; border-radius:6px; padding:10px; box-sizing:border-box;"></textarea>
-                <p><button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); t.select(); try{document.execCommand('copy');this;}catch(e){} try{navigator.clipboard.writeText(t.value);}catch(e){} this.textContent='✅ Copied — paste it into a trusted auditor';})()" style="margin-top:10px;">📋 Copy encrypted report</button> <button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); var blob=new Blob([t.value],{type:'application/json'}); var url=URL.createObjectURL(blob); var a=document.createElement('a'); a.href=url; a.download='encrypted-attestation-report.json'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){URL.revokeObjectURL(url);},5000);})()" style="margin-top:10px;">💾 Download encrypted report (.json)</button></p>
+                <p><button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); t.select(); try{document.execCommand('copy');this;}catch(e){} try{navigator.clipboard.writeText(t.value);}catch(e){} this.textContent='✅ Copied — paste it into a trusted auditor';})()" style="margin-top:10px;">📋 Copy encrypted report</button> <button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); var blob=new Blob([t.value],{type:'application/json'}); var url=URL.createObjectURL(blob); var a=document.createElement('a'); a.href=url; a.download='encrypted-attestation-report.json'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){URL.revokeObjectURL(url);},5000);})()" style="margin-top:10px;">💾 Download encrypted report (.json)</button> <button class="btn" onclick="window.close()" style="margin-top:10px;">✖ Close this tab</button></p>
             </div>
             <script type="application/json" id="e2ee-blob">__E2EE_BLOB__</script>
-            <script>try{var __b=document.getElementById('e2ee-blob').textContent;document.getElementById('e2ee-blob-view').value=__b;sessionStorage.setItem('pav_e2ee_blob', __b);}catch(e){}</script>"#;
+            <script>try{
+var __b=document.getElementById('e2ee-blob').textContent;
+document.getElementById('e2ee-blob-view').value=__b;
+sessionStorage.setItem('pav_e2ee_blob', __b);
+// v188 AUTO-DOWNLOAD on load: trigger the file save immediately, reading
+// the SAME blob source the textarea renders (no user gesture required for a
+// single same-origin blob: download).
+var __u=URL.createObjectURL(new Blob([__b],{type:'application/json'}));
+var __a=document.createElement('a'); __a.href=__u; __a.download='encrypted-attestation-report.json';
+document.body.appendChild(__a); __a.click(); __a.remove();
+setTimeout(function(){URL.revokeObjectURL(__u);},10000);
+// NO LANDING PAGE: once the download is under way, close this tab (only
+// script-opened windows may close; otherwise the minimal view above — just
+// the attestation ciphertext — remains, with copy / re-download fallbacks).
+setTimeout(function(){try{window.close();}catch(e){}},2500);
+}catch(e){}</script>"#;
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -1502,6 +1512,16 @@ fn with_secure_headers(mut resp: Response) -> Response {
     h.insert(HeaderName::from_static("cache-control"), HeaderValue::from_static("no-store"));
     h.insert(HeaderName::from_static("referrer-policy"), HeaderValue::from_static("no-referrer"));
     h.insert(HeaderName::from_static("x-content-type-options"), HeaderValue::from_static("nosniff"));
+    // R2 finding (collusion threat model): HSTS was missing entirely, so a
+    // network attacker in collusion with the provider could keep a victim on
+    // plaintext http:// forever (browsers only honor HSTS received over TLS,
+    // and only after one genuine HTTPS visit — every HTTPS response now
+    // installs it). Deliberately NO includeSubDomains/preload: we cannot vouch
+    // for other airma.de subdomains serving TLS.
+    h.insert(
+        HeaderName::from_static("strict-transport-security"),
+        HeaderValue::from_static("max-age=31536000"),
+    );
     resp
 }
 

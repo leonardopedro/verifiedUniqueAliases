@@ -1,16 +1,19 @@
-// Browser end-to-end for the login → claim → DOWNLOAD flow (the AGENTS.md
-// debugging playbook's browser step). Runs the REAL secure login from a
-// trusted file:// copy of verify.html against the live enclave, drives the
-// PayPal sandbox consent, presses "Claim Encrypted Report" (the v187 single
-// workflow button's claim state), and FAILS unless the attestation report is
-// actually downloaded.
+// Browser end-to-end for the v188 login → AUTO-DOWNLOAD → audit → report
+// flow (the AGENTS.md debugging playbook's browser step). Runs the REAL
+// secure login from a trusted file:// copy of verify.html against the live
+// enclave (explicit login link → PayPal sandbox consent), then FAILS unless:
+//   * the /callback page AUTO-DOWNLOADS the encrypted attestation (no
+//     landing page, no button — the v188 main.rs change),
+//   * loading that ciphertext into the trusted tab's report box decrypts it
+//     (decryptPastedBlob — there is deliberately NO claim button any more),
+//   * the audit goes green and the plain attestation-report-*.json downloads.
 //
 // Why this exists: the download is the first casualty of any red audit row —
 // a missing file is a SYMPTOM (v178: the identity-preimage gate failed on
 // every honest login and silently suppressed the download). This script makes
-// the whole chain observable: login-session status, callback handoff, the
-// ?afterlogin=1 page, the claim verdict, download events, and the claimed
-// report JSON (saved for offline inspection of the failing gate).
+// the whole chain observable: login-session status, callback auto-download,
+// the paste-decrypt verdict, download events, and the decrypted report JSON
+// (saved for offline inspection of the failing gate).
 //
 // Usage:
 //   npm install --no-save playwright          # once
@@ -22,8 +25,9 @@
 //   CHROMIUM_PATH    — required on NixOS/containers: the bundled playwright
 //                      chromium dies on missing distro libs (e.g. libglib)
 //
-// Exit code 0 = claim audited AND the report file downloaded.
-import { writeFileSync } from 'fs';
+// Exit code 0 = ciphertext auto-downloaded, paste-decrypt audited green AND
+// the plain report file downloaded.
+import { readFileSync, writeFileSync } from 'fs';
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
@@ -50,7 +54,8 @@ const browser = await chromium.launch({
 const ctx = await browser.newContext({ locale: 'en-US', viewport: { width: 1280, height: 900 } });
 const page = await ctx.newPage();
 
-let downloaded = null;
+let downloaded = null;     // final plain attestation-report-*.json
+let encDownload = null;    // callback's automatic encrypted-attestation-report.json
 page.on('download', (d) => {
   downloaded = d.suggestedFilename();
   log('  [DOWNLOAD]', downloaded);
@@ -60,37 +65,41 @@ page.on('console', (m) => {
 });
 
 try {
-  // v187: for the full round, land WITH the hash so the DOMContentLoaded
-  // auto-login starts it (a later hash-only goto would not re-fire load).
-  await page.goto(VERIFY + (FLOW === 'full' ? '#login-full' : ''), { waitUntil: 'domcontentloaded' });
+  await page.goto(VERIFY, { waitUntil: 'domcontentloaded' });
   await page.fill('#localEnclaveHost', 'https://login.airma.de');
-  log('1. loaded', VERIFY, '(trusted copy)', FLOW === 'full' ? '#login-full' : '');
+  log('1. loaded', VERIFY, '(trusted copy)');
 
   // Step 1 — login session (v180: NO pre-login attestation — S_enc-signed
-  // fields only; the hardware audit runs on the post-login report) + client
-  // keypair.
-  // Popup FIX (user report): the handoff is a plain link (#securePaypalUrl),
-  // NOT window.open() — an async-time popup is blocked by every browser. The
-  // button requests the login session and reveals the link; clicking the link
-  // (target=_blank) is a real user gesture, so the new tab is never blocked.
-  // v187 (single workflow button): only ONE login button is visible at a
-  // time — the verified button on a fresh page; `#login-full` (used above)
-  // auto-started the full round, so no click is needed there.
-  if (FLOW !== 'full') {
-    await page.click('button:has-text("Log in with PayPal (Verified account only)")');
-  }
-  await page.waitForSelector('#securePaypalUrl', { state: 'visible', timeout: 90000 });
+  // fields only; the hardware audit runs on the post-login report).
+  // v188: TWO EXPLICIT login links (#loginVerifiedLink / #loginFullLink);
+  // the v187 morphing button is gone. A click prepares the signed session
+  // and turns THAT link into the "Continue to PayPal →" handoff; the second
+  // click (target=_blank, a real user gesture) opens PayPal and is never
+  // popup-blocked.
+  const flowLink = FLOW === 'full' ? '#loginFullLink' : '#loginVerifiedLink';
+  await page.click(flowLink);
+  await page.waitForFunction(
+    (sel) => { const a = document.querySelector(sel); return a && a.href && a.href.includes('authorize'); },
+    flowLink, { timeout: 90000 });
+  log('1b. flow link ready:', (await page.textContent(flowLink).catch(() => '')).slice(0, 80));
   const [popup] = await Promise.all([
     ctx.waitForEvent('page', { timeout: 30000 }).catch(() => null),
-    page.click('#securePaypalUrl'),
+    page.click(flowLink),
   ]);
   log('2. step-1 status:', (await page.textContent('#secureLoginStatus').catch(() => '')).slice(0, 240));
 
   const pp = popup;
-  if (!pp) throw new Error('no PayPal tab opened from the #securePaypalUrl link (login-session failed?)');
+  if (!pp) throw new Error('no PayPal tab opened from the flow link (login-session failed?)');
+  // Capture downloads from the very start of the popup's life: the callback
+  // page fires its automatic download on LOAD (v188).
+  pp.on('download', (d) => {
+    const f = d.suggestedFilename();
+    log('  [DOWNLOAD:popup]', f);
+    if (f === 'encrypted-attestation-report.json') encDownload = { d, f };
+    else downloaded = f;
+  });
   await pp.waitForLoadState('domcontentloaded').catch(() => {});
   log('3. popup landed:', pp.url().slice(0, 110));
-  pp.on('download', (d) => { downloaded = d.suggestedFilename(); log('  [DOWNLOAD]', downloaded); });
 
   // PayPal classic split form: DOM-focus each field and type REAL keystrokes
   // (Playwright actionability is unreliable on the z-stacked panes).
@@ -157,44 +166,51 @@ try {
   await pp.waitForLoadState('networkidle', { timeout: 45000 }).catch(() => {});
   log('6. callback:', pp.url().slice(0, 120));
 
-  // v187: the callback landing page must offer a real DOWNLOAD of the
-  // encrypted report (the user-reported gap: copy only). Hard-fail otherwise
-  // — this is the deployed-feature check for the main.rs change.
-  const dlCount = await pp.locator('button:has-text("Download encrypted report")').count();
-  log('6b. callback download button count:', dlCount);
-  if (!dlCount) throw new Error('callback landing page lacks the "Download encrypted report" button (v187 main.rs change not deployed?)');
+  // v188: the callback must AUTO-DOWNLOAD the ciphertext on load — no
+  // landing page, no button click. Hard-fail if the automatic download never
+  // fires (this is the deployed-feature check for the main.rs change).
+  for (let i = 0; i < 40 && !encDownload; i++) await pp.waitForTimeout(500);
+  if (!encDownload) throw new Error('callback did NOT auto-download encrypted-attestation-report.json (v188 main.rs change not deployed?)');
+  log('6b. callback auto-download fired:', encDownload.f);
+  const encPath = await encDownload.d.path();
+  const encJson = readFileSync(encPath, 'utf8');
+  log('   ciphertext saved (' + encJson.length + ' bytes) →', encPath.slice(0, 80));
 
-  // The callback's report button leads to the webservice copy — it can only
-  // show guidance (the key lives in THIS local page), but exercise it anyway.
-  const btn = pp.locator('a:has-text("Get my attestation report")').first();
-  if (await btn.count()) {
-    await btn.click({ timeout: 10000 }).catch(() => {});
-    await pp.waitForLoadState('domcontentloaded').catch(() => {});
-    await pp.waitForTimeout(4000);
-    log('7. afterlogin page:', pp.url().slice(0, 110), '|',
-      (await pp.textContent('#secureLoginStatus').catch(() => '')).slice(0, 140));
-  }
-
-  // Step 2 — claim on the trusted page: decrypt + verify + audit + auto-download.
+  // Step 2 — the trusted tab: load the downloaded ciphertext into the report
+  // box (there is deliberately NO claim button any more) and run the audit;
+  // decryptPastedBlob() performs the keyed decryption + fail-closed checks.
   await page.bringToFront();
-  await page.click('button:has-text("Claim Encrypted Report")');
+  await page.fill('#attestationInput', encJson);
+  await page.click('button:has-text("Perform Cryptographic Audit")');
   await page.waitForTimeout(12000);
-  // v186: single status line — localClaim() now reports on #secureLoginStatus
-  // (the #localLoginStatus paragraph was removed in the simplification pass).
   const status = (await page.textContent('#secureLoginStatus').catch(() => '')).slice(0, 350);
-  log('8. claim status:', status);
+  log('8. audit status:', status);
+  const rows = await page.evaluate(() => ({
+    enclave: document.getElementById('enclaveCheck').className,
+    firmware: document.getElementById('firmwareCheck').className,
+    btn: document.getElementById('reportDownloadBtn').style.display,
+  }));
+  log('   verdict rows:', JSON.stringify(rows));
+  const green = /verified/.test(rows.enclave) && /verified/.test(rows.firmware) && rows.btn === 'block';
+  if (!green) {
+    throw new Error('paste-decrypt audit did NOT go green (enclave=' + rows.enclave + ' firmware=' + rows.firmware + ') — ' + status.slice(0, 200));
+  }
 
   const rep = await page.evaluate(() => document.getElementById('attestationInput').value);
   if (rep && rep.trim().startsWith('{')) {
     writeFileSync('/tmp/claimed-report.json', rep);
-    log('   claimed report saved → /tmp/claimed-report.json (' + rep.length + ' bytes)');
+    log('   decrypted report saved → /tmp/claimed-report.json (' + rep.length + ' bytes)');
   }
+
+  // Step 3 — the green audit unlocks the plain-report download (v164).
+  await page.click('#reportDownloadBtn');
+  await page.waitForTimeout(3000);
   await browser.close();
 
-  const ok = downloaded && /✅/.test(status);
+  const ok = !!encDownload && green && !!downloaded && /^attestation-report-/.test(downloaded);
   log('\n' + (ok
-    ? `RESULT: PASS — audit green and report downloaded (${downloaded})`
-    : `RESULT: FAIL — downloaded=${downloaded || 'none'} status=${status.slice(0, 120)}`));
+    ? `RESULT: PASS — callback auto-download ✓, audit green ✓, report downloaded (${downloaded})`
+    : `RESULT: FAIL — enc=${encDownload ? 'yes' : 'no'} green=${green} downloaded=${downloaded || 'none'} status=${String(status).slice(0, 120)}`));
   process.exit(ok ? 0 : 1);
 } catch (e) {
   await browser.close().catch(() => {});
