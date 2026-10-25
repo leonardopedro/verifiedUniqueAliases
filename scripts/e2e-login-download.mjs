@@ -157,6 +157,13 @@ try {
   await pp.waitForLoadState('networkidle', { timeout: 45000 }).catch(() => {});
   log('6. callback:', pp.url().slice(0, 120));
 
+  // v187: the callback landing page must offer a real DOWNLOAD of the
+  // encrypted report (the user-reported gap: copy only). Hard-fail otherwise
+  // — this is the deployed-feature check for the main.rs change.
+  const dlCount = await pp.locator('button:has-text("Download encrypted report")').count();
+  log('6b. callback download button count:', dlCount);
+  if (!dlCount) throw new Error('callback landing page lacks the "Download encrypted report" button (v187 main.rs change not deployed?)');
+
   // The callback's report button leads to the webservice copy — it can only
   // show guidance (the key lives in THIS local page), but exercise it anyway.
   const btn = pp.locator('a:has-text("Get my attestation report")').first();
