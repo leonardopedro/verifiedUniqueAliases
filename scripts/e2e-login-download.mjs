@@ -164,7 +164,9 @@ try {
   await page.bringToFront();
   await page.click('button:has-text("Claim Encrypted Report")');
   await page.waitForTimeout(12000);
-  const status = (await page.textContent('#localLoginStatus').catch(() => '')).slice(0, 350);
+  // v186: single status line — localClaim() now reports on #secureLoginStatus
+  // (the #localLoginStatus paragraph was removed in the simplification pass).
+  const status = (await page.textContent('#secureLoginStatus').catch(() => '')).slice(0, 350);
   log('8. claim status:', status);
 
   const rep = await page.evaluate(() => document.getElementById('attestationInput').value);

@@ -97,7 +97,33 @@ Based on the architecture of **Intel TDX on Alibaba Cloud** (as specified in Ali
 
 ---
 
+#### Status — v186 audit round 5 (2026-10-25, independent audit `audit5.md` + user directives: heartbeat survives lockdown, maximum UI simplification)
+
+| Item | Status | Evidence / rationale |
+|---|---|---|
+| **Self-report success heartbeat survives egress lockdown** (queued directive) | ✅ `egress_lockdown()` calls `selfreport::pin_sink_network()` BEFORE flushing the output chain (DNS still open; 3 attempts, IPv4 only) and adds `ip daddr {…} tcp dport 443 accept` for exactly those addresses; `put()` pins the reqwest resolver (`resolve_to_addrs`) so post-lockdown publishes need **no DNS** — deliberately NO `udp 53` reopen (no query-channel exfil; the payload stays secret-free, signed per request by the write-only RAM key). Root cause: the flush ran before `selfreport::serving()`, so the heartbeat and every post-lockdown halt were silently dropped while pre-lockdown stage docs landed. | cargo `selfreport_survives_egress_lockdown_v186` (pin-before-flush ordering, sink rule present, no-DNS pin, IPv4-only) · **LIVE-PROVEN twice**: `boot/latest.json` = `kind:ok, stage:serving` on the v186a AND v186b boots (uptime_s 112 / 157 — published after lockdown) |
+| **NEW — session-time FLOW substitution refused** | ✅ The enclave signs whatever flow label the (adversary-owned) request path delivered; substituting `verified → full` passed EVERY signature, app-pin and PKCE check (the full app is legitimately in `EXPECTED_APPS`) — the audit-time FLOW ESCALATION only caught it AFTER the PayPal consent. `executePreflightAndLogin` now compares `sf.flow` against the flow THIS tab requested, before the authorize link exists. | harness Test 32 (`substituteFlow` stub → FLOW SUBSTITUTION, no link built, no extra session) |
+| **NEW — 512-byte `custom_info` cap on BOTH ends** | ✅ The auditor always capped it client-side; `/attest/login-session` accepted unbounded `custom_info` — the field is copied TWICE into the signed response (state + signed_fields) while charged 4 KiB egress (≈256× budget bypass), and a forged `/callback` state could park an unbounded blob in the 32 KiB-charged vault. Shared `canonical_custom_info()` → 400 / `invalid_session`; auditor check switched to `TextEncoder` BYTES (257 two-byte chars = 514 B refused pre-fetch). | cargo `custom_info_512_byte_cap_v186` (bounds, multibyte, both call-site source pins) + harness byte-cap case |
+| **NEW — no green Identity row on unauthenticated reports** | ✅ `identityCheck` was painted green BEFORE the enclave-signature check — a forged report rendered a green Identity row beside the red signature row. Moved after `sigOk`; explicitly failed + explained on invalid sig. | harness Test 16 (row ≠ verified + /unauthenticated/ explanation) |
+| **Max UI simplification** (user directive: BOTH login buttons + 5 result rows explicitly KEPT) | ✅ Two `.grid` wrappers → one; login card 3 → 2 paragraphs (content preserved); second status paragraph removed (single status line for login+claim). Dead code deleted: `localPreflight()` (5.8 KB duplicate of `executePreflightAndLogin`, zero UI callers — harness's untrusted-origin assertion moved to the claim path), `preflightUrl`/`localPaypalUrl` fallbacks. verify.html **163,150 → 158,202 B** (`242b033e…`) == README == served == index.html (byte-identical mirror). | harness 201/0 · e2e claim-status selector updated to `#secureLoginStatus` |
+| **audit5.md disposition** | ✅ **Key invariants 1–4 already shipped**: Gate-1 cryptographic completeness (quote ECDSA over header+body, `SHA-256(attkey‖qe_auth)` binding, QE report signed by PCK leaf, chain walk to the pinned Intel root `44a0196b…`), Gate-3 zero-wildcard dual-slot (v182 — paste mode reconstructs slot2 from `session_context` fail-closed), no pre-flight quote (v180 `/attest/login-session`, RAM-only PKCE), GRUB 2.12 → RTMR2 hard pins. §3 protocol ≡ shipped; §5.1/§5.2 code ≡ shipped handlers; §6 threat-matrix rows all map to shipped controls. **§4 sample `verify.html`: engine NOT replaced** — its single `EXPECTED_PAYPAL_CLIENT_ID` pin would break the full flow and is weaker than per-flow `EXPECTED_APPS` (client_id+scope+authorize_base+flow), and the sample lacks the enclave-signature / PKCE / flow-binding / provenance / P_enc-continuity / TLS gates the shipped engine keeps. §4's single-button + 4-gate UI: **user explicitly chose** both-buttons + 5-rows this cycle. §4 tail (replace the /callback copy-encrypted-report button with a plain download): not adopted — the copy button is the pinned fallback of the trusted-copy recovery flow (harness Test 33 + untrusted-origin guidance), and a downloaded blob cannot decrypt in another origin without the key (that is the design). | this cycle |
+| **Two-cycle deploy (sanctioned pin-rotation procedure)** | ✅ Cycle A: disk `643f013e…`/md5 `5f7925aa…` → HK `disk186a.raw` → relay186a green (2.2 min, s1→s4 + `relay-ok186a.txt`) → Beijing intranet → `ImportImage` `m-2zefiag79exwggjl8z0m` + NVMe (flat-wire RPC) → prod swap (config re-pushed after ReplaceSystemDisk — user_data is disk-bound, §0.6 quirk) → TLS 200 in 2.3 min → envelope → **RTMR2 rotated `61ce2879… → 99c5322d…`** (MRTD/RTMR0/1/3 held; live binary_sha256 == pin `68281d24…`). Cycle B: rebuild **byte-identical** binary `68281d24…` + initrd `1af2c963…` (reproducible synthesis → RTMR2 stable) carrying the rotated verify.html on the ESP → disk `66befe70…`/md5 `58815d45…` → relay186b (2 min) → `m-2ze5hs6tgv7q4lyymybm` + NVMe → prod swap (disk `d-2ze5juogkfapt7f97584`) → TLS 200 05:20 UTC. | HANDOVER §0.11 |
+| **v186 gates** | ✅ offline **201/0** (196 → 201: +identity-row ×2, flow-substitution ×2, byte-cap ×1) · live-envelope **209/0** (captures from BOTH cycle boots) · cargo **22/0** · `check-manifest-parity` **PARITY OK** (6 same incl. verify.html, 0 mismatched) · served == README == `242b033e…` over https **and** http/IP · **live PayPal sandbox e2e PASS ×2** (verified + full buttons). | this cycle · HANDOVER §0.11 |
+
+---
+
 ### Root Flaw in the Current Implementation
+
+> **STATUS (v186, 2026-10-25): RESOLVED.** The self-measurement trap described
+> below is closed in the shipped code: `binary_sha256` gates NOTHING
+> (informational row only; `EXPECTED_ENCLAVE_SHA256` is a display pin), and
+> code identity is decided EXCLUSIVELY by the MRTD/RTMR silicon pins enforced
+> in the auditor over the Intel-signed quote. RTMR2 rotates with every
+> `/init` build (last rotation this cycle: `61ce2879… → 99c5322d…`), so a
+> backdoored initrd on the virtual disk yields a quote whose RTMR2 fails the
+> hard pin — exactly the collusion exploit this section warned about. The
+> UKI-based fix (Phase 1 below) remains deferred WITH justification; see the
+> phase-status table.
 
 In the current repository (`verify.html` and `src/main.rs`):
 1. **Self-Measurement Trap**: `/init` reads `/init` from its own filesystem, hashes it, puts `binary_sha256` into the JSON report, and binds it into `REPORTDATA`.
@@ -123,6 +149,17 @@ In the current repository (`verify.html` and `src/main.rs`):
 ```
 
 ---
+
+#### Phase status (v186, 2026-10-25) — plan is LARGELY EXECUTED; deviations documented
+
+| Phase | Status | Where |
+|---|---|---|
+| 1 — UKI / eliminate unmeasured boot | ⚠️ **Deferred with justification** — GRUB 2.12's `EFI_CC_MEASUREMENT_PROTOCOL` live-proven to measure vmlinuz+initrd+cmdline into RTMR2 (RTMR2 rotated with every initrd build, incl. this cycle); residual = hypervisor torn-read TOCTOU, the plan-sanctioned deferral | AGENTS.md "Deviations" · v179 status row |
+| 2 — In-guest CCEL replay (+ optional RTMR extension) | ✅ **Shipped** — `intel_tdx::replay_ccel` replays the ACPI CCEL against the quoted RTMRs at boot, fail-closed on mismatch; golden-vector self-test shared with the JS tool and the Rust test | `src/intel_tdx.rs` · `ccel_replay_selftest_v168` |
+| 3 — Fail-closed hardware quote generation | ✅ **Shipped** — `tdx_quote_b64` is published only from a hardware-signed quote (configfs_tsm / tdx-guest probe); no mocks or dummy fallbacks; the auditor rejects every other evidence class outright (Intel-only gate) | `src/intel_tdx.rs` · verify.html Gate 1 |
+| 4 — Hard pins in verify.html | ✅ **Shipped** — EXPECTED_MRTD + EXPECTED_RTMR0–3 hard pins over the quote body (fail-closed on missing/malformed pins), offsets per Intel DCAP spec | verify.html silicon gate |
+| 5 — Anti-collusion client-bound E2EE session | ✅ **Shipped** — client ECDH keys browser-only, dual-slot REPORTDATA (SEC-02 slot1 + client-session slot2), P_enc key-continuity, RAM-only PKCE, app/flow/environment binding | verify.html + `src/main.rs` |
+| 6 — Egress lockdown + RAM-only operation | ✅ **Shipped** — nftables post-boot lockdown (v186 adds the pinned self-report sink on 443), kernel hardening (swapoff/kexec/suid_dumpable/core-dump), zeroize of secrets | `egress_lockdown` · `harden_kernel` |
 
 #### Phase 1: Eliminate Unmeasured Boot via Unified Kernel Image (UKI)
 

@@ -241,6 +241,22 @@ status table in `plan.md` ("Status — v185 audit round 4").
 
 ---
 
+### 0.11 v186 cycle — audit round 5 (`audit5.md`) + heartbeat fix + max UI simplification (2026-10-25)
+
+Status table: `plan.md` ("Status — v186 audit round 5").
+
+| Item | Value |
+|---|---|
+| **Self-report heartbeat survives lockdown (queued directive)** | ✅ `egress_lockdown()` now calls `selfreport::pin_sink_network()` BEFORE flushing the output chain (DNS still open; 3 attempts, IPv4 only) and adds `ip daddr {…} tcp dport 443 accept` for exactly those addresses; `put()` pins the reqwest resolver (`resolve_to_addrs`) so post-lockdown publishes need **no DNS** — deliberately NO `udp 53` reopen (no query-channel exfil; payload stays secret-free, signed per request by the write-only RAM key). **LIVE-PROVEN twice**: `boot/latest.json` = `{"kind":"ok","stage":"serving","ok":true}` on the v186a AND v186b boots (uptime_s 112 / 157 — published after lockdown; pre-fix this doc never landed). Source-pinned by cargo `selfreport_survives_egress_lockdown_v186`. |
+| **Two more audit fixes (fresh pass, collusion lens)** | ✅ **session-time FLOW substitution**: the enclave signs whatever flow label the (adversary-owned) request path delivered — substituting `verified → full` passed signature + app-pin + PKCE (the full app IS in EXPECTED_APPS) and was only caught by the audit-time FLOW ESCALATION *after* the PayPal consent; the auditor now refuses before the authorize link exists. **512-byte `custom_info` cap on BOTH ends**: `canonical_custom_info()` (login-session → 400, forged callback state → invalid_session; auditor check now counts `TextEncoder` BYTES — 514 B refused pre-fetch); the field was unbounded while charged 4 KiB (≈256× budget bypass) and parkable in the 32 KiB-charged vault. **Identity row**: painted green only after `sigOk` (a forged report used to show a green Identity row beside the red signature row; now failed + explained). |
+| **UI (user directive: BOTH login buttons + 5 result rows kept)** | ✅ One `.grid` (was two), login card 3 → 2 paragraphs (content preserved), single status line; dead `localPreflight()` deleted (5.8 KB duplicate of `executePreflightAndLogin`, zero UI callers — harness's untrusted-origin assertion moved to the claim path) + `preflightUrl`/`localPaypalUrl` fallbacks. verify.html **163,150 → 158,202 B**, `242b033e…` == README == served == `index.html` (byte-identical). |
+| **Build/deploy lineage (two cycles — sanctioned rotation procedure)** | Cycle A: disk **`643f013e…`** (md5 `5f7925aa…`, HK `disk186a.raw`) → relay186a green in 2.2 min (s1→s4 + `relay-ok186a.txt`, md5 round-trip) → Beijing intranet → `ImportImage` (flat `.Format=raw`) **`m-2zefiag79exwggjl8z0m`** + NVMe flat-wire RPC → prod Stop → ReplaceSystemDisk → **config re-pushed** (user_data is disk-bound — §0.6 quirk) → Start → TLS 200 in 2.3 min → `/debug/envelope` → **RTMR2 rotated `61ce2879… → 99c5322df676198c0b9aa86dd0e9ea63062f36b16c2609a4c5160033650236bcf161581d6047513411d9f1aa0ae25d13`** (MRTD/RTMR0/1/3 byte-held; live binary_sha256 == pin `68281d24…`). Cycle B: rebuild **byte-identical** binary `68281d24…` + initrd `1af2c963…` (RTMR2 stable — reproducible Docker synthesis, both shas re-checked) carrying the rotated verify.html on the ESP → disk **`66befe70…`** (md5 `58815d45…`, `disk186b.raw`) → relay186b green in 2 min → **`m-2ze5hs6tgv7q4lyymybm`** + NVMe → prod swap (disk `d-2ze5juogkfapt7f97584`, 1 GiB cloud_auto) → TLS 200 05:20:01 UTC. |
+| **v186 gates** | ✅ offline **201/0** (196 → 201: +identity-row ×2, flow-substitution ×2, byte-cap ×1) · live-envelope **209/0** (captures from BOTH cycle boots) · cargo **22/0** · `check-manifest-parity` **PARITY OK** (6 same incl. verify.html, 0 mismatched, NvVars excluded) · served == README == `242b033e…` over https **and** http/IP · **live PayPal sandbox e2e PASS ×2** (verified AND full — the full run exercises the flow check symmetrically; e2e claim-status selector updated `#localLoginStatus` → `#secureLoginStatus`). |
+| **Ops notes (this cycle)** | OAuth STS in `~/.aliyun/config.json` expires (~1 h) and the presign helpers read it directly → dead token = `InvalidAccessKeyId`; **ONE `aliyun …` call re-mints it** (config rewritten with a new expiration). `DescribeImageAttribute` is NOT a valid CLI action — use `aliyun ecs DescribeImages --ImageId …`. Relay re-arm order re-confirmed (Stop → Replace → UserData → Start) + fresh presigns generated immediately before each arm. Rollback images kept: `m-2zefiag79exwggjl8z0m` (A), `m-2ze5hs6tgv7pwfzcuryu` (v185d). Relay stopped in economy mode after each leg. |
+| **Residuals (unchanged, justified)** | RR-6 session-time enclave authentication gap (audit.md §7.8 — no collusion-proof pre-quote authenticator exists without the removed pre-login DoS surface) · UKI deferral (GRUB 2.12 → RTMR2 live-proven) · sandbox/staging deployment (loud two-verdict model) · GitHub-outage provenance row advisory · self-report informational-only (code identity = silicon pins exclusively). audit5.md disposition in plan.md. |
+
+---
+
 ## 1. Mission & threat model
 
 Run an independent end-to-end security audit of the project, of the **live
@@ -449,7 +465,7 @@ E2E + harness + PII all passing.**
 
 | What | Where |
 |---|---|
-| Prod enclave config (PayPal pair, CF `dns01_secret`, EAB, attestation key) | instance user_data (`DescribeUserData i-2zefwa6bdimeg1rbcfsg`); mirrored at `/tmp/prod-config.json`, `/tmp/prod-ud.b64` (ephemeral) |
+| Prod enclave config (PayPal pair, CF `dns01_secret`, EAB, attestation key) | instance user_data (`DescribeUserData i-2ze4tvkuf12u933nsw8a`); mirrored at `/tmp/prod-config.json`, `/tmp/prod-ud.b64`, `/tmp/prod-ud186.b64` + `/tmp/prod-config186.json` (ephemeral) |
 | Local (pair-swapped!) config | `/tmp/ali-config.json` |
 | Alibaba STS/OAuth profile | `~/.aliyun/config.json` |
 | Self-report RAM key (PutObject `boot/*` only, created 2026-10-24) | RAM user `pav-selfreport`; secret returned ONCE at creation — local mirror `/tmp/pav-ak.id` + `/tmp/pav-ak.secret` (ephemeral, 600) |
