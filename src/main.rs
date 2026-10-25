@@ -205,15 +205,41 @@ mod enclave_init {
     /// BOOTP exchange at boot — there is no lease renewal daemon to starve.)
     pub fn egress_lockdown() {
         kmsg("POST-BOOT EGRESS LOCKDOWN: dropping IMDS/metadata, DNS, port 80; 443 only to pinned PayPal endpoints...");
-        let commands = [
-            "flush chain inet filter output",
-            "add rule inet filter output oif lo accept",
-            "add rule inet filter output ct state established,related accept",
+        // v186 (self-report heartbeat fix): capture the sink's addresses while
+        // DNS is STILL open, then allow EXACTLY those on 443. The boot-stage
+        // documents already landed pre-lockdown, but `selfreport::serving()`
+        // (and any later halt/failure) publishes after this flush — previously
+        // dropped by the output policy, so a healthy box was indistinguishable
+        // from a dark one. The sink payload is secret-free and signed per
+        // request (write-only RAM key), so this reopens no exfil channel: no
+        // DNS, no port 80, no wildcard — just 443 to the one pinned endpoint.
+        let sink_addrs = crate::selfreport::pin_sink_network();
+        let mut commands: Vec<String> = vec![
+            "flush chain inet filter output".into(),
+            "add rule inet filter output oif lo accept".into(),
+            "add rule inet filter output ct state established,related accept".into(),
             // == hardened_client() pin set (api-m.paypal.com / api-m.sandbox) ==
-            "add rule inet filter output ip daddr { 104.16.124.74, 146.75.123.1 } tcp dport 443 accept",
+            "add rule inet filter output ip daddr { 104.16.124.74, 146.75.123.1 } tcp dport 443 accept".into(),
         ];
+        if !sink_addrs.is_empty() {
+            let set = sink_addrs
+                .iter()
+                .map(|a| a.ip().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            commands.push(format!(
+                "add rule inet filter output ip daddr {{ {} }} tcp dport 443 accept",
+                set
+            ));
+            kmsg(&format!(
+                "Self-report sink survives lockdown: 443 pinned to {}",
+                set
+            ));
+        } else if crate::selfreport::sink_configured() {
+            kmsg("WARNING: self-report sink configured but its hostname did not resolve pre-lockdown — post-lockdown reports will be dropped.");
+        }
         for cmd in commands {
-            match std::process::Command::new("/usr/sbin/nft").arg(cmd).status() {
+            match std::process::Command::new("/usr/sbin/nft").arg(&cmd).status() {
                 Ok(s) if s.success() => {}
                 _ => {
                     kmsg(&format!("FATAL: egress lockdown command '{}' failed — halting (fail closed).", cmd));
@@ -221,7 +247,7 @@ mod enclave_init {
                 }
             }
         }
-        kmsg("Egress locked down: output policy drop except loopback + PayPal pinned 443.");
+        kmsg("Egress locked down: output policy drop except loopback + PayPal pinned 443 + self-report sink 443.");
     }
 
     pub fn mount_filesystems() {
@@ -851,6 +877,29 @@ fn client_session_binding(client_pub_der: &[u8], client_nonce: &[u8]) -> [u8; 32
     hasher.update(client_pub_der);
     hasher.update(client_nonce);
     hasher.finalize().into()
+}
+
+/// v186 (audit round 5): canonicalize `custom_info` (trim; empty → "NONE")
+/// and enforce the SAME 512-byte bound the auditor has always applied
+/// client-side. The enclave previously accepted any size: `custom_info` is
+/// copied TWICE into the signed login-session response (state token +
+/// signed_fields) yet charged as 4 KiB of egress, so a direct caller could
+/// inflate a single response ~256x past its budget charge — and, via a
+/// forged `/callback` state token, park an unbounded blob in the E2EE vault
+/// (charged 32 KiB). `None` = reject (fail closed). Shared by
+/// `/attest/login-session` and `/callback` so both ends enforce one rule.
+fn canonical_custom_info(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let s = if trimmed.is_empty() {
+        "NONE".to_string()
+    } else {
+        trimmed.to_string()
+    };
+    if s.len() > 512 {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 // Sign the canonical (sorted-key) JSON of an attestation_report with the
@@ -1561,8 +1610,13 @@ async fn attest_login_session(
 
     let flow = payload.flow.as_deref().unwrap_or("verified");
     let (cid, _csec, scope, label) = state.get_flow_config(flow);
-    let custom_info = payload.custom_info.as_deref().unwrap_or("NONE").trim();
-    let custom_info_str = if custom_info.is_empty() { "NONE" } else { custom_info };
+    // v186: 512-byte bound, enforced server-side (was client-side only).
+    let custom_info_str = match canonical_custom_info(payload.custom_info.as_deref().unwrap_or("")) {
+        Some(s) => s,
+        None => {
+            return (StatusCode::BAD_REQUEST, "custom_info exceeds 512 bytes").into_response()
+        }
+    };
 
     // Self-describing state token (v180): the client session travels inside
     // the OAuth `state` and is re-parsed by /callback after PayPal redirects
@@ -1868,9 +1922,14 @@ async fn callback(
     };
     // Same custom_info canonicalization as the login-session endpoint
     // (trim; empty → "NONE") so the SEC-02 nonce binds what the auditor
-    // recorded locally.
-    let custom_info = st.get("c").and_then(|v| v.as_str()).unwrap_or("NONE").trim();
-    let custom_info_str = if custom_info.is_empty() { "NONE".to_string() } else { custom_info.to_string() };
+    // recorded locally. v186: the state token is UNTRUSTED — a forged state
+    // could otherwise smuggle an unbounded custom_info into the quote, the
+    // signed report and the vault blob (both ends now share the 512-byte
+    // bound in canonical_custom_info).
+    let custom_info_str = match canonical_custom_info(st.get("c").and_then(|v| v.as_str()).unwrap_or("")) {
+        Some(s) => s,
+        None => return invalid_session(),
+    };
 
     // R3-1: resolve THIS state's PKCE verifier before any PayPal call.
     // No verifier (forged state, restarted enclave, expired TTL) ⇒ fail
@@ -2568,6 +2627,38 @@ mod security_tests {
         );
     }
 
+    /// v186 (audit round 5): `custom_info` is capped at 512 BYTES on BOTH
+    /// ends of the state round-trip (login-session request → state token →
+    /// /callback), matching verify.html's client-side TextEncoder byte
+    /// check. The cap is what keeps the signed response and the vault blob
+    /// inside their egress-budget charges — the field used to be accepted
+    /// unbounded while the request was charged 4 KiB (a ~256x budget-bypass
+    /// amplification surface under the collusion/DoS model).
+    #[test]
+    fn custom_info_512_byte_cap_v186() {
+        assert_eq!(canonical_custom_info("  hello  ").as_deref(), Some("hello"));
+        assert_eq!(canonical_custom_info("").as_deref(), Some("NONE"));
+        assert_eq!(canonical_custom_info("   ").as_deref(), Some("NONE"));
+        assert_eq!(canonical_custom_info("NONE").as_deref(), Some("NONE"));
+        assert_eq!(canonical_custom_info(&"x".repeat(512)).map(|s| s.len()), Some(512));
+        assert_eq!(canonical_custom_info(&"x".repeat(513)), None, "513 bytes must be rejected");
+        // multibyte counts as BYTES, exactly like the auditor's TextEncoder check
+        assert_eq!(canonical_custom_info(&"é".repeat(256)).map(|s| s.len()), Some(512));
+        assert!(canonical_custom_info(&"é".repeat(257)).is_none(), "514 bytes must be rejected");
+
+        // Source pin: BOTH handlers must route through the shared cap.
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("src/main.rs must be readable");
+        assert!(
+            src.contains("canonical_custom_info(payload.custom_info.as_deref().unwrap_or(\"\"))"),
+            "/attest/login-session must enforce the 512-byte custom_info cap"
+        );
+        assert!(
+            src.contains("canonical_custom_info(st.get(\"c\")"),
+            "/callback must enforce the 512-byte custom_info cap on the untrusted state token"
+        );
+    }
+
     /// v179 (plan Phase 4 — host egress defense): the kernel-hardening block
     /// must keep every protection the plan requires — swap off (fail closed),
     /// kexec disabled, suid dumps off, core dumps off. Source-level pin in the
@@ -2645,6 +2736,52 @@ mod security_tests {
         assert!(
             client_fn.contains("add_root_certificate"),
             "hardened_client() must pin the embedded roots explicitly"
+        );
+    }
+
+    /// v186 (self-report heartbeat): the post-lockdown publish must survive
+    /// the flush — `pin_sink_network()` runs BEFORE the output chain is
+    /// flushed and lockdown pins the sink's IPv4s on 443; `put()` pins the
+    /// resolver so no DNS query happens afterwards. Losing either half
+    /// silently returns to the 2026-10-25 state where
+    /// `selfreport::serving()` (and every later halt) was firewalled away.
+    #[test]
+    fn selfreport_survives_egress_lockdown_v186() {
+        let main_src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("src/main.rs must be readable");
+        let lockdown = main_src
+            .split("pub fn egress_lockdown()")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub fn ").next())
+            .expect("egress_lockdown() body must exist");
+        let pin_at = lockdown
+            .find("pin_sink_network()")
+            .expect("lockdown must pin the sink's addresses while DNS is still open");
+        let flush_at = lockdown
+            .find("flush chain inet filter output")
+            .expect("lockdown must flush the output chain");
+        assert!(
+            pin_at < flush_at,
+            "pin_sink_network() must run BEFORE the flush — DNS egress only exists pre-lockdown"
+        );
+        assert!(
+            lockdown.contains("ip daddr {{ {} }} tcp dport 443 accept"),
+            "lockdown must add an nft allow rule for exactly the pinned sink addresses on 443"
+        );
+        assert!(
+            !lockdown.contains("udp dport 53 accept"),
+            "lockdown must NOT reopen DNS — the sink pins its resolver instead (no query-channel exfil)"
+        );
+
+        let sr_src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/selfreport.rs"))
+            .expect("src/selfreport.rs must be readable");
+        assert!(
+            sr_src.contains("resolve_to_addrs(&sink.host(), addrs)"),
+            "put() must pin the resolver to the pre-lockdown addresses (post-lockdown there is no DNS)"
+        );
+        assert!(
+            sr_src.contains("a.is_ipv4()"),
+            "only IPv4 sink addresses may be pinned — the nft rule is `ip daddr`"
         );
     }
 

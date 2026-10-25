@@ -790,6 +790,13 @@ console.log('\nTest 16: tampered enclave signature → hard fail (unauthenticate
   check('audit fails', ok === false, `ok=${ok}`);
   check('enclave signature INVALID reason', /enclave signature over this report is INVALID/.test(alert || ''), alert);
   check('enclaveCheck row failed', row('enclaveCheck').cls === 'check-item failed', row('enclaveCheck').cls);
+  // v186 (audit round 5): the identity row used to be painted green BEFORE
+  // the signature check, so a forged report rendered a green "Identity"
+  // row next to the red signature row. It must be failed + explained now.
+  check('identity row NOT green on an unauthenticated report (v186)',
+    row('identityCheck').cls !== 'check-item verified', row('identityCheck').cls);
+  check('identity row explains the report is unauthenticated',
+    /unauthenticated/i.test(row('identityCheck').desc), row('identityCheck').desc.slice(0, 200));
 }
 
 console.log('\nTest 17: pre-flight pin violation → deterministic fail before anything else');
@@ -1399,14 +1406,14 @@ console.log('\nTest 24: auditor isolation — key generation refused outside fil
   check('secure-login refuses on the enclave origin',
     /UNTRUSTED AUDITOR ORIGIN/.test(el('secureLoginStatus').innerText),
     el('secureLoginStatus').innerText.slice(0, 140));
-  await localPreflight();
-  check('local pre-flight refuses on the enclave origin',
-    /UNTRUSTED AUDITOR ORIGIN/.test(el('localLoginStatus').innerText),
-    el('localLoginStatus').innerText.slice(0, 140));
+  // v186: localPreflight() was deleted from the auditor — it was a dead
+  // duplicate of executePreflightAndLogin (no UI caller ever reached it),
+  // part of the max-simplification pass. The claim path is the second
+  // remaining entry point and must refuse here too (single status element).
   await localClaim();
   check('claim refuses on the enclave origin',
-    /UNTRUSTED AUDITOR ORIGIN/.test(el('localLoginStatus').innerText),
-    el('localLoginStatus').innerText.slice(0, 140));
+    /UNTRUSTED AUDITOR ORIGIN/.test(el('secureLoginStatus').innerText),
+    el('secureLoginStatus').innerText.slice(0, 140));
   setLoc({ protocol: 'file:', host: '', origin: 'null' });
   check('file:// copy is trusted', trustedAuditorContext() === true);
   setLoc({ protocol: 'https:', host: 'leonardopedro.github.io', origin: 'https://leonardopedro.github.io' });
@@ -1610,6 +1617,10 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
   // base64url per RFC 7636. `omitPkce` lets the downgrade case be driven.
   const PKCE_CHALLENGE = 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG'; // 43 chars
   let omitPkce = false;
+  // v186: simulate the collusion-model request substitution — the stub
+  // answers with the audited FULL-flow app no matter what flow was asked for
+  // (every signature/pin/app allow-list check legitimately passes).
+  let substituteFlow = false;
   const requests = [];
   const origFetch = globalThis.fetch;
   globalThis.fetch = async (url, opts) => {
@@ -1618,7 +1629,8 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
       const body = JSON.parse(opts.body);
       const pubDer = Buffer.from(body.client_ecdh_pub_b64, 'base64');
       const binding = await clientSessionBindingHex(pubDer, body.client_nonce_hex);
-      const app = globalThis.EXPECTED_APPS.find(a => a.flow === (body.flow || 'verified'));
+      const app = globalThis.EXPECTED_APPS.find(a => a.flow ===
+        (substituteFlow ? 'full' : (body.flow || 'verified')));
       const sf = reorder({
         binding: 'v180', state: 'teststate-abc', flow: app.flow,
         paypal_client_id: app.client_id, paypal_environment: 'sandbox',
@@ -1671,6 +1683,35 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
       (elements['secureLoginStatus'].innerText || '').slice(0, 160));
     check('refusal made exactly one further session call and built no new link',
       requests.length === 2, JSON.stringify(requests));
+
+    // v186 (audit round 5 — session-time FLOW binding): a request whose flow
+    // label was swapped in transit (owner+provider own the path) gets a
+    // fully-valid signed response for the WRONG app — app pin and PKCE both
+    // pass — so the auditor must compare the signed flow against the one THIS
+    // tab requested, before any authorize link exists.
+    elements['securePaypalUrl'].style.display = 'none'; // hide the happy-path link
+    substituteFlow = true;
+    await executePreflightAndLogin('verified');
+    substituteFlow = false;
+    check('flow-substituted session is refused before PayPal (v186)',
+      /FLOW SUBSTITUTION/.test(elements['secureLoginStatus'].innerText || ''),
+      (elements['secureLoginStatus'].innerText || '').slice(0, 200));
+    check('flow substitution built no authorize link',
+      requests.length === 3 && elements['securePaypalUrl'].style.display === 'none',
+      JSON.stringify({ requests: requests.length, display: elements['securePaypalUrl'].style.display }));
+
+    // v186: the client-side custom_info cap counts BYTES (TextEncoder),
+    // matching the enclave's new server-side 512-byte rejection. 257 two-byte
+    // chars = 257 UTF-16 units (the old char-count check passed them) but
+    // 514 bytes — must be refused BEFORE any network call.
+    document.getElementById('customInfoInput').value = 'é'.repeat(257);
+    await executePreflightAndLogin('verified');
+    document.getElementById('customInfoInput').value = '';
+    check('oversized custom_info refused client-side by BYTES (v186)',
+      /exceeds 512 bytes/.test(elements['secureLoginStatus'].innerText || ''),
+      (elements['secureLoginStatus'].innerText || '').slice(0, 160));
+    check('oversized custom_info made no network call',
+      requests.length === 3, JSON.stringify(requests));
   } finally {
     globalThis.fetch = origFetch;
     setLoc(null);
@@ -1830,8 +1871,12 @@ console.log('\nTest 34: audit round 3 — payment-flow abuse + side-channel hard
     rustSrc.includes('const MAX_PENDING_PKCE: usize = 4096') && rustSrc.includes('const PKCE_TTL_SECS: u64 = 600'), 'ceiling/TTL missing');
   check('user-cancel/empty code handled BEFORE any exchange or consumption',
     rustSrc.includes('PayPal returned an error — no code was exchanged'), 'error-path early return missing');
-  check('auditor requires PKCE before PayPal (definition + both flows)',
-    (verifySrc.match(/requirePkceChallenge\(/g) || []).length >= 3,
+  check('auditor requires PKCE before PayPal (definition + login path)',
+    // v186: was >=3 (definition + executePreflightAndLogin + localPreflight);
+    // localPreflight was deleted as dead duplication, so the invariant is now
+    // definition + the single remaining login path (the claim path never
+    // builds an authorize URL).
+    (verifySrc.match(/requirePkceChallenge\(/g) || []).length >= 2,
     String((verifySrc.match(/requirePkceChallenge\(/g) || []).length));
   check('auditor carries the challenge + S256 method into the authorize URL',
     verifySrc.includes('&code_challenge=${encodeURIComponent(sf.code_challenge)}&code_challenge_method=S256'), 'authorize URL lacks PKCE');

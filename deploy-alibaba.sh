@@ -154,6 +154,27 @@ else
     echo '{}' > "$CONFIG_TMPFILE"
 fi
 
+# Self-report sink (boot status -> OSS): inject `self_report` whenever the
+# write-only RAM key is provided. Keeps future deploys from silently dropping
+# the sink that prod user_data carries today (HANDOVER §0.10/§6). The config
+# file path is left untouched — a file that already carries self_report wins.
+if [[ -n "${SELF_REPORT_ACCESS_KEY_ID:-}" && -n "${SELF_REPORT_ACCESS_KEY_SECRET:-}" ]]; then
+    SELF_REPORT_BUCKET="${SELF_REPORT_BUCKET:-paypal-tdx-relay-1792227992}"
+    SELF_REPORT_ENDPOINT="${SELF_REPORT_ENDPOINT:-oss-cn-hongkong.aliyuncs.com}"
+    SELF_REPORT_PREFIX="${SELF_REPORT_PREFIX:-boot}"
+    SELF_REPORT_MERGED=$(mktemp)
+    jq --arg b "$SELF_REPORT_BUCKET" \
+       --arg e "$SELF_REPORT_ENDPOINT" \
+       --arg p "$SELF_REPORT_PREFIX" \
+       --arg k "$SELF_REPORT_ACCESS_KEY_ID" \
+       --arg s "$SELF_REPORT_ACCESS_KEY_SECRET" \
+       '. + {self_report: {bucket:$b, endpoint:$e, prefix:$p,
+                           access_key_id:$k, access_key_secret:$s, sts_token:null}}' \
+       "$CONFIG_TMPFILE" > "$SELF_REPORT_MERGED"
+    mv "$SELF_REPORT_MERGED" "$CONFIG_TMPFILE"
+    echo "   Config      : self_report sink -> oss://$SELF_REPORT_BUCKET/$SELF_REPORT_PREFIX (write-only key)"
+fi
+
 # user_data = raw JSON (the enclave reads /latest/user-data directly; there is
 # no cloud-init in the initramfs to interpret a bash script)
 USER_DATA_B64=$(base64 -w0 < "$CONFIG_TMPFILE")

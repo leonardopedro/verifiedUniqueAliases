@@ -212,8 +212,7 @@
     <div class="grid" style="margin-top: -10px;">
         <div class="input-card" style="grid-column: span 2; border-color: #4caf50;">
             <label>Log in with PayPal — the login IS the pre-flight check</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem;">There is deliberately <b>no separate pre-login hardware check</b>: it would let anyone exhaust the enclave's resources, and a completed PayPal login is itself the attacker filter. Your browser generates a throwaway encryption key that never leaves this page. Your PayPal identity comes back encrypted to that key — neither the site owner (who holds the PayPal client secret and can issue TLS certificates for this domain) nor the cloud provider (who sees all traffic leaving the machine) can read it. After PayPal verifies you, the enclave mints the hardware proof (an Intel TDX quote) bound to <i>this</i> login and your session, this page audits it, and only a fully green audit decrypts here. <b>This page</b> builds the PayPal link; the enclave never redirects you.</p>
-            <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;">The strongest setup is your own copy: take <code>verify.html</code> from the project's GitHub, save it and open it locally (<code>file://</code>, or use the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a>) — keys are then created only on your machine, anything injected on the enclave's origin only ever sees ciphertext, and this enclave-origin copy refuses key generation by design (Web Auditor Tampering defense).</p>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">There is deliberately <b>no separate pre-login hardware check</b>: it would let anyone exhaust the enclave's resources, and a completed PayPal login is itself the attacker filter. Your browser generates a throwaway encryption key that never leaves this page. Your PayPal identity comes back encrypted to that key — neither the site owner (who holds the PayPal client secret and can issue TLS certificates for this domain) nor the cloud provider (who sees all traffic leaving the machine) can read it. After PayPal verifies you, the enclave mints the hardware proof (an Intel TDX quote) bound to <i>this</i> login and your session, this page audits it, and only a fully green audit decrypts here. <b>This page</b> builds the PayPal link; the enclave never redirects you. The strongest setup is your own copy: take <code>verify.html</code> from the project's GitHub, save it and open it locally (<code>file://</code>, or use the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a>) — keys are then created only on your machine, anything injected on the enclave's origin only ever sees ciphertext, and this enclave-origin copy refuses key generation by design (Web Auditor Tampering defense).</p>
             <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow:</b> click a login button → finish PayPal in the new tab → return here and press “Claim Encrypted Report” below when it appears — it fetches your still-ENCRYPTED report from the enclave's vault using the throwaway key that exists only in this browser, then decrypts, audits and downloads it in one step (nobody else — not even the site owner — can open it). If any step fails, nothing is saved, so you are safe to close the tab.</p>
             <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                 <button onclick="executePreflightAndLogin('verified')" style="background:#4caf50;">🔒 Log in with PayPal (Verified account only)</button>
@@ -227,11 +226,7 @@
                 style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
             <a id="securePaypalUrl" style="display:none; margin-top:10px;" class="btn" target="_blank" rel="noopener">Continue to PayPal →</a>
             <p id="secureLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
-            <p id="localLoginStatus" style="margin: 6px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
         </div>
-    </div>
-
-    <div class="grid" style="margin-top: -10px;">
         <div class="input-card" style="grid-column: span 2;">
             <label>Audit a report you already have</label>
             <p style="color: var(--text-dim); font-size: 0.9rem;">A saved report JSON (💾 offered on the login success page, or the Download button after a passing audit) audits offline in <b>any</b> copy of this auditor, including the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a> or your own saved <code>verify.html</code>. The optional certificate field additionally binds a saved TLS certificate to the report (extra safety). The audit is fail-closed: any red row — including “No valid Silicon Root of Trust” — means the evidence in the report did not verify; a common benign cause is a stale auditor page, so always take the latest <code>verify.html</code> from the project's GitHub. Only trust a report that passes every check.</p>
@@ -486,8 +481,7 @@
             // context (file:// / GitHub Pages), never in the enclave-served copy.
             if (!trustedAuditorContext()) throw untrustedOriginError();
             rememberSelectedFlow(flow);
-            const enclaveBase = ((document.getElementById('localEnclaveHost') || {}).value
-                || (document.getElementById('preflightUrl') || {}).value || '').trim().replace(/\/+$/, ''); // preflightUrl: legacy field, kept for old saved copies
+            const enclaveBase = ((document.getElementById('localEnclaveHost') || {}).value || '').trim().replace(/\/+$/, '');
             if (!/^https:\/\/[^\/]+/.test(enclaveBase)) {
                 throw new Error('Enter the enclave origin (https://<enclave>) in the "enclave address" field first.');
             }
@@ -505,8 +499,8 @@
             // identically to the enclave (trim; empty → 'NONE').
             const customInfoRaw = (document.getElementById('customInfoInput') || {}).value || '';
             const customInfo = customInfoRaw.trim() || 'NONE';
-            if (customInfo !== 'NONE' && customInfo.length > 512) {
-                throw new Error('custom data exceeds 512 characters — shorten it (e.g. hash your key first)');
+            if (customInfo !== 'NONE' && new TextEncoder().encode(customInfo).length > 512) {
+                throw new Error('custom data exceeds 512 bytes — shorten it (e.g. hash your key first)');
             }
             sessionStorage.setItem('pav_custom_info', customInfo);
 
@@ -543,6 +537,18 @@
             // R3-1: refuse a PKCE-less (downgraded or stale) login BEFORE any
             // session state is stored or the user is sent to PayPal.
             requirePkceChallenge(pf.signed_fields);
+            // v186 (audit round 5 — session-time FLOW binding): the enclave
+            // signs whatever flow label arrived in the REQUEST, and under the
+            // collusion model the owner+provider own that path end-to-end:
+            // substituting flow=verified → full turns this session into the
+            // full-PII PayPal app while EVERY signature and pin still verifies
+            // (the full app is legitimately in EXPECTED_APPS). The audit-time
+            // FLOW ESCALATION check only catches that AFTER the PayPal consent
+            // screen, so refuse here — before the authorize link is built.
+            const requestedFlow = (flow === 'full') ? 'full' : 'verified';
+            if (String(pf.signed_fields.flow || '') !== requestedFlow) {
+                throw new Error('FLOW SUBSTITUTION: this browser requested the "' + requestedFlow + '" flow but the enclave signed flow="' + String(pf.signed_fields.flow) + '" — the request or response was altered in transit. Aborting before PayPal.');
+            }
 
             // The enclave must echo back exactly what this browser sent (the
             // binding it will hardware-bind at /callback, and the custom data).
@@ -699,7 +705,7 @@
     // (b9292a31…), live-confirmed by the post-swap envelope self-reporting
     // 01c74f89… . Rotate again with the next binary release, in the same
     // reviewed commit as the README digest (harness Test 21d/28 anchor it).
-    var EXPECTED_ENCLAVE_SHA256 = '01c74f89d64abca22a2f6ef8c1aaeeb1884c417a8eb3bac447b41e4a8809511d';
+    var EXPECTED_ENCLAVE_SHA256 = '68281d2437fa092489bd7d509b8e698c72b74389e755c867dee5281a222fe618';
 
     // ========================================================================
     // v162 (audit VULN-04): GOLDEN PCR PINS — CI-captured constants for the
@@ -820,85 +826,8 @@
         return envelope;
     }
 
-    async function localPreflight(flow) {
-        const log = document.getElementById('localLoginStatus');
-        const say = m => { if (log) log.innerText = m; };
-        try {
-            // v168 (plan Phase 3.3): keys only in a TRUSTED auditor context.
-            if (!trustedAuditorContext()) throw untrustedOriginError();
-            rememberSelectedFlow(flow || 'verified');
-            const host = (document.getElementById('localEnclaveHost').value || '').trim().replace(/\/$/, '');
-            if (!/^https:\/\//.test(host)) throw new Error('Enter the enclave origin, e.g. https://login.airma.de');
-            say('⏳ Generating LOCAL session keypair (ECDH P-256) + nonce…');
-            const kp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
-            const pubRaw = await crypto.subtle.exportKey('spki', kp.publicKey);
-            const pubB64 = btoa(String.fromCharCode(...new Uint8Array(pubRaw)));
-            const clientNonce = crypto.getRandomValues(new Uint8Array(32));
-            const nonceHex = Array.from(clientNonce).map(b => b.toString(16).padStart(2, '0')).join('');
-            const customInfoRaw = (document.getElementById('customInfoInput') || {}).value || '';
-            const customInfo = customInfoRaw.trim() || 'NONE';
-            if (customInfo !== 'NONE' && customInfo.length > 512) throw new Error('custom data exceeds 512 characters');
-
-            say('🔐 Requesting login session (no pre-login attestation — the PayPal login IS the filter)…');
-            // v180 (user directive — no pre-login attestation): same flow as
-            // Step 1 — S_enc-signed fields only, NO hardware quote, and the
-            // full hardware audit deferred to the POST-login report (which a
-            // PayPal-verified code exchange gates).
-            const resp = await fetch(host + '/attest/login-session', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ client_ecdh_pub_b64: pubB64, client_nonce_hex: nonceHex, flow: flow || 'verified', custom_info: customInfo === 'NONE' ? '' : customInfo })
-            });
-            if (!resp.ok) throw new Error('login-session request rejected (HTTP ' + resp.status + ')' + (resp.status === 404 ? ' — this deployment still exposes the old pre-flight endpoint; refresh this page from the project GitHub' : ''));
-            const pf = await resp.json();
-
-            say('🔏 Verifying S_enc signature + app pin…');
-            const sigKey = await crypto.subtle.importKey('spki', pemToBuffer(pf.enclave_signing_public_key), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
-            const sigOk = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', sigKey, pemToBuffer(pf.login_signature_b64),
-                new TextEncoder().encode(JSON.stringify(reorder(pf.signed_fields))));
-            if (!sigOk) throw new Error('LOGIN-SESSION SIGNATURE INVALID — aborting.');
-            checkExpectedApp(pf.signed_fields);
-            const sf = pf.signed_fields;
-            // R3-1: refuse a PKCE-less (downgraded or stale) login BEFORE any
-            // session state is stored or the user is sent to PayPal.
-            requirePkceChallenge(sf);
-            const expectedBinding = await clientSessionBindingHex(new Uint8Array(pubRaw), nonceHex);
-            if ((sf.custom_info || 'NONE') !== customInfo
-                || (sf.client_session_binding_hex || '').toLowerCase() !== expectedBinding) {
-                throw new Error('Session fields do NOT match what this browser generated — aborting.');
-            }
-
-            // Key-continuity pin: the post-login report must be signed by THIS
-            // enclave key (no pre-login quote exists to audit any more — the
-            // hardware proof is the post-login TDX quote itself).
-            preFlightPubKeyPem = pf.enclave_signing_public_key;
-            try { sessionStorage.setItem('pav_p_enc', pf.enclave_signing_public_key); } catch (e) {}
-
-            // Keys stay in THIS file origin's storage — never the enclave's.
-            // v179 (plan Phase 1): the client-session binding travels with the
-            // session so the claim audit enforces the quote's session slot.
-            auditorSessionBindingHex = expectedBinding;
-            try { sessionStorage.setItem('pav_session_binding_hex', auditorSessionBindingHex); } catch (e) {}
-            localStorage.setItem('pav_local_session', JSON.stringify({
-                host, jwk: JSON.stringify(await crypto.subtle.exportKey('jwk', kp.privateKey)),
-                nonceHex, customInfo, p_enc: pf.enclave_signing_public_key, state: sf.state,
-                flow: sf.flow || flow || 'verified',
-                clientPubB64: pubB64, sessionBindingHex: auditorSessionBindingHex,
-            }));
-            const url = `${sf.authorize_base}?client_id=${encodeURIComponent(sf.paypal_client_id)}` +
-                `&response_type=code&scope=${sf.scope}&redirect_uri=${encodeURIComponent(sf.redirect_uri)}` +
-                `&state=${sf.state}` +
-                `&code_challenge=${encodeURIComponent(sf.code_challenge)}&code_challenge_method=S256`;
-            const link = document.getElementById('localPaypalUrl') || document.getElementById('securePaypalUrl');
-            if (link) { link.href = url; link.style.display = 'inline-block'; }
-            say('✅ Login session ready. Log in via the PayPal link above, then come back HERE and press “🔓 2. Claim Encrypted Report’ — the hardware audit runs on the delivered report, which decrypts, audits and downloads in THIS tab (your key never leaves it).');
-            return url;
-        } catch (e) {
-            say('❌ ' + e.message);
-        }
-    }
-
     async function localClaim() {
-        const log = document.getElementById('localLoginStatus');
+        const log = document.getElementById('secureLoginStatus');
         const say = m => { if (log) log.innerText = m; };
         try { const cb = document.getElementById('claimBtn'); if (cb) cb.style.display = 'none'; } catch (e) {}
         try {
@@ -1015,12 +944,8 @@
                 try { postLogin = !!sessionStorage.getItem('pav_e2ee_blob') || location.search.indexOf('afterlogin=1') !== -1; } catch (e) {}
                 if (postLogin) {
                     say('✅ Your PayPal login COMPLETED — the encrypted report is in the enclave\'s vault. Two ways to retrieve it: (1) go back to the SUCCESS PAGE (“Authentication Succeeded”) and press “📋 Copy encrypted report”, then paste it into the “Attestation JSON report” box of a TRUSTED auditor (GitHub Pages copy or your saved file:// verify.html) and run the audit there; or (2) if the tab where you started the login is still open, press “🔓 2. Claim Encrypted Report” THERE — only that tab holds your key, so the report decrypts, audits and downloads on THAT page. Claiming from this owner-controlled copy is refused by design (Web Auditor Tampering defense).');
-                    const l = document.getElementById('localLoginStatus');
-                    if (l) l.innerText = '✅ Login done — copy the encrypted report from the success page (or claim it on your trusted login tab) and audit it in a trusted copy. This copy cannot hold your key.';
                 } else {
                     say('⚠️ UNTRUSTED AUDITOR COPY — this page is served by the enclave\'s own webserver, which its owner controls. The secure login and key generation are DISABLED here (Web Auditor Tampering defense). Save this file from the project GitHub and open it locally (file://) — or use the GitHub Pages copy — to log in. Paste-report auditing below still works on this copy.');
-                    const l = document.getElementById('localLoginStatus');
-                    if (l) l.innerText = '⚠️ Use a trusted copy (file:// or GitHub Pages) for the secure login — this copy cannot generate keys.';
                 }
             }
         } catch (e) { /* no location (harness) — skip */ }
@@ -1749,7 +1674,6 @@
             const expectedNonce = Array.from(new Uint8Array(combinedHash)).map(b => b.toString(16).padStart(2, '0')).join('');
             
             // Note: The JSON nonce_hex is entirely untrusted. We use expectedNonce moving forward.
-            updateStatus('identityCheck', true, "Identity cryptographically hashed." + (preFlightPubKeyPem ? " 🔒 P_enc matches the login-session pin." : " ℹ️ No enclave-key pin in this session — the hardware audit above IS the gate (silicon root + MRTD/RTMR pins + client-session binding)."));
 
             // 2. Enclave Signature Validation
             const sig = pemToBuffer(rawData.enclave_signature_b64 || report.signature_b64);
@@ -1760,7 +1684,17 @@
             // v164: fail closed. A report whose enclave signature does not
             // verify is UNAUTHENTICATED — continuing to green sub-checks would
             // let a fabricated report render mostly-verified rows.
-            if (!sigOk) throw new Error("CRITICAL: the enclave signature over this report is INVALID — the report content is unauthenticated (tampered or fabricated). Failing closed.");
+            if (!sigOk) {
+                // v186 (audit round 5): the identity row must NOT stay green on
+                // an UNAUTHENTICATED report — the preimage match above only
+                // means anything once the enclave signature binds it. It used
+                // to be painted green BEFORE this check, so a forged report
+                // rendered a green "Identity" row beside the red signature.
+                updateStatus('identityCheck', false, "❌ Report signature INVALID — the identity preimage above is unauthenticated and cannot be trusted.");
+                throw new Error("CRITICAL: the enclave signature over this report is INVALID — the report content is unauthenticated (tampered or fabricated). Failing closed.");
+            }
+            // Only now — report authenticated — does the identity row go green.
+            updateStatus('identityCheck', true, "Identity cryptographically hashed + report authenticated." + (preFlightPubKeyPem ? " 🔒 P_enc matches the login-session pin." : " ℹ️ No enclave-key pin in this session — the hardware audit above IS the gate (silicon root + MRTD/RTMR pins + client-session binding)."));
 
             // 3. TPM Hardware Audit — REMOVED (v180, audit.md §5.1): the GCP
             // vTPM path (quote signature, session nonce, PCR digests, golden

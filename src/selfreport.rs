@@ -151,6 +151,12 @@ pub fn sign_hmac_sha1(secret: &str, canonical: &str) -> String {
 
 static SINK: OnceLock<Option<SinkConfig>> = OnceLock::new();
 static STAGE: OnceLock<parking_lot::Mutex<String>> = OnceLock::new();
+/// IPv4 addresses the sink host resolved to while DNS was still open.
+/// `egress_lockdown()` captures them immediately BEFORE flushing the output
+/// chain and pins them in nftables (443 only); `put()` pins them in the HTTP
+/// client, so post-lockdown publishes need no DNS query at all — the 2026-10-25
+/// fix for the success heartbeat that lockdown used to silently drop.
+static PINNED_ADDRS: OnceLock<Vec<std::net::SocketAddr>> = OnceLock::new();
 static LAST_FAILURE: OnceLock<parking_lot::Mutex<Option<String>>> = OnceLock::new();
 static HALTED: AtomicBool = AtomicBool::new(false);
 static STARTED: OnceLock<Instant> = OnceLock::new();
@@ -201,6 +207,64 @@ pub fn init_from_bootstrap_file(path: &str) {
     {
         init(Some(sink));
     }
+}
+
+/// Resolve the sink host ONCE, while egress (DNS) is still open. Called by
+/// `enclave_init::egress_lockdown()` before the output chain is flushed; the
+/// result drives BOTH the nftables allow rule and the client-side resolver
+/// override, so every later publish connects straight to these addresses —
+/// no DNS after lockdown, and exactly those IPs are permitted on 443.
+///
+/// Best effort: an empty result means post-lockdown publishes will fail the
+/// same way they did before this fix (logged to kmsg, boot unaffected).
+pub fn pin_sink_network() -> Vec<std::net::SocketAddr> {
+    if let Some(a) = PINNED_ADDRS.get() {
+        return a.clone();
+    }
+    let Some(Some(sink)) = SINK.get() else {
+        let _ = PINNED_ADDRS.set(Vec::new());
+        return Vec::new();
+    };
+    use std::net::ToSocketAddrs;
+    let target = format!("{}:443", sink.host());
+    let mut last_err = String::from("unknown");
+    for attempt in 1..=3 {
+        match target.as_str().to_socket_addrs() {
+            Ok(it) => {
+                let addrs: Vec<std::net::SocketAddr> =
+                    it.filter(|a| a.is_ipv4()).collect();
+                if !addrs.is_empty() {
+                    log_line(&format!(
+                        "selfreport: sink pinned pre-lockdown: {} -> {}",
+                        target,
+                        addrs.iter().map(|a| a.ip().to_string()).collect::<Vec<_>>().join(", ")
+                    ));
+                    let _ = PINNED_ADDRS.set(addrs.clone());
+                    return addrs;
+                }
+                last_err = "no IPv4 answers".to_string();
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+        log_line(&format!(
+            "selfreport: sink DNS attempt {}/3 for {} failed: {}",
+            attempt, target, last_err
+        ));
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let _ = PINNED_ADDRS.set(Vec::new());
+    Vec::new()
+}
+
+/// The pinned sink addresses (empty before `pin_sink_network()` runs or when
+/// no sink is configured). Used by `egress_lockdown()` for the nft rule.
+pub fn pinned_addrs() -> &'static [std::net::SocketAddr] {
+    PINNED_ADDRS.get().map(|v| v.as_slice()).unwrap_or(&[])
+}
+
+/// Whether a sink is configured (drives lockdown logging).
+pub fn sink_configured() -> bool {
+    SINK.get().and_then(|s| s.as_ref()).is_some()
 }
 
 /// Record the current boot stage (cheap; no upload). The stage is included in
@@ -279,10 +343,16 @@ impl SinkConfig {
 fn put(sink: &SinkConfig, key: &str, body: &str) -> Result<(), String> {
     // Blocking client in a detached thread: safe outside the tokio runtime and
     // bounded so a dead network can never pin the reporter.
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
+    //
+    // After egress lockdown there is no DNS egress, so the resolver is pinned
+    // to the addresses captured pre-lockdown (TLS SNI/verification still use
+    // the hostname — reqwest connects to the IP, verifies the cert for host).
+    // Pre-lockdown `PINNED_ADDRS` is unset and normal DNS applies.
+    let mut builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(10));
+    if let Some(addrs) = PINNED_ADDRS.get().filter(|a| !a.is_empty()) {
+        builder = builder.resolve_to_addrs(&sink.host(), addrs);
+    }
+    let client = builder.build().map_err(|e| e.to_string())?;
     let resp = client
         .put(sink.signed_url("PUT", "application/json", key, 3600))
         .header("Content-Type", "application/json")
