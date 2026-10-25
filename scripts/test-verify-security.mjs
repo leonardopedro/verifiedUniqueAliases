@@ -1744,9 +1744,36 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
       !!sess && !!sess.sessionBindingHex && sess.p_enc === encPem && sess.state === 'teststate-abc',
       JSON.stringify(sess && { state: sess.state, hasBinding: !!sess.sessionBindingHex }));
 
+    // F6 (live e2e finding 2026-10-25): a SECOND click on the already-
+    // prepared handoff link must NAVIGATE with the EXISTING session and
+    // mint nothing. Before the fix every login re-ran the login-session
+    // request: the popup carried state #1 to PayPal while state #2's fresh
+    // nonce overwrote this tab's storage, so the callback's ciphertext
+    // (sealed to #1) failed GCM auth against #2 — every real login.
+    {
+      const reqsBefore = requests.length;
+      const nonceBefore = globalThis.sessionStorage.getItem('pav_client_nonce');
+      const sessBefore = globalThis.localStorage.getItem('pav_local_session');
+      const hrefBefore = elements['loginVerifiedLink'].href;
+      await executePreflightAndLogin('verified');
+      check('F6: repeat click on a prepared handoff makes NO new session call',
+        requests.length === reqsBefore,
+        `requests ${reqsBefore} -> ${requests.length}`);
+      check('F6: repeat click does NOT rotate the client nonce (blob seal nonce preserved)',
+        globalThis.sessionStorage.getItem('pav_client_nonce') === nonceBefore,
+        `nonce ${String(nonceBefore).slice(0, 12)} -> ${String(globalThis.sessionStorage.getItem('pav_client_nonce')).slice(0, 12)}`);
+      check('F6: repeat click does NOT rewrite pav_local_session (state #1 stays live)',
+        globalThis.localStorage.getItem('pav_local_session') === sessBefore);
+      check('F6: the authorize href is untouched by the repeat click',
+        elements['loginVerifiedLink'].href === hrefBefore
+        && String(elements['loginVerifiedLink'].href).includes('authorize'));
+    }
+
     // R3-1 downgrade defense: S_enc-signed login fields WITHOUT a PKCE
     // challenge (stale enclave, or a relay stripping fields before signing)
-    // must be refused BEFORE the user is sent to PayPal.
+    // must be refused BEFORE the user is sent to PayPal. Start from an
+    // UNPREPARED link (F6 keeps a prepared link from re-entering prepare).
+    elements['loginVerifiedLink'].href = '';
     omitPkce = true;
     await executePreflightAndLogin('verified');
     omitPkce = false;

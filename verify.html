@@ -575,6 +575,15 @@
         const say = m => { if (log) log.innerText = m; };
         flow = (flow === 'full') ? 'full' : 'verified';
         const link = document.getElementById(LOGIN_LINK_ID[flow]);
+        // v188.1 (F6 — live e2e finding 2026-10-25): if this link is ALREADY
+        // a prepared PayPal handoff, a repeat click must NAVIGATE with the
+        // EXISTING signed session and mint NOTHING. Re-preparing here races
+        // the navigation: the popup carries state #1 to PayPal while the
+        // fresh round overwrites this tab's client nonce + pav_local_session
+        // with state #2 — the callback's ciphertext is sealed to state #1's
+        // nonce, so decryption with #2 fails (live-observed GCM OperationError
+        // on every login). Reload the page to start a fresh round.
+        if (link && link.href && String(link.href).includes('authorize')) return;
         if (loginBusy[flow]) return;
         loginBusy[flow] = true;
         if (link) link.textContent = '⏳ Preparing secure session…';
