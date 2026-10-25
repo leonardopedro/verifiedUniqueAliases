@@ -510,6 +510,21 @@ made from an OSS object via `ImportImage`.
   after an EIP swap, watching "Running" on the new box while the old one had
   already stopped). List all + filter client-side, or pass the plural
   `InstanceIds` form
+- **`RunCommand` targets instances with the INDEXED flag `--InstanceId.1 <id>`**
+  (2026-10-25) — bare `--InstanceId` is accepted syntactically then fails
+  server-side with `MissingParam.InstanceId`, and `--InstanceIds '[…]'` is
+  rejected as an unknown flag (the help's "Did you mean: InstanceId" suggestion
+  is misleading). Poll with `describe-invocation-results --biz-region-id
+  cn-beijing --invoke-id <id>`; the result JSON is
+  `Invocation.InvocationResults.InvocationResult[0]`, `Output` is base64
+- **Both image buckets refuse the OSS PUBLIC endpoint entirely** (2026-10-25):
+  `PublicEndpointForbidden … please use CNAME instead` from anywhere, and
+  path-style addressing on the regional endpoint additionally returns
+  `SecondLevelDomainForbidden` — so even presigned PUTs need **virtual-hosted**
+  style. Working upload path: presigned vhost PUT → HK bucket → relay ECS →
+  **Beijing intranet endpoint** PUT (ETag==MD5 on both hops), then
+  `ALI_OSS_BUCKET=paypal-tdx-image-1792145409 SKIP_OSS_UPLOAD=1 bash
+  import-alibaba-image.sh`
 
 ### TCG event-log & RTMR traps (hit live 2026-10-22)
 

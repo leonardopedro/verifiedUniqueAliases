@@ -230,8 +230,8 @@ leaves whatever offline system you keep it on.
 | Adapt this document to project state | ✅ |
 | Circuit written + compiled (circom 2.2.3, 200,818 constraints, 271 public signals) | ✅ |
 | Witness gate vs **real captured identity** (full R1CS check + ECIES round-trip) | ✅ `node zk/test-witness.mjs` → PASS |
-| Local trusted setup (`scripts/build-zk.sh`, power 18, beacon) | 🔄 running |
-| `verify.html` ZK integration (lazy SRI snarkjs, ZK_BASE fetch + hash pins, embedded vkey, prove/verify UI) | ⬜ |
-| `scripts/zk-decrypt-escrow.mjs` | ⬜ |
-| Harness Test 38 + full suites (offline, cargo, live-envelope) | ⬜ |
-| README digest + `index.html` sync + two-cycle deploy (v188) + e2e ×2 | ⬜ (deploy carries the v188 main.rs + auditor changes together) |
+| Local trusted setup (`scripts/build-zk.sh`, power 18, beacon) | ✅ zkey `eb173e5b…` (single-party ceremony, §4 honesty note) |
+| `verify.html` ZK integration (lazy SRI snarkjs, ZK_BASE fetch + hash pins, embedded vkey, prove/verify UI) | ✅ + F5 split-part reassembly (`zkFetchZkey` — GitHub refuses >100 MB objects) + **F4** every summary field bound to the proven `raw[]` signals before any statement is displayed |
+| `scripts/zk-decrypt-escrow.mjs` | ✅ fail-closed (SHA-256 must equal `identity_hash_hex`) |
+| Harness Test 38 + 39 + full suites (offline, cargo, live-envelope) | ✅ offline **286/0** · live **294/0** · cargo **22/0** |
+| README digest + `index.html` sync + deploy (v188, THREE cycles incl. F6) + e2e ×3 | ✅ 2026-10-25 — deployed build `0eb6324f…` == README == served; see HANDOVER §0.13 |

@@ -287,6 +287,59 @@ before fixing (Phase A of the audit).
 
 ---
 
+### 0.13 v188 / v188.1 cycle — ZK escrow layer + audit round 2 (F1–F6), three-cycle deploy (2026-10-25 22:1x UTC)
+
+**Findings fixed this round (collusion model: provider + login.airma.de owner):**
+
+| # | Finding | Fix |
+|---|---|---|
+| F1 | A LOGIN report with no client-session fields fell through to the zero-slot (non-login) branch in paste mode — an owner-crafted/legacy zero-slot report audited green | verify.html: login-shaped + no binding anywhere ⇒ hard reject ("no unverified quote slots"); harness negative test |
+| F2 | `index.html` (GitHub Pages root) carries a byte-identical auditor that had already diverged from `verify.html` | Harness **Test 40**: byte-parity gate + node --check; re-synced |
+| F3 | **No HSTS** on any response — a colluding network keeps victims on plaintext http:// forever | `with_secure_headers()` now sends `strict-transport-security: max-age=31536000` (deliberately no includeSubDomains/preload — can't vouch for other airma.de subdomains); source-pinned in Test 28 |
+| F4 | `zkVerifyCredential` built its statement from **untrusted summary fields** — a valid Groth16 proof over a DIFFERENT identity/bit-0/other escrow key could be displayed as the audited identity | All summary fields (identity hash, verified bit, ephemeral pubkey, ciphertext, escrow key) now bound to the PROVEN `raw[271]` signals; 6 negative tests |
+| F5 | The 105 MB zkey cannot be pushed to GitHub (>100 MB object limit; release assets send no CORS) | Published SPLIT (`zk/*.zkey.part{0,1}` 60+45 MB, Pages serves ACAO:*); browser reassembles + pins ONE sha256; `build-zk.sh` regenerates parts; assembled file gitignored |
+| F6 | **Live-e2e blocker**: the v188 handoff link re-ran `executePreflightAndLogin` on EVERY click — the PayPal-opening click navigated with state #1 while state #2's fresh nonce overwrote `pav_client_nonce`/`pav_local_session`, so the callback ciphertext (sealed to #1) failed GCM auth (every real login) | Prepared link (href contains `authorize`) returns immediately — click just navigates; +4 harness regression checks |
+
+**Also shipped**: the whole ZK selective-disclosure subsystem (circom.md, circuit 200,818
+constraints, local ceremony, lazy SRI-pinned snarkjs, embedded vkey, artifact sha256
+pins, `zk-decrypt-escrow.mjs`, Tests 38/39) and the v188 flow (callback auto-download
++ window.close, two explicit login links, no claim step; e2e tooling updated).
+
+**Deploy: THREE cycles (RTMR2 rotated once, then byte-held):**
+
+| Cycle | Image / disk | Notes |
+|---|---|---|
+| A | `m-2zegh5k0goup4x432oai`, disk `7d8781b7…` (md5 `1f12e2f4…`) | binary `3f684786…` + initrd `26c891b2…`; live envelope ⇒ **RTMR2 `153b4f71… → 09e22230…`**, MRTD/RTMR0/1/3 byte-held; EXPECTED_ENCLAVE_SHA256 rotated pre-build (offline — sha of the built binary, no boot needed) |
+| B | `m-2ze8vh5ynx2z7pn4e55c`, disk `3caf960d…` (md5 `8d71df42…`) | rotated auditor (`98d3196a…`) on ESP; RTMR2 held live-proven; prod swap disk `d-2zed9gkche659r9nva2u` |
+| C | `m-2ze7zy0u7fv3shpcrxw0`, disk `366c1f6e…` (md5 `92c2fc89…`) | **F6 auditor (`0eb6324f…`, 238,881 B)** on ESP; swap disk `d-2zeitwv66qbu50hvb3u9`; no pin rotation needed (binary/initrd byte-identical ⇒ ESP-only change) |
+
+**Final gates (on the cycle-C deployment):** served == README == local == **`0eb6324f…`** ·
+`check-manifest-parity` **PARITY OK** (6 same incl. verify.html, 0 mismatched) ·
+live-envelope harness **294/0** · offline harness **286/0** · cargo **22/0** · zk witness
+R1CS PASS · real groth16 prove/verify PASS (2.7 s) · **live PayPal e2e PASS ×3**
+(verified + full after F6, + final verified smoke on cycle C) · HSTS + full header set
+live · CI runs (f2b0ddf, 65b99ca, 2ab7560, bacb725) all **success**.
+
+**Runbook deltas (all hit live):** `RunCommand` needs `--InstanceId.1` (indexed
+RepeatList; bare `--InstanceId`/`--InstanceIds` both fail); BOTH OSS buckets now refuse
+the **public endpoint** entirely (`PublicEndpointForbidden`) — uploads = presigned PUT
+(vhost style; path-style → `SecondLevelDomainForbidden`) to HK, relay pull, Beijing
+**intranet** PUT, ETag==MD5 on both hops; `import-alibaba-image.sh` gained
+`SKIP_OSS_UPLOAD=1` for that staging; relay used: `i-2zefiag79exwsshidi3z`
+(debian_12_15, zone cn-beijing-i, sg `sg-2zehehuvi1f0v67q11bo`, vsw
+`vsw-2zemsk0m5ky2j6uttlk82`) — **stopped in economy mode after the legs** (restart:
+`aliyun ecs StartInstance`). Staging objects `disk188{,b,c}.raw` remain in the HK
+bucket (≤147 MB, cents/month; data-plane delete is geo-blocked from the operator).
+
+**Traps:** `scripts/e2e-sandbox.mjs` is STALE (navigates to `/login`, which does not
+exist since v180 — 404); the working tool is `scripts/e2e-login-download.mjs`
+(`VERIFY_HTML=… CHROMIUM_PATH=… node scripts/e2e-login-download.mjs verified|full`).
+A second local clone exists outside this worktree (parallel `m` commits; its push was
+rejected once as non-FF — reconcile it with `git fetch && git rebase origin/alibabacloud`
+before pushing from there).
+
+---
+
 ## 2. Where things stand right now (2026-10-20 14:30 UTC)
 
 ### 2.1 Code & CI — round 1 complete, all green
@@ -406,7 +459,7 @@ node /tmp/ali-rpc.mjs ecs RebootInstance RegionId=cn-beijing InstanceId=<new>
 - [x] **T5 · Decommission old prod** — ✅ `i-2zefwa6bdimeg1rbcfsg` **Stopped**
   (ForceStop=true; the enclave has no ACPI handler but force-stop works).
   Prod TLS unaffected (200/ssl=0). Do not delete without asking the user.
-- [ ] **T6 · Audit round 2** (the cycle): re-audit everything fixed in round 1
+- [x] **T6 · Audit round 2** (the cycle) — ✅ **2026-10-25 (v188/v188.1 cycle, §0.13)**: re-audit + new surfaces under the collusion model → **F1–F6 fixed** (zero-slot login fall-through, auditor-copy parity gate, missing HSTS, ZK summary-vs-proven-signal forgery, >100 MB zkey publish blocker, live-e2e double-prepare nonce race), all documented above with justifications; three deploy cycles, CI green, E2E ×3, full gates on the audited build. Residual/deferred WITH justification: (a) self-reported fields remain informational by design — code identity is decided exclusively by MRTD/RTMR silicon pins (v168 rationale, unchanged); (b) single-party ZK ceremony — a forged credential still requires an Intel-signed quote binding the same identity hash (circom.md §4); (c) optional TLS-leaf cross-check row stays optional so offline paste audits keep working — every other row is hardware/pin-bound; (d) `e2e-sandbox.mjs` left as-is (stale tool, superseded by `e2e-login-download.mjs` — documented trap).
   (prove the fixes hold under the collusion threat model), then audit the
   remaining surfaces not yet covered (e.g. bandwidth/rate-limit bypasses,
   attestation replay windows, boot-chain manifest gaps). Document findings →
