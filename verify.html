@@ -213,18 +213,15 @@
         <div class="input-card" style="grid-column: span 2; border-color: #4caf50;">
             <label>Log in with PayPal — the login IS the pre-flight check</label>
             <p style="color: var(--text-dim); font-size: 0.9rem;">There is deliberately <b>no separate pre-login hardware check</b>: it would let anyone exhaust the enclave's resources, and a completed PayPal login is itself the attacker filter. Your browser generates a throwaway encryption key that never leaves this page. Your PayPal identity comes back encrypted to that key — neither the site owner (who holds the PayPal client secret and can issue TLS certificates for this domain) nor the cloud provider (who sees all traffic leaving the machine) can read it. After PayPal verifies you, the enclave mints the hardware proof (an Intel TDX quote) bound to <i>this</i> login and your session, this page audits it, and only a fully green audit decrypts here. <b>This page</b> builds the PayPal link; the enclave never redirects you. The strongest setup is your own copy: take <code>verify.html</code> from the project's GitHub, save it and open it locally (<code>file://</code>, or use the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a>) — keys are then created only on your machine, anything injected on the enclave's origin only ever sees ciphertext, and this enclave-origin copy refuses key generation by design (Web Auditor Tampering defense).</p>
-            <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow:</b> click a login button → finish PayPal in the new tab → return here and press “Claim Encrypted Report” below when it appears — it fetches your still-ENCRYPTED report from the enclave's vault using the throwaway key that exists only in this browser, then decrypts, audits and downloads it in one step (nobody else — not even the site owner — can open it). If any step fails, nothing is saved, so you are safe to close the tab.</p>
-            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                <button onclick="executePreflightAndLogin('verified')" style="background:#4caf50;">🔒 Log in with PayPal (Verified account only)</button>
-                <button onclick="executePreflightAndLogin('full')">🔒 Log in with PayPal (Share full profile)</button>
-            </div>
-            <button id="claimBtn" onclick="localClaim()" style="display:none; margin-top:10px;">🔓 2. Claim Encrypted Report</button>
+            <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow (one button):</b> the single button below runs the whole sequence — it starts as “Log in with PayPal” (first the verified-only round, then the full-profile round), turns into the “Continue to PayPal →” link that replaces it, and after you return from PayPal becomes “Claim Encrypted Report”. Claiming fetches your still-ENCRYPTED report from the enclave's vault using the throwaway key that exists only in this browser, then decrypts, audits and downloads it in one step (nobody else — not even the site owner — can open it); the button then advances to the next round and ends as “Download Attestation Report”. If any step fails, nothing is saved, so you are safe to close the tab.</p>
+            <!-- v187 (user request): ONE workflow control. The button morphs with the workflow state; during the PayPal step it is REPLACED by the plain link below (a clicked target=_blank link is never popup-blocked), and clicking that link swaps in the next button. Sequence: verified round → PayPal → claim → full-profile round → PayPal → claim → download. -->
+            <button id="workflowBtn" onclick="workflowClick()" style="width:100%; background:#4caf50;">🔒 Log in with PayPal (Verified account only)</button>
+            <a id="securePaypalUrl" onclick="setWorkflow('claim')" style="display:none; margin-top:10px;" class="btn" target="_blank" rel="noopener">Continue to PayPal →</a>
             <input type="text" id="localEnclaveHost" placeholder="https://login.airma.de"
                 style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
             <input type="text" id="customInfoInput" maxlength="512"
                 placeholder="Optional: your public key / wallet / nonce — bound into the hardware quote and the report"
                 style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
-            <a id="securePaypalUrl" style="display:none; margin-top:10px;" class="btn" target="_blank" rel="noopener">Continue to PayPal →</a>
             <p id="secureLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
         </div>
         <div class="input-card" style="grid-column: span 2;">
@@ -473,13 +470,88 @@
     //      returns the report encrypted to P_client; only this browser can
     //      open it (same-origin sessionStorage / local session).
     // ========================================================================
+    // ========================================================================
+    // v187 (user request): ONE workflow button. The control slot holds exactly
+    // one thing at a time — the morphing button, or the plain PayPal link that
+    // replaces it during the PayPal step (a clicked target=_blank link is
+    // never popup-blocked); the link's own click swaps in the next button.
+    // Sequence: start (verified) → PayPal link → claim round 1 → start
+    // round 2 (full profile) → PayPal link → claim round 2 → download.
+    // State is derived from storage on load (pav_local_session +
+    // pav_wf_stage), so a reload resumes the workflow where it left off.
+    // ========================================================================
+    let wfState = 'start-verified';
+
+    function wfStage() {
+        try { return localStorage.getItem('pav_wf_stage') || ''; } catch (e) { return ''; }
+    }
+
+    function renderWorkflow() {
+        const btn = document.getElementById('workflowBtn');
+        const link = document.getElementById('securePaypalUrl');
+        if (!btn) return;
+        let text = '', disabled = false, showLink = false, green = false;
+        if (wfState === 'to-paypal') {
+            showLink = true; // the link REPLACES the button in the same slot
+        } else if (wfState === 'preflight') {
+            text = '⏳ Preparing secure session…'; disabled = true;
+        } else if (wfState === 'claiming') {
+            text = '⏳ Claiming + auditing…'; disabled = true;
+        } else if (wfState === 'claim') {
+            text = '🔓 Claim Encrypted Report';
+        } else if (wfState === 'start-full') {
+            text = '🔒 Log in with PayPal (Share full profile) — step 2 of 2'; green = true;
+        } else if (wfState === 'done') {
+            text = '💾 Download Attestation Report (JSON)';
+        } else { // start-verified
+            text = '🔒 Log in with PayPal (Verified account only)'; green = true;
+        }
+        btn.style.display = showLink ? 'none' : 'inline-block';
+        btn.disabled = disabled;
+        btn.textContent = text;
+        btn.style.background = green ? '#4caf50' : '';
+        if (link) link.style.display = showLink ? 'inline-block' : 'none';
+    }
+
+    function setWorkflow(state) { wfState = state; renderWorkflow(); }
+
+    function workflowClick() {
+        if (wfState === 'start-verified') executePreflightAndLogin('verified');
+        else if (wfState === 'start-full') executePreflightAndLogin('full');
+        else if (wfState === 'claim') localClaim();
+        else if (wfState === 'done') downloadReportFile();
+        // 'preflight' / 'claiming' are disabled; 'to-paypal' hides the button
+        // (the link is the control then).
+    }
+
+    function applyWorkflowState() {
+        const stage = wfStage();
+        let hasSession = false, hasReport = false;
+        try { hasSession = !!localStorage.getItem('pav_local_session'); } catch (e) { /* no storage */ }
+        try {
+            const ta = document.getElementById('attestationInput');
+            hasReport = !!(ta && ta.value && String(ta.value).trim());
+        } catch (e) { /* no DOM */ }
+        if (stage === 'complete') { setWorkflow(hasReport ? 'done' : 'start-verified'); return; }
+        if (hasSession) { setWorkflow('claim'); return; }
+        if (stage === 'full-pending') { setWorkflow('start-full'); return; }
+        setWorkflow('start-verified');
+    }
+
     async function executePreflightAndLogin(flow) {
         const log = document.getElementById('secureLoginStatus');
         const say = m => { if (log) log.innerText = m; };
+        setWorkflow('preflight');
         try {
             // v168 (plan Phase 3.3): keys only ever exist in a TRUSTED auditor
             // context (file:// / GitHub Pages), never in the enclave-served copy.
             if (!trustedAuditorContext()) throw untrustedOriginError();
+            // v187: workflow bookkeeping — 'verified' starts round 1 fresh;
+            // 'full' is round 2 of the sequence (unless already complete).
+            try {
+                if (flow === 'full') { if (wfStage() !== 'complete') localStorage.setItem('pav_wf_stage', 'full-pending'); }
+                else localStorage.removeItem('pav_wf_stage');
+            } catch (e) { /* no storage (harness/offline) */ }
             rememberSelectedFlow(flow);
             const enclaveBase = ((document.getElementById('localEnclaveHost') || {}).value || '').trim().replace(/\/+$/, '');
             if (!/^https:\/\/[^\/]+/.test(enclaveBase)) {
@@ -592,16 +664,15 @@
             // clicked target=_blank link is never blocked, and this page stays
             // open for "Claim").
             const link = document.getElementById('securePaypalUrl');
-            if (link) {
-                link.href = url;
-                link.style.display = 'inline-block';
-            }
-            say('✅ Login session ready — no hardware attestation happens until AFTER PayPal verifies you. Click “Continue to PayPal →” above (opens in a NEW tab); after logging in, come back to THIS tab and press “🔓 2. Claim Encrypted Report” below — that is where your key lives, so the report decrypts, audits and downloads HERE.');
-            // v184: surface the claim action once a client session/key exists
-            // (the button is hidden by default to keep the page minimal).
-            try { const cb = document.getElementById('claimBtn'); if (cb) cb.style.display = 'inline-block'; } catch (e) {}
+            if (link) link.href = url;
+            say('✅ Login session ready — no hardware attestation happens until AFTER PayPal verifies you. The workflow control has now turned into “➡️ Continue to PayPal →” (opens in a NEW tab): click it, log in there, then come back to THIS tab where it becomes “🔓 Claim Encrypted Report” — that is where your key lives, so the report decrypts, audits and downloads HERE.');
+            // v187: the PayPal link REPLACES the button in the same slot; its
+            // inline onclick swaps in the claim button afterwards.
+            setWorkflow('to-paypal');
         } catch (e) {
             say('❌ ' + e.message);
+            // Fail closed back to this round's start — no orphaned link.
+            try { setWorkflow(flow === 'full' ? 'start-full' : 'start-verified'); } catch (e2) { /* no DOM */ }
         }
     }
 
@@ -829,17 +900,17 @@
     async function localClaim() {
         const log = document.getElementById('secureLoginStatus');
         const say = m => { if (log) log.innerText = m; };
-        try { const cb = document.getElementById('claimBtn'); if (cb) cb.style.display = 'none'; } catch (e) {}
+        setWorkflow('claiming');
         try {
             // v168 (plan Phase 3.3): decryption only in a TRUSTED auditor context.
             if (!trustedAuditorContext()) {
                 // Post-login hint (v179 user report): pressing Claim on the
                 // enclave-served copy after a completed login is the classic
                 // dead-end — point at the tab that actually holds the key.
-                throw new Error('UNTRUSTED AUDITOR ORIGIN: this page is served by the enclave\'s own webserver — its owner can rewrite this script at will, so keys generated here would be exposed (Web Auditor Tampering defense). Key generation and logins are REFUSED here. Download verify.html from the project GitHub (or use the GitHub Pages copy) and open it as a local file (file://) to run the secure login. Paste-report auditing on this copy is still safe. IF YOU JUST LOGGED IN: your encrypted report is waiting in the enclave\'s vault — go back to the SUCCESS PAGE (the “Authentication Succeeded” tab) and press “📋 Copy encrypted report”, then paste it into the “Attestation JSON report” box of a trusted auditor (GitHub Pages copy or your saved file:// verify.html) and run the audit there. If the tab where you started the login is still open, press “🔓 2. Claim Encrypted Report” THERE instead — only that tab holds your key, so the report can never be claimed from this page.');
+                throw new Error('UNTRUSTED AUDITOR ORIGIN: this page is served by the enclave\'s own webserver — its owner can rewrite this script at will, so keys generated here would be exposed (Web Auditor Tampering defense). Key generation and logins are REFUSED here. Download verify.html from the project GitHub (or use the GitHub Pages copy) and open it as a local file (file://) to run the secure login. Paste-report auditing on this copy is still safe. IF YOU JUST LOGGED IN: your encrypted report is waiting in the enclave\'s vault — go back to the SUCCESS PAGE (the “Authentication Succeeded” tab) and press “📋 Copy encrypted report”, then paste it into the “Attestation JSON report” box of a trusted auditor (GitHub Pages copy or your saved file:// verify.html) and run the audit there. If the tab where you started the login is still open, press “🔓 Claim Encrypted Report” THERE instead — only that tab holds your key, so the report can never be claimed from this page.');
             }
             const s = JSON.parse(localStorage.getItem('pav_local_session') || 'null');
-            if (!s) throw new Error('no local session — run step 1 first (from a local copy of this page)');
+            if (!s) throw new Error('no local session — start the workflow with the “Log in with PayPal” button first (from a trusted copy of this page)');
             // v179: restore the client-session binding so the claim-time audit
             // enforces the quote's report_data[32..64] session slot.
             if (s.sessionBindingHex) auditorSessionBindingHex = s.sessionBindingHex;
@@ -854,12 +925,22 @@
             document.getElementById('attestationInput').value = JSON.stringify(envelope, null, 2);
             const sub = (envelope.attestation_report.paypal_user_info || {}).sub || '(unknown)';
             if (!(await runAudit())) throw new Error('Full audit FAILED on the delivered report');
+            // v187: round bookkeeping — the verified flow completes round 1
+            // (the workflow then offers the full-profile round); the full
+            // flow completes the sequence (the button becomes a re-download).
+            const roundNext = (s.flow === 'full') ? 'complete' : 'full-pending';
+            try { localStorage.setItem('pav_wf_stage', roundNext); } catch (e) { /* no storage */ }
             localStorage.removeItem('pav_local_session');
             const saved = downloadReportFile();
             say(`✅ Decrypted + signature-verified + hardware-audited (silicon root + MRTD/RTMR pins + session binding). PayPal identity: ${sub}.` +
-                (saved ? ' The attestation report was saved as a JSON file — it audits offline in ANY copy of the auditor.' : ' Use the 💾 Download button below to save the JSON.'));
+                (saved ? ' The attestation report was saved as a JSON file — it audits offline in ANY copy of the auditor.' : ' Use the 💾 Download button below to save the JSON.') +
+                (roundNext === 'full-pending'
+                    ? ' ROUND 1 OF 2 (verified) DONE — press “🔒 Log in with PayPal (Share full profile) — step 2 of 2” for the full-profile round.'
+                    : ' WORKFLOW COMPLETE — both rounds are audited; the button now re-downloads the report.'));
+            setWorkflow(roundNext === 'full-pending' ? 'start-full' : 'done');
         } catch (e) {
             say('❌ ' + e.message);
+            try { applyWorkflowState(); } catch (e2) { /* no DOM */ }
         }
     }
 
@@ -897,7 +978,7 @@
                 const jwk = sessionStorage.getItem('pav_client_jwk');
                 const nonceHex = sessionStorage.getItem('pav_client_nonce');
                 if (!jwk || !nonceHex) {
-                    say('ℹ️ This is the webservice\u2019s copy of the auditor. The decryption key exists only in the trusted copy where you started the login (your saved file:// page or the GitHub Pages copy) — go back to that tab and press \u201c2. Claim Encrypted Report\u201d: the report decrypts, audits and downloads THERE. The key never reaches this page by design.');
+                    say('ℹ️ This is the webservice\u2019s copy of the auditor. The decryption key exists only in the trusted copy where you started the login (your saved file:// page or the GitHub Pages copy) — go back to that tab and press \u201cClaim Encrypted Report\u201d: the report decrypts, audits and downloads THERE. The key never reaches this page by design.');
                 } else {
                     const pinned = sessionStorage.getItem('pav_p_enc');
                     // v180: the pre-login hardware audit is gone (user
@@ -943,16 +1024,16 @@
                 let postLogin = false;
                 try { postLogin = !!sessionStorage.getItem('pav_e2ee_blob') || location.search.indexOf('afterlogin=1') !== -1; } catch (e) {}
                 if (postLogin) {
-                    say('✅ Your PayPal login COMPLETED — the encrypted report is in the enclave\'s vault. Two ways to retrieve it: (1) go back to the SUCCESS PAGE (“Authentication Succeeded”) and press “📋 Copy encrypted report”, then paste it into the “Attestation JSON report” box of a TRUSTED auditor (GitHub Pages copy or your saved file:// verify.html) and run the audit there; or (2) if the tab where you started the login is still open, press “🔓 2. Claim Encrypted Report” THERE — only that tab holds your key, so the report decrypts, audits and downloads on THAT page. Claiming from this owner-controlled copy is refused by design (Web Auditor Tampering defense).');
+                    say('✅ Your PayPal login COMPLETED — the encrypted report is in the enclave\'s vault. Two ways to retrieve it: (1) go back to the SUCCESS PAGE (“Authentication Succeeded”) and press “📋 Copy encrypted report”, then paste it into the “Attestation JSON report” box of a TRUSTED auditor (GitHub Pages copy or your saved file:// verify.html) and run the audit there; or (2) if the tab where you started the login is still open, press “🔓 Claim Encrypted Report” THERE — only that tab holds your key, so the report decrypts, audits and downloads on THAT page. Claiming from this owner-controlled copy is refused by design (Web Auditor Tampering defense).');
                 } else {
                     say('⚠️ UNTRUSTED AUDITOR COPY — this page is served by the enclave\'s own webserver, which its owner controls. The secure login and key generation are DISABLED here (Web Auditor Tampering defense). Save this file from the project GitHub and open it locally (file://) — or use the GitHub Pages copy — to log in. Paste-report auditing below still works on this copy.');
                 }
             }
         } catch (e) { /* no location (harness) — skip */ }
-        // v184: a stored session means the throwaway key still exists in this
-        // browser's storage — surface the claim action so the flow stays
-        // discoverable after a reload (the button is otherwise hidden).
-        try { if (localStorage.getItem('pav_local_session')) { const cb = document.getElementById('claimBtn'); if (cb) cb.style.display = 'inline-block'; } } catch (e) {}
+        // v187: derive the single workflow button's state from storage so a
+        // reload resumes exactly where the workflow left off (claim / round 2 /
+        // download / fresh start).
+        try { applyWorkflowState(); } catch (e) { /* no DOM */ }
         if (location.hash === '#login-verified') executePreflightAndLogin('verified');
         if (location.hash === '#login-full') executePreflightAndLogin('full');
     });
@@ -1535,7 +1616,7 @@
             } catch (e) { /* ignore */ }
         }
         if (!jwk || !nonceHex) {
-            throw new Error('ENCRYPTED BLOB pasted (ciphertext, not a decrypted report): this browser copy holds NO decryption key for it — the throwaway key only ever existed in the copy where the PayPal login started. Go back to that tab and press “🔓 2. Claim Encrypted Report”, or audit the plain attestation-report-*.json you downloaded after the login (that file audits in ANY copy of the auditor, no keys needed).');
+            throw new Error('ENCRYPTED BLOB pasted (ciphertext, not a decrypted report): this browser copy holds NO decryption key for it — the throwaway key only ever existed in the copy where the PayPal login started. Go back to that tab and press “🔓 Claim Encrypted Report”, or audit the plain attestation-report-*.json you downloaded after the login (that file audits in ANY copy of the auditor, no keys needed).');
         }
         try { const sb = sessionStorage.getItem('pav_session_binding_hex'); if (sb) auditorSessionBindingHex = sb; } catch (e) { /* ignore */ }
         if (sess && sess.sessionBindingHex) auditorSessionBindingHex = sess.sessionBindingHex;

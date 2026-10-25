@@ -1936,6 +1936,63 @@ console.log('\nTest 35: deploy-alibaba.sh keeps the self-report sink (v186 — a
     'secret appears in an echo line');
 }
 
-rmSync(dir, { recursive: true, force: true });
+console.log('\nTest 36: single workflow button (v187 — one morphing control drives the whole login flow)');
+{
+  const verifySrc2 = readFileSync(join(repoRoot, 'verify.html'), 'utf8');
+  // Structure: ONE control slot — a morphing button + the PayPal link that
+  // replaces it; the old separate login/claim buttons are gone, and the link
+  // itself swaps in the claim button when clicked.
+  check('page has one workflow button and no leftover claim/login buttons',
+    verifySrc2.includes('id="workflowBtn"')
+      && !verifySrc2.includes('id="claimBtn"')
+      && (verifySrc2.match(/onclick="executePreflightAndLogin\(/g) || []).length === 0,
+    'workflowBtn/claimBtn/inline login handlers out of sync');
+  check('PayPal link replaces the button AND swaps in the next button on click',
+    verifySrc2.includes('onclick="setWorkflow(\'claim\')"'),
+    'link click handler missing');
+
+  // State machine: render swaps the slot, storage derives the resume point.
+  setWorkflow('to-paypal');
+  check('to-paypal state: button hidden, link revealed (harness pin target)',
+    elements['workflowBtn'].style.display === 'none'
+      && elements['securePaypalUrl'].style.display === 'inline-block',
+    JSON.stringify({ btn: elements['workflowBtn'].style.display, link: elements['securePaypalUrl'].style.display }));
+  workflowClick(); // no-op: the link is the control in this state
+  check('workflowClick is inert while the link owns the slot',
+    elements['workflowBtn'].style.display === 'none', elements['workflowBtn'].style.display);
+  setWorkflow('start-verified');
+  check('start state: button back, link hidden, login text shown',
+    elements['workflowBtn'].style.display === 'inline-block'
+      && elements['securePaypalUrl'].style.display === 'none'
+      && /Log in with PayPal \(Verified account only\)/.test(elements['workflowBtn'].textContent),
+    elements['workflowBtn'].textContent);
+
+  globalThis.localStorage = (() => { const m = new Map(); return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: k => m.delete(k) }; })();
+  try {
+    applyWorkflowState();
+    check('fresh storage → starts round 1 (verified)',
+      /Verified account only/.test(elements['workflowBtn'].textContent), elements['workflowBtn'].textContent);
+    localStorage.setItem('pav_local_session', '{"state":"s1","flow":"verified"}');
+    applyWorkflowState();
+    check('stored session → claim button',
+      /Claim Encrypted Report/.test(elements['workflowBtn'].textContent), elements['workflowBtn'].textContent);
+    localStorage.removeItem('pav_local_session');
+    localStorage.setItem('pav_wf_stage', 'full-pending');
+    applyWorkflowState();
+    check('round 1 done → full-profile round offered',
+      /Share full profile/.test(elements['workflowBtn'].textContent), elements['workflowBtn'].textContent);
+    localStorage.setItem('pav_wf_stage', 'complete');
+    elements['attestationInput'].value = '{"attestation_report":{}}';
+    applyWorkflowState();
+    check('both rounds done + report present → download button',
+      /Download Attestation Report/.test(elements['workflowBtn'].textContent), elements['workflowBtn'].textContent);
+  } finally {
+    delete globalThis.localStorage;
+    elements['attestationInput'].value = '';
+    setWorkflow('start-verified');
+  }
+}
+
+rmSync(dir, { recursive: true, force: true });;
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
