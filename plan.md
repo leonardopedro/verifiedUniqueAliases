@@ -112,6 +112,26 @@ Based on the architecture of **Intel TDX on Alibaba Cloud** (as specified in Ali
 
 ---
 
+#### Production cutover readiness (2026-10-25 — live production-mode audit cycle)
+
+Probe: live `POST /attest/login-session` (HTTP 200) + config/auditor/enclave
+static cross-check. **Verdict: NOT READY — 3 blockers, all config/allow-list
+level; the enclave and auditor code paths are production-complete.**
+
+| Area | State | Evidence |
+|---|---|---|
+| Enclave production code path | ✅ ready | `PAYPAL_PRODUCTION_AUTH` (main.rs:1025); `staging:false` flips authorize_base + signed `paypal_environment: "production"`; both flows configured (`get_flow_config`) |
+| Auditor production gates | ✅ ready | harness `production login passes` (production envelope → identity green); environment + app + scope all live inside the S_enc-signed report (unspoofable); sandbox keeps its loud amber verdict by design (v177 two-verdict) |
+| Hardware + transport | ✅ ready | MRTD/RTMR pins live `99c5322d…`, live-envelope 206–209/0, ZeroSSL cert valid → 2027-01-22, DigiCert-G2 transport pin covers BOTH api-m.paypal.com and api-m.sandbox (v179) |
+| Live probe (today) | ℹ️ sandbox mode | signed `paypal_environment: sandbox`, `authorize_base: sandbox.paypal.com`, verified app `AZXkzMWM…`, PKCE S256/43, `binding v180` — session contract healthy |
+| **Blocker 1 — production PayPal apps** | ❌ missing | the configured ids are SANDBOX apps (they only authorize at sandbox.paypal.com). Cutover needs live REST apps (verified + full) with `https://login.airma.de/callback` whitelisted |
+| **Blocker 2 — EXPECTED_APPS allow-list is sandbox-only** | ❌ | both entries pin `authorize_base: https://www.sandbox.paypal.com/signin/authorize` — `checkExpectedApp` would fail-closed REFUSE a production session (pin discipline working as intended). A reviewed commit must add the production entries (client_id + authorize_base + scope × both flows) BEFORE the config flip |
+| **Blocker 3 — config flip** | ❌ `staging: true` | prod user_data carries `staging:true` + sandbox secrets. Cutover = push `staging:false` + live pairs (deploy-alibaba.sh env path — sink emission pinned by harness Test 35) + restart |
+| Post-cutover validation | ⚠️ manual step | production consent cannot be e2e-automated without a real PayPal account; the offline harness already audits production reports green (206/0) |
+
+
+---
+
 ### Root Flaw in the Current Implementation
 
 > **STATUS (v186, 2026-10-25): RESOLVED.** The self-measurement trap described

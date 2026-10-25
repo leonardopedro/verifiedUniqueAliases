@@ -1909,6 +1909,33 @@ console.log('\nTest 34: audit round 3 — payment-flow abuse + side-channel hard
 }
 
 // ===========================================================================
+
+console.log('\nTest 35: deploy-alibaba.sh keeps the self-report sink (v186 — a future deploy must not drop it)');
+{
+  // HANDOVER §0.10 found prod user_data hand-pushed with self_report while
+  // deploy-alibaba.sh did NOT emit it — the next deploy would have silently
+  // gone dark. The emission is now env-gated and source-pinned here.
+  const depSrc = readFileSync(join(repoRoot, 'deploy-alibaba.sh'), 'utf8');
+  check('emission gated on the write-only RAM key env pair',
+    /\[\[ -n "\$\{SELF_REPORT_ACCESS_KEY_ID:-\}" && -n "\$\{SELF_REPORT_ACCESS_KEY_SECRET:-\}" \]\]/.test(depSrc),
+    'env gate missing');
+  check('emission merges self_report via jq (JSON-safe, not string concat)',
+    /\. \+ \{self_report:/.test(depSrc) && depSrc.includes('sts_token:null'),
+    'jq merge missing');
+  check('sink defaults match the live prod config (HK bucket, hongkong endpoint, boot prefix)',
+    depSrc.includes('paypal-tdx-relay-1792227992')
+      && depSrc.includes('oss-cn-hongkong.aliyuncs.com')
+      && depSrc.includes('SELF_REPORT_PREFIX:-boot'),
+    'defaults drifted from the deployed sink');
+  check('emission runs BEFORE user_data is base64-encoded',
+    depSrc.indexOf('SELF_REPORT_MERGED') > 0
+      && depSrc.indexOf('USER_DATA_B64=') > depSrc.indexOf('SELF_REPORT_MERGED'),
+    'emission after base64 — the sink would never reach user_data');
+  check('deploy script never echoes the sink secret',
+    !/echo[^\n]*\$SELF_REPORT_ACCESS_KEY_SECRET/.test(depSrc),
+    'secret appears in an echo line');
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
