@@ -1478,7 +1478,22 @@ if (process.env.REAL_REPORT) {
   if (live) {
     const { ok, alert } = await runAuditWith(live);
     const fw = fwDesc();
-    check('live audit returns true', ok === true, `alert=${alert}`);
+    // verify.html v177: a SANDBOX deployment passes the INTEGRITY audit
+    // (silicon root + MRTD/RTMR pins + every binding) but must never render
+    // as a verified PRODUCTION identity — the identity row is downgraded to a
+    // loud warning and runAudit() returns the string 'sandbox' (truthy), NOT
+    // true. Asserting `ok === true` therefore fails on every genuine sandbox
+    // report; the honest gate is that the VERDICT MATCHES the environment the
+    // report itself declares, and that the downgrade is present.
+    const liveEnv = String((live.attestation_report || live).paypal_environment || '').toLowerCase();
+    check('live audit verdict matches the declared PayPal environment',
+      (ok === 'sandbox' && liveEnv === 'sandbox') || (ok === true && liveEnv === 'production'),
+      `ok=${JSON.stringify(ok)} env=${liveEnv} alert=${alert}`);
+    check('live report declares a known paypal_environment',
+      liveEnv === 'production' || liveEnv === 'sandbox', liveEnv);
+    check('sandbox verdict still carries the SANDBOX IDENTITY downgrade',
+      ok !== 'sandbox' || /SANDBOX IDENTITY/.test(row('identityCheck').desc),
+      row('identityCheck').desc.slice(0, 160));
     check('live TDX silicon root verified', /Intel TDX Silicon Root Verified/.test(fw), fw.slice(0, 900));
     check('live chain reaches the REAL pinned Intel root', /leaf → Intel SGX Root CA pinned \(44a0196b/.test(fw), fw.slice(0, 900));
     check('live session-nonce binding in report_data', fw.includes("report_data[0..32] == this session's combined nonce"), fw.slice(0, 900));
