@@ -2683,6 +2683,113 @@ console.log('\nTest 42: authority escrow public key — paste field + file picke
   repEl.value = savedRep;
 }
 
+console.log('\nTest 43: browser-side BabyJubjub keypair generator — no circomlibjs (v191)');
+{
+  const { buildBabyjub } = require('circomlibjs');
+  const bj = await buildBabyjub();
+  const toBig = (x) => (typeof x === 'bigint' ? x : bj.F.toObject(x));
+  const SUB = BigInt('2736030358979909402780800718157159386076813972158567259200215660948447373041');
+
+  check('keygen functions exposed (scalar / random / button / save)',
+    ['zkKeypairFromScalar', 'zkRandomScalar', 'zkGenerateAuthorityKeypair', 'zkSaveAuthorityKeypair']
+      .every((n) => typeof globalThis[n] === 'function'));
+
+  // Deterministic scalar → the page's own point arithmetic must agree with
+  // circomlibjs (the reference implementation the decryptor uses), exactly.
+  const SK = 75834567890123456789012345678901234567890123456789n;
+  const kp = globalThis.zkKeypairFromScalar(SK);
+  const ref = bj.mulPointEscalar(bj.Base8, SK);
+  check('deterministic scalar: x byte-identical to circomlibjs', kp.x === toBig(ref[0]).toString(),
+    kp.x.slice(0, 24) + ' vs ' + toBig(ref[0]).toString().slice(0, 24));
+  check('deterministic scalar: y byte-identical to circomlibjs', kp.y === toBig(ref[1]).toString(),
+    kp.y.slice(0, 24) + ' vs ' + toBig(ref[1]).toString().slice(0, 24));
+  check('sk stays < subOrder (so decryptor and circuit agree)', kp.sk === SK && SK < SUB);
+  check('generated point passes the page own on-curve check',
+    globalThis.zkPointOnBabyJub(BigInt(kp.x), BigInt(kp.y)));
+
+  // Random keygen from Web Crypto → fills exactly what the prover reads.
+  const escX = document.getElementById('zkEscrowX'), escY = document.getElementById('zkEscrowY');
+  const ak = document.getElementById('zkAuthorityKey');
+  escX.value = ''; escY.value = ''; ak.value = '';
+  const g = globalThis.zkGenerateAuthorityKeypair();
+  check('random keygen returns a keypair', !!g, document.getElementById('zkKeygenStatus').innerText.slice(0, 120));
+  check('status line reports success', document.getElementById('zkKeygenStatus').innerText.startsWith('✅'));
+  if (g) {
+    check('sk drawn from Web Crypto lands in [1, subOrder)', g.sk > 0n && g.sk < SUB);
+    const ref2 = bj.mulPointEscalar(bj.Base8, g.sk);
+    check('random keypair matches circomlibjs for the same sk',
+      g.x === toBig(ref2[0]).toString() && g.y === toBig(ref2[1]).toString());
+    check('public key written into the fields the prover reads',
+      escX.value === g.x && escY.value === g.y);
+    check('public key written into the authority field (bound + re-validated on prove)',
+      ak.value === g.x + ' ' + g.y);
+    check('generated key survives the strict parser',
+      globalThis.zkParseAuthorityKey(g.x + ' ' + g.y).x === g.x);
+
+    // Save path — the ONLY place the private scalar is written out.
+    const realCU = URL.createObjectURL, realRU = URL.revokeObjectURL;
+    const realCE = document.createElement, realBD = document.body;
+    const blobs = [];
+    URL.createObjectURL = (b) => { blobs.push(b); return 'blob:t43'; };
+    URL.revokeObjectURL = () => {};
+    document.createElement = () => ({ click() {}, remove() {}, style: {}, href: '', download: '' });
+    document.body = { appendChild() {}, removeChild() {} };
+    const doc = globalThis.zkSaveAuthorityKeypair();
+    const savedOk = doc && doc.schema === 'pav-babyjubjub-keypair/v1'
+      && doc.private_key === g.sk.toString()
+      && doc.public_key && doc.public_key.x === g.x && doc.public_key.y === g.y;
+    check('save emits a pav-babyjubjub-keypair/v1 file holding the SAME scalar', !!savedOk,
+      doc && JSON.stringify(doc.public_key).slice(0, 60));
+    check('save offers exactly one download', blobs.length === 1, String(blobs.length));
+    check('saved document names the decryptor CLI (schema + note pinned)',
+      !!doc && /zk-decrypt-escrow\.mjs credential\.json/.test(doc.note));
+    URL.createObjectURL = realCU; URL.revokeObjectURL = realRU;
+    document.createElement = realCE; document.body = realBD;
+  }
+
+  // Fail closed #1 — no Web Crypto, no key (never improvise entropy).
+  const cryptoDesc = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+  delete globalThis.crypto;
+  document.getElementById('zkKeygenStatus').innerText = '';
+  const noCrypto = globalThis.zkGenerateAuthorityKeypair();
+  check('without crypto.getRandomValues keygen fails closed',
+    noCrypto === null && /Web Crypto is unavailable/.test(document.getElementById('zkKeygenStatus').innerText),
+    document.getElementById('zkKeygenStatus').innerText.slice(0, 120));
+  if (cryptoDesc) Object.defineProperty(globalThis, 'crypto', cryptoDesc);
+
+  // Fail closed #2 — the enclave-origin copy must not mint keys either
+  // (Web Auditor Tampering defense, same as the throwaway login key).
+  globalThis.location = { protocol: 'https:', host: 'login.airma.de' };
+  document.getElementById('zkKeygenStatus').innerText = '';
+  const onEnclave = globalThis.zkGenerateAuthorityKeypair();
+  check('enclave-origin copy refuses to generate keys',
+    onEnclave === null && /UNTRUSTED AUDITOR ORIGIN/.test(document.getElementById('zkKeygenStatus').innerText),
+    document.getElementById('zkKeygenStatus').innerText.slice(0, 120));
+  delete globalThis.location;
+
+  // Structural pins: the controls exist, they sit BEFORE the ⚡ button, the
+  // generator is dependency-free (no fetch/import/eval inside its block), and
+  // index.html mirrors them.
+  const pos = (s, t) => s.indexOf(t);
+  check('generate + save buttons are wired into the authority block',
+    html.includes('id="zkKeygenBtn"') && html.includes('onclick="zkGenerateAuthorityKeypair()"')
+      && html.includes('onclick="zkSaveAuthorityKeypair()"'));
+  check('keygen controls sit BEFORE the prove button',
+    pos(html, 'zkKeygenBtn') > -1 && pos(html, 'zkKeygenBtn') < pos(html, 'zkProveBtn'));
+  const block = html.slice(pos(html, 'v191 (user request): BabyJubjub keypair generator'), pos(html, '⚡ Prove.'));
+  check('generator block makes no network or eval calls',
+    block.length > 0 && !/fetch\s*\(|import\s*\(|\beval\s*\(|require\s*\(/.test(block),
+    block.slice(0, 80));
+  const idxNow = readFileSync(join(repoRoot, 'index.html'), 'utf8');
+  check('index.html carries the same keygen controls',
+    idxNow.includes('id="zkKeygenBtn"') && idxNow.includes('zkSaveAuthorityKeypair'));
+
+  // restore
+  escX.value = ''; escY.value = ''; ak.value = '';
+  document.getElementById('zkKeygenStatus').innerText = '';
+  if (typeof globalThis.zkLastKeypair !== 'undefined') globalThis.zkLastKeypair = null;
+}
+
 rmSync(dir, { recursive: true, force: true });;;
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

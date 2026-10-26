@@ -334,6 +334,18 @@
                 <input type="file" id="zkAuthorityKeyFile" accept=".txt,.json,.key,.pub,.pem,.asc" class="file-input" onchange="zkAuthorityKeyFromFile(this)">
             </div>
             <p id="zkAuthorityKeyStatus" style="margin:6px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);"></p>
+            <!-- v191 (user request): mint the authority keypair right here, so
+                 a recipient needs neither circomlibjs nor any other tooling.
+                 Pure BigInt double-and-add over BabyJubjub using the curve
+                 constants this page already checks points against; entropy
+                 comes from Web Crypto. The PRIVATE scalar never leaves the tab
+                 — it is written only into the file you save below. -->
+            <div style="margin-top:10px; border-top:1px dashed #30363d; padding-top:8px;">
+                <p style="margin:0 0 6px; color:var(--text-dim); font-size:0.85rem;">No key yet? <b>Generate one in this tab</b> — a BabyJubjub keypair derived from your browser's Web Crypto, with no circomlibjs, no wasm and no network. The private scalar stays in this page's memory and reaches disk only when you press <b>💾 Save private key</b>.</p>
+                <button type="button" id="zkKeygenBtn" onclick="zkGenerateAuthorityKeypair()">🔑 Generate a BabyJubjub keypair here (no library)</button>
+                <button type="button" id="zkKeygenSaveBtn" onclick="zkSaveAuthorityKeypair()" style="display:none; margin-left:8px;">💾 Save private key (.json)</button>
+                <p id="zkKeygenStatus" style="margin:6px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);"></p>
+            </div>
         </div>
         <button id="zkProveBtn" onclick="zkGenerateCredential()" style="width:100%; margin-top:12px;">⚡ Generate ZK escrow credential (proves in this browser)</button>
         <p id="zkProveStatus" style="margin:8px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);"></p>
@@ -2713,7 +2725,7 @@
         var t = String(raw == null ? '' : raw).trim();
         if (!t) throw new Error('authority public key is empty — paste the key or load it from a file');
         if (t.indexOf('-----BEGIN') === 0) {
-            throw new Error('that is a PEM/X.509 key. The in-circuit escrow can only be addressed by a BabyJubjub public key (two decimal field elements) — ask the authority for their BabyJubjub x/y (generate: buildBabyjub + mulPointEscalar(Base8, sk), circom.md §7).');
+            throw new Error('that is a PEM/X.509 key. The in-circuit escrow can only be addressed by a BabyJubjub public key (two decimal field elements) — ask the authority for their BabyJubjub x/y (they can mint one with the 🔑 button below, in their own browser, no circomlibjs — or via buildBabyjub + mulPointEscalar(Base8, sk), circom.md §7).');
         }
         var x, y;
         if (t.charAt(0) === '[' || t.charAt(0) === '{') {
@@ -2783,6 +2795,164 @@
         };
         r.onerror = function () { fail('could not read file "' + f.name + '"'); };
         r.readAsText(f);
+    }
+
+    // ==== v191 (user request): BabyJubjub keypair generator — NO LIBRARY ====
+    // A recipient must be able to mint the key this circuit encrypts to
+    // without circomlibjs (or any tooling at all). Everything needed is
+    // already on this page: the curve constants the on-curve check above
+    // uses, plus Web Crypto for entropy. Keygen is then exactly what
+    // circomlibjs does:
+    //     sk = random scalar in [1, subOrder)   pub = sk · Base8
+    // computed with a ~250-step double-and-add in BigInt — no dependency, no
+    // wasm, no network, no eval. The result is byte-identical to
+    //     buildBabyjub().mulPointEscalar(Base8, sk)      (pinned by Test 43)
+    // so scripts/zk-decrypt-escrow.mjs opens a credential with this scalar
+    // unchanged (it reduces mod subOrder, and sk < subOrder already).
+    var ZK_BB_SUBORDER = 2736030358979909402780800718157159386076813972158567259200215660948447373041n;
+    var ZK_BB_BASE8 = [
+        5299619240641551281634865583518297030282874472190772894086521144482721001553n,
+        16950150798460657717958625567821834550301663161624707787222815936182638968203n
+    ];
+    var ZK_LAST_KEYPAIR = null;   // {sk, x, y} of the pair minted in this tab
+
+    // Modular inverse mod p (extended Euclid). Affine addition needs one per
+    // coordinate; Fermat would cost ~250 modmuls per inversion instead.
+    function zkFieldInv(a) {
+        var p = ZK_BN254_P;
+        var t = 0n, nt = 1n;
+        var r = p, nr = ((a % p) + p) % p;
+        if (nr === 0n) throw new Error('division by zero in field inversion');
+        while (nr !== 0n) {
+            var q = r / nr;
+            var s1 = t - q * nt; t = nt; nt = s1;
+            var s2 = r - q * nr; r = nr; nr = s2;
+        }
+        if (r > 1n) throw new Error('value is not invertible mod p');
+        if (t < 0n) t += p;
+        return t;
+    }
+
+    // Twisted-Edwards affine addition (the same formula circomlibjs uses):
+    //   x3 = (x1y2 + y1x2) / (1 + d·x1x2y1y2)
+    //   y3 = (y1y2 − a·x1x2) / (1 − d·x1x2y1y2)      a=168700 d=168696 mod p
+    function zkEdAdd(P, Q) {
+        var p = ZK_BN254_P;
+        var x1 = P[0], y1 = P[1], x2 = Q[0], y2 = Q[1];
+        var beta = (x1 * y2) % p;
+        var gamma = (y1 * x2) % p;
+        var alpha = (x1 * x2) % p;
+        var eps = (y1 * y2) % p;
+        var den = (ZK_BB_D * ((alpha * eps) % p)) % p;
+        var nx = (beta + gamma) % p;
+        var ny = (((eps - ZK_BB_A * alpha) % p) + p) % p;
+        var dx = (1n + den) % p;
+        var dy = (((1n - den) % p) + p) % p;
+        return [(nx * zkFieldInv(dx)) % p, (ny * zkFieldInv(dy)) % p];
+    }
+
+    // Double-and-add scalar multiplication over the subgroup generator.
+    function zkEdMul(k, P) {
+        if (k < 0n) throw new Error('negative scalar');
+        var R = [0n, 1n];        // identity element of BabyJubjub
+        var base = P;
+        while (k > 0n) {
+            if ((k & 1n) === 1n) R = zkEdAdd(R, base);
+            base = zkEdAdd(base, base);
+            k >>= 1n;
+        }
+        return R;
+    }
+
+    // 32 bytes of Web Crypto → scalar in [1, subOrder). Fail closed: without
+    // crypto.getRandomValues there is no key, because improvised entropy would
+    // be worse than no key at all.
+    function zkRandomScalar() {
+        var c = (typeof globalThis !== 'undefined' && globalThis.crypto) ? globalThis.crypto
+            : ((typeof crypto !== 'undefined') ? crypto : null);
+        if (!c || typeof c.getRandomValues !== 'function') {
+            throw new Error('Web Crypto is unavailable (crypto.getRandomValues missing) — refusing to mint a key from anything less than real entropy. Use a current browser, or open this file locally.');
+        }
+        for (var i = 0; i < 8; i++) {
+            var buf = new Uint8Array(32);
+            c.getRandomValues(buf);
+            var v = 0n;
+            for (var b = 0; b < 32; b++) v = (v << 8n) | BigInt(buf[b]);
+            v %= ZK_BB_SUBORDER;
+            if (v > 0n) return v;
+        }
+        throw new Error('could not draw a non-zero scalar from Web Crypto');
+    }
+
+    // scalar → {sk, x, y}. Reduced mod subOrder so the decryptor (which does
+    // `scalar % subOrder`) and the circuit (pub = sk·Base8) always agree.
+    function zkKeypairFromScalar(sk) {
+        var s = BigInt(sk);
+        if (!(s > 0n)) throw new Error('private scalar must be greater than 0');
+        if (s >= ZK_BB_SUBORDER) s %= ZK_BB_SUBORDER;
+        if (!(s > 0n)) throw new Error('private scalar is a multiple of the subgroup order — draw a new one');
+        var P = zkEdMul(s, ZK_BB_BASE8);
+        if (P[0] === 0n && P[1] === 1n) throw new Error('scalar produced the identity point — draw a new one');
+        if (!zkPointOnBabyJub(P[0], P[1])) throw new Error('generated point is NOT on BabyJubjub — internal error, refusing to hand out this key');
+        return { sk: s, x: P[0].toString(), y: P[1].toString() };
+    }
+
+    // Button 1 — mint the pair, fill the fields the prover reads, announce.
+    function zkGenerateAuthorityKeypair() {
+        var st = document.getElementById('zkKeygenStatus');
+        function say(m, color) { if (st) { st.innerText = m; st.style.color = color || 'var(--text-dim)'; } }
+        try {
+            // Same Web Auditor Tampering defense as the login key: a copy
+            // served by the enclave's own origin may be rewritten at will, so
+            // it never generates keys.
+            if (!trustedAuditorContext()) throw untrustedOriginError();
+            var kp = zkKeypairFromScalar(zkRandomScalar());
+            ZK_LAST_KEYPAIR = kp;
+            var xe = document.getElementById('zkEscrowX');
+            var ye = document.getElementById('zkEscrowY');
+            if (xe) xe.value = kp.x;
+            if (ye) ye.value = kp.y;
+            var ak = document.getElementById('zkAuthorityKey');
+            if (ak) ak.value = kp.x + ' ' + kp.y;   // the prove path re-validates exactly this key
+            var save = document.getElementById('zkKeygenSaveBtn');
+            if (save) save.style.display = '';
+            say('✅ keypair minted in this tab (Web Crypto + BigInt, no library) — public x ' + kp.x.slice(0, 16) + '… y ' + kp.y.slice(0, 16) + '… is filled in above and bound into the proof as escrow_pubkey. The private scalar exists only in memory until you save it.', '#3fb950');
+            return kp;
+        } catch (e) {
+            ZK_LAST_KEYPAIR = null;
+            say('❌ ' + e.message, '#f85149');
+            return null;
+        }
+    }
+
+    // Button 2 — the ONLY place the private scalar is written anywhere.
+    function zkSaveAuthorityKeypair() {
+        var st = document.getElementById('zkKeygenStatus');
+        function say(m, color) { if (st) { st.innerText = m; st.style.color = color || 'var(--text-dim)'; } }
+        if (!ZK_LAST_KEYPAIR) { say('❌ generate a keypair first', '#f85149'); return null; }
+        var doc = {
+            schema: 'pav-babyjubjub-keypair/v1',
+            curve: 'BabyJubjub twisted Edwards (a=168700, d=168696) over the BN254 scalar field',
+            generator: 'Base8',
+            private_key: ZK_LAST_KEYPAIR.sk.toString(),
+            public_key: { x: ZK_LAST_KEYPAIR.x, y: ZK_LAST_KEYPAIR.y },
+            created_utc: new Date().toISOString(),
+            note: 'PRIVATE — anyone holding private_key can read every pav-circom-escrow/v1 credential escrowed to public_key. Open one with: node scripts/zk-decrypt-escrow.mjs credential.json <private_key>'
+        };
+        try {
+            var blob = new Blob([JSON.stringify(doc, null, 2) + '\n'], { type: 'application/json' });
+            var a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'babyjubjub-authority-key-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+            document.body.appendChild(a);
+            a.click();
+            if (a.remove) a.remove();
+            say('✅ private key saved. Keep it offline — it is the only thing that can open a credential escrowed to ' + doc.public_key.x.slice(0, 16) + '… (open with scripts/zk-decrypt-escrow.mjs).', '#3fb950');
+            return doc;
+        } catch (e) {
+            say('❌ could not save the private key: ' + e.message, '#f85149');
+            return null;
+        }
     }
 
     // ⚡ Prove. Runs entirely in this tab (no network except the artifact
