@@ -462,6 +462,22 @@ made from an OSS object via `ImportImage`.
   `OperationDenied.NoStock` on a launch → pick another instance type via
   `DescribeAvailableResource --DestinationResource instanceType
   --SpotStrategy SpotAsPriceGo` rather than another zone/region.
+- **`import-alibaba-image.sh` imports `paypal-auth-vm/$(basename "$DISK_FILE")`** —
+  the staged OSS object must carry that EXACT basename. Staging bytes as
+  `disk190.raw` and letting the script import `disk-alibaba.raw` silently
+  imports the **STALE** object (hit 2026-10-26: image built from the previous
+  round's disk, no error anywhere). Fix without re-staging:
+  `cp <disk> /tmp/<staged-name>.raw` + `DISK_FILE=/tmp/<staged-name>.raw SKIP_OSS_UPLOAD=1`.
+- Hand-signed VPC RPCs (`/tmp/ecs-call.mjs`) need `_version=2016-04-28` —
+  the default `2014-05-26` is ECS-only and returns `InvalidVersion`.
+- `AssociateEipAddress` rejects an instance in `Stopping`
+  (`InvalidStatus.NotAllow`) but ACCEPTS `Stopped`; and a `RebootInstance`
+  issued right after releasing that instance's auto public IP hangs in
+  `Stopping` for minutes (PID 1 never ACKs ACPI) → force-stop, bind the EIP
+  while `Stopped`, then `StartInstance`.
+- Marker polling against the HK bucket must use `curl -sf`: a missing key
+  returns an XML `NoSuchKey` BODY (not an empty 404), which reads as marker
+  content otherwise.
 - **Serial console output is lost once an instance stops**
   (`GetInstanceConsoleOutput` returns 0 bytes after `Stopped`) — and the
   relay runner powers itself off. Poll the console *while the instance is
