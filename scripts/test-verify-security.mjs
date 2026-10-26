@@ -3107,7 +3107,26 @@ console.log('\nTest 46: GitHub Pages copy == repo verify.html (served-auditor dr
         }
         let reason;
         if (pagesRun && branch && pagesRun.head_branch && pagesRun.head_branch !== branch) {
-          reason = `Pages builds from \`${pagesRun.head_branch}\` but this branch is \`${branch}\` — push it too (git push origin ${branch}:main) or repoint the Pages source`;
+          // Pages publishes from ANOTHER branch. If that branch ALREADY has
+          // this commit (the push-both-branches rule was followed) the site is
+          // simply about to update — that is the push race, not drift. Only a
+          // commit that is NOT on the Pages branch is real drift.
+          git('fetch', '--quiet', 'origin', pagesRun.head_branch);
+          const tip = git('rev-parse', 'FETCH_HEAD');
+          let onPagesBranch = !!tip && tip === headSha;
+          if (!onPagesBranch && tip && headSha) {
+            const r = spawnSync('git', ['merge-base', '--is-ancestor', headSha, tip], { cwd: repoRoot });
+            onPagesBranch = r.status === 0;
+          }
+          if (onPagesBranch && (!strict || process.env.CI) && ageMin < 20) {
+            check('GitHub Pages verify.html == repo verify.html (Pages branch push race, grace)', true,
+              `pages=${pagesDigest.slice(0, 16)} repo=${repoDigest.slice(0, 16)} — Pages builds from \`${pagesRun.head_branch}\`, which already has ${headSha.slice(0, 7)}; rebuild pending`);
+            reason = undefined;
+          } else if (onPagesBranch) {
+            reason = `Pages builds from \`${pagesRun.head_branch}\` and ${headSha.slice(0, 7)} IS on it, but the served copy still differs — the Pages rebuild for that commit has not landed (check the 'pages build and deployment' run)`;
+          } else {
+            reason = `Pages builds from \`${pagesRun.head_branch}\` but ${headSha ? headSha.slice(0, 7) : 'this commit'} is not on it — push it too (git push origin ${branch}:${pagesRun.head_branch}) or repoint the Pages source`;
+          }
         } else if (pagesRun && headSha && pagesRun.head_sha === headSha
               && pagesRun.status === 'completed' && pagesRun.conclusion === 'success') {
           reason = `Pages finished building ${headSha.slice(0, 7)} yet serves a different file`;
