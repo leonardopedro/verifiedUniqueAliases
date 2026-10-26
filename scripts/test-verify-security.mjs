@@ -21,6 +21,7 @@
 // Usage:  npm install --no-save node-forge && node scripts/test-verify-security.mjs
 import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
 import { execFileSync, spawnSync } from 'child_process';
+import * as https from 'https';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createRequire } from 'module';
@@ -2983,6 +2984,102 @@ console.log('\nTest 45: real Groth16 credential from the CAPTURED odd-length rep
     opened.identityJson === D);
   check('CAPTURED identity: decrypted hash re-derives the signed raw_hash',
     opened.sha256 === rep.paypal_user_info_raw_hash);
+}
+
+console.log('\nTest 46: GitHub Pages copy == repo verify.html (served-auditor drift gate)');
+{
+  // Found in the v192 cycle (2026-10-26): GitHub Pages publishes from `main`
+  // while the active line of work is `alibabacloud`. After the v192 pin
+  // rotation Pages kept serving the PREVIOUS verify.html — old RTMR2 /
+  // EXPECTED_ENCLAVE_SHA256 pins — so the "GitHub Pages auditor" link failed
+  // every audit against the deployment the enclave, repo and README all
+  // agreed on. The ZK artifacts (wasm + zkey parts) live on the SAME Pages
+  // branch, so a stale branch serves a stale AUDITOR next to correct
+  // downloads: silent, and only visible by comparing digests across the wire.
+  //
+  // This gate fetches the Pages copy over HTTPS and compares it byte-for-byte
+  // with the working tree. A MISMATCH fails; a network failure only fails
+  // under PAGES_PARITY=1 (offline `node scripts/…` stays usable), and
+  // PAGES_PARITY=0 skips the test entirely.
+  const mode = process.env.PAGES_PARITY || '';
+  if (mode === '0') {
+    console.log('  ⏭  PAGES_PARITY=0 — skipped by request');
+  } else {
+    const strict = mode === '1';
+    const PAGES_VERIFY_URL = process.env.PAGES_VERIFY_URL
+      || 'https://leonardopedro.github.io/verifiedUniqueAliases/verify.html';
+    const git = (...args) => {
+      try { return execFileSync('git', args, { cwd: repoRoot, encoding: 'utf8' }).trim(); }
+      catch { return null; }
+    };
+    const sha = (buf) => createHash('sha256').update(buf).digest('hex');
+    // Raw https (NOT globalThis.fetch): the harness stubs fetch from line ~63
+    // to drive the provenance row offline.
+    const httpGet = (url, redirects = 3) => new Promise((resolve) => {
+      let req;
+      try { req = https.get(url, { headers: { 'User-Agent': 'test-verify-security', Accept: '*/*' }, timeout: 15000 }, (res) => {
+        const status = res.statusCode || 0;
+        if (status >= 300 && status < 400 && res.headers.location && redirects > 0) {
+          res.resume();
+          return resolve(httpGet(new URL(res.headers.location, url).href, redirects - 1));
+        }
+        if (status !== 200) { res.resume(); return resolve(null); }
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+      }); } catch { return resolve(null); }
+      req.on('error', () => resolve(null));
+      req.on('timeout', () => req.destroy(new Error('timeout')));
+    });
+
+    const repoDigest = sha(readFileSync(join(repoRoot, 'verify.html')));
+    const body = await httpGet(PAGES_VERIFY_URL);
+    if (!body) {
+      // Not drift — we learned nothing about the served bytes.
+      if (strict) check('GitHub Pages copy fetched over HTTPS', false, `GET ${PAGES_VERIFY_URL} failed`);
+      else console.log(`  ⚠️  Pages copy NOT fetched (${PAGES_VERIFY_URL}) — network down? PAGES_PARITY=1 makes this fatal`);
+    } else {
+      const pagesDigest = sha(body);
+      if (pagesDigest === repoDigest) {
+        check('GitHub Pages serves byte-identical verify.html', true, pagesDigest.slice(0, 16));
+        const rm = await httpGet(new URL('README.md', PAGES_VERIFY_URL).href);
+        if (rm) check('Pages README publishes the CURRENT verify.html digest',
+          rm.toString('utf8').includes(repoDigest), 'Pages README digest is stale');
+        else console.log('  ⚠️  Pages README not fetched — verify.html parity already proven');
+      } else {
+        // Classify the mismatch so the failure says WHICH branch is stale.
+        const branchRaw = git('rev-parse', '--abbrev-ref', 'HEAD');
+        const branch = branchRaw === 'HEAD' ? null : branchRaw; // detached (CI) → unknown
+        const headSha = git('rev-parse', 'HEAD');
+        const ageMin = headSha
+          ? (Date.now() / 1000 - Number(git('log', '-1', '--format=%ct') || 0)) / 60
+          : Number.POSITIVE_INFINITY;
+        let pagesRun = null;
+        const m = /^https?:\/\/([^.]+)\.github\.io\/([^/]+)\//.exec(PAGES_VERIFY_URL);
+        if (m) {
+          const raw = await httpGet(`https://api.github.com/repos/${m[1]}/${m[2]}/actions/runs?per_page=20`);
+          try {
+            const j = JSON.parse(raw.toString('utf8'));
+            pagesRun = (j.workflow_runs || []).find((r) => r.name === 'pages build and deployment') || null;
+          } catch { /* API unavailable → fall through to the age rule */ }
+        }
+        let reason;
+        if (pagesRun && branch && pagesRun.head_branch && pagesRun.head_branch !== branch) {
+          reason = `Pages builds from \`${pagesRun.head_branch}\` but this branch is \`${branch}\` — push it too (git push origin ${branch}:main) or repoint the Pages source`;
+        } else if (pagesRun && headSha && pagesRun.head_sha === headSha
+              && pagesRun.status === 'completed' && pagesRun.conclusion === 'success') {
+          reason = `Pages finished building ${headSha.slice(0, 7)} yet serves a different file`;
+        } else if (!strict && ageMin < 20) {
+          check('GitHub Pages verify.html == repo verify.html (rebuild pending, grace)', true,
+            `pages=${pagesDigest.slice(0, 16)} repo=${repoDigest.slice(0, 16)} — commit is ${ageMin.toFixed(0)} min old, Pages has not rebuilt it yet; re-run after the pages build`);
+          reason = undefined;
+        } else {
+          reason = `pages=${pagesDigest.slice(0, 16)} repo=${repoDigest.slice(0, 16)}${strict ? ' (PAGES_PARITY=1: no grace)' : ''}`;
+        }
+        if (reason) check('GitHub Pages serves byte-identical verify.html', false, reason);
+      }
+    }
+  }
 }
 
 rmSync(dir, { recursive: true, force: true });;;
