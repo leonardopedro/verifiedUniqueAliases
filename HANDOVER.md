@@ -399,6 +399,19 @@ Status table: `plan.md` (v190 row). Four user requests, all shipped and live-ver
 
 ---
 
+## 0.15 v191 follow-ups — ESP auditor refresh, `luks.key` rotation, captured-report gate (2026-10-26)
+
+Three user requests issued while the v191 deploy cycle was in flight. All
+verified this session.
+
+| Item | Value |
+|---|---|
+| **1 — ESP `verify.html` carries the rotated ZK pins** | `build-alibaba-image.sh` `mcopy`s `./verify.html` onto the ESP, so the refreshed tree is what ships. Verified end-to-end: **served `https://login.airma.de/verify.html` == GitHub Pages == `index.html` (byte-identical) == README == local** = **`84d9ec41f233d7ba96b411865ed53ca8ca09d984246c7b99c19de6ab94bbee4c`** (261,710 B); that file's `ZK_WASM_SHA256 = b8ce562f…585e8d` and `ZK_ZKEY_SHA256 = e320086d…27365` **byte-equal** `sha256sum zk/identity_escrow.wasm` and `sha256(cat zk/*_final.zkey.part{0,1})`. `check-manifest-parity.mjs` against the live `/debug/envelope` + `output-alibaba/disk-alibaba.raw` → **PARITY OK, 6 same incl. `verify.html`, 0 mismatched, NvVars excluded** — the deployed ESP is exactly this tree. Deployed `binary_sha256 = d1e288c6…` == `EXPECTED_ENCLAVE_SHA256` in verify.html. |
+| **2 — `luks.key` rotated + volume audit** | **Audit: nothing uses it.** The 512 B blob (sha256 `f6a551da9375ff8b66a83c792241fc5fbf201a631bf8d201f2bfc476c79fa5f9`) was added in `818e953` (2025-11-26) and deleted the next day in `b9e5cf6` with the whole dracut-era stack. It is on **no branch tip**, and `git grep luks.key` across **every** ref (sh/mjs/rs/yml/md/json/toml) returns **zero** references. Byte-scan of all four images (`output-alibaba/disk-alibaba.raw`, `output-relay/disk-relay.raw`, both `initramfs-*.img`): the `LUKS\xba\xbe` hits are **not 512-B-aligned** and sit inside GRUB/cryptsetup **string tables** (`Invalid LUKS2 JSON header`, `crypto_LUKS.DM_integrity`) — there is **no LUKS1/LUKS2 header** anywhere (no JSON `"keyslots":`/`"segments":`/`"pbkdf":` marker in any image), and `cryptsetup`/`luks` appears in no package list. Cloud side: all **144** objects in `paypal-tdx-relay-1792227992` → **0** matching `luks`/`.key`; the image bucket listing is blocked by the known `PublicEndpointForbidden` endpoint quirk, but its objects are md5-verified copies of the local `disk*.raw` already scanned. **Rotation:** fresh 512 B at `luks.key`, mode `600`, sha256 **`f22a2fc4b4ff0a776fcdd2ce1cf2a41ec65d45ad3816a26b79a8714119121a07`**, and `.gitignore` now ignores `luks.key` + `*.key` so the original mistake cannot recur. ⚠️ **No consumer exists** — the new key is staged, not wired to anything. The historical blob is still in git history and therefore burned; treat it as public. |
+| **3 — harness gate on a CAPTURED odd-length report** | New **Test 45** (9 checks) in `scripts/test-verify-security.mjs`, fixture `scripts/fixtures/captured-odd-report.json` (sandbox `verified` flow, saved live capture). Test 44 proves a *synthesized* 251-byte identity; Test 45 proves the identity **extracted from the capture** through the **REAL** `snarkjs.groth16.fullProve` + `verify` against the committed vkey: canonical order (`user_id, sub, verified_account, payer_id`) → **len 251 (odd)**, in band, `sha256 == ` the report's own signed `paypal_user_info_raw_hash` (`53dd6264…48c81`), 271 signals, `verified_account_bit = 1`, and the credential **decrypts back to the exact captured bytes**. This closes the report→identity extraction path (key order / null handling / UTF-8), not just the circuit. `zkProverPaths()` hoisted so Tests 44/45 share the wasm/vkey/zkey-part resolution. **Harness 348/0 → 357/0, exit 0.** |
+
+---
+
 ## 2. Where things stand right now (2026-10-20 14:30 UTC)
 
 ### 2.1 Code & CI — round 1 complete, all green

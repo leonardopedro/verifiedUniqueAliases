@@ -2790,6 +2790,22 @@ console.log('\nTest 43: browser-side BabyJubjub keypair generator — no circoml
   if (typeof globalThis.zkLastKeypair !== 'undefined') globalThis.zkLastKeypair = null;
 }
 
+// Shared by every REAL-prover gate below (Tests 44/45): locate the committed
+// wasm + verification key, and the assembled proving key. The full zkey is
+// gitignored (GitHub's 100 MB object limit) — rebuild it from the TRACKED
+// split parts when absent, exactly like the browser does.
+function zkProverPaths() {
+  const wasmPath = join(repoRoot, 'zk/identity_escrow.wasm');
+  const vkey = JSON.parse(readFileSync(join(repoRoot, 'zk/identity_escrow_vkey.json'), 'utf8'));
+  let zkeyPath = join(repoRoot, 'zk/identity_escrow_final.zkey');
+  try { readFileSync(zkeyPath); } catch {
+    zkeyPath = join(tmpdir(), 'identity_escrow_final.zkey');
+    writeFileSync(zkeyPath, Buffer.concat((globalThis.ZK_ZKEY_PARTS || [])
+      .map((p) => readFileSync(join(repoRoot, 'zk', p)))));
+  }
+  return { wasmPath, vkey, zkeyPath };
+}
+
 console.log('\nTest 44: odd-length + band-floor identities prove end-to-end (v191 circuit)');
 {
   // Regression gate for the two circuit bugs fixed in v191: the padded
@@ -2799,17 +2815,7 @@ console.log('\nTest 44: odd-length + band-floor identities prove end-to-end (v19
   // wasm/zkey — a mocked prover can never catch a witness-calc assert.
   const snarkjs = require('snarkjs');
   const { EXAMPLE_ESCROW_SK, decryptCredential } = await import('./zk-decrypt-escrow.mjs');
-  const wasmPath = join(repoRoot, 'zk/identity_escrow.wasm');
-  const vkey = JSON.parse(readFileSync(join(repoRoot, 'zk/identity_escrow_vkey.json'), 'utf8'));
-
-  // The assembled proving key is gitignored (>100 MB object limit) — rebuild
-  // it from the TRACKED split parts when absent, exactly like the browser does.
-  let zkeyPath = join(repoRoot, 'zk/identity_escrow_final.zkey');
-  try { readFileSync(zkeyPath); } catch {
-    zkeyPath = join(tmpdir(), 'identity_escrow_final.zkey');
-    writeFileSync(zkeyPath, Buffer.concat((globalThis.ZK_ZKEY_PARTS || [])
-      .map((p) => readFileSync(join(repoRoot, 'zk', p)))));
-  }
+  const { wasmPath, vkey, zkeyPath } = zkProverPaths();
 
   // Canonical identity JSON of an EXACT target length (circom.md §1 band).
   const identityOf = (len) => {
@@ -2875,6 +2881,76 @@ console.log('\nTest 44: odd-length + band-floor identities prove end-to-end (v19
     /lenGeMin\.in\[0\] <== 247/.test(csrc));
   check('pinned wasm is byte-identical to the one just proven with',
     createHash('sha256').update(readFileSync(wasmPath)).digest('hex') === globalThis.ZK_WASM_SHA256);
+}
+
+console.log('\nTest 45: real Groth16 credential from the CAPTURED odd-length report');
+{
+  // Test 44 proves a SYNTHESIZED 251-byte identity. This gate proves the
+  // identity extracted from a SAVED live capture (scripts/fixtures/
+  // captured-odd-report.json — sandbox 'verified' flow) — the artifact that
+  // exposed both v191 circuit bugs. It covers report → identity extraction
+  // (canonical key order, null handling, UTF-8) AND the circuit, so a
+  // regression cannot come back through either path.
+  const snarkjs = require('snarkjs');
+  const { EXAMPLE_ESCROW_SK, decryptCredential } = await import('./zk-decrypt-escrow.mjs');
+  const { wasmPath, vkey, zkeyPath } = zkProverPaths();
+
+  const capture = JSON.parse(readFileSync(
+    join(repoRoot, 'scripts', 'fixtures', 'captured-odd-report.json'), 'utf8'));
+  const rep = capture.attestation_report;
+  check('captured report present and carries paypal_user_info',
+    !!rep && !!rep.paypal_user_info, String(rep && Object.keys(rep).length));
+  const u = rep.paypal_user_info;
+
+  // The enclave's canonical preimage — key order fixed by identityHashOf()
+  // (user_id, sub, verified_account, payer_id) and signed into the report.
+  const D = JSON.stringify({
+    user_id: u.user_id, sub: u.sub ?? null,
+    verified_account: u.verified_account, payer_id: u.payer_id ?? null,
+  });
+  const Dsha = createHash('sha256').update(D, 'utf8').digest('hex');
+
+  check('captured identity is ODD length (the pre-v191 failure shape)',
+    D.length % 2 === 1, `len=${D.length}`);
+  check('captured identity is inside the circuit band [248,300]',
+    D.length >= 248 && D.length <= 300, `len=${D.length}`);
+  check('extracted identity hash === the report\'s signed paypal_user_info_raw_hash',
+    Dsha === rep.paypal_user_info_raw_hash, Dsha.slice(0, 16));
+
+  // REAL Groth16 over the committed wasm/zkey (no mocked prover here).
+  const bits = [];
+  for (const b of createHash('sha256').update(D).digest())
+    for (let t = 7; t >= 0; t--) bits.push((b >> t) & 1);
+  const raw = new Array(300).fill(0);
+  for (const [i, b] of [...Buffer.from(D, 'utf8')].entries()) raw[i] = b;
+  const { proof, publicSignals } = await snarkjs.groth16.fullProve({
+    identity_hash_bits: bits,
+    escrow_pubkey_x: globalThis.ZK_EXAMPLE_ESCROW_X,
+    escrow_pubkey_y: globalThis.ZK_EXAMPLE_ESCROW_Y,
+    raw_json_bytes: raw,
+    msg_len: D.length,
+    ephemeral_private_key: '98765432109876543210987654321098765432109876543210',
+  }, wasmPath, zkeyPath);
+
+  check('CAPTURED identity: 271 public signals emitted',
+    publicSignals.length === 271, String(publicSignals.length));
+  const ok = await snarkjs.groth16.verify(vkey, publicSignals, proof);
+  check('CAPTURED identity: real Groth16 proof verifies against the committed vkey',
+    ok === true, String(ok));
+  check('CAPTURED identity: verified_account_bit proven = 1', publicSignals[2] === '1');
+
+  const opened = await decryptCredential({
+    schema: 'pav-circom-escrow/v1',
+    public_signals: {
+      ephemeral_pubkey: [publicSignals[0], publicSignals[1]],
+      ciphertext: publicSignals.slice(3, 13),
+      identity_hash_hex: Dsha,
+    },
+  }, EXAMPLE_ESCROW_SK);
+  check('CAPTURED identity: credential decrypts to the exact captured bytes',
+    opened.identityJson === D);
+  check('CAPTURED identity: decrypted hash re-derives the signed raw_hash',
+    opened.sha256 === rep.paypal_user_info_raw_hash);
 }
 
 rmSync(dir, { recursive: true, force: true });;;
