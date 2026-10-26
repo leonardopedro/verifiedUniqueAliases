@@ -2642,19 +2642,40 @@
         });
     }
 
+    // v193: shown on every integrity failure. A mismatch is almost always the
+    // browser's HTTP cache replaying bytes downloaded BEFORE the pin rotated
+    // (live incident: v188 wasm served for the v191 URL), not a compromised
+    // host — so the message names the one action that resolves it instead of
+    // leaving the user stuck at a gate that will never open.
+    function zkStaleCacheHint(name) {
+        return ' Most likely cause: your BROWSER CACHE still holds ' + name
+            + ' from before the pin rotated. Hard-reload this page (Ctrl/Cmd+Shift+R)'
+            + ' or clear "Cached images and files" for this site, then retry.'
+            + ' If a hard-reload still fails, the served artifact really is wrong —'
+            + ' do NOT bypass this gate; compare its sha256 with the pin in a'
+            + ' reviewed commit.';
+    }
+
     // Fetch ONE proving artifact and verify it byte-for-byte against its
     // pinned digest before anything touches it. Fail closed on ANY doubt.
     function zkFetchArtifact(name, pinnedSha) {
         var key = name + '|' + pinnedSha;
         if (zkAssetCache[key]) return Promise.resolve(zkAssetCache[key]);
-        return fetch(ZK_BASE + name, { cache: 'force-cache' }).then(function(resp) {
+        // v193 (live incident 2026-10-26): the URL is VERSIONED BY THE PIN.
+        // `force-cache` on an unversioned URL let a copy downloaded before a
+        // pin rotation be re-served forever — the browser answered the v191
+        // request with the v188 wasm (6300a547… vs pinned b8ce562f…) and the
+        // gate correctly refused to prove. A rotated pin is now a DIFFERENT
+        // URL, so the cache can only ever hold the artifact that pin names.
+        var url = ZK_BASE + name + (pinnedSha ? '?v=' + encodeURIComponent(pinnedSha) : '');
+        return fetch(url, { cache: 'force-cache' }).then(function(resp) {
             if (!resp || !resp.ok) throw new Error('ZK artifact fetch failed: ' + name + ' (HTTP ' + (resp ? resp.status : '?') + ') from ' + ZK_BASE);
             return resp.arrayBuffer();
         }).then(function(buf) {
             return crypto.subtle.digest('SHA-256', buf).then(function(d) {
                 var hex = zkHex(d);
                 if (!pinnedSha || hex !== pinnedSha) {
-                    throw new Error('ZK ARTIFACT INTEGRITY FAILURE: ' + name + ' sha256 ' + hex.slice(0, 20) + '… does NOT match the pinned digest ' + String(pinnedSha).slice(0, 20) + '… — refusing to prove (pins rotate only via a reviewed commit, circom.md §4).');
+                    throw new Error('ZK ARTIFACT INTEGRITY FAILURE: ' + name + ' sha256 ' + hex.slice(0, 20) + '… does NOT match the pinned digest ' + String(pinnedSha).slice(0, 20) + '… — refusing to prove (pins rotate only via a reviewed commit, circom.md §4).' + zkStaleCacheHint(name));
                 }
                 // snarkjs's fastfile accepts ONLY a Uint8Array / string /
                 // {type:…} object: a raw ArrayBuffer falls through to `o.type`
@@ -2675,7 +2696,10 @@
         var key = 'zkey|' + ZK_ZKEY_SHA256;
         if (zkAssetCache[key]) return Promise.resolve(zkAssetCache[key]);
         return Promise.all(ZK_ZKEY_PARTS.map(function(part) {
-            return fetch(ZK_BASE + part, { cache: 'force-cache' }).then(function(resp) {
+            // Versioned by the assembled-key pin, exactly like the wasm above:
+            // a rotated pin = a new URL, so `force-cache` can only replay the
+            // artifact that THIS pin names (v193, stale-cache incident).
+            return fetch(ZK_BASE + part + (ZK_ZKEY_SHA256 ? '?v=' + encodeURIComponent(ZK_ZKEY_SHA256) : ''), { cache: 'force-cache' }).then(function(resp) {
                 if (!resp || !resp.ok) throw new Error('ZK artifact fetch failed: ' + part + ' (HTTP ' + (resp ? resp.status : '?') + ') from ' + ZK_BASE);
                 return resp.arrayBuffer();
             });
@@ -2688,7 +2712,7 @@
             return crypto.subtle.digest('SHA-256', buf).then(function(d) {
                 var hex = zkHex(d);
                 if (!ZK_ZKEY_SHA256 || hex !== ZK_ZKEY_SHA256) {
-                    throw new Error('ZK ARTIFACT INTEGRITY FAILURE: assembled identity_escrow_final.zkey sha256 ' + hex.slice(0, 20) + '… does NOT match the pinned digest ' + String(ZK_ZKEY_SHA256).slice(0, 20) + '… — refusing to prove (pins rotate only via a reviewed commit, circom.md §4).');
+                    throw new Error('ZK ARTIFACT INTEGRITY FAILURE: assembled identity_escrow_final.zkey sha256 ' + hex.slice(0, 20) + '… does NOT match the pinned digest ' + String(ZK_ZKEY_SHA256).slice(0, 20) + '… — refusing to prove (pins rotate only via a reviewed commit, circom.md §4).' + zkStaleCacheHint('identity_escrow_final.zkey'));
                 }
                 // Uint8Array, NOT the bare ArrayBuffer — snarkjs fastfile would
                 // throw "Invalid FastFile type: undefined" (see zkFetchArtifact).

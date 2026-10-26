@@ -3046,6 +3046,44 @@ console.log('\nTest 46: GitHub Pages copy == repo verify.html (served-auditor dr
         if (rm) check('Pages README publishes the CURRENT verify.html digest',
           rm.toString('utf8').includes(repoDigest), 'Pages README digest is stale');
         else console.log('  ⚠️  Pages README not fetched — verify.html parity already proven');
+
+        // v193: the ZK artifacts live on the SAME Pages branch and are fetched
+        // by the auditor with `force-cache` — so a stale Pages (or a stale
+        // browser copy of it) serves the WRONG wasm/zkey beside a correct
+        // auditor. That is the live incident behind the `6300a547… vs
+        // b8ce562f…` INTEGRITY FAILURE: the gate fired, but only in the
+        // victim's browser. Pin them here too, byte-for-byte, against the
+        // repo files AND against the digests the auditor embeds.
+        if (process.env.PAGES_ZK_ARTIFACTS !== '0') {
+          const vsrc = readFileSync(join(repoRoot, 'verify.html'), 'utf8');
+          const wasmPin = (vsrc.match(/var ZK_WASM_SHA256 = '([0-9a-f]{64})'/) || [])[1];
+          const zkeyPin = (vsrc.match(/var ZK_ZKEY_SHA256 = '([0-9a-f]{64})'/) || [])[1];
+          const wasmLocal = readFileSync(join(repoRoot, 'zk', 'identity_escrow.wasm'));
+          const part0 = readFileSync(join(repoRoot, 'zk', 'identity_escrow_final.zkey.part0'));
+          const part1 = readFileSync(join(repoRoot, 'zk', 'identity_escrow_final.zkey.part1'));
+          check('repo wasm == the ZK_WASM_SHA256 the auditor embeds',
+            sha(wasmLocal) === wasmPin, `${sha(wasmLocal).slice(0, 16)} vs pin ${String(wasmPin).slice(0, 16)}`);
+          check('repo zkey parts assemble to the ZK_ZKEY_SHA256 the auditor embeds',
+            sha(Buffer.concat([part0, part1])) === zkeyPin,
+            `${sha(Buffer.concat([part0, part1])).slice(0, 16)} vs pin ${String(zkeyPin).slice(0, 16)}`);
+          const zkBase = new URL('zk/', PAGES_VERIFY_URL).href;
+          const wanted = [
+            ['identity_escrow.wasm', wasmLocal],
+            ['identity_escrow_final.zkey.part0', part0],
+            ['identity_escrow_final.zkey.part1', part1],
+          ];
+          for (const [file, localBuf] of wanted) {
+            const got = await httpGet(zkBase + file);
+            if (!got) {
+              check(`Pages serves zk/${file}`, strict, `GET ${zkBase}${file} failed`);
+              continue;
+            }
+            const pagesSha = sha(got), repoSha = sha(localBuf);
+            check(`Pages zk/${file} byte-identical to the repo artifact`,
+              pagesSha === repoSha,
+              `pages=${pagesSha.slice(0, 16)} repo=${repoSha.slice(0, 16)} — every browser auditing from Pages would hit INTEGRITY FAILURE`);
+          }
+        }
       } else {
         // Classify the mismatch so the failure says WHICH branch is stale.
         // GITHUB_REF_NAME covers CI's detached checkout (git reports `HEAD`).

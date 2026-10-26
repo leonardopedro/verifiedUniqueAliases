@@ -96,11 +96,11 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 261,710 bytes | `c450eedb6ff2a071d108102244dd3665c5f7638b44b6f5a9799a125f7e44551c` |
+| `verify.html` | 263,502 bytes | `a7e6fdb6a181c27ecce39d7e0b6c50ee1f3472554c55d1b2655af9d080265d54` |
 
 ```bash
 sha256sum verify.html
-# c450eedb6ff2a071d108102244dd3665c5f7638b44b6f5a9799a125f7e44551c  verify.html
+# a7e6fdb6a181c27ecce39d7e0b6c50ee1f3472554c55d1b2655af9d080265d54  verify.html
 ```
 
 - Rotate this hash in the **same reviewed commit** that changes `verify.html`;
