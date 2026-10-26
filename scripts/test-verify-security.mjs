@@ -2023,16 +2023,25 @@ console.log('\nTest 35: deploy-alibaba.sh keeps the self-report sink (v186 — a
   // deploy-alibaba.sh did NOT emit it — the next deploy would have silently
   // gone dark. The emission is now env-gated and source-pinned here.
   const depSrc = readFileSync(join(repoRoot, 'deploy-alibaba.sh'), 'utf8');
-  check('emission gated on the write-only RAM key env pair',
-    /\[\[ -n "\$\{SELF_REPORT_ACCESS_KEY_ID:-\}" && -n "\$\{SELF_REPORT_ACCESS_KEY_SECRET:-\}" \]\]/.test(depSrc),
+  // 2026-10-26: these three pins tracked the FIRST (env-gated) draft of the
+  // emission and went stale when commit 3ddf904 replaced it with the
+  // verified always-emit implementation (env → /tmp/pav-ak.* mirror → config
+  // file block, bucket/endpoint/prefix env → file → prod default). Re-pinned
+  // to the committed behaviour — same properties, current spelling.
+  check('emission keyed on the write-only RAM key (env pair, else pav-ak mirror)',
+    depSrc.includes('SR_KEY_ID="${SELF_REPORT_ACCESS_KEY_ID:-}"')
+      && depSrc.includes('SR_KEY_SECRET="${SELF_REPORT_ACCESS_KEY_SECRET:-}"')
+      && /\[\[ -n "\$SR_KEY_ID" && -n "\$SR_KEY_SECRET" \]\]/.test(depSrc),
     'env gate missing');
   check('emission merges self_report via jq (JSON-safe, not string concat)',
-    /\. \+ \{self_report:/.test(depSrc) && depSrc.includes('sts_token:null'),
+    depSrc.includes('.self_report = {')
+      && depSrc.includes('sts_token: (.self_report.sts_token // null)')
+      && depSrc.includes('> "$SELF_REPORT_MERGED"'),
     'jq merge missing');
   check('sink defaults match the live prod config (HK bucket, hongkong endpoint, boot prefix)',
-    depSrc.includes('paypal-tdx-relay-1792227992')
-      && depSrc.includes('oss-cn-hongkong.aliyuncs.com')
-      && depSrc.includes('SELF_REPORT_PREFIX:-boot'),
+    depSrc.includes('SELF_REPORT_BUCKET_DEF="paypal-tdx-relay-1792227992"')
+      && depSrc.includes('SELF_REPORT_ENDPOINT_DEF="oss-cn-hongkong.aliyuncs.com"')
+      && depSrc.includes('SELF_REPORT_PREFIX_DEF="boot"'),
     'defaults drifted from the deployed sink');
   check('emission runs BEFORE user_data is base64-encoded',
     depSrc.indexOf('SELF_REPORT_MERGED') > 0
@@ -2127,6 +2136,48 @@ console.log('\nTest 37: /callback AUTO-DOWNLOADS the attestation, no landing pag
   check('heading advertises the automatic download',
     cbContent.includes('Your encrypted attestation is downloading automatically'),
     'heading not updated');
+  // v189 (user request): the page must WARN in order — download in progress,
+  // this page closes itself, then upload the file in the previous local tab.
+  check('callback warns the download is IN PROGRESS (1/3)',
+    cbContent.includes('1/3 — download in progress'), 'step 1 warning missing');
+  check('callback warns the page AUTO-CLOSES itself (2/3, live countdown)',
+    cbContent.includes('2/3 — this page will close itself automatically')
+      && cbContent.includes('autoclose-secs'), 'auto-close warning missing');
+  check('callback says to upload the file in the PREVIOUS local tab after closing (3/3)',
+    cbContent.includes('3/3 — once this page has closed, go back to the PREVIOUS (local) tab')
+      && cbContent.includes('file picker'), 'post-close instruction missing');
+  check('a BLOCKED auto-close falls back to a manual instruction, not a dead page',
+    cbContent.includes('would not close the tab automatically')
+      && cbContent.includes('Close this tab'), 'fallback warning missing');
+}
+
+console.log('\nTest 41: TLS certificate download offered BEFORE login (v189)');
+{
+  const rust = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  check('enclave routes GET /tls-cert.pem',
+    rust.includes('.route("/tls-cert.pem", get(serve_tls_cert))'), 'route missing');
+  check('handler serves application/x-pem-file with attachment disposition',
+    rust.includes('application/x-pem-file')
+      && rust.includes('CONTENT_DISPOSITION')
+      && rust.includes('enclave-tls-certificate.pem'),
+    'PEM response shape missing');
+  check('handler fails closed before the cert is issued (503, no empty body)',
+    rust.includes("TLS certificate not issued yet"), 'no not-ready branch');
+  check('cert download is charged to the egress budget like every other GET',
+    rust.includes('record_egress(addr.ip(), 4096)'), 'egress not charged');
+  check('verify.html offers the cert download BEFORE the PayPal login links',
+    html.indexOf('id="tlsCertDownload"') > -1
+      && html.indexOf('id="tlsCertDownload"') < html.indexOf('id="loginVerifiedLink"'),
+    'cert block missing or after the login links');
+  check('download targets the enclave origin (https-validated), not a hard-coded host',
+    html.includes("base + '/tls-cert.pem'") && html.includes("function downloadTlsCert()"),
+    'downloadTlsCert missing');
+  check('instructions cover the audit cert picker AND manual openssl inspection',
+    html.includes('Browser TLS certificate (optional)') && html.includes('openssl x509')
+      && html.includes('openssl s_client'), 'instructions incomplete');
+  const idx2 = readFileSync(join(repoRoot, 'index.html'), 'utf8');
+  check('index.html carries the cert block too (root page parity)',
+    idx2.includes('id="tlsCertDownload"'), 'index.html missing the block');
 }
 
 console.log('\nTest 39: ZK escrow credential card — prove/verify wiring (v188, circom.md §5)');
@@ -2260,6 +2311,13 @@ console.log('\nTest 39: ZK escrow credential card — prove/verify wiring (v188,
           createHash('sha256').update(Buffer.from(wasmBuf)).digest('hex') === wasmSha);
         check('prover receives the real pinned zkey bytes',
           createHash('sha256').update(Buffer.from(zkeyBuf)).digest('hex') === zkeySha);
+        // snarkjs fastfile only accepts a Uint8Array / string / {type} object:
+        // handing it the raw ArrayBuffer made the LIVE Generate button throw
+        // "Invalid FastFile type: undefined" (2026-10-26 user report) — the
+        // mocked prover can't reproduce that, so pin the type here.
+        check('prover receives Uint8Array FastFiles (raw ArrayBuffer ⇒ "Invalid FastFile type: undefined")',
+          wasmBuf instanceof Uint8Array && zkeyBuf instanceof Uint8Array,
+          `wasm=${Object.prototype.toString.call(wasmBuf)} zkey=${Object.prototype.toString.call(zkeyBuf)}`);
         // public signal layout: [R.x, R.y, verified, C0..C9, hashBits(256), ex, ey]
         const bits = [];
         for (let i = 0; i < input.identity_hash_bits.length; i++) bits.push(String(input.identity_hash_bits[i]));
@@ -2507,6 +2565,124 @@ console.log('\nTest 40: index.html ↔ verify.html auditor parity (F2 — no sta
   })());
 }
 
-rmSync(dir, { recursive: true, force: true });;
+console.log('\nTest 42: authority escrow public key — paste field + file picker (v190)');
+{
+  const parse = globalThis.zkParseAuthorityKey;
+  check('zkParseAuthorityKey exposed by the auditor script', typeof parse === 'function');
+
+  const EX = globalThis.ZK_EXAMPLE_ESCROW_X, EY = globalThis.ZK_EXAMPLE_ESCROW_Y;
+  check('decimal "x y" pair parses to the same coordinates',
+    parse(EX + ' ' + EY).x === EX && parse(EX + ' ' + EY).y === EY);
+
+  // BabyJubjub Base8 — a SECOND valid point (on-curve verified offline
+  // against circomlibjs, a=168700 d=168696 over the BN254 scalar field).
+  const BX = '5299619240641551281634865583518297030282874472190772894086521144482721001553';
+  const BY = '16950150798460657717958625567821834550301663161624707787222815936182638968203';
+  check('labelled "x: … / y: …" form parses', parse('x: ' + BX + '\n  y: ' + BY).x === BX);
+  check('JSON {"x","y"} form parses', parse(JSON.stringify({ x: BX, y: BY })).x === BX);
+  check('JSON {"pubkey":[x,y]} form parses', parse(JSON.stringify({ pubkey: [BX, BY] })).y === BY);
+  const err = (t) => { try { parse(t); return '(accepted!)'; } catch (e) { return e.message; } };
+  check('PEM input rejected with a BabyJubjub-specific message',
+    /BabyJubjub/.test(err('-----BEGIN PUBLIC KEY-----\nMIIBojANBgkqghello')), err('-----BEGIN PUBLIC KEY-----\nMIIBojANBgkqghello').slice(0, 90));
+  check('off-curve point rejected (fails closed before proving)',
+    /NOT on BabyJubjub/.test(err('1 1')), err('1 1'));
+  check('non-decimal coordinate rejected', /decimal/.test(err('0x1234 abcd')), err('0x1234 abcd'));
+  check('wrong token count rejected', /two decimal/.test(err('123')), err('123'));
+
+  const savedX = document.getElementById('zkEscrowX').value;
+  const savedY = document.getElementById('zkEscrowY').value;
+  globalThis.zkApplyAuthorityKey(BX + ' ' + BY, 'file "authority.txt"');
+  check('apply() writes the authority key into the fields the prover reads',
+    document.getElementById('zkEscrowX').value === BX
+      && document.getElementById('zkEscrowY').value === BY,
+    document.getElementById('zkEscrowX').value.slice(0, 22));
+
+  const idxNow = readFileSync(join(repoRoot, 'index.html'), 'utf8');
+  const pos = (s, id) => s.indexOf('id="' + id + '"');
+  check('verify.html: paste field + file picker BOTH before the ⚡ button',
+    pos(html, 'zkAuthorityKey') > -1 && pos(html, 'zkAuthorityKeyFile') > -1
+      && pos(html, 'zkAuthorityKey') < pos(html, 'zkProveBtn')
+      && pos(html, 'zkAuthorityKeyFile') < pos(html, 'zkProveBtn'));
+  check('index.html carries the same authority-key controls',
+    pos(idxNow, 'zkAuthorityKey') > -1 && pos(idxNow, 'zkAuthorityKeyFile') > -1);
+  check('prove path re-validates a pasted key (source-pinned)',
+    /akRaw = \(\(document\.getElementById\('zkAuthorityKey'\)/.test(html)
+      && html.includes('if (akRaw) zkApplyAuthorityKey(akRaw,'));
+
+  // ---- end-to-end: the pasted authority key reaches the PROOF ------------
+  const savedId2 = globalThis.zkIdentityJson, savedHash2 = globalThis.zkIdentityHashHex;
+  const repEl = document.getElementById('attestationInput');
+  const savedRep = repEl.value;
+  if (!repEl.value) repEl.value = JSON.stringify({ fixture: 'authority-key-flow' });
+  const realFetch2 = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes('/zk/')) {
+      const buf = readFileSync(join(repoRoot, 'zk', u.split('/zk/')[1].split('?')[0]));
+      return { ok: true, status: 200, arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) };
+    }
+    return realFetch2(url);
+  };
+  const realCU = URL.createObjectURL, realRU = URL.revokeObjectURL;
+  const realCE2 = document.createElement, realBD2 = document.body;
+  const blobs2 = [];
+  URL.createObjectURL = (b) => { blobs2.push(b); return 'blob:t2'; };
+  URL.revokeObjectURL = () => {};
+  document.createElement = () => ({ click() {}, remove() {}, style: {}, href: '', download: '' });
+  document.body = { appendChild() {}, removeChild() {} };
+  let proveInput2 = null;
+  globalThis.zkSnarkjsModule = { groth16: {
+    fullProve: async (input) => {
+      proveInput2 = input;
+      const ps = [
+        '1556631486497778477605397274746159966306848378885429798549421757913197467405',
+        '16893061115786568867716241603005123395306176793643233966794415383620167560086',
+        '1',
+        ...Array.from({ length: 10 }, (_, i) => String(1000 + i)),
+        ...input.identity_hash_bits.map(String),
+        input.escrow_pubkey_x, input.escrow_pubkey_y,
+      ];
+      if (ps.length !== 271) throw new Error('fixture layout bug: ' + ps.length);
+      return { proof: { pi_a: ['1', '2', '1'], pi_b: [['1', '2'], ['1', '2'], ['1', '1']], pi_c: ['1', '2', '1'], protocol: 'groth16', curve: 'bn128' }, publicSignals: ps };
+    },
+    verify: async () => true,
+  } };
+  document.getElementById('zkAuthorityKey').value = BX + ' ' + BY;
+  try { const pA = zkGenerateCredential(); if (pA) await pA; } catch (e) { /* surfaced below */ }
+  const stA = document.getElementById('zkProveStatus').innerText;
+  const credA = blobs2.length ? JSON.parse(await blobs2[0].text()) : null;
+  check('prove flow runs green with an authority key pasted', stA.startsWith('✅'), stA.slice(0, 240));
+  check('the PROOF is bound to the authority key (escrow_pubkey === pasted key)',
+    proveInput2 && proveInput2.escrow_pubkey_x === BX && proveInput2.escrow_pubkey_y === BY,
+    proveInput2 && String(proveInput2.escrow_pubkey_x).slice(0, 22));
+  check('the credential carries the authority key as escrow recipient',
+    credA && credA.public_signals.escrow_pubkey[0] === BX
+      && credA.public_signals.escrow_pubkey[1] === BY,
+    credA && JSON.stringify(credA.public_signals.escrow_pubkey));
+
+  document.getElementById('zkAuthorityKey').value = '1 1';
+  document.getElementById('zkProveStatus').innerText = '';
+  blobs2.length = 0; proveInput2 = null;
+  const pB = zkGenerateCredential();
+  if (pB) { try { await pB; } catch (e) { /* expected */ } }
+  check('an off-curve authority key fails closed BEFORE proving',
+    !proveInput2
+      && document.getElementById('zkProveStatus').innerText.includes('NOT on BabyJubjub'),
+    document.getElementById('zkProveStatus').innerText.slice(0, 200));
+
+  // ---- restore ----------------------------------------------------------
+  globalThis.fetch = realFetch2;
+  URL.createObjectURL = realCU; URL.revokeObjectURL = realRU;
+  document.createElement = realCE2; document.body = realBD2;
+  globalThis.zkSnarkjsModule = null; globalThis.zkAssetCache = {};
+  document.getElementById('zkAuthorityKey').value = '';
+  document.getElementById('zkEscrowX').value = savedX;
+  document.getElementById('zkEscrowY').value = savedY;
+  document.getElementById('zkProveStatus').innerText = '';
+  globalThis.zkIdentityJson = savedId2; globalThis.zkIdentityHashHex = savedHash2;
+  repEl.value = savedRep;
+}
+
+rmSync(dir, { recursive: true, force: true });;;
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

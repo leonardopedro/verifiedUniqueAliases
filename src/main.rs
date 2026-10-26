@@ -1066,8 +1066,11 @@ const HTML_TEMPLATE: &str = r#"
 // nothing and forges nothing.
 const CALLBACK_CONTENT: &str = r#"<h1>Authentication Succeeded</h1>
             <div class="info">
-                <h3>Your encrypted attestation is downloading automatically</h3>
-                <p><code>encrypted-attestation-report.json</code> was saved by this page on load — no button needed. It is CIPHERTEXT, sealed to a throwaway key that only ever existed in the browser tab where you started the login, so it is useless to anyone else (including this site). Load it with the “Attestation JSON report” file picker of a trusted auditor (your saved <code>verify.html</code> or the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color:#64b5f6;">GitHub Pages auditor</a>) to decrypt, audit, and get the plain JSON. This tab holds nothing else and will try to close itself.</p>
+                <h3>Your encrypted attestation is downloading automatically — this page will close itself next</h3>
+                <p><b>⏳ 1/3 — download in progress:</b> <code>encrypted-attestation-report.json</code> was saved by this page the moment it loaded — no button needed. It is CIPHERTEXT, sealed to a throwaway key that only ever existed in the browser tab where you started the login, so it is useless to anyone else (including this site).</p>
+                <p><b>🚪 2/3 — this page will close itself automatically</b> in a few seconds (live countdown below). If your browser refuses to close a tab it did not open, close it by hand with the ✖ button — nothing else is held here.</p>
+                <p><b>⬅️ 3/3 — once this page has closed, go back to the PREVIOUS (local) tab</b> — your <code>verify.html</code> (file:// or the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color:#64b5f6;">GitHub Pages auditor</a>) that started this login — and upload the downloaded file there with its “Attestation JSON report” file picker. That trusted copy decrypts it with the key it generated on load, runs the full hardware audit and offers the plain JSON for offline auditing.</p>
+                <p id="autoclose-notice" style="margin:12px 0 0; padding:10px 12px; border-radius:6px; background:#0d1117; border:1px solid #3fb950; color:#3fb950; font-size:0.9rem;">⏳ Download started — this page closes itself in <b><span id="autoclose-secs">3</span> s</b>… then upload the file in your previous (local) auditor tab.</p>
                 <textarea id="e2ee-blob-view" readonly style="width:100%; height:180px; background:#0d1117; color:#9e9e9e; font-size:12px; border:1px solid #30363d; border-radius:6px; padding:10px; box-sizing:border-box;"></textarea>
                 <p><button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); t.select(); try{document.execCommand('copy');this;}catch(e){} try{navigator.clipboard.writeText(t.value);}catch(e){} this.textContent='✅ Copied — paste it into a trusted auditor';})()" style="margin-top:10px;">📋 Copy encrypted report</button> <button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); var blob=new Blob([t.value],{type:'application/json'}); var url=URL.createObjectURL(blob); var a=document.createElement('a'); a.href=url; a.download='encrypted-attestation-report.json'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){URL.revokeObjectURL(url);},5000);})()" style="margin-top:10px;">💾 Download encrypted report (.json)</button> <button class="btn" onclick="window.close()" style="margin-top:10px;">✖ Close this tab</button></p>
             </div>
@@ -1083,10 +1086,22 @@ var __u=URL.createObjectURL(new Blob([__b],{type:'application/json'}));
 var __a=document.createElement('a'); __a.href=__u; __a.download='encrypted-attestation-report.json';
 document.body.appendChild(__a); __a.click(); __a.remove();
 setTimeout(function(){URL.revokeObjectURL(__u);},10000);
-// NO LANDING PAGE: once the download is under way, close this tab (only
-// script-opened windows may close; otherwise the minimal view above — just
-// the attestation ciphertext — remains, with copy / re-download fallbacks).
-setTimeout(function(){try{window.close();}catch(e){}},2500);
+// NO LANDING PAGE: once the download is under way, count DOWN visibly and
+// close this tab (only script-opened windows may close; otherwise the minimal
+// view above — the attestation ciphertext with copy / re-download fallbacks —
+// remains, now TELLING the user what to do by hand instead of dying silently).
+var __secs=3, __notice=document.getElementById('autoclose-notice'), __sp=document.getElementById('autoclose-secs');
+var __timer=setInterval(function(){ __secs--; if(__sp) __sp.textContent=String(__secs>0?__secs:0); if(__secs<=0) clearInterval(__timer); },1000);
+setTimeout(function(){
+    try{ window.close(); }catch(e){}
+    // Still visible? The browser blocked the auto-close — spell out the manual
+    // step (upload in the PREVIOUS local tab) instead of leaving a dead page.
+    setTimeout(function(){
+        if(!__notice) return;
+        __notice.style.borderColor='#d29922'; __notice.style.color='#d29922';
+        __notice.innerHTML='⚠️ This browser would not close the tab automatically. Click “✖ Close this tab”, then go back to the PREVIOUS (local) verify.html tab and upload <code>encrypted-attestation-report.json</code> with the “Attestation JSON report” file picker.';
+    },800);
+},3200);
 }catch(e){}</script>"#;
 
 #[derive(Debug, Deserialize)]
@@ -1563,6 +1578,57 @@ async fn serve_verify_html() -> impl IntoResponse {
             )
                 .into_response(),
         },
+    }
+}
+
+// ----------------------------------------------------------------------------
+// TLS certificate download (GET /tls-cert.pem) — v189 (user request)
+// ----------------------------------------------------------------------------
+// Browsers expose NO JS API for "the certificate of this connection", so the
+// enclave hands out the chain it is itself serving. This is public data — the
+// exact bytes every TLS client already receives during the handshake (no key
+// material) and the same PEM the report records as
+// `session_context.tls_certificate_pem`. The auditor offers it BEFORE the
+// PayPal login so the visitor can save it and load it into the audit's
+// optional "Browser TLS certificate" binding row (and inspect it offline with
+// openssl). No new minting surface: it is a RAM copy of a static string —
+// never a quote — and the ~2 KB response is charged to the caller's egress
+// budget like every other GET here.
+async fn serve_tls_cert(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(status) = state.record_egress(addr.ip(), 4096) {
+        return status.into_response();
+    }
+    match state.tls_cert_pem.read().clone() {
+        Some(pem) if !pem.is_empty() => {
+            let mut resp = (
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/x-pem-file"),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"enclave-tls-certificate.pem\"",
+                    ),
+                ],
+                pem.into_bytes(),
+            )
+                .into_response();
+            // The auditor's trusted copy lives on another origin (file:// /
+            // GitHub Pages) and fetches this cross-origin; the body is public
+            // and carries no credentials, so ACAO:* is safe (and inert for the
+            // same-origin <a download> path, which never sends CORS).
+            resp.headers_mut().insert(
+                axum::http::header::HeaderName::from_static("access-control-allow-origin"),
+                axum::http::HeaderValue::from_static("*"),
+            );
+            with_secure_headers(resp)
+        }
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TLS certificate not issued yet — retry once the enclave reports 'serving'",
+        )
+            .into_response(),
     }
 }
 
@@ -2401,6 +2467,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .route("/verify.html", get(serve_verify_html))
             .route("/attest/login-session", axum::routing::options(login_session_cors).post(attest_login_session))
             .route("/debug/envelope", get(debug_envelope))
+            // v189 (user request): the enclave's own TLS chain as a PEM file,
+            // offered by verify.html BEFORE the PayPal login (see handler).
+            .route("/tls-cert.pem", get(serve_tls_cert))
             .route("/callback", get(callback))
             .route("/e2ee-blob", get(get_e2ee_blob))
             // R3-4 (audit round 3 — side channel): the default span logs the

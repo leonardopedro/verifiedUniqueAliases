@@ -216,6 +216,23 @@
             <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow (two explicit links):</b> your throwaway encryption key is generated AUTOMATICALLY when this page loads — the green note below says exactly when — so there is nothing to click for that. Then pick ONE of the two links: minimal disclosure (“verified status only”) or the full profile. A click prepares the signed login session and that same link turns into “✅ Continue to PayPal →” (opens in a NEW tab); after PayPal returns, the enclave's callback page <b>downloads your still-ENCRYPTED attestation automatically</b> — no landing page. Bring that file back to THIS tab and load it with the “Attestation JSON report” file picker above: this trusted copy decrypts it with the key it generated on load, runs the full hardware audit, and offers the plain JSON for offline auditing. There is deliberately no “claim” button any more — one auto-generated key, two explicit links, one audit. If any step fails, nothing is saved, so you are safe to close the tab.</p>
             <!-- v188 (user request): the morphing workflow button is SUPPRESSED (removed) — two explicit login links replace it, the throwaway key is auto-generated on render (keyNotice announces it), and the claim step is gone: /callback AUTO-DOWNLOADS the ciphertext and this tab loads it with the file picker (decryptPastedBlob → runAudit). -->
             <div id="keyNotice" style="display:none; margin-top:12px; padding:10px 12px; border-radius:8px; font-size:0.85rem; background:rgba(63,185,80,0.08); border:1px solid #3fb950; color:#3fb950;"></div>
+            <!-- v189 (user request): the enclave's own TLS certificate, offered
+                 BEFORE the PayPal login. Browsers expose no JS API for "the
+                 certificate of this connection", so the enclave serves its own
+                 chain at GET /tls-cert.pem — the same bytes the report records
+                 as session_context.tls_certificate_pem. -->
+            <details id="tlsCertBox" style="margin-top:12px; border:1px dashed #30363d; border-radius:8px; padding:8px 12px; background:#0d1117;">
+                <summary style="cursor:pointer; color:#58a6ff; font-size:0.9rem; font-weight:600;">🔒 Save this enclave's TLS certificate (PEM) — recommended BEFORE logging in</summary>
+                <div style="color: var(--text-dim); font-size: 0.85rem; margin-top:10px;">
+                    <p style="margin:0 0 8px;">Downloads the exact certificate chain this enclave presented to <b>this</b> browser — the same bytes later recorded inside the report (<code>session_context.tls_certificate_pem</code>). The download connects only to the enclave address below; the PayPal login itself is a separate, <b>direct</b> connection from your browser to PayPal (the enclave never proxies it), so you can save the certificate first and keep your own copy of what you trusted.</p>
+                    <a id="tlsCertDownload" href="#" onclick="return downloadTlsCert();" style="display:inline-block; padding:10px 16px; background:#d29922; color:#0d1117; border-radius:6px; font-weight:600; text-decoration:none;">⬇️ Download TLS certificate (PEM)</a>
+                    <ol style="margin:10px 0 0 18px; padding:0; line-height:1.6;">
+                        <li>Save <code>enclave-tls-certificate.pem</code> next to your attestation report.</li>
+                        <li><b>Use it in the audit:</b> load that file with the “Browser TLS certificate (optional)” picker in the “Audit a report you already have” card below — the auditor then cross-checks the chain recorded in the report against this independent copy you fetched yourself.</li>
+                        <li><b>Inspect it yourself (optional):</b> <code>openssl x509 -in enclave-tls-certificate.pem -noout -subject -issuer -dates</code>, or compare it with a live handshake using <code>openssl s_client -connect enclave-host:443 -showcerts</code> — see the <a href="https://docs.openssl.org/master/apps/s_client/" style="color:#64b5f6;">openssl s_client documentation</a>.</li>
+                    </ol>
+                </div>
+            </details>
             <a id="loginVerifiedLink" onclick="executePreflightAndLogin('verified')" style="display:block; margin-top:12px; padding:14px; text-align:center; background:#4caf50; color:#fff; border-radius:10px; font-weight:600; text-decoration:none; cursor:pointer;">🔐 Log in with PayPal — verified status only (no extra info)</a>
             <a id="loginFullLink" onclick="executePreflightAndLogin('full')" style="display:block; margin-top:10px; padding:14px; text-align:center; background:#1f6feb; color:#fff; border-radius:10px; font-weight:600; text-decoration:none; cursor:pointer;">🔐 Log in with PayPal — share full profile (name, email, address)</a>
             <input type="text" id="localEnclaveHost" placeholder="https://login.airma.de"
@@ -303,6 +320,21 @@
             <input type="text" id="zkEscrowX" spellcheck="false" placeholder="escrow pubkey x (decimal)" style="width:calc(50% - 6px); padding:8px; border-radius:4px; border:1px solid #30363d; background:#0d1117; color:#58a6ff; font-family:'JetBrains Mono',monospace; font-size:0.75rem;">
             <input type="text" id="zkEscrowY" spellcheck="false" placeholder="escrow pubkey y (decimal)" style="width:calc(50% - 6px); margin-left:8px; padding:8px; border-radius:4px; border:1px solid #30363d; background:#0d1117; color:#58a6ff; font-family:'JetBrains Mono',monospace; font-size:0.75rem;">
         </div>
+        <!-- v190 (user request): paste OR upload the PUBLIC KEY of an authority
+             (e.g. law enforcement) that must be able to read the escrowed
+             identity. It is validated against the BabyJubjub curve, written
+             into the x/y fields above, and then BOUND INTO THE PROOF as the
+             escrow_pubkey public signal — so a verifier can prove which key
+             the plaintext was escrowed to, and nobody can swap it later. -->
+        <div style="margin-top:12px; border-top:1px dashed #30363d; padding-top:10px;">
+            <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">🗝️ Authority escrow public key — paste it, or load it from a file <span style="color:var(--text-dim); font-size:0.8rem;">(optional)</span></label>
+            <p style="color: var(--text-dim); font-size: 0.85rem; margin:6px 0 8px;">Generate the proof below for an <b>authority who must be able to read the identity</b> (police, court, regulator, auditor): paste their <b>BabyJubjub public key</b> here or load it from a file. The key is checked against the curve first, then <b>bound into the proof</b> as a public signal, so the credential proves exactly which key the plaintext was escrowed to and that key cannot be swapped after the fact — the holder opens the credential with <code>scripts/zk-decrypt-escrow.mjs credential.json &lt;private scalar&gt;</code>. Leave both empty to keep the EXAMPLE key (public — zero secrecy). <b>Note:</b> only a BabyJubjub keypair can receive this ciphertext — a PEM/RSA/X.509 key cannot be used by the circuit.</p>
+            <textarea id="zkAuthorityKey" spellcheck="false" placeholder="Paste the authority's public key: two decimal field elements (x y) — or JSON like {&quot;x&quot;:&quot;…&quot;,&quot;y&quot;:&quot;…&quot;}" style="width:100%; height:66px; padding:8px; border-radius:4px; border:1px solid #30363d; background:#0d1117; color:#58a6ff; font-family:'JetBrains Mono',monospace; font-size:0.75rem; box-sizing:border-box;"></textarea>
+            <div style="margin-top:8px;">
+                <input type="file" id="zkAuthorityKeyFile" accept=".txt,.json,.key,.pub,.pem,.asc" class="file-input" onchange="zkAuthorityKeyFromFile(this)">
+            </div>
+            <p id="zkAuthorityKeyStatus" style="margin:6px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);"></p>
+        </div>
         <button id="zkProveBtn" onclick="zkGenerateCredential()" style="width:100%; margin-top:12px;">⚡ Generate ZK escrow credential (proves in this browser)</button>
         <p id="zkProveStatus" style="margin:8px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);"></p>
         <div style="border-top:1px solid #30363d; margin:16px 0 12px;"></div>
@@ -330,6 +362,28 @@
             }
         } catch (e) { /* harness without DOM — skip */ }
     })();
+
+    // v189 (user request): save the enclave's TLS chain as a file BEFORE the
+    // login. No browser API exposes "the certificate of this connection", so
+    // this points a plain anchor at the enclave origin the visitor already
+    // entered above (GET /tls-cert.pem → application/x-pem-file +
+    // Content-Disposition: attachment). Fail closed on a non-https origin,
+    // exactly like the login path does.
+    function downloadTlsCert() {
+        var hi = document.getElementById('localEnclaveHost');
+        var base = ((hi && hi.value) || '').trim().replace(/\/+$/, '');
+        if (!/^https:\/\/[^\/]+/.test(base)) {
+            alert('Enter the enclave origin (https://<enclave>) in the "enclave address" field first — the certificate is downloaded from that address.');
+            return false;
+        }
+        var a = document.createElement('a');
+        a.href = base + '/tls-cert.pem';
+        a.rel = 'noopener';
+        (document.body || document.head || document.documentElement).appendChild(a);
+        a.click();
+        a.remove();
+        return false;
+    }
 
     // v169: fail closed (with an actionable message) if the SRI-pinned forge
     // bundle did not load — a missing certificate parser must never degrade
@@ -2586,8 +2640,14 @@
                 if (!pinnedSha || hex !== pinnedSha) {
                     throw new Error('ZK ARTIFACT INTEGRITY FAILURE: ' + name + ' sha256 ' + hex.slice(0, 20) + '… does NOT match the pinned digest ' + String(pinnedSha).slice(0, 20) + '… — refusing to prove (pins rotate only via a reviewed commit, circom.md §4).');
                 }
-                zkAssetCache[key] = buf;
-                return buf;
+                // snarkjs's fastfile accepts ONLY a Uint8Array / string /
+                // {type:…} object: a raw ArrayBuffer falls through to `o.type`
+                // and dies with "Invalid FastFile type: undefined" (live-
+                // observed on the Generate button). Cache AND return the view —
+                // caching the bare ArrayBuffer would break every cache HIT.
+                var u8 = new Uint8Array(buf);
+                zkAssetCache[key] = u8;
+                return u8;
             });
         });
     }
@@ -2614,10 +2674,111 @@
                 if (!ZK_ZKEY_SHA256 || hex !== ZK_ZKEY_SHA256) {
                     throw new Error('ZK ARTIFACT INTEGRITY FAILURE: assembled identity_escrow_final.zkey sha256 ' + hex.slice(0, 20) + '… does NOT match the pinned digest ' + String(ZK_ZKEY_SHA256).slice(0, 20) + '… — refusing to prove (pins rotate only via a reviewed commit, circom.md §4).');
                 }
-                zkAssetCache[key] = buf;
-                return buf;
+                // Uint8Array, NOT the bare ArrayBuffer — snarkjs fastfile would
+                // throw "Invalid FastFile type: undefined" (see zkFetchArtifact).
+                // Cache the view so cache hits take the same type.
+                var u8 = new Uint8Array(buf);
+                zkAssetCache[key] = u8;
+                return u8;
             });
         });
+    }
+
+    // ==== v190 (user request): authority escrow public key (paste or file) ====
+    // The circuit's escrow recipient is a BabyJubjub point, so an authority's
+    // key arrives as two decimal field elements (x y), a JSON pair, or a file
+    // holding either form. Everything below FAILS CLOSED: non-decimal input,
+    // coordinates outside BN254, and points that are not on the curve are all
+    // rejected before a single constraint is proven — a bound key nobody can
+    // decrypt with would be worse than no key at all.
+    var ZK_BN254_P = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+    var ZK_BB_A = 168700n;   // BabyJubjub twisted Edwards: a·x² + y² = 1 + d·x²·y²
+    var ZK_BB_D = 168696n;
+
+    function zkPointOnBabyJub(x, y) {
+        var p = ZK_BN254_P;
+        var m = function (n) { var r = n % p; return r < 0n ? r + p : r; };
+        var x2 = m(x * x), y2 = m(y * y);
+        return m(ZK_BB_A * x2 + y2) === m(1n + ZK_BB_D * m(x2 * y2));
+    }
+
+    // Accepts: "<x> <y>" (whitespace / comma / semicolon separated, optional
+    // "x:" "y:" labels), JSON [x, y], or JSON {"x":…,"y":…} (aliases
+    // pubkey / public_key / escrow_pubkey → 2-array). Returns {x, y} decimal.
+    function zkParseAuthorityKey(raw) {
+        var t = String(raw == null ? '' : raw).trim();
+        if (!t) throw new Error('authority public key is empty — paste the key or load it from a file');
+        if (t.indexOf('-----BEGIN') === 0) {
+            throw new Error('that is a PEM/X.509 key. The in-circuit escrow can only be addressed by a BabyJubjub public key (two decimal field elements) — ask the authority for their BabyJubjub x/y (generate: buildBabyjub + mulPointEscalar(Base8, sk), circom.md §7).');
+        }
+        var x, y;
+        if (t.charAt(0) === '[' || t.charAt(0) === '{') {
+            var j;
+            try { j = JSON.parse(t); } catch (e) { throw new Error('looks like JSON but does not parse: ' + e.message); }
+            if (Array.isArray(j)) {
+                if (j.length !== 2) throw new Error('JSON array must be exactly [x, y]');
+                x = j[0]; y = j[1];
+            } else if (j && typeof j === 'object') {
+                if (j.x !== undefined && j.y !== undefined) { x = j.x; y = j.y; }
+                else {
+                    var arr = j.pubkey || j.public_key || j.publicKey || j.escrow_pubkey;
+                    if (Array.isArray(arr) && arr.length === 2) { x = arr[0]; y = arr[1]; }
+                }
+            }
+            if (x === undefined || y === undefined) {
+                throw new Error('JSON must carry {"x":"…","y":"…"} or {"pubkey":[x, y]}');
+            }
+        } else {
+            // strip optional "x:" / "y:" labels before splitting
+            var norm = t.replace(/(^|[^\w])[xX]\s*:\s*/g, '$1').replace(/(^|[^\w])[yY]\s*:\s*/g, '$1');
+            var tok = norm.split(/[\s,;]+/).filter(Boolean);
+            if (tok.length !== 2) throw new Error('expected exactly two decimal field elements (x y), got ' + tok.length + ' token(s)');
+            x = tok[0]; y = tok[1];
+        }
+        var xs = String(x).trim(), ys = String(y).trim();
+        if (!/^\d+$/.test(xs) || !/^\d+$/.test(ys)) {
+            throw new Error('coordinates must be decimal integers — got "' + xs.slice(0, 20) + '" / "' + ys.slice(0, 20) + '" (PEM/hex/base58 keys are not supported)');
+        }
+        var xb = BigInt(xs), yb = BigInt(ys);
+        if (xb >= ZK_BN254_P || yb >= ZK_BN254_P) throw new Error('coordinate outside the BN254 scalar field (must be < p ≈ 2.18·10⁷⁶)');
+        if (!zkPointOnBabyJub(xb, yb)) throw new Error('point is NOT on BabyJubjub — refusing to bind a key nobody could decrypt with');
+        return { x: xs, y: ys };
+    }
+
+    // Validate → write into the x/y fields the prover reads → announce.
+    function zkApplyAuthorityKey(raw, src) {
+        var k = zkParseAuthorityKey(raw);
+        var xe = document.getElementById('zkEscrowX');
+        var ye = document.getElementById('zkEscrowY');
+        if (xe) xe.value = k.x;
+        if (ye) ye.value = k.y;
+        var st = document.getElementById('zkAuthorityKeyStatus');
+        if (st) {
+            st.innerText = '✅ ' + src + ' key accepted (on BabyJubjub) — it will be bound into the proof as escrow_pubkey';
+            st.style.color = '#3fb950';
+        }
+        return k;
+    }
+
+    // File → same validation path as a paste (failures stay visible in the
+    // status line; a rejected file never reaches the prover).
+    function zkAuthorityKeyFromFile(input) {
+        var st = document.getElementById('zkAuthorityKeyStatus');
+        var f = input && input.files && input.files[0];
+        if (!f) { if (st) { st.innerText = ''; } return; }
+        var fail = function (msg) {
+            if (st) { st.innerText = '❌ ' + msg; st.style.color = '#f85149'; }
+            try { input.value = ''; } catch (e) { /* ignore */ }
+        };
+        if (typeof FileReader === 'undefined') return fail('this environment has no FileReader — paste the key instead');
+        var r = new FileReader();
+        r.onload = function () {
+            try {
+                zkApplyAuthorityKey(String(r.result || ''), 'file "' + f.name + '"');
+            } catch (e) { fail(e.message); }
+        };
+        r.onerror = function () { fail('could not read file "' + f.name + '"'); };
+        r.readAsText(f);
     }
 
     // ⚡ Prove. Runs entirely in this tab (no network except the artifact
@@ -2631,6 +2792,12 @@
             if (!zkIdentityJson || !zkIdentityHashHex) {
                 throw new Error('no audited identity in this session — run a GREEN audit first (the ZK statement binds exactly what the audit verified).');
             }
+            // v190 (user request): an authority key pasted/loaded above wins over
+            // the manual fields. Re-validated HERE — not only on input/change —
+            // so a raw paste with no blur still binds, and a malformed or
+            // off-curve key fails closed BEFORE any proving work starts.
+            var akRaw = ((document.getElementById('zkAuthorityKey') || {}).value || '').trim();
+            if (akRaw) zkApplyAuthorityKey(akRaw, 'pasted');
             var xe = document.getElementById('zkEscrowX');
             var ye = document.getElementById('zkEscrowY');
             var escrowX = String(((xe && xe.value) || '').trim() || ZK_EXAMPLE_ESCROW_X);
