@@ -268,6 +268,14 @@ GCP Confidential VMs (n2d with AMD SEV-SNP) **do not pre-provision persistent At
   a buffer fetched at 16:25 still showed a 15:14 boot tail). Always check the
   wall-clock timestamps INSIDE the capture against the boot being debugged
   before concluding anything.
+- **The cap does NOT reset on `Stop → Start` either** (hit live 2026-10-26):
+  prod returned `0 bytes` while Stopped, then — within 10 s of
+  `StartInstance` — the SAME stale pre-stop 64 KB buffer, byte-identical
+  including an old boot's mid-line splice; `RebootInstance` changed nothing
+  either. Treat the enclave's serial console as permanently frozen at its
+  first 64 KB: fresh-boot evidence must come from the self-report heartbeat
+  (`boot/latest.json` fetched with a relay-presigned GET) instead. The
+  relay's own console advances normally (used as the control).
 - Verbose TDVF/OVMF firmware can eat the whole budget before the kernel prints
   anything (a boot that "froze at kernel 0.595 s" is usually just the cap).
   Likewise a log line landing at offset ~65505 (e.g. `BOOT-TIME TDX QUOTE
@@ -486,6 +494,16 @@ made from an OSS object via `ImportImage`.
   `user_data` at boot, so an init path exists, but do not assume a command
   agent). Confirm `InstanceCloudAssistantStatusSet` is non-empty **before**
   designing a diagnostic that needs `RunCommand`.
+  **Update 2026-10-26**: relay `RunCommand` DOES work now (4 live
+  invocations `Success`) — flags are `--CommandContent` (NOT `--Content`)
+  and `--Timeout` (NOT `--CommandTimeout`), instance as `--InstanceId.1`,
+  results via `DescribeInvocationResults --InvokeId`. On the ENCLAVE
+  instance it returns an `InvokeId` and then settles at **`Aborted`** — no
+  cloud-assistant agent in the hardened initramfs, by design (there is no
+  shell to run a command in). Presign note: `/tmp/oss-url.mjs`'s `vhost`
+  branch needs the FULL `$BUCKET.oss-cn-hongkong.aliyuncs.com` as its host
+  arg — a bare endpoint host silently produces a path-style URL → 403
+  "must be addressed using the specified endpoint".
 - `DeleteDisk` takes lowercase `--force`; `StopInstance` takes `--ForceStop`
 - **EIP bind/unbind is VPC-side and rejects `InstanceType`**: ECS
   `DisassociateEipAddress` and `UnassociatePublicIpAddress` do not exist

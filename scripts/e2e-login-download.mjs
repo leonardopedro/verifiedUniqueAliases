@@ -59,6 +59,15 @@ const page = await ctx.newPage();
 
 let downloaded = null;     // final plain attestation-report-*.json
 let encDownload = null;    // callback's automatic encrypted-attestation-report.json
+// F6 (production race detector): exactly ONE prepare per login. The double-
+// prepare race sealed the callback ciphertext to a nonce that a second,
+// racing round had already overwritten (live GCM OperationError on every
+// login, 2026-10-25). Count the POSTs at the network layer — the guard in
+// executePreflightAndLogin must hold in production, not just in the harness.
+let preparePosts = 0;
+page.on('request', (r) => {
+  if (r.method() === 'POST' && r.url().includes('/attest/login-session')) preparePosts++;
+});
 page.on('download', (d) => {
   downloaded = d.suggestedFilename();
   log('  [DOWNLOAD]', downloaded);
@@ -210,10 +219,11 @@ try {
   await page.waitForTimeout(3000);
   await browser.close();
 
-  const ok = !!encDownload && green && !!downloaded && /^attestation-report-/.test(downloaded);
+  log('9. prepare POSTs to /attest/login-session:', preparePosts, preparePosts === 1 ? '(F6 single-prepare ✓)' : '← F6 VIOLATION (must be exactly 1)');
+  const ok = !!encDownload && green && !!downloaded && /^attestation-report-/.test(downloaded) && preparePosts === 1;
   log('\n' + (ok
-    ? `RESULT: PASS — callback auto-download ✓, audit green ✓, report downloaded (${downloaded})`
-    : `RESULT: FAIL — enc=${encDownload ? 'yes' : 'no'} green=${green} downloaded=${downloaded || 'none'} status=${String(status).slice(0, 120)}`));
+    ? `RESULT: PASS — callback auto-download ✓, audit green ✓, report downloaded (${downloaded}), single-prepare ✓`
+    : `RESULT: FAIL — enc=${encDownload ? 'yes' : 'no'} green=${green} downloaded=${downloaded || 'none'} preparePosts=${preparePosts} status=${String(status).slice(0, 120)}`));
   process.exit(ok ? 0 : 1);
 } catch (e) {
   await browser.close().catch(() => {});

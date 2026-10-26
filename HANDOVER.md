@@ -350,6 +350,34 @@ direction: old tip preserved as **`oldmain`** (`67f5952`, recoverable), then
 CI on `e548856` = **success**. Note: `refs/heads/zk/…` release-style refs are
 absent locally (`git log --remotes` misses them); fetch explicitly if needed.
 
+**Post-cycle ops round (2026-10-26 06:17–07:11 UTC — three user requests):**
+- **Pages-served e2e PASS ×4/4**: `e2e-login-download.mjs` now accepts a full
+  `https://` `VERIFY_HTML`; drove the pinned Pages auditor through the live
+  PayPal flow before the reboot and after each fresh boot — auto-download →
+  paste-decrypt green → plain-report download every time.
+- **F6 proven gone in production at the network layer**: the e2e now counts
+  POSTs to `/attest/login-session` and FAILS unless exactly 1 — **1 ✓ on
+  every instrumented run** (the old race minted a second, racing round whose
+  nonce overwrote the one PayPal carried). Combined with the 294/0 harness
+  (offline F6 regression) the fix is covered on both ends.
+- **`self_report` always wired into `deploy-alibaba.sh`** (§0.10 gaps marked
+  resolved): key precedence env `SELF_REPORT_*` → `/tmp/pav-ak.*` mirror →
+  the config file's own block; placeholder and fully-missing sink both warn
+  loudly. 5-scenario harness green (env inject / mirror inject == prod key
+  `LTAI5t…` / file kept verbatim / placeholder warn / drop warn).
+- **Fresh boots green ×2** (relay188 started; prod `RebootInstance`, then a
+  `Stop → Start`): strict TLS `200 verify=0` (ZeroSSL chain) ~90–150 s after
+  start on both, heartbeat `boot/latest.json` `stage=serving ok=true`
+  (uptime 435 s / 110 s) published post-lockdown on both — the sink fires on
+  every boot. e2e #4 (final boot) PASS with single-prepare ✓.
+- **Serial-console trap EXTENDED (AGENTS updated)**: `GetInstanceConsoleOutput`
+  on prod returns the SAME stale 64 KB buffer across Reboot AND Stop→Start —
+  0 bytes while Stopped, then the OLD pre-stop capture back byte-identical
+  within 10 s of Start. Fresh-boot console for this instance is unobtainable;
+  use the heartbeat. `RunCommand` on prod → `Aborted` (no agent, by design);
+  relay `RunCommand` works — flags `--CommandContent` / `--Timeout` /
+  `--InstanceId.1`.
+
 ---
 
 ## 2. Where things stand right now (2026-10-20 14:30 UTC)
