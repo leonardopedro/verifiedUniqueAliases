@@ -860,7 +860,7 @@
     // ========================================================================
     var EXPECTED_RTMR0 = '06a32a2f92ea455dd628bc41be9bb5910c2782a2eb93c646c6a5ddebd70291839f197792d289cca528572b6d910294db';
     var EXPECTED_RTMR1 = '6fa0352319182f7ec8cb713223cbc1853506caf719c64d04475a26975ae8ebf72003f592dcf0aafe392cc74de33d3f90';
-    var EXPECTED_RTMR2 = '09e22230d89be9778e0b7d15a257b313068522e97e4a0ac6982be8c07594d0e9745376a35a3bca3c2a5cb83c218b286a';
+    var EXPECTED_RTMR2 = '0fda7c8a5318d6c8fb9b3246695bb6774b973c11d3089c3654c006f6837e4f6f7895116f15af44e9141aebb662ab4079';
     var EXPECTED_RTMR3 = '000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000';
 
     // ========================================================================
@@ -884,7 +884,11 @@
     // (b9292a31…), live-confirmed by the post-swap envelope self-reporting
     // 01c74f89… . Rotate again with the next binary release, in the same
     // reviewed commit as the README digest (harness Test 21d/28 anchor it).
-    var EXPECTED_ENCLAVE_SHA256 = '3f68478671738f9841899ffc6b122804f520b9a22b4a17d94c789777bb4192ed';
+    // v190 rotation (2026-10-26): the v190 binary (GET /tls-cert.pem, callback
+    // close-warnings) — digest of the pipeline build that produced disk
+    // eccb2ec6…, live-confirmed by the post-swap envelope self-reporting
+    // d1e288c6… (RTMR2 rotated 09e22230… → 0fda7c8a…; MRTD/RTMR0/1/3 held).
+    var EXPECTED_ENCLAVE_SHA256 = 'd1e288c688ccf81a7519994f6698282d2678a58eb8eed0835011f832236e56ab';
 
     // ========================================================================
     // v162 (audit VULN-04): GOLDEN PCR PINS — CI-captured constants for the
