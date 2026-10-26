@@ -1066,11 +1066,11 @@ const HTML_TEMPLATE: &str = r#"
 // nothing and forges nothing.
 const CALLBACK_CONTENT: &str = r#"<h1>Authentication Succeeded</h1>
             <div class="info">
-                <h3>Your encrypted attestation is downloading automatically — this page will close itself next</h3>
+                <h3>Your encrypted attestation is downloading automatically — save this tab's TLS certificate before you leave it</h3>
                 <p><b>⏳ 1/3 — download in progress:</b> <code>encrypted-attestation-report.json</code> was saved by this page the moment it loaded — no button needed. It is CIPHERTEXT, sealed to a throwaway key that only ever existed in the browser tab where you started the login, so it is useless to anyone else (including this site).</p>
-                <p><b>🚪 2/3 — this page will close itself automatically</b> in a few seconds (live countdown below). If your browser refuses to close a tab it did not open, close it by hand with the ✖ button — nothing else is held here.</p>
-                <p><b>⬅️ 3/3 — once this page has closed, go back to the PREVIOUS (local) tab</b> — your <code>verify.html</code> (file:// or the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color:#64b5f6;">GitHub Pages auditor</a>) that started this login — and upload the downloaded file there with its “Attestation JSON report” file picker. That trusted copy decrypts it with the key it generated on load, runs the full hardware audit and offers the plain JSON for offline auditing.</p>
-                <p id="autoclose-notice" style="margin:12px 0 0; padding:10px 12px; border-radius:6px; background:#0d1117; border:1px solid #3fb950; color:#3fb950; font-size:0.9rem;">⏳ Download started — this page closes itself in <b><span id="autoclose-secs">3</span> s</b>… then upload the file in your previous (local) auditor tab.</p>
+                <p><b>🔒 2/3 — save the TLS certificate of THIS page:</b> this tab is the very response that carried your attestation, so its certificate panel is the only independent record of the connection that delivered it. Open it now — <b>Chrome / Edge:</b> padlock → <i>Connection is secure</i> → <i>Certificate is valid</i> → Details → Export → PEM. <b>Firefox:</b> padlock → <i>Connection secure</i> → <i>More information</i> → View Certificate → ⋯ → Save/Export PEM. <b>Safari:</b> ⋯ → Show Certificate → drag the certificate out. Do <b>not</b> substitute this site's <code>/tls-cert.pem</code> download for it: that file is served by the same party whose report you are about to check, so it can never disagree with the report. No page can read its own connection certificate from script — that is why this step is manual.</p>
+                <p><b>⬅️ 3/3 — go back to the PREVIOUS (local) tab</b> — your <code>verify.html</code> (file:// or the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color:#64b5f6;">GitHub Pages auditor</a>) that started this login. Load <code>encrypted-attestation-report.json</code> with the “Attestation JSON report” picker and the certificate you just exported with the “Browser TLS certificate” picker, then run the audit. That trusted copy decrypts with the key it generated on load and runs the full hardware audit; with a certificate supplied, the channel row proves the CA-validated endpoint you actually reached served exactly the chain recorded inside the hardware-signed report. This tab holds nothing else — close it with the ✖ button whenever you like.</p>
+                <p id="cert-reminder" style="margin:12px 0 0; padding:10px 12px; border-radius:6px; background:#0d1117; border:1px solid #d29922; color:#d29922; font-size:0.9rem;">🔒 Export this tab's certificate <b>before</b> closing it — a closed tab's certificate cannot be retrieved. Nothing is held here: the ciphertext above is useless without the key that only ever existed in your other tab.</p>
                 <textarea id="e2ee-blob-view" readonly style="width:100%; height:180px; background:#0d1117; color:#9e9e9e; font-size:12px; border:1px solid #30363d; border-radius:6px; padding:10px; box-sizing:border-box;"></textarea>
                 <p><button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); t.select(); try{document.execCommand('copy');this;}catch(e){} try{navigator.clipboard.writeText(t.value);}catch(e){} this.textContent='✅ Copied — paste it into a trusted auditor';})()" style="margin-top:10px;">📋 Copy encrypted report</button> <button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); var blob=new Blob([t.value],{type:'application/json'}); var url=URL.createObjectURL(blob); var a=document.createElement('a'); a.href=url; a.download='encrypted-attestation-report.json'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){URL.revokeObjectURL(url);},5000);})()" style="margin-top:10px;">💾 Download encrypted report (.json)</button> <button class="btn" onclick="window.close()" style="margin-top:10px;">✖ Close this tab</button></p>
             </div>
@@ -1086,22 +1086,12 @@ var __u=URL.createObjectURL(new Blob([__b],{type:'application/json'}));
 var __a=document.createElement('a'); __a.href=__u; __a.download='encrypted-attestation-report.json';
 document.body.appendChild(__a); __a.click(); __a.remove();
 setTimeout(function(){URL.revokeObjectURL(__u);},10000);
-// NO LANDING PAGE: once the download is under way, count DOWN visibly and
-// close this tab (only script-opened windows may close; otherwise the minimal
-// view above — the attestation ciphertext with copy / re-download fallbacks —
-// remains, now TELLING the user what to do by hand instead of dying silently).
-var __secs=3, __notice=document.getElementById('autoclose-notice'), __sp=document.getElementById('autoclose-secs');
-var __timer=setInterval(function(){ __secs--; if(__sp) __sp.textContent=String(__secs>0?__secs:0); if(__secs<=0) clearInterval(__timer); },1000);
-setTimeout(function(){
-    try{ window.close(); }catch(e){}
-    // Still visible? The browser blocked the auto-close — spell out the manual
-    // step (upload in the PREVIOUS local tab) instead of leaving a dead page.
-    setTimeout(function(){
-        if(!__notice) return;
-        __notice.style.borderColor='#d29922'; __notice.style.color='#d29922';
-        __notice.innerHTML='⚠️ This browser would not close the tab automatically. Click “✖ Close this tab”, then go back to the PREVIOUS (local) verify.html tab and upload <code>encrypted-attestation-report.json</code> with the “Attestation JSON report” file picker.';
-    },800);
-},3200);
+// v192 (user request): NO AUTO-CLOSE. This tab is the only place its own TLS
+// certificate can still be read from the browser's certificate panel, and
+// that panel is the ONE channel a hostile host cannot fake — no page can read
+// its own connection certificate from script. Closing the tab 3 s after it
+// opened destroyed that opportunity. The ciphertext is already auto-
+// downloaded above; the ✖ button remains for the manual close.
 }catch(e){}</script>"#;
 
 #[derive(Debug, Deserialize)]

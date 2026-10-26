@@ -2151,19 +2151,36 @@ console.log('\nTest 37: /callback AUTO-DOWNLOADS the attestation, no landing pag
   check('heading advertises the automatic download',
     cbContent.includes('Your encrypted attestation is downloading automatically'),
     'heading not updated');
-  // v189 (user request): the page must WARN in order — download in progress,
-  // this page closes itself, then upload the file in the previous local tab.
+  // v192 (user request): the page must NO LONGER close itself — it is the only
+  // place its own TLS certificate can still be exported from the browser's
+  // certificate panel, and that panel is the one channel a hostile host cannot
+  // fake. It must instead walk the user through that export, and it must say
+  // plainly that /tls-cert.pem is NOT an independent source for it.
   check('callback warns the download is IN PROGRESS (1/3)',
     cbContent.includes('1/3 — download in progress'), 'step 1 warning missing');
-  check('callback warns the page AUTO-CLOSES itself (2/3, live countdown)',
-    cbContent.includes('2/3 — this page will close itself automatically')
-      && cbContent.includes('autoclose-secs'), 'auto-close warning missing');
-  check('callback says to upload the file in the PREVIOUS local tab after closing (3/3)',
-    cbContent.includes('3/3 — once this page has closed, go back to the PREVIOUS (local) tab')
-      && cbContent.includes('file picker'), 'post-close instruction missing');
-  check('a BLOCKED auto-close falls back to a manual instruction, not a dead page',
-    cbContent.includes('would not close the tab automatically')
-      && cbContent.includes('Close this tab'), 'fallback warning missing');
+  check('callback NO LONGER force-closes the tab (no countdown, no timer close)',
+    !cbContent.includes('autoclose-secs') && !cbContent.includes('autoclose-notice')
+      && !/__secs\s*=\s*3/.test(cbContent) && !/__timer\s*=/.test(cbContent),
+    'auto-close machinery still present');
+  check('manual ✖ Close this tab button is still offered (v187 pinned fallback)',
+    cbContent.includes('Close this tab') && cbContent.includes('window.close()'),
+    'manual close button missing');
+  check("step 2/3 walks the user through exporting THIS tab's certificate",
+    cbContent.includes('2/3 — save the TLS certificate of THIS page')
+      && cbContent.includes('Certificate is valid') && cbContent.includes('View Certificate'),
+    'per-browser cert-export instructions missing');
+  check('step 2/3 names /tls-cert.pem as NOT an independent source',
+    cbContent.includes('/tls-cert.pem') && cbContent.includes('can never disagree with the report'),
+    'self-comparison warning missing');
+  check('step 3/3 says to load BOTH files in the previous local tab',
+    cbContent.includes('3/3 — go back to the PREVIOUS (local) tab')
+      && cbContent.includes('Browser TLS certificate')
+      && cbContent.includes('Attestation JSON report'),
+    'post-login instruction missing');
+  check('the export reminder sits ABOVE the close button',
+    cbContent.includes('cert-reminder')
+      && cbContent.indexOf('cert-reminder') < cbContent.indexOf('Close this tab'),
+    'cert reminder missing or below the close button');
 }
 
 console.log('\nTest 41: TLS certificate download offered BEFORE login (v189)');
