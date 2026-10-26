@@ -6,7 +6,8 @@
 |---|---|---|
 | **`alibabacloud`** (default branch) | ✅ Active line of work | Alibaba Cloud / **aliyun CLI** stack: `Dockerfile.alibaba`, `build-alibaba-docker.sh` (the build; wraps `build-alibaba-image.sh` + `build-initramfs-tools.sh`), `deploy-alibaba.sh`, `import-alibaba-image.sh`, `build-scripts/create-alien-deb.sh`. **Legacy (do not use for deploys)**: `build-alibaba.sh`, `build-alibaba-disk.sh` and `build-alibaba-simple.sh` are retired hard-fail stubs (v184/v185 — they produced non-bootable/unused artifacts) |
 | `oraclecloud` | 🧊 Archive — do not develop here | Former `main`: Oracle OCI stack (`Dockerfile.oci`, `build-oci-*.sh`, `deploy-oci.sh`, `import-oci-image.sh`), the v161–v162 security hardenings, and the `oasis/` Sapphire + SEV-SNP sub-project |
-| `origin/main` | 🧊 Archive ref — unchanged on GitHub | `oraclecloud` content minus the final `capture-golden-pcrs.mjs` commit |
+| `oldmain` | 🧊 Archive ref — preserved 2026-10-26 | The former `main` (frozen at the v164 era, `67f5952`) that GitHub Pages used to deploy from; kept so the Pages re-point was fully reversible |
+| `origin/main` | ✅ = `alibabacloud` (since 2026-10-26) | GitHub Pages **source branch** — force-pushed from `alibabacloud` so the trusted remote auditor (`leonardopedro.github.io/verifiedUniqueAliases/`) serves current bytes instead of the stale v164 copy. Before 2026-10-26 it was `oraclecloud` content minus `capture-golden-pcrs.mjs`, later frozen at a v164 sync |
 
 - **The OCI files are NOT on this branch.** `build-oci-*.sh`, `Dockerfile.oci`, the v161+ `verify.html`/`scripts/` tooling and `oasis/` live only on `oraclecloud`. To resume Oracle work: `git switch oraclecloud`.
 - OCI local build state (host `ol10/` staging, `.build-provenance`, qcow2/UKI/initramfs images, `node_modules/`) was deliberately deleted from this worktree on 2026-10-16 — it is all gitignored/regenerable (`bash build-oci-docker.sh`, `bash extract-ol10-platform.sh`).

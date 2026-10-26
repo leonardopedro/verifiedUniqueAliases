@@ -338,6 +338,18 @@ A second local clone exists outside this worktree (parallel `m` commits; its pus
 rejected once as non-FF — reconcile it with `git fetch && git rebase origin/alibabacloud`
 before pushing from there).
 
+**Branch restructure 2026-10-26 (Pages trust-path fix):** GitHub Pages deploys from
+`main`, which had been frozen at the **v164 era** (`67f5952`, verify.html sha
+`2f397676…`) since work moved to `alibabacloud` — the README-documented trusted
+remote copy was serving a stale auditor that REDs on current reports. Per user
+direction: old tip preserved as **`oldmain`** (`67f5952`, recoverable), then
+`alibabacloud` force-pushed onto `main` (lease-guarded). Verified live:
+`leonardopedro.github.io/verifiedUniqueAliases/` now serves `verify.html`
+`0eb6324f…` (238,881 B, byte-identical to worktree), `index.html` `b35ff106…`,
+`zk/identity_escrow_vkey.json` `18063c00…` — all matching repo `e548856`.
+CI on `e548856` = **success**. Note: `refs/heads/zk/…` release-style refs are
+absent locally (`git log --remotes` misses them); fetch explicitly if needed.
+
 ---
 
 ## 2. Where things stand right now (2026-10-20 14:30 UTC)
