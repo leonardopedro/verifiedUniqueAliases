@@ -43,8 +43,11 @@ try {
 const FLOW = (process.argv[2] || 'verified') === 'full' ? 'full' : 'verified';
 const EMAIL = process.env.PPEMAIL || 'sb-fuobx47090577@personal.example.com';
 const PASSWORD = process.env.PPPASS || '4&itWr>M';
-const VERIFY = 'file://' + (process.env.VERIFY_HTML
-  || new URL('../verify.html', import.meta.url).pathname);
+// VERIFY_HTML may be a local path (→ file:// copy) or a full https:// URL
+// (→ the pinned GitHub Pages auditor, exercising the real remote trust path).
+const VERIFY_RAW = process.env.VERIFY_HTML
+  || new URL('../verify.html', import.meta.url).pathname;
+const VERIFY = /^https?:\/\//.test(VERIFY_RAW) ? VERIFY_RAW : 'file://' + VERIFY_RAW;
 const log = (...a) => console.log(...a);
 
 const browser = await chromium.launch({

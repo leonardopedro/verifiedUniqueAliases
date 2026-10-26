@@ -154,25 +154,54 @@ else
     echo '{}' > "$CONFIG_TMPFILE"
 fi
 
-# Self-report sink (boot status -> OSS): inject `self_report` whenever the
-# write-only RAM key is provided. Keeps future deploys from silently dropping
-# the sink that prod user_data carries today (HANDOVER §0.10/§6). The config
-# file path is left untouched — a file that already carries self_report wins.
-if [[ -n "${SELF_REPORT_ACCESS_KEY_ID:-}" && -n "${SELF_REPORT_ACCESS_KEY_SECRET:-}" ]]; then
-    SELF_REPORT_BUCKET="${SELF_REPORT_BUCKET:-paypal-tdx-relay-1792227992}"
-    SELF_REPORT_ENDPOINT="${SELF_REPORT_ENDPOINT:-oss-cn-hongkong.aliyuncs.com}"
-    SELF_REPORT_PREFIX="${SELF_REPORT_PREFIX:-boot}"
+# Self-report sink (boot status -> OSS): ALWAYS emitted so a deploy never
+# drops the heartbeat prod user_data carries today (HANDOVER §0.10 — the
+# "config generator does NOT emit self_report" gap, resolved 2026-10-26).
+# Key precedence:
+#   1. SELF_REPORT_ACCESS_KEY_ID/SECRET env vars (explicit override)
+#   2. HANDOVER §6 write-only RAM mirrors: /tmp/pav-ak.id + /tmp/pav-ak.secret
+#   3. a self_report already present in the config file (kept verbatim)
+# bucket/endpoint/prefix: env override > existing file block > prod default.
+SELF_REPORT_BUCKET_DEF="paypal-tdx-relay-1792227992"
+SELF_REPORT_ENDPOINT_DEF="oss-cn-hongkong.aliyuncs.com"
+SELF_REPORT_PREFIX_DEF="boot"
+SR_KEY_ID="${SELF_REPORT_ACCESS_KEY_ID:-}"
+SR_KEY_SECRET="${SELF_REPORT_ACCESS_KEY_SECRET:-}"
+SR_KEY_SRC="env"
+if [[ -z "$SR_KEY_ID" || -z "$SR_KEY_SECRET" ]]; then
+    if [[ -s /tmp/pav-ak.id && -s /tmp/pav-ak.secret ]]; then
+        SR_KEY_ID=$(tr -d '[:space:]' < /tmp/pav-ak.id)
+        SR_KEY_SECRET=$(tr -d '[:space:]' < /tmp/pav-ak.secret)
+        SR_KEY_SRC="mirror /tmp/pav-ak.*"
+    fi
+fi
+if [[ -n "$SR_KEY_ID" && -n "$SR_KEY_SECRET" ]]; then
     SELF_REPORT_MERGED=$(mktemp)
-    jq --arg b "$SELF_REPORT_BUCKET" \
-       --arg e "$SELF_REPORT_ENDPOINT" \
-       --arg p "$SELF_REPORT_PREFIX" \
-       --arg k "$SELF_REPORT_ACCESS_KEY_ID" \
-       --arg s "$SELF_REPORT_ACCESS_KEY_SECRET" \
-       '. + {self_report: {bucket:$b, endpoint:$e, prefix:$p,
-                           access_key_id:$k, access_key_secret:$s, sts_token:null}}' \
-       "$CONFIG_TMPFILE" > "$SELF_REPORT_MERGED"
+    jq --arg b "${SELF_REPORT_BUCKET:-}" \
+       --arg e "${SELF_REPORT_ENDPOINT:-}" \
+       --arg p "${SELF_REPORT_PREFIX:-}" \
+       --arg k "$SR_KEY_ID" --arg s "$SR_KEY_SECRET" \
+       --arg bd "$SELF_REPORT_BUCKET_DEF" \
+       --arg ed "$SELF_REPORT_ENDPOINT_DEF" \
+       --arg pd "$SELF_REPORT_PREFIX_DEF" \
+       '.self_report = {
+            bucket:   (if $b != "" then $b else (.self_report.bucket   // $bd) end),
+            endpoint: (if $e != "" then $e else (.self_report.endpoint // $ed) end),
+            prefix:   (if $p != "" then $p else (.self_report.prefix   // $pd) end),
+            access_key_id: $k, access_key_secret: $s,
+            sts_token: (.self_report.sts_token // null)
+        }' "$CONFIG_TMPFILE" > "$SELF_REPORT_MERGED"
     mv "$SELF_REPORT_MERGED" "$CONFIG_TMPFILE"
-    echo "   Config      : self_report sink -> oss://$SELF_REPORT_BUCKET/$SELF_REPORT_PREFIX (write-only key)"
+    SR_SINK=$(jq -r '(.self_report.bucket + "/" + .self_report.prefix)' "$CONFIG_TMPFILE")
+    echo "   Config      : self_report sink -> oss://$SR_SINK (write-only key from $SR_KEY_SRC)"
+elif jq -e '.self_report.access_key_id // "" | test("YOUR_|STS_OR_RAM|RAM_SECRET")' "$CONFIG_TMPFILE" >/dev/null 2>&1; then
+    echo "⚠️  self_report in the config file has PLACEHOLDER credentials — heartbeat will 403 at boot."
+    echo "   Set SELF_REPORT_ACCESS_KEY_ID/SECRET or restore /tmp/pav-ak.{id,secret} (HANDOVER §6)."
+elif jq -e '.self_report' "$CONFIG_TMPFILE" >/dev/null 2>&1; then
+    echo "   Config      : self_report kept from config file (no key env/mirror available)"
+else
+    echo "⚠️  self_report NOT wired — the boot heartbeat will be DROPPED (HANDOVER §0.10)."
+    echo "   Set SELF_REPORT_ACCESS_KEY_ID/SECRET or restore /tmp/pav-ak.{id,secret} (HANDOVER §6)."
 fi
 
 # user_data = raw JSON (the enclave reads /latest/user-data directly; there is
