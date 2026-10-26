@@ -3048,19 +3048,23 @@ console.log('\nTest 46: GitHub Pages copy == repo verify.html (served-auditor dr
         else console.log('  ⚠️  Pages README not fetched — verify.html parity already proven');
       } else {
         // Classify the mismatch so the failure says WHICH branch is stale.
+        // GITHUB_REF_NAME covers CI's detached checkout (git reports `HEAD`).
         const branchRaw = git('rev-parse', '--abbrev-ref', 'HEAD');
-        const branch = branchRaw === 'HEAD' ? null : branchRaw; // detached (CI) → unknown
+        const branch = (branchRaw && branchRaw !== 'HEAD') ? branchRaw
+          : (process.env.GITHUB_REF_NAME || null);
         const headSha = git('rev-parse', 'HEAD');
         const ageMin = headSha
           ? (Date.now() / 1000 - Number(git('log', '-1', '--format=%ct') || 0)) / 60
           : Number.POSITIVE_INFINITY;
         let pagesRun = null;
+        let apiOk = false;
         const m = /^https?:\/\/([^.]+)\.github\.io\/([^/]+)\//.exec(PAGES_VERIFY_URL);
         if (m) {
           const raw = await httpGet(`https://api.github.com/repos/${m[1]}/${m[2]}/actions/runs?per_page=20`);
           try {
             const j = JSON.parse(raw.toString('utf8'));
             pagesRun = (j.workflow_runs || []).find((r) => r.name === 'pages build and deployment') || null;
+            apiOk = !!pagesRun || Array.isArray(j.workflow_runs);
           } catch { /* API unavailable → fall through to the age rule */ }
         }
         let reason;
@@ -3069,12 +3073,24 @@ console.log('\nTest 46: GitHub Pages copy == repo verify.html (served-auditor dr
         } else if (pagesRun && headSha && pagesRun.head_sha === headSha
               && pagesRun.status === 'completed' && pagesRun.conclusion === 'success') {
           reason = `Pages finished building ${headSha.slice(0, 7)} yet serves a different file`;
-        } else if (!strict && ageMin < 20) {
+        } else if (pagesRun && headSha && pagesRun.head_sha === headSha
+              && pagesRun.status && pagesRun.status !== 'completed') {
+          // Pages is building THIS commit right now — in flight, not drift.
+          // Survives strict mode so CI on a push-to-both-branches is not red
+          // for the ~1-3 min the Pages job needs.
+          check('GitHub Pages verify.html == repo verify.html (Pages build in flight, grace)', true,
+            `pages=${pagesDigest.slice(0, 16)} repo=${repoDigest.slice(0, 16)} — ${pagesRun.status}; re-run after it completes`);
+          reason = undefined;
+        } else if ((!strict || process.env.CI) && ageMin < 20) {
+          // CI runs seconds after the push, before Pages can rebuild a matching
+          // branch — strict there would be red for a race, not a regression.
           check('GitHub Pages verify.html == repo verify.html (rebuild pending, grace)', true,
             `pages=${pagesDigest.slice(0, 16)} repo=${repoDigest.slice(0, 16)} — commit is ${ageMin.toFixed(0)} min old, Pages has not rebuilt it yet; re-run after the pages build`);
           reason = undefined;
         } else {
-          reason = `pages=${pagesDigest.slice(0, 16)} repo=${repoDigest.slice(0, 16)}${strict ? ' (PAGES_PARITY=1: no grace)' : ''}`;
+          reason = `pages=${pagesDigest.slice(0, 16)} repo=${repoDigest.slice(0, 16)}`
+            + `${apiOk ? '' : ' (GitHub API unavailable — could not classify)'}`
+            + `${strict ? ' (PAGES_PARITY=1: no grace)' : ''}`;
         }
         if (reason) check('GitHub Pages serves byte-identical verify.html', false, reason);
       }

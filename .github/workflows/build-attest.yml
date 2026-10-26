@@ -30,6 +30,16 @@ jobs:
       # verify.html loads (forge/1.3.1) so the harness runs the same library
       # auditors get in the browser.
       - name: verify.html security regression tests
+        env:
+          # v192 (Test 46): Pages publishes from `main` and hosts the
+          # "GitHub Pages auditor" copy + the ZK artifacts, so a stale
+          # `main` silently serves an auditor whose pins contradict the
+          # build this workflow just produced. Strict parity makes that a
+          # red build with an actionable message ("push it too: git push
+          # origin <branch>:main"). The harness's in-flight/rebuild grace
+          # survives strict mode so a push-to-both-branches is not red for
+          # the ~1-3 min the Pages job needs.
+          PAGES_PARITY: '1'
         run: |
           npm install
           node scripts/test-verify-security.mjs
