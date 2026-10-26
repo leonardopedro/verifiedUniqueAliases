@@ -73,7 +73,13 @@ rm -f identity_escrow_0001.zkey
 run_snarkjs zkey verify ../build/identity_escrow.r1cs pot18_final.ptau identity_escrow_final.zkey
 
 echo "== 4/4 export artifacts =="
-run_snarkjs zkey export verificationkey identity_escrow_final.zkey ../identity_escrow_vkey.jsoncp identity_escrow_final.zkey ../identity_escrow_final.zkey
+# NOTE (v191): the export and the two `cp`s used to sit on ONE line —
+# "…vkey.jsoncp identity_escrow_final.zkey …" — so snarkjs got a bogus output
+# path, printed its usage text and exited 99, while `set -e` stopped the
+# script before any top-level artifact was updated (the repo's committed
+# artifacts predate this, i.e. the script had never run end-to-end).
+run_snarkjs zkey export verificationkey identity_escrow_final.zkey ../identity_escrow_vkey.json
+cp identity_escrow_final.zkey ../identity_escrow_final.zkey
 cp ../build/identity_escrow_js/identity_escrow.wasm ../identity_escrow.wasm
 rm -f pot18_final.ptau          # regenerable; never committed (see header)
 cd ../..

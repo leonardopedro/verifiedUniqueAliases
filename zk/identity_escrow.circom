@@ -93,7 +93,10 @@ template IdentityEscrow(MAX) {
     lenBits.in <== msg_len;
 
     component lenGeMin = LessThan(10);          // msg_len >= 248
-    lenGeMin.in[0] <== 248;
+    // NOTE (v191 fix): LessThan(a,b) is strict (a < b), so in[0] must be
+    // 247 to admit the documented lower bound 248 — with 248 here the band
+    // was effectively [249, 300] and a 248-byte identity could never prove.
+    lenGeMin.in[0] <== 247;
     lenGeMin.in[1] <== msg_len;
     lenGeMin.out === 1;
 
@@ -169,8 +172,13 @@ template IdentityEscrow(MAX) {
                 else if (t == 6) streamBits[j * 8 + t] <== lenBits.out[6];
                 else             streamBits[j * 8 + t] <== lenBits.out[5];
             } else if (j == 319) {
-                // (len*8) & 0xff = 8 * (msg_len mod 32)
-                if (t < 4)      streamBits[j * 8 + t] <== lenBits.out[4 - t];
+                // (len*8) & 0xff = 8 * (msg_len mod 32)  —  bit i of the byte
+                // is bit i of 8·len: bit7..bit3 = lenBits[4..0], bits2..0 = 0.
+                // NOTE (v191 fix): this used to stop at t<4, forcing the
+                // byte's bit3 (= msg_len's bit 0) to 0 — i.e. every ODD-length
+                // identity got a wrong SHA-256 length field and the hash
+                // constraint could never be satisfied (~half of all users).
+                if (t < 5)      streamBits[j * 8 + t] <== lenBits.out[4 - t];
                 else            streamBits[j * 8 + t] <== 0;
             } else {
                 streamBits[j * 8 + t] <== 0;    // bytes 312..317 (high length)
