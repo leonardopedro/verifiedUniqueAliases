@@ -69,7 +69,7 @@ zk/work/
 zk/identity_escrow_final.zkey
 
 # Secret key material — NEVER commit. The original luks.key (512 B) was
-# committed in 818e953 and had to be rotated 2026-10-26; git history still
-# carries the old blob, so it is burned regardless of this rule.
-luks.key
+# committed in 818e953 and removed the next day in b9e5cf6, but git history
+# still carries the blob, so it is burned regardless of this rule. Nothing
+# consumes it (HANDOVER §0.15), so it was dropped rather than rotated.
 *.key
