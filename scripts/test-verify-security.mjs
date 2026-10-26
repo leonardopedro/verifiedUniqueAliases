@@ -2790,6 +2790,93 @@ console.log('\nTest 43: browser-side BabyJubjub keypair generator — no circoml
   if (typeof globalThis.zkLastKeypair !== 'undefined') globalThis.zkLastKeypair = null;
 }
 
+console.log('\nTest 44: odd-length + band-floor identities prove end-to-end (v191 circuit)');
+{
+  // Regression gate for the two circuit bugs fixed in v191: the padded
+  // stream used to drop msg_len's bit 0 (every ODD identity failed the
+  // in-circuit SHA-256) and lenGeMin used a strict LessThan (msg_len == 248
+  // was rejected). This runs the REAL Groth16 prover over the committed
+  // wasm/zkey — a mocked prover can never catch a witness-calc assert.
+  const snarkjs = require('snarkjs');
+  const { EXAMPLE_ESCROW_SK, decryptCredential } = await import('./zk-decrypt-escrow.mjs');
+  const wasmPath = join(repoRoot, 'zk/identity_escrow.wasm');
+  const vkey = JSON.parse(readFileSync(join(repoRoot, 'zk/identity_escrow_vkey.json'), 'utf8'));
+
+  // The assembled proving key is gitignored (>100 MB object limit) — rebuild
+  // it from the TRACKED split parts when absent, exactly like the browser does.
+  let zkeyPath = join(repoRoot, 'zk/identity_escrow_final.zkey');
+  try { readFileSync(zkeyPath); } catch {
+    zkeyPath = join(tmpdir(), 'identity_escrow_final.zkey');
+    writeFileSync(zkeyPath, Buffer.concat((globalThis.ZK_ZKEY_PARTS || [])
+      .map((p) => readFileSync(join(repoRoot, 'zk', p)))));
+  }
+
+  // Canonical identity JSON of an EXACT target length (circom.md §1 band).
+  const identityOf = (len) => {
+    const base = JSON.stringify({ user_id: '', sub: null, verified_account: 'true', payer_id: null });
+    const pad = len - base.length;
+    if (pad < 0) throw new Error('fixture too short');
+    const d = JSON.stringify({ user_id: 'U'.repeat(pad), sub: null, verified_account: 'true', payer_id: null });
+    if (d.length !== len) throw new Error(`fixture length drift: ${d.length} != ${len}`);
+    return d;
+  };
+  const inputsFor = (D) => {
+    const bits = [];
+    for (const b of createHash('sha256').update(D).digest()) for (let t = 7; t >= 0; t--) bits.push((b >> t) & 1);
+    const raw = new Array(300).fill(0);
+    for (const [i, b] of [...Buffer.from(D, 'utf8')].entries()) raw[i] = b;
+    return {
+      identity_hash_bits: bits,
+      escrow_pubkey_x: globalThis.ZK_EXAMPLE_ESCROW_X,
+      escrow_pubkey_y: globalThis.ZK_EXAMPLE_ESCROW_Y,
+      raw_json_bytes: raw,
+      msg_len: D.length,
+      ephemeral_private_key: '98765432109876543210987654321098765432109876543210',
+    };
+  };
+  const proveAndOpen = async (len) => {
+    const D = identityOf(len);
+    const { proof, publicSignals } = await snarkjs.groth16.fullProve(inputsFor(D), wasmPath, zkeyPath);
+    const ok = await snarkjs.groth16.verify(vkey, publicSignals, proof);
+    const opened = await decryptCredential({
+      schema: 'pav-circom-escrow/v1',
+      public_signals: {
+        ephemeral_pubkey: [publicSignals[0], publicSignals[1]],
+        ciphertext: publicSignals.slice(3, 13),
+        identity_hash_hex: createHash('sha256').update(D).digest('hex'),
+      },
+    }, EXAMPLE_ESCROW_SK);
+    return { D, publicSignals, ok, opened };
+  };
+
+  // 1. the exact shape that FAILED before v191: odd length (251 = today's
+  //    live verified-flow capture).
+  const odd = await proveAndOpen(251);
+  check('identity fixture is odd-length + inside the band',
+    odd.D.length === 251 && odd.D.length % 2 === 1 && odd.D.length >= 248 && odd.D.length <= 300);
+  check('ODD identity: real Groth16 prove succeeded (wasm assert would throw)',
+    odd.publicSignals.length === 271, String(odd.publicSignals.length));
+  check('ODD identity: proof verifies against the committed vkey', odd.ok === true);
+  check('ODD identity: verified_account_bit proven = 1', odd.publicSignals[2] === '1');
+  check('ODD identity: ciphertext decrypts to the exact bytes the hash covers',
+    odd.opened.identityJson === odd.D);
+
+  // 2. the band floor that lenGeMin's strict LessThan used to reject.
+  const floor = await proveAndOpen(248);
+  check('msg_len == 248 (band floor) proves', floor.publicSignals.length === 271 && floor.ok === true);
+  check('msg_len == 248 decrypts to the exact identity', floor.opened.identityJson === floor.D);
+
+  // 3. static guards: cheap checks that catch a revert of either fix without
+  //    paying for another proof.
+  const csrc = readFileSync(join(repoRoot, 'zk/identity_escrow.circom'), 'utf8');
+  check('circuit maps msg_len bit 0 into byte 319 (t < 5 branch)',
+    /if \(t < 5\)\s+streamBits\[j \* 8 \+ t\] <== lenBits\.out\[4 - t\]/.test(csrc));
+  check('circuit band floor is LessThan(247, msg_len) ⇔ msg_len ≥ 248',
+    /lenGeMin\.in\[0\] <== 247/.test(csrc));
+  check('pinned wasm is byte-identical to the one just proven with',
+    createHash('sha256').update(readFileSync(wasmPath)).digest('hex') === globalThis.ZK_WASM_SHA256);
+}
+
 rmSync(dir, { recursive: true, force: true });;;
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
