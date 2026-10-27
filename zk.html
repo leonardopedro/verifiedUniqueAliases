@@ -1044,13 +1044,20 @@
         return zkStashIdentity(parsed.identityJson, parsed.declaredHash, text);
     }
 
-    // HANDOFF path: accept ONLY from the pinned Pages origin (the only origin
-    // this page is served from). A file:// auditor cannot authenticate itself
-    // in a message (origin "null") → its users take the paste path above.
+    // HANDOFF path: accept only from PINNED opener origins — the Pages
+    // origin (where this page is served) and the measured enclave origin
+    // `https://login.airma.de`, whose verify.html copy opens this page via
+    // the ⚡ button (v194 split: an enclave-copy handoff must ack, not spin
+    // out its 10 s timeout — the enclave is the most trustworthy opener
+    // there is, and zkStashIdentity re-verifies every handed-over identity
+    // fail-closed below REGARDLESS of origin: band, hash re-derivation,
+    // SIGNED raw-hash cross-check). A file:// auditor cannot authenticate
+    // itself in a message (origin "null") → its users take the paste path.
     var ZK_HANDOFF_ORIGIN = 'https://leonardopedro.github.io';
+    var ZK_HANDOFF_ORIGINS = [ZK_HANDOFF_ORIGIN, 'https://login.airma.de'];
     if (typeof window !== 'undefined' && window.addEventListener) {
         window.addEventListener('message', function(ev) {
-            if (ev.origin !== ZK_HANDOFF_ORIGIN) return;   // fail closed
+            if (ZK_HANDOFF_ORIGINS.indexOf(ev.origin) === -1) return;   // fail closed
             var d = ev.data;
             if (!d || d.pavZkHandoff !== true) return;
             zkSetHandoffStatus('⏳ verifying the handed-over identity against the report…', '#d29922');

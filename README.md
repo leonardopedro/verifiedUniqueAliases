@@ -97,12 +97,12 @@ the file it describes:
 | Artifact | Size | SHA-256 |
 |---|---|---|
 | `verify.html` | 177,053 bytes | `5fd32b9e1438bee9fecd399834c84d8b733df12a2069a56b24ee11277987fcbb` |
-| `zk.html` | 111,151 bytes | `3f70a1ea002093d81a26be7c41b7a04ed04785a2bf8ab21acef3431154834baf` |
+| `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
 
 ```bash
 sha256sum verify.html zk.html
 # 5fd32b9e1438bee9fecd399834c84d8b733df12a2069a56b24ee11277987fcbb  verify.html
-# 3f70a1ea002093d81a26be7c41b7a04ed04785a2bf8ab21acef3431154834baf  zk.html
+# 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
 ```
 
 (`zk.html` is the standalone zero-knowledge prover — split out of
