@@ -96,12 +96,19 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 263,502 bytes | `a7e6fdb6a181c27ecce39d7e0b6c50ee1f3472554c55d1b2655af9d080265d54` |
+| `verify.html` | 177,053 bytes | `5fd32b9e1438bee9fecd399834c84d8b733df12a2069a56b24ee11277987fcbb` |
+| `zk.html` | 111,029 bytes | `2df9f0a8b729dd2c573cc46fc0226e4c5ddca47991b7f54310a430c5cfcb4257` |
 
 ```bash
-sha256sum verify.html
-# a7e6fdb6a181c27ecce39d7e0b6c50ee1f3472554c55d1b2655af9d080265d54  verify.html
+sha256sum verify.html zk.html
+# 5fd32b9e1438bee9fecd399834c84d8b733df12a2069a56b24ee11277987fcbb  verify.html
+# 2df9f0a8b729dd2c573cc46fc0226e4c5ddca47991b7f54310a430c5cfcb4257  zk.html
 ```
+
+(`zk.html` is the standalone zero-knowledge prover — split out of
+`verify.html` in v194 so the ZK layer can be debugged without rebuilding the
+enclave image; a green audit in `verify.html` hands the audited identity over
+to it via a pinned-origin postMessage, or you paste the report directly.)
 
 - Rotate this hash in the **same reviewed commit** that changes `verify.html`;
   `node scripts/test-verify-security.mjs` fails when the README and the file
@@ -124,6 +131,7 @@ sha256sum verify.html
 | `src/intel_tdx.rs` | TDX evidence acquisition: DCAP quote, CCEL replay, PCK/TCB handling |
 | `src/paypal.pem` | Embedded TLS trust root for the pinned PayPal API endpoints — **DigiCert Global Root G2** (SHA-256 `cb3ccbb7…ab1cb5f`, fingerprint pinned by test `paypal_api_root_is_digicert_g2_v179`) |
 | `verify.html` | Browser auditor: TD Quote parser, PCK chain walk to the pinned Intel root, WebCrypto, GitHub attestation lookup |
+| `zk.html` | Standalone ZK escrow prover/verifier (GitHub Pages origin): Groth16 prove + verify, authority-key handling, fail-closed identity handoff/paste gate |
 | `build-alibaba-docker.sh` | The reproducible build (Debian Trixie pinned snapshots) |
 | `build-initramfs-tools.sh` | Initramfs construction with kernel module selection |
 | `build-alibaba-disk.sh` | **Retired (hard-fail stub)** — legacy non-bootable artifact; use `build-alibaba-docker.sh` |

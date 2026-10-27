@@ -41,6 +41,10 @@ globalThis.forge = forge;
 const repoRoot = new URL('..', import.meta.url).pathname;
 const html = readFileSync(join(repoRoot, 'verify.html'), 'utf8');
 const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
+// v194 (split): the ZK engine lives in its OWN page (zk.html, GitHub Pages
+// origin) so it can be debugged without an enclave rebuild — load both.
+const zkHtml = readFileSync(join(repoRoot, 'zk.html'), 'utf8');
+const zkScript = zkHtml.match(/<script>([\s\S]*)<\/script>/)[1];
 
 // ---- DOM stubs -------------------------------------------------------------
 const elements = {};
@@ -75,9 +79,13 @@ globalThis.fetch = async () => {
   return { ok: false, status: 404, json: async () => ({}) };
 };
 
-// Evaluate the page script in this global scope (function decls + var leak
-// to globalThis; const/let stay in the eval's lexical scope).
+// Evaluate the page scripts in this global scope (function decls + var leak
+// to globalThis; const/let stay in the eval's lexical scope). The auditor
+// runs FIRST, then zk.html's script — so every ZK binding the tests touch
+// resolves exactly as it would on the real zk.html (its own reportFileText
+// and stash win any name overlap).
 (0, eval)(script);
+(0, eval)(zkScript);
 
 async function runAuditWith(envelope) {
   lastAlert = null;
@@ -2283,8 +2291,15 @@ console.log('\nTest 39: ZK escrow credential card — prove/verify wiring (v188,
   });
   const res = await runAuditWith(built.envelope);
   check('green login audit passes', res.ok === true, `alert=${res.alert}`);
-  const zkCard = document.getElementById('zkCard');
-  check('zkCard revealed by the green login audit', zkCard.style.display === 'block');
+  const zkCard = document.getElementById('zkHandoffCard');
+  check('ZK handoff card revealed by the green login audit', zkCard.style.display === 'block');
+  check('auditor carries the pinned zk.html link + postMessage sender',
+    html.includes('id="zkOpenBtn"')
+      && html.includes('onclick="return openZkProver(this.href)"')
+      && html.includes("ZK_PROVER_URL = 'https://leonardopedro.github.io/verifiedUniqueAliases/zk.html'")
+      && html.includes('ev.origin !== ZK_PROVER_ORIGIN'));
+  check('the ZK CARD itself lives in zk.html, not in the auditor (v194 split)',
+    zkHtml.includes('id="zkCard"') && !html.includes('id="zkCard"'));
   check('stash === the canonical preimage bytes the gate hashed',
     globalThis.zkIdentityJson === canonicalId,
     `stashLen=${globalThis.zkIdentityJson && globalThis.zkIdentityJson.length} wantLen=${canonicalId.length}`);
@@ -2308,6 +2323,34 @@ console.log('\nTest 39: ZK escrow credential card — prove/verify wiring (v188,
     globalThis.zkIdentityJson === canonicalId, 'stash was clobbered by a failed audit');
   // restore a green envelope in the textarea for the prove step
   await runAuditWith(built.envelope);
+
+  // ---- (2.5) v194 HANDOFF: zk.html re-verifies the stash fail-closed -------
+  // band → hash re-derivation → SIGNED raw-hash cross-check → report bytes.
+  // This is exactly what the real postMessage receiver runs before it acks.
+  const handoffText = JSON.stringify(built.envelope, null, 2);
+  check('handoff accepted by zk.html (band + hash + signed raw-hash)',
+    await globalThis.zkStashIdentity(canonicalId, identityHashOf(who), handoffText) === true,
+    document.getElementById('zkIdentityStatus').innerText.slice(0, 160));
+  check('zk.html holds the exact report bytes report_sha256 must bind',
+    globalThis.zkReportText === handoffText,
+    `len=${globalThis.zkReportText && globalThis.zkReportText.length} want=${handoffText.length}`);
+  {
+    const stashBefore = globalThis.zkIdentityJson;
+    check('handoff with a TAMPERED hash is refused',
+      await globalThis.zkStashIdentity(canonicalId, '0'.repeat(64), handoffText) === false,
+      document.getElementById('zkIdentityStatus').innerText.slice(0, 120));
+    check('a refused handoff never overwrites the stash',
+      globalThis.zkIdentityJson === stashBefore, 'stash clobbered by a refused handoff');
+    // identity == ours but the REPORT carries another user's record: the
+    // report-side preimage cross-check must refuse (auditor-gate parity).
+    check('handoff whose identity ≠ the report identity is refused',
+      await globalThis.zkStashIdentity(canonicalId, identityHashOf(who),
+        JSON.stringify(spoof.envelope, null, 2)) === false,
+      document.getElementById('zkIdentityStatus').innerText.slice(0, 120));
+    // restore the good stash for the prove step
+    check('good handoff re-applied for the prove step',
+      await globalThis.zkStashIdentity(canonicalId, identityHashOf(who), handoffText) === true);
+  }
 
   // ---- (3) generate: mocked snarkjs, REAL artifact fetch+pin verification --
   const realFetch = globalThis.fetch;
@@ -2555,8 +2598,9 @@ console.log('\nTest 39: ZK escrow credential card — prove/verify wiring (v188,
   globalThis.zkIdentityJson = null; globalThis.zkIdentityHashHex = null;
   const p4 = zkGenerateCredential();
   if (p4) await p4;
-  check('generate without a green audit fails closed',
-    document.getElementById('zkProveStatus').innerText.includes('run a GREEN audit first'));
+  check('generate with no identity loaded (handoff/paste) fails closed',
+    document.getElementById('zkProveStatus').innerText.includes('no identity loaded on this page'),
+    document.getElementById('zkProveStatus').innerText.slice(0, 160));
   globalThis.zkIdentityJson = savedId; globalThis.zkIdentityHashHex = savedHash;
 
   // ---- restore everything ----------------------------------------------
@@ -2586,10 +2630,11 @@ console.log('\nTest 40: index.html ↔ verify.html auditor parity (F2 — no sta
     vScript === iScript,
     `verify=${vScript.length}B index=${iScript.length}B` +
       (vScript === iScript ? '' : ' — RE-SYNC index.html from verify.html'));
-  check('both copies carry the ZK card markup (id="zkCard")',
-    html.includes('id="zkCard"') && idxHtml.includes('id="zkCard"'));
-  check('both copies carry the embedded credential verification key',
-    html.includes('var zkCredVkey = {') && idxHtml.includes('var zkCredVkey = {'));
+  check('both copies carry the ZK HANDOFF markup (id="zkHandoffCard")',
+    html.includes('id="zkHandoffCard"') && idxHtml.includes('id="zkHandoffCard"'));
+  check('ZK card + embedded vkey moved OUT of the auditor (v194: zk.html owns them)',
+    !html.includes('id="zkCard"') && !html.includes('var zkCredVkey = {')
+      && zkHtml.includes('id="zkCard"') && zkHtml.includes('var zkCredVkey = {'));
   check('index.html inline script passes node --check', (() => {
     const tmp = join(dir, 'index-script.js');
     writeFileSync(tmp, iScript);
@@ -2601,7 +2646,7 @@ console.log('\nTest 40: index.html ↔ verify.html auditor parity (F2 — no sta
 console.log('\nTest 42: authority escrow public key — paste field + file picker (v190)');
 {
   const parse = globalThis.zkParseAuthorityKey;
-  check('zkParseAuthorityKey exposed by the auditor script', typeof parse === 'function');
+  check('zkParseAuthorityKey exposed by zk.html', typeof parse === 'function');
 
   const EX = globalThis.ZK_EXAMPLE_ESCROW_X, EY = globalThis.ZK_EXAMPLE_ESCROW_Y;
   check('decimal "x y" pair parses to the same coordinates',
@@ -2632,15 +2677,15 @@ console.log('\nTest 42: authority escrow public key — paste field + file picke
 
   const idxNow = readFileSync(join(repoRoot, 'index.html'), 'utf8');
   const pos = (s, id) => s.indexOf('id="' + id + '"');
-  check('verify.html: paste field + file picker BOTH before the ⚡ button',
-    pos(html, 'zkAuthorityKey') > -1 && pos(html, 'zkAuthorityKeyFile') > -1
-      && pos(html, 'zkAuthorityKey') < pos(html, 'zkProveBtn')
-      && pos(html, 'zkAuthorityKeyFile') < pos(html, 'zkProveBtn'));
-  check('index.html carries the same authority-key controls',
-    pos(idxNow, 'zkAuthorityKey') > -1 && pos(idxNow, 'zkAuthorityKeyFile') > -1);
-  check('prove path re-validates a pasted key (source-pinned)',
-    /akRaw = \(\(document\.getElementById\('zkAuthorityKey'\)/.test(html)
-      && html.includes('if (akRaw) zkApplyAuthorityKey(akRaw,'));
+  check('zk.html: paste field + file picker BOTH before the ⚡ button',
+    pos(zkHtml, 'zkAuthorityKey') > -1 && pos(zkHtml, 'zkAuthorityKeyFile') > -1
+      && pos(zkHtml, 'zkAuthorityKey') < pos(zkHtml, 'zkProveBtn')
+      && pos(zkHtml, 'zkAuthorityKeyFile') < pos(zkHtml, 'zkProveBtn'));
+  check('the auditor copies no longer carry the ZK controls (v194 split)',
+    !html.includes('id="zkAuthorityKey"') && !idxNow.includes('id="zkAuthorityKey"'));
+  check('prove path re-validates a pasted key (source-pinned in zk.html)',
+    /akRaw = \(\(document\.getElementById\('zkAuthorityKey'\)/.test(zkHtml)
+      && zkHtml.includes('if (akRaw) zkApplyAuthorityKey(akRaw,'));
 
   // ---- end-to-end: the pasted authority key reaches the PROOF ------------
   const savedId2 = globalThis.zkIdentityJson, savedHash2 = globalThis.zkIdentityHashHex;
@@ -2804,18 +2849,18 @@ console.log('\nTest 43: browser-side BabyJubjub keypair generator — no circoml
   // generator is dependency-free (no fetch/import/eval inside its block), and
   // index.html mirrors them.
   const pos = (s, t) => s.indexOf(t);
-  check('generate + save buttons are wired into the authority block',
-    html.includes('id="zkKeygenBtn"') && html.includes('onclick="zkGenerateAuthorityKeypair()"')
-      && html.includes('onclick="zkSaveAuthorityKeypair()"'));
+  check('generate + save buttons are wired into the authority block (zk.html)',
+    zkHtml.includes('id="zkKeygenBtn"') && zkHtml.includes('onclick="zkGenerateAuthorityKeypair()"')
+      && zkHtml.includes('onclick="zkSaveAuthorityKeypair()"'));
   check('keygen controls sit BEFORE the prove button',
-    pos(html, 'zkKeygenBtn') > -1 && pos(html, 'zkKeygenBtn') < pos(html, 'zkProveBtn'));
-  const block = html.slice(pos(html, 'v191 (user request): BabyJubjub keypair generator'), pos(html, '⚡ Prove.'));
+    pos(zkHtml, 'zkKeygenBtn') > -1 && pos(zkHtml, 'zkKeygenBtn') < pos(zkHtml, 'zkProveBtn'));
+  const block = zkHtml.slice(pos(zkHtml, 'v191 (user request): BabyJubjub keypair generator'), pos(zkHtml, '⚡ Prove.'));
   check('generator block makes no network or eval calls',
     block.length > 0 && !/fetch\s*\(|import\s*\(|\beval\s*\(|require\s*\(/.test(block),
     block.slice(0, 80));
   const idxNow = readFileSync(join(repoRoot, 'index.html'), 'utf8');
-  check('index.html carries the same keygen controls',
-    idxNow.includes('id="zkKeygenBtn"') && idxNow.includes('zkSaveAuthorityKeypair'));
+  check('the auditor copies no longer carry the keygen controls (v194 split)',
+    !html.includes('id="zkKeygenBtn"') && !idxNow.includes('id="zkKeygenBtn"'));
 
   // restore
   escX.value = ''; escY.value = ''; ak.value = '';
@@ -3047,6 +3092,19 @@ console.log('\nTest 46: GitHub Pages copy == repo verify.html (served-auditor dr
           rm.toString('utf8').includes(repoDigest), 'Pages README digest is stale');
         else console.log('  ⚠️  Pages README not fetched — verify.html parity already proven');
 
+        // v194: zk.html (the ZK engine) is a Pages-served security file too —
+        // the SAME stale-branch trap that bit verify.html applies to it, and
+        // the prover's pins only protect you if Pages serves THIS build.
+        const zkRepoBuf = readFileSync(join(repoRoot, 'zk.html'));
+        const zkBody = await httpGet(new URL('zk.html', PAGES_VERIFY_URL).href);
+        if (zkBody) {
+          const zkPages = sha(zkBody), zkRepo = sha(zkRepoBuf);
+          check('GitHub Pages serves byte-identical zk.html', zkPages === zkRepo,
+            `pages=${zkPages.slice(0, 16)} repo=${zkRepo.slice(0, 16)} — push to the Pages branch (both-branches rule)`);
+        } else {
+          check('GitHub Pages zk.html fetched over HTTPS', !strict, `GET ${new URL('zk.html', PAGES_VERIFY_URL).href} failed`);
+        }
+
         // v193: the ZK artifacts live on the SAME Pages branch and are fetched
         // by the auditor with `force-cache` — so a stale Pages (or a stale
         // browser copy of it) serves the WRONG wasm/zkey beside a correct
@@ -3055,7 +3113,8 @@ console.log('\nTest 46: GitHub Pages copy == repo verify.html (served-auditor dr
         // victim's browser. Pin them here too, byte-for-byte, against the
         // repo files AND against the digests the auditor embeds.
         if (process.env.PAGES_ZK_ARTIFACTS !== '0') {
-          const vsrc = readFileSync(join(repoRoot, 'verify.html'), 'utf8');
+          // v194: the pins moved into zk.html with the engine.
+          const vsrc = zkHtml;
           const wasmPin = (vsrc.match(/var ZK_WASM_SHA256 = '([0-9a-f]{64})'/) || [])[1];
           const zkeyPin = (vsrc.match(/var ZK_ZKEY_SHA256 = '([0-9a-f]{64})'/) || [])[1];
           const wasmLocal = readFileSync(join(repoRoot, 'zk', 'identity_escrow.wasm'));
