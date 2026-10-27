@@ -2959,6 +2959,42 @@ console.log('\nTest 44: odd-length + band-floor identities prove end-to-end (v19
     /lenGeMin\.in\[0\] <== 247/.test(csrc));
   check('pinned wasm is byte-identical to the one just proven with',
     createHash('sha256').update(readFileSync(wasmPath)).digest('hex') === globalThis.ZK_WASM_SHA256);
+
+  // 4. v194 input-contract regression (live user failure 2026-10-27):
+  //    "Assert Failed. Error in template Num2Bits_103 line: 38 /
+  //     BabyPbk_114 line: 97 / IdentityEscrow_191 line: 267"
+  //    The circuit decomposes the ephemeral scalar with Num2Bits(253) — an
+  //    UNREDUCED 256-bit draw (what zk.html used to generate) dies in witness
+  //    calculation. The mocked prover can never see that, so run the REAL
+  //    wtns calculate on both sides of the contract.
+  const wtnsCalc = (inputs) => {
+    const wi = join(dir, 'v194-in.json'), wo = join(dir, 'v194-out.wtns');
+    writeFileSync(wi, JSON.stringify(inputs));
+    const r = spawnSync(process.execPath,
+      [join(repoRoot, 'node_modules/snarkjs/build/cli.cjs'), 'wtns', 'calculate', wasmPath, wi, wo],
+      { encoding: 'utf8' });
+    try { rmSync(wo, { force: true }); } catch (e) { /* absent on failure */ }
+    // snarkjs CLI splits the report across streams — match BOTH.
+    r.all = String(r.stdout || '') + '\n' + String(r.stderr || '');
+    return r;
+  };
+  {
+    const base = inputsFor(identityOf(251));
+    const bad = wtnsCalc({ ...base, ephemeral_private_key: ((1n << 253n) + 12345n).toString() });
+    check('circuit REJECTS an unreduced ≥2^253 ephemeral key (the live failure, exact chain)',
+      bad.status !== 0 && /Num2Bits/.test(bad.all) && /BabyPbk/.test(bad.all)
+        && /IdentityEscrow/.test(bad.all),
+      bad.all.split('\n').filter((l) => l.trim()).slice(0, 5).join(' | ').slice(0, 220));
+    const pageR = globalThis.zkRandomScalar();
+    check('zk.html scalar draws are reduced (0 < r < subOrder < 2^253)',
+      typeof pageR === 'bigint' && pageR > 0n && pageR < (1n << 253n), String(pageR).slice(0, 24));
+    const good = wtnsCalc({ ...base, ephemeral_private_key: pageR.toString() });
+    check('a page-drawn scalar passes REAL witness generation', good.status === 0,
+      good.all.split('\n').filter((l) => l.trim()).slice(-3).join(' | ').slice(0, 200));
+    check('prove path draws the ephemeral key via zkRandomScalar() (source-pinned)',
+      /var r = zkRandomScalar\(\);/.test(zkHtml)
+        && !/getRandomValues\(new Uint8Array\(32\)\);\s*\n\s*var r = 0n/.test(zkHtml));
+  }
 }
 
 console.log('\nTest 45: real Groth16 credential from the CAPTURED odd-length report');

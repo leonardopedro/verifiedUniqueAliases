@@ -129,5 +129,46 @@ if (dec !== D) {
   process.exit(1);
 }
 console.log('✓ escrow ciphertext decrypts outside the circuit to the exact identity JSON');
+// v194 input-contract gate (live failure 2026-10-27): the ephemeral scalar is
+// decomposed with Num2Bits(253) IN-CIRCUIT (BabyPbk's pvkBits + rBits at
+// IdentityEscrow line 271), so an UNREDUCED 256-bit draw kills witness
+// generation with exactly:
+//   Assert Failed ← Num2Bits_103:38 ← BabyPbk_114:97 ← IdentityEscrow_191:267
+// zk.html draws its ephemeral key via zkRandomScalar() (reduced mod the
+// BabyJubjub subgroup order); both halves of that contract are pinned here so
+// a regression shows up as THIS gate failing, not as a user-facing crash.
+{
+  const wtns = (inp, tag) => {
+    const wi2 = `/tmp/zk-contract-${tag}.json`, wo2 = `/tmp/zk-contract-${tag}.wtns`;
+    writeFileSync(wi2, JSON.stringify(inp));
+    try {
+      execFileSync(snarkjs[0], [...snarkjs[1], 'wtns', 'calculate',
+        repo + 'zk/build/identity_escrow_js/identity_escrow.wasm', wi2, wo2], { stdio: ['ignore', 'pipe', 'pipe'] });
+      return { ok: true, out: '' };
+    } catch (e) {
+      // snarkjs CLI splits the report across streams ("ERROR: 4" on stderr,
+      // the template/line chain may land on stdout) — match BOTH.
+      return { ok: false, out: String(e.stdout || '') + '\n' + String(e.stderr || e.message || '') };
+    } finally {
+      rmSync(wi2, { force: true }); rmSync(wo2, { force: true });
+    }
+  };
+  const bad = wtns({ ...inputs, ephemeral_private_key: ((1n << 253n) + 12345n).toString() }, 'bad');
+  if (bad.ok || !/Num2Bits/.test(bad.out) || !/BabyPbk/.test(bad.out)
+      || !/IdentityEscrow/.test(bad.out)) {
+    console.error('FAIL: expected the circuit to REJECT an unreduced ≥2^253 scalar with the documented assert chain; got:\n'
+      + (bad.ok ? 'witness ACCEPTED (out-of-range scalar accepted — contract broken)' : bad.out.slice(0, 400)));
+    process.exit(1);
+  }
+  console.log('✓ circuit REJECTS an unreduced ≥2^253 ephemeral key (the live Assert Failed chain)');
+  const reduced = (BigInt('75834567890123456789012345678901234567890123456789') % babyJub.subOrder).toString();
+  const fixed = wtns({ ...inputs, ephemeral_private_key: reduced }, 'fix');
+  if (!fixed.ok) {
+    console.error('FAIL: a reduced (page-style) scalar must pass witness generation; got:\n' + fixed.out.slice(0, 400));
+    process.exit(1);
+  }
+  console.log('✓ reduced scalar (zkRandomScalar-style draw, mod subOrder) passes witness generation');
+}
+
 console.log('ZK WITNESS TEST: PASS');
 rmSync(wIn, { force: true }); rmSync(wOut, { force: true }); rmSync(wJson, { force: true });

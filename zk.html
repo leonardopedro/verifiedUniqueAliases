@@ -723,9 +723,10 @@
                 b = parseInt(zkIdentityHashHex.substr(i, 2), 16);
                 for (t = 7; t >= 0; t--) hbits.push((b >> t) & 1);
             }
-            var rB = crypto.getRandomValues(new Uint8Array(32));
-            var r = 0n;
-            for (i = 0; i < rB.length; i++) r = (r << 8n) + BigInt(rB[i]);
+            // v194 fix: UNREDUCED 256-bit draws fail the circuit's Num2Bits(253)
+            // (live: Assert Failed ← Num2Bits ← BabyPbk ← IdentityEscrow:267).
+            // Draw through the reduced path instead — R = r·G is unchanged.
+            var r = zkRandomScalar();
             work = zkLoadSnarkjs().then(function(m) {
                 sn = m;
                 return Promise.all([
