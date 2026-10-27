@@ -98,17 +98,24 @@ the file it describes:
 |---|---|---|
 | `verify.html` | 177,053 bytes | `5fd32b9e1438bee9fecd399834c84d8b733df12a2069a56b24ee11277987fcbb` |
 | `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
+| `zk-rsa.html` | 51,405 bytes | `ce763e2054df7859acdee350e74e6c71bf2c6933a64deb409695fccb8e965fd1` |
 
 ```bash
-sha256sum verify.html zk.html
+sha256sum verify.html zk.html zk-rsa.html
 # 5fd32b9e1438bee9fecd399834c84d8b733df12a2069a56b24ee11277987fcbb  verify.html
 # 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
+# ce763e2054df7859acdee350e74e6c71bf2c6933a64deb409695fccb8e965fd1  zk-rsa.html
 ```
 
 (`zk.html` is the standalone zero-knowledge prover — split out of
 `verify.html` in v194 so the ZK layer can be debugged without rebuilding the
 enclave image; a green audit in `verify.html` hands the audited identity over
-to it via a pinned-origin postMessage, or you paste the report directly.)
+to it via a pinned-origin postMessage, or you paste the report directly.
+`zk-rsa.html` is the **alternative prover for RSA keys** — OpenPGP/GPG
+whistleblower keys and S/MIME certificates: a zero-knowledge proof of
+key possession (Guillou–Quisquater Fiat–Shamir over SHA-256, no trusted
+setup, no circuit) with the identity escrowed RSA-OAEP+AES-GCM to a recipient
+key — it makes zero network requests and never sees a passphrase.)
 
 - Rotate this hash in the **same reviewed commit** that changes `verify.html`;
   `node scripts/test-verify-security.mjs` fails when the README and the file
@@ -132,6 +139,8 @@ to it via a pinned-origin postMessage, or you paste the report directly.)
 | `src/paypal.pem` | Embedded TLS trust root for the pinned PayPal API endpoints — **DigiCert Global Root G2** (SHA-256 `cb3ccbb7…ab1cb5f`, fingerprint pinned by test `paypal_api_root_is_digicert_g2_v179`) |
 | `verify.html` | Browser auditor: TD Quote parser, PCK chain walk to the pinned Intel root, WebCrypto, GitHub attestation lookup |
 | `zk.html` | Standalone ZK escrow prover/verifier (GitHub Pages origin): Groth16 prove + verify, authority-key handling, fail-closed identity handoff/paste gate |
+| `zk-rsa.html` | Standalone RSA ZK escrow prover/verifier: OpenPGP/S-MIME/raw key parsing, Guillou–Quisquater Fiat–Shamir proof of key possession, hybrid escrow encryption, in-page verifier — zero network requests |
+| `zk/rsa-test/` | TEST-ONLY fixture keys (PGP/X.509/PEM) + generators for the zk-rsa harness tests |
 | `build-alibaba-docker.sh` | The reproducible build (Debian Trixie pinned snapshots) |
 | `build-initramfs-tools.sh` | Initramfs construction with kernel module selection |
 | `build-alibaba-disk.sh` | **Retired (hard-fail stub)** — legacy non-bootable artifact; use `build-alibaba-docker.sh` |

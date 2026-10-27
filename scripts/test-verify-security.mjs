@@ -45,6 +45,11 @@ const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
 // origin) so it can be debugged without an enclave rebuild — load both.
 const zkHtml = readFileSync(join(repoRoot, 'zk.html'), 'utf8');
 const zkScript = zkHtml.match(/<script>([\s\S]*)<\/script>/)[1];
+// v195: the RSA escrow prover (zk-rsa.html) — a standalone alternative for
+// OpenPGP/S-MIME RSA keys (GQ Fiat–Shamir, no setup). Its script co-evals
+// too; every top-level name in it is `zkRsa`-prefixed so nothing collides.
+const zkRsaHtml = readFileSync(join(repoRoot, 'zk-rsa.html'), 'utf8');
+const zkRsaScript = zkRsaHtml.match(/<script>([\s\S]*)<\/script>/)[1];
 
 // ---- DOM stubs -------------------------------------------------------------
 const elements = {};
@@ -83,9 +88,11 @@ globalThis.fetch = async () => {
 // to globalThis; const/let stay in the eval's lexical scope). The auditor
 // runs FIRST, then zk.html's script — so every ZK binding the tests touch
 // resolves exactly as it would on the real zk.html (its own reportFileText
-// and stash win any name overlap).
+// and stash win any name overlap). zk-rsa.html loads last (zkRsa-prefixed,
+// no overlaps by construction).
 (0, eval)(script);
 (0, eval)(zkScript);
+(0, eval)(zkRsaScript);
 
 async function runAuditWith(envelope) {
   lastAlert = null;
@@ -3248,6 +3255,100 @@ console.log('\nTest 46: GitHub Pages copy == repo verify.html (served-auditor dr
       }
     }
   }
+}
+
+console.log('\nTest 47: zk-rsa.html — RSA ZK escrow credential (PGP / X.509 / PEM / raw)');
+{
+  const fix = (f) => readFileSync(join(repoRoot, 'zk', 'rsa-test', f), 'utf8');
+  const sec = await zkRsaParseAny(fix('signer-sec.asc'));
+  const pub = await zkRsaParseAny(fix('signer-pub.asc'));
+  const crt = await zkRsaParseAny(fix('signer-cert.pem'));
+  const pem = await zkRsaParseAny(fix('signer-key.pem'));
+  const raw = await zkRsaParseAny(fix('signer-raw.txt'));
+  const recip = await zkRsaParseAny(fix('recipient-pub.asc'));
+
+  check('PGP v4 secret key parses (s2k usage 0 → private part present)',
+    sec.format === 'pgp-secret' && sec.hasPrivate === true, sec.format);
+  check('all five encodings agree on the same RSA key',
+    [pub, crt, pem, raw].every((k) => k.fp === sec.fp),
+    [sec, pub, crt, pem, raw].map((k) => k.fp.slice(0, 8)).join(' '));
+  check('PGP fingerprint = SHA1(0x99 ‖ len ‖ material) in uppercase hex',
+    /^[0-9A-F]{40}$/.test(sec.pgp_fingerprint || ''), sec.pgp_fingerprint);
+  check('RSA-2048 fixture over the 1024-bit floor', sec.bits === 2048, 'bits=' + sec.bits);
+  check('public encodings cannot prove', pub.hasPrivate === false && crt.hasPrivate === false && raw.hasPrivate === false);
+
+  // passphrase-protected secret key must be REFUSED (never touch passphrases):
+  // flip the s2k usage octet inside the packet and drop the (now invalid) CRC.
+  {
+    const armored = fix('signer-sec.asc');
+    const b64 = armored.split('\n\n')[1].split('\n=')[0].replace(/\s+/g, '');
+    const bin = Buffer.from(b64, 'base64');
+    let off = 3 + 6;                       // old-format hdr (3) + v4/time/algo (6)
+    for (let k = 0; k < 2; k++) {          // skip n, e MPIs
+      const bits = bin.readUInt16BE(off);
+      off += 2 + Math.ceil(bits / 8);
+    }
+    bin[off] = 0xfe;                       // s2k usage 254 = SHA1-checked sym-encrypted
+    const tampered = '-----BEGIN PGP SECRET KEY BLOCK-----\n\n' +
+      bin.toString('base64').replace(/.{1,64}/g, '$&\n') +
+      '-----END PGP SECRET KEY BLOCK-----\n';
+    let refused = null;
+    try { await zkRsaParseAny(tampered); } catch (e) { refused = e.message; }
+    check('passphrase-protected secret key refused with instructions',
+      !!refused && /PASSPHRASE-PROTECTED/.test(refused), String(refused).slice(0, 80));
+  }
+
+  const nonce = 'ab12'.repeat(8);
+  const cred = await zkRsaProve({
+    key: sec, attrsText: JSON.stringify({ label: 'harness' }),
+    recipientKey: recip, domain: 'harness.test', nonce, purpose: 'Test 47',
+  });
+  check('credential produced (type/version/shape)',
+    cred.type === 'pav-rsa-escrow' && cred.version === 1 &&
+    /^[0-9a-f]{64}$/.test(cred.identity_hash) && !!cred.escrow.ct,
+    cred.type + ' v' + cred.version);
+  const res = await zkRsaVerify(cred, { nonce, domain: 'harness.test' });
+  check('proof verifies green (GQ relation + challenge re-derivation + expected nonce/domain)',
+    res.ok === true, res.rows.filter((r) => r.cls === 'failed').map((r) => r.title).join('; '));
+  check('no-circuit binding-completeness caveat is stated (warning row, not hidden)',
+    res.rows.some((r) => r.cls === 'warning' && /binding/i.test(r.title)), 'caveat row missing');
+
+  const t1 = JSON.parse(JSON.stringify(cred)); t1.statement.nonce = 'ffff'.repeat(8);
+  check('altered nonce fails the challenge', !(await zkRsaVerify(t1, {})).ok);
+  const t2 = JSON.parse(JSON.stringify(cred));
+  t2.escrow.ct = t2.escrow.ct.slice(0, -4) + (t2.escrow.ct.endsWith('AAAA') ? 'BBBB' : 'AAAA');
+  check('altered ciphertext fails the challenge', !(await zkRsaVerify(t2, {})).ok);
+  const t3 = JSON.parse(JSON.stringify(cred));
+  t3.proof.z = (BigInt('0x' + cred.proof.z) - 1n).toString(16);
+  check('altered response z fails the GQ relation', !(await zkRsaVerify(t3, {})).ok);
+  const t4 = JSON.parse(JSON.stringify(cred));
+  t4.issuer_key.n = (BigInt('0x' + cred.issuer_key.n) - 2n).toString(16);
+  check('foreign modulus fails (fingerprint + relation)', !(await zkRsaVerify(t4, {})).ok);
+  const resW = await zkRsaVerify(cred, { nonce: 'not-my-nonce', domain: 'other.test' });
+  check('expected-nonce/domain mismatch is flagged', resW.ok === false);
+
+  const opened = await zkRsaEscrowOpen(cred, fix('recipient-key.pem'));
+  check('recipient opens the escrow; plaintext hash == identity_hash', opened.matches === true, opened.hash);
+  check('attrs survive the escrow round-trip', JSON.parse(opened.json).attrs.label === 'harness');
+  let wrongRejected = false;
+  try { await zkRsaEscrowOpen(cred, fix('signer-key.pem')); } catch { wrongRejected = true; }
+  check('wrong recipient key cannot open the escrow', wrongRejected);
+
+  let refusedPub = null;
+  try {
+    await zkRsaProve({ key: pub, attrsText: '{}', recipientKey: recip, domain: '', nonce: 'x', purpose: '' });
+  } catch (e) { refusedPub = e.message; }
+  check('proving with a PUBLIC key fails closed', /no private part/.test(String(refusedPub)), String(refusedPub).slice(0, 70));
+
+  const rsaDigest = sha256(readFileSync(join(repoRoot, 'zk-rsa.html'))).toString('hex');
+  const readmeNow = readFileSync(join(repoRoot, 'README.md'), 'utf8');
+  check('README publishes the CURRENT zk-rsa.html sha256',
+    readmeNow.includes(rsaDigest), rsaDigest.slice(0, 24) + '…');
+  check('zk-rsa.html loads NO external subresources (zero-network by construction)',
+    !/<script[^>]+\bsrc\s*=/i.test(zkRsaHtml) && !/<link[^>]+\bhref\s*=\s*["']https?:/i.test(zkRsaHtml),
+    'external <script src> or <link href> found');
+  const rsaRes = await zkRsaVerify(JSON.parse(JSON.stringify(cred)), { nonce, domain: 'harness.test' });
+  check('fresh verify of a re-parsed credential (JSON round-trip)', rsaRes.ok === true);
 }
 
 rmSync(dir, { recursive: true, force: true });;;

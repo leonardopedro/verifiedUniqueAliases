@@ -1,0 +1,1051 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RSA ZK Escrow Credential | Zero-Knowledge Prover for PGP / S-MIME keys</title>
+    <!-- No external resources at all: no fonts, no CDNs, no scripts. Opening
+         this page issues ZERO network requests — a deliberate property for
+         whistleblower/threat-model use (a page load must not be observable). -->
+    <style>
+        :root {
+            --bg: #0a0c10;
+            --card: #161b22;
+            --primary: #58a6ff;
+            --success: #3fb950;
+            --error: #f85149;
+            --warning: #d29922;
+            --text: #c9d1d9;
+            --text-dim: #8b949e;
+            --accent: #1f6feb;
+        }
+
+        * { box-sizing: border-box; }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+            margin: 0;
+            padding: 40px 20px;
+            display: flex;
+            justify-content: center;
+            line-height: 1.6;
+        }
+
+        .container { max-width: 900px; width: 100%; }
+
+        header { text-align: center; margin-bottom: 40px; }
+
+        h1 {
+            font-size: 2.3rem;
+            margin: 0;
+            background: linear-gradient(135deg, #fff 0%, #58a6ff 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 600;
+        }
+
+        p.subtitle { color: var(--text-dim); font-size: 1.05rem; margin-top: 10px; }
+
+        .input-card {
+            background: var(--card);
+            border: 1px solid #30363d;
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
+        }
+
+        label { display: block; margin-bottom: 12px; font-weight: 600; color: var(--text); }
+
+        textarea {
+            width: 100%;
+            height: 160px;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            color: #58a6ff;
+            font-family: ui-monospace, 'Cascadia Mono', Menlo, Consolas, monospace;
+            font-size: 0.8rem;
+            padding: 12px;
+            resize: vertical;
+            outline: none;
+        }
+
+        input[type="text"] {
+            width: 100%;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            color: #58a6ff;
+            font-family: ui-monospace, 'Cascadia Mono', Menlo, Consolas, monospace;
+            font-size: 0.85rem;
+            padding: 10px 12px;
+            outline: none;
+        }
+
+        button {
+            padding: 14px 18px;
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: filter 0.2s, transform 0.1s;
+            margin-top: 10px;
+        }
+
+        button:hover { filter: brightness(1.2); }
+        button:active { transform: scale(0.98); }
+
+        a { color: #58a6ff; text-decoration: underline; font-weight: 600; }
+        a:hover { color: #90caf9; }
+
+        .status-card {
+            background: rgba(88, 166, 255, 0.05);
+            border: 1px solid rgba(88, 166, 255, 0.2);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
+        }
+
+        .check-item {
+            display: flex;
+            align-items: flex-start;
+            margin-bottom: 12px;
+            padding: 12px;
+            background: rgba(255, 255, 255, 0.02);
+            border-radius: 8px;
+        }
+
+        .check-icon { font-size: 1.3rem; margin-right: 14px; width: 28px; text-align: center; flex-shrink: 0; }
+        .check-text h4 { margin: 0; font-size: 0.95rem; }
+        .check-text p { margin: 2px 0 0; font-size: 0.85rem; color: var(--text-dim); word-break: break-all; }
+
+        .verified { border-left: 4px solid var(--success); }
+        .failed { border-left: 4px solid var(--error); }
+        .warning { border-left: 4px solid var(--warning); }
+        .verified .check-icon { color: var(--success); }
+        .failed .check-icon { color: var(--error); }
+        .warning .check-icon { color: var(--warning); }
+
+        .file-input {
+            width: 100%;
+            background: #0d1117;
+            border: 1px dashed #30363d;
+            padding: 10px;
+            border-radius: 8px;
+            color: var(--text-dim);
+            font-size: 0.85rem;
+            cursor: pointer;
+            margin-top: 8px;
+        }
+        .file-input:hover { border-color: var(--primary); }
+
+        .hint { color: var(--text-dim); font-size: 0.88rem; }
+        .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.82rem; word-break: break-all; }
+        .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+        @media (max-width: 640px) { .row2 { grid-template-columns: 1fr; } }
+
+        .warnbox {
+            background: rgba(210, 153, 34, 0.08);
+            border: 1px solid rgba(210, 153, 34, 0.35);
+            border-radius: 12px;
+            padding: 16px 20px;
+            margin-bottom: 20px;
+            font-size: 0.9rem;
+        }
+        .infobox {
+            background: rgba(63, 185, 80, 0.06);
+            border: 1px solid rgba(63, 185, 80, 0.3);
+            border-radius: 12px;
+            padding: 16px 20px;
+            margin-bottom: 20px;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <a href="https://leonardopedro.github.io/verifiedUniqueAliases/zk.html" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← The TDX/attestation prover (zk.html)</a>
+        <h1>RSA ZK Escrow Credential</h1>
+        <p class="subtitle">Prove — <b>without revealing your identity</b> — that you hold an <b>RSA key</b> (PGP/GPG or S/MIME, the kind used on encrypted whistleblower &amp; police mail), bound to a statement, with the plaintext escrowed to a recipient key you choose.</p>
+    </header>
+
+    <div class="infobox">
+        <b>🛡 What this does.</b> It produces one JSON <i>credential</i> containing:
+        (a) a <b>zero-knowledge proof of possession</b> of the RSA private key — a
+        Guillou–Quisquater-style Fiat–Shamir proof (SHA-256 challenge, no trusted
+        setup, no circuit, no ceremony); nobody can forge it without the private
+        key, and it reveals nothing about the key beyond its public part;
+        (b) your <b>identity payload</b> (fingerprint + attributes) encrypted
+        <b>hybrid RSA-OAEP + AES-256-GCM to the recipient's key</b>, plus its
+        SHA-256 hash in the clear, so anyone can see <i>which</i> identity is
+        committed while only the recipient can read it.
+        Everything — parsing, proving, encrypting, verifying — happens in this
+        tab. <b>No network requests are made at all</b> (this file loads no
+        scripts, fonts or artifacts; disconnect and it still works).
+        <br><br>
+        <b>⚖ What it does NOT prove.</b> With no circuit there is no in-proof
+        binding between the ciphertext and the hash: the proof binds <i>you</i>
+        to <i>this</i> ciphertext+hash pair, and the <b>recipient completes the
+        binding after decrypting</b> (SHA-256 of the plaintext must equal
+        <span class="mono">identity_hash</span> — the verifier below checks this
+        when you supply the recipient key). Statement fields (nonce, domain) are
+        covered by the challenge, so they cannot be swapped after the fact.
+    </div>
+
+    <div class="warnbox">
+        <b>⚠ Threat-model honesty.</b> A secret key typed or pasted into <i>any</i>
+        web page is only as safe as the machine rendering it: a compromised
+        browser, OS or extension can read it. For real whistleblower use:
+        Tails/Tor Browser on a clean machine, and prefer keys with no
+        passphrase exported only for this session — on a trusted machine run
+        <span class="mono">gpg --pinentry-mode loopback --passphrase '' --export-secret-keys --armor NAME</span>
+        to get an unencrypted block, prove, then <b>delete it</b>. Passphrase-protected
+        secret keys are refused by design (we will not handle your passphrase).
+        The <b>public</b> side needs no precautions: any reader can verify a credential.
+    </div>
+
+    <!-- 1 — signer key -->
+    <div class="input-card">
+        <label>1️⃣ Your RSA key (proves possession)</label>
+        <p class="hint">Paste <b>any</b> of: an OpenPGP <span class="mono">PUBLIC/SECRET KEY</span> block (GPG), an X.509 <span class="mono">CERTIFICATE</span> (S/MIME), a <span class="mono">RSA/PRIVATE KEY</span> PEM, or raw <span class="mono">n=… / e=…</span> lines. To <i>prove</i>, the private part is required (PGP secret key, PKCS#1/PKCS#8 PEM). Detection is automatic.</p>
+        <textarea id="zkRsaKeyIn" spellcheck="false" placeholder="-----BEGIN PGP PRIVATE KEY BLOCK-----&#10;…&#10;-----END PGP PRIVATE KEY BLOCK-----   (or CERTIFICATE / RSA PRIVATE KEY / n=hex…)"></textarea>
+        <input type="file" class="file-input" id="zkRsaKeyFile" accept=".asc,.pgp,.pem,.crt,.cer,.key,.txt" onchange="zkRsaFileInto(this, 'zkRsaKeyIn')">
+        <button type="button" onclick="zkRsaParseKeyBox()">🔎 Parse key</button>
+        <p id="zkRsaKeyStatus" style="margin:8px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);">Paste a key and parse it.</p>
+    </div>
+
+    <!-- 2 — identity + statement + recipient -->
+    <div class="input-card">
+        <label>2️⃣ Identity, statement &amp; escrow recipient</label>
+
+        <div style="margin-bottom:14px;">
+            <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Attributes (JSON object — encrypted to the recipient; never shown in the clear)</label>
+            <textarea id="zkRsaAttrsIn" spellcheck="false" style="height:70px;">{"label": "anonymous handle", "note": ""}</textarea>
+        </div>
+
+        <div class="row2">
+            <div>
+                <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Domain / audience (who this credential is for)</label>
+                <input type="text" id="zkRsaDomainIn" spellcheck="false" placeholder="drop.example.org">
+            </div>
+            <div>
+                <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Nonce (issued by the relying party)</label>
+                <input type="text" id="zkRsaNonceIn" spellcheck="false" placeholder="leave empty to generate">
+            </div>
+        </div>
+        <button type="button" id="zkRsaNonceBtn" onclick="zkRsaNewNonce()" style="padding:8px 14px; font-size:0.85rem; border-radius:8px;">🎲 fresh nonce</button>
+
+        <div style="margin-top:14px;">
+            <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Purpose (free text, part of the signed statement)</label>
+            <input type="text" id="zkRsaPurposeIn" spellcheck="false" placeholder="whistleblower submission 2026-10">
+        </div>
+
+        <div style="margin-top:16px; border-top:1px dashed #30363d; padding-top:12px;">
+            <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Recipient's RSA PUBLIC key (escrow target — where the identity gets encrypted)</label>
+            <textarea id="zkRsaRecipientIn" spellcheck="false" style="height:90px;" placeholder="-----BEGIN PGP PUBLIC KEY BLOCK----- … or CERTIFICATE / n=hex …"></textarea>
+            <input type="file" class="file-input" id="zkRsaRecipientFile" accept=".asc,.pgp,.pem,.crt,.cer,.key,.txt" onchange="zkRsaFileInto(this, 'zkRsaRecipientIn')">
+            <p id="zkRsaRecipientStatus" style="margin:6px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);"></p>
+        </div>
+    </div>
+
+    <button type="button" id="zkRsaGenBtn" onclick="zkRsaGenerateCredential()" style="width:100%; padding:18px; font-size:1.15rem; border-radius:14px;">⚡ Generate the ZK escrow credential (proves in this browser)</button>
+    <p id="zkRsaGenStatus" style="margin:10px 0 20px; font-size:0.9rem; min-height:1.4em; color:var(--text-dim);"></p>
+
+    <div class="input-card" id="zkRsaResultCard" style="display:none;">
+        <label>💾 Credential (JSON — hand this to the verifier)</label>
+        <textarea id="zkRsaCredentialOut" spellcheck="false" style="height:220px;"></textarea>
+        <div class="row2">
+            <button type="button" onclick="zkRsaCopyOut()">📋 Copy</button>
+            <button type="button" style="background:#238636;" onclick="zkRsaDownloadOut()">💾 Download .json</button>
+        </div>
+    </div>
+
+    <!-- 3 — verifier -->
+    <div class="status-card">
+        <label>3️⃣ Verify a credential (anyone can — needs only public data)</label>
+        <textarea id="zkRsaVerifyIn" spellcheck="false" style="height:160px;" placeholder='{ "type": "pav-rsa-escrow", … }'></textarea>
+        <input type="file" class="file-input" id="zkRsaVerifyFile" accept=".json,.txt" onchange="zkRsaFileInto(this, 'zkRsaVerifyIn')">
+        <div class="row2" style="margin-top:12px;">
+            <div>
+                <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Expected nonce (optional)</label>
+                <input type="text" id="zkRsaExpectNonce" spellcheck="false">
+            </div>
+            <div>
+                <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Expected domain (optional)</label>
+                <input type="text" id="zkRsaExpectDomain" spellcheck="false">
+            </div>
+        </div>
+        <button type="button" onclick="zkRsaVerifyCredential()" style="width:100%;">✅ Verify proof + statement</button>
+        <div id="zkRsaVerifyRows" style="margin-top:6px;"></div>
+
+        <div style="margin-top:18px; border-top:1px dashed #30363d; padding-top:14px;">
+            <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Binding completion (recipient only): paste the recipient's PRIVATE key to decrypt the escrow and check SHA-256(plaintext) == identity_hash</label>
+            <textarea id="zkRsaRecipientPriv" spellcheck="false" style="height:90px;" placeholder="-----BEGIN PRIVATE KEY----- / PGP SECRET KEY (optional)"></textarea>
+            <button type="button" onclick="zkRsaCheckBinding()" style="width:100%;">🔓 Decrypt escrow + complete the binding check</button>
+            <div id="zkRsaBindingRows" style="margin-top:6px;"></div>
+        </div>
+    </div>
+
+    <p class="hint" style="text-align:center; margin-top:28px;">
+        Verify this file's digest against <a href="https://github.com/leonardopedro/verifiedUniqueAliases/blob/alibabacloud/README.md">README.md</a> before use ·
+        the auditor it accompanies: <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">verify.html</a>
+    </p>
+</div>
+
+<script>
+// ===========================================================================
+// zk-rsa.html — RSA ZK escrow credential (protocol `pav-rsa-escrow` v1)
+//
+// An ALTERNATIVE prover to zk.html for RSA keys as used on encrypted email
+// (OpenPGP/GPG whistleblower keys, S/MIME police/corporate certs):
+//
+//   PROOF   Guillou–Quisquater Σ-protocol made non-interactive by
+//           Fiat–Shamir over SHA-256. Public: RSA modulus n, exponent e.
+//           Witness: the private exponent d. Pick g ∈ Z_n*, s = g^d mod n
+//           (computed here, in JS, with CRT when primes are known):
+//             commit  t = w^e mod n          (w random in Z_n*)
+//             challenge c = SHA-256(canonical statement ‖ g ‖ t)
+//             respond z = w · s^c mod n
+//           verify: z^e ≡ t·g^c (mod n)  AND  c re-derives exactly.
+//           Forgery without d is the RSA problem; transcripts are simulatable
+//           without d (pick z, t = z^e·g^-c … in the ROM) ⇒ zero-knowledge.
+//           No trusted setup, no circuit, no artifacts: native BigInt modexp
+//           (2048-bit: a few tens of ms). Soundness error ~2^-256 (SHA-256
+//           challenge) with e ≥ 65537.
+//
+//   ESCROW  identity JSON (fingerprint + attrs) → AES-256-GCM under a fresh
+//           32-byte key, key wrapped to the recipient with RSA-OAEP-SHA256.
+//           identity_hash = SHA-256(identity JSON bytes) is public and bound
+//           by the challenge; the plaintext↔hash tie is completed by the
+//           RECIPIENT after decrypt (no circuit to do it in-proof — stated
+//           plainly in the UI).
+//
+//   KEYS    parse WITHOUT any library: OpenPGP v4 transferable packets (old
+//           and new format headers, s2k usage 0 only), X.509 DER → SPKI,
+//           PKCS#1 / PKCS#8 PEM, raw n/e lines. PGP fingerprint =
+//           SHA1(0x99 ‖ len16 ‖ material). Passphrase-protected secret keys
+//           are refused with instructions (never touch a passphrase).
+//
+//   HARNESS all top-level names are prefixed `zkRsa` so the security harness
+//           can co-eval this page's script after verify.html + zk.html
+//           (scripts/test-verify-security.mjs, Test 47).
+// ===========================================================================
+
+// ---------- bytes / hex / base64 -------------------------------------------
+function zkRsaUtf8(s) { return new TextEncoder().encode(s); }
+function zkRsaBytesHex(u8) {
+    let out = '';
+    for (const b of u8) out += b.toString(16).padStart(2, '0');
+    return out;
+}
+function zkRsaHexToBytes(h) {
+    const s = h.length % 2 ? '0' + h : h;
+    const out = new Uint8Array(s.length / 2);
+    for (let i = 0; i < out.length; i++) out[i] = parseInt(s.substr(i * 2, 2), 16);
+    return out;
+}
+function zkRsaBigToBytes(v) {
+    let hex = v.toString(16);
+    if (hex.length % 2) hex = '0' + hex;
+    return zkRsaHexToBytes(hex);
+}
+function zkRsaBytesToBig(u8) {
+    let v = 0n;
+    for (const b of u8) v = (v << 8n) | BigInt(b);
+    return v;
+}
+function zkRsaBigToHex(v) { return v.toString(16); }
+function zkRsaB64(u8) {
+    let s = '';
+    for (const b of u8) s += String.fromCharCode(b);
+    return btoa(s);
+}
+function zkRsaB64ToBytes(s) {
+    const bin = atob(s.replace(/\s+/g, ''));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+}
+function zkRsaB64url(u8) { return zkRsaB64(u8).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+function zkRsaB64urlToBytes(s) {
+    return zkRsaB64ToBytes(s.replace(/-/g, '+').replace(/_/g, '/'));
+}
+async function zkRsaSha256Hex(u8orStr) {
+    const u8 = typeof u8orStr === 'string' ? zkRsaUtf8(u8orStr) : u8orStr;
+    const d = await crypto.subtle.digest('SHA-256', u8);
+    return zkRsaBytesHex(new Uint8Array(d));
+}
+async function zkRsaSha1Hex(u8) {
+    const d = await crypto.subtle.digest('SHA-1', u8);
+    return zkRsaBytesHex(new Uint8Array(d)).toUpperCase();
+}
+
+// ---------- BigInt modular arithmetic --------------------------------------
+function zkRsaBitLen(v) { return v.toString(2).length; }
+function zkRsaModPow(base, exp, mod) {
+    if (mod === 1n) return 0n;
+    let result = 1n;
+    base = ((base % mod) + mod) % mod;
+    while (exp > 0n) {
+        if (exp & 1n) result = (result * base) % mod;
+        base = (base * base) % mod;
+        exp >>= 1n;
+    }
+    return result;
+}
+function zkRsaGcd(a, b) { while (b) { [a, b] = [b, a % b]; } return a < 0n ? -a : a; }
+function zkRsaModInv(a, m) {
+    let [old_r, r] = [((a % m) + m) % m, m];
+    let [old_s, s] = [1n, 0n];
+    while (r !== 0n) {
+        const q = old_r / r;
+        [old_r, r] = [r, old_r - q * r];
+        [old_s, s] = [s, old_s - q * s];
+    }
+    if (old_r !== 1n) throw new Error('not invertible');
+    return ((old_s % m) + m) % m;
+}
+// Rejection-sampled uniform element of Z_n* — NOT a raw draw: the v194 zk.html
+// bug class was an unreduced random draw; here every draw is reduced mod a
+// runtime-computed bound with ≥2^64 headroom and gcd-checked.
+function zkRsaRandGroupElem(n) {
+    const bytes = Math.ceil(zkRsaBitLen(n) / 8) + 8;
+    for (;;) {
+        const buf = new Uint8Array(bytes);
+        crypto.getRandomValues(buf);
+        const v = zkRsaBytesToBig(buf) % (n - 3n) + 2n;
+        if (zkRsaGcd(v, n) === 1n) return v;
+    }
+}
+
+// ---------- PEM / DER -------------------------------------------------------
+function zkRsaPemBlock(text) {
+    const m = /-----BEGIN ([A-Z0-9 ]+)-----([\s\S]*?)-----END \1-----/.exec(text);
+    if (!m) return null;
+    return { label: m[1], der: zkRsaB64ToBytes(m[2].replace(/\s+/g, '')) };
+}
+function zkRsaDerLen(buf, off) {
+    const l = buf[off];
+    if (l < 0x80) return { len: l, start: off + 1 };
+    const n = l & 0x7f;
+    let len = 0;
+    for (let i = 0; i < n; i++) len = (len << 8) | buf[off + 1 + i];
+    return { len, start: off + 1 + n };
+}
+function zkRsaDerSeq(buf, off) {
+    if (buf[off] !== 0x30) throw new Error('DER: expected SEQUENCE at ' + off);
+    const { len, start } = zkRsaDerLen(buf, off + 1);
+    return { s: start, e: start + len, next: start + len };
+}
+function zkRsaDerSkip(buf, off) {          // any TLV (e.g. [0] version tag)
+    const { len, start } = zkRsaDerLen(buf, off + 1);
+    return start + len;
+}
+function zkRsaDerIntAt(buf, off) {
+    if (buf[off] !== 0x02) throw new Error('DER: expected INTEGER at ' + off);
+    const { len, start } = zkRsaDerLen(buf, off + 1);
+    return { v: zkRsaBytesToBig(buf.subarray(start, start + len)), next: start + len };
+}
+function zkRsaDerInts(buf, start, end, count) {
+    const out = [];
+    let i = start;
+    for (let k = 0; k < count && i < end; k++) {
+        const r = zkRsaDerIntAt(buf, i);
+        out.push(r.v);
+        i = r.next;
+    }
+    return out;
+}
+function zkRsaParsePkcs1(der) {
+    const seq = zkRsaDerSeq(der, 0);
+    const [v, n, e, d, p, q] = zkRsaDerInts(der, seq.s, seq.e, 6);
+    if (v !== 0n && v !== 1n) throw new Error('unsupported PKCS#1 version');
+    if (!n || !e) throw new Error('PKCS#1: missing modulus/exponent');
+    return { n, e, d, p, q };
+}
+function zkRsaParsePkcs8(der) {
+    const seq = zkRsaDerSeq(der, 0);
+    let i = seq.s;
+    i = zkRsaDerIntAt(der, i).next;                 // version
+    const alg = zkRsaDerSeq(der, i);                // AlgorithmIdentifier
+    const ab = der.subarray(alg.s, alg.e);
+    const isRsa = ab[0] === 0x06 && ab[1] === 0x09 &&
+        ab[2] === 0x2a && ab[3] === 0x86 && ab[4] === 0x48 &&
+        ab[5] === 0x86 && ab[6] === 0xf7 && ab[7] === 0x0d &&
+        ab[8] === 0x01 && ab[9] === 0x01 && ab[10] === 0x01;
+    if (!isRsa) throw new Error('PKCS#8 key is not rsaEncryption — only RSA keys are supported');
+    i = alg.next;
+    if (der[i] !== 0x04) throw new Error('PKCS#8: expected OCTET STRING');
+    const { len, start } = zkRsaDerLen(der, i + 1);
+    return zkRsaParsePkcs1(der.subarray(start, start + len));
+}
+function zkRsaParseX509(der) {
+    const cert = zkRsaDerSeq(der, 0);
+    const tbs = zkRsaDerSeq(der, cert.s);
+    let i = tbs.s;
+    // optional [0] version; then serial, sig, issuer, validity, subject, SPKI
+    if (der[i] === 0xa0) i = zkRsaDerSkip(der, i);
+    i = zkRsaDerIntAt(der, i).next;                 // serial
+    i = zkRsaDerSeq(der, i).next;                   // signature alg
+    i = zkRsaDerSeq(der, i).next;                   // issuer
+    i = zkRsaDerSeq(der, i).next;                   // validity
+    i = zkRsaDerSeq(der, i).next;                   // subject
+    const spki = zkRsaDerSeq(der, i);               // subjectPublicKeyInfo
+    const alg = zkRsaDerSeq(der, spki.s);
+    // rsaEncryption OID = 1.2.840.113549.1.1.1 → 06 09 2a 86 48 86 f7 0d 01 01 01
+    const algBytes = der.subarray(alg.s, alg.e);
+    const isRsa = algBytes[0] === 0x06 && algBytes[1] === 0x09 &&
+        algBytes[2] === 0x2a && algBytes[3] === 0x86 && algBytes[4] === 0x48 &&
+        algBytes[5] === 0x86 && algBytes[6] === 0xf7 && algBytes[7] === 0x0d &&
+        algBytes[8] === 0x01 && algBytes[9] === 0x01 && algBytes[10] === 0x01;
+    if (!isRsa) throw new Error('certificate is not an RSA key (S/MIME RSA certs only)');
+    const bitStr = alg.next;
+    if (der[bitStr] !== 0x03) throw new Error('SPKI: expected BIT STRING');
+    const bl = zkRsaDerLen(der, bitStr + 1);
+    const inner = zkRsaDerSeq(der, bl.start + 1);   // +1: unused-bits octet
+    const [n, e] = zkRsaDerInts(der, inner.s, inner.e, 2);
+    return { n, e };
+}
+
+// ---------- OpenPGP ---------------------------------------------------------
+function zkRsaCrc24(u8) {
+    let crc = 0xb704ce;
+    for (const b of u8) {
+        crc ^= b << 16;
+        for (let i = 0; i < 8; i++) {
+            crc <<= 1;
+            if (crc & 0x1000000) crc ^= 0x1864cfb;
+        }
+    }
+    return crc & 0xffffff;
+}
+function zkRsaPgpPackets(text) {
+    const m = /-----BEGIN PGP ([A-Z ]+) BLOCK-----([\s\S]*?)-----END PGP \1 BLOCK-----/.exec(text);
+    if (!m) throw new Error('not an OpenPGP armored block');
+    const kind = m[1];
+    const body = m[2];
+    const crcMatch = /\n=([A-Za-z0-9+/]{4})\n/.exec(body);
+    const b64 = body.replace(/^.*?\n\n/s, '').split(/\n=/)[0].replace(/\s+/g, '');
+    const bin = zkRsaB64ToBytes(b64);
+    if (crcMatch) {
+        const want = zkRsaBytesToBig(zkRsaB64ToBytes(crcMatch[1]));
+        const got = BigInt(zkRsaCrc24(bin));
+        if (want !== got) throw new Error('PGP armor CRC mismatch — truncated or tampered block');
+    }
+    const out = [];
+    let i = 0;
+    while (i < bin.length) {
+        const b = bin[i++];
+        if (!(b & 0x80)) throw new Error('malformed PGP packet header');
+        let tag, len;
+        if (b & 0x40) {                              // new format
+            tag = b & 0x3f;
+            const l = bin[i];
+            if (l < 192) { len = l; i += 1; }
+            else if (l < 224) { len = ((l - 192) << 8) + bin[i + 1] + 192; i += 2; }
+            else if (l === 255) { len = (bin[i + 1] << 24) | (bin[i + 2] << 16) | (bin[i + 3] << 8) | bin[i + 4]; i += 5; }
+            else throw new Error('partial body lengths are not supported in key packets');
+        } else {                                     // old format
+            tag = (b >> 2) & 0x0f;
+            const lt = b & 3;
+            if (lt === 0) { len = bin[i]; i += 1; }
+            else if (lt === 1) { len = (bin[i] << 8) | bin[i + 1]; i += 2; }
+            else if (lt === 2) { len = (bin[i] << 24) | (bin[i + 1] << 16) | (bin[i + 2] << 8) | bin[i + 3]; i += 4; }
+            else { len = bin.length - i; }
+        }
+        if (i + len > bin.length) throw new Error('PGP packet overruns the block');
+        out.push({ tag, body: bin.subarray(i, i + len) });
+        i += len;
+    }
+    return { kind, packets: out };
+}
+function zkRsaPgpMpi(buf, off) {
+    if (off + 2 > buf.length) throw new Error('MPI overruns packet');
+    const bits = (buf[off] << 8) | buf[off + 1];
+    const nb = Math.ceil(bits / 8);
+    if (off + 2 + nb > buf.length) throw new Error('MPI value overruns packet');
+    return { v: zkRsaBytesToBig(buf.subarray(off + 2, off + 2 + nb)), next: off + 2 + nb };
+}
+function zkRsaParsePgp(text) {
+    const { kind, packets } = zkRsaPgpPackets(text);
+    const keyPacket = packets.find((p) => p.tag === 6 || p.tag === 5);
+    if (!keyPacket) throw new Error('no OpenPGP key packet found in this block');
+    const isSecret = keyPacket.tag === 5;
+    const body = keyPacket.body;
+    if (body[0] !== 4) throw new Error('unsupported OpenPGP key version ' + body[0] + ' (v4 only — v2/v3 keys are obsolete)');
+    const algo = body[5];
+    if (algo !== 1 && algo !== 2 && algo !== 3) {
+        throw new Error('not an RSA OpenPGP key (algorithm id ' + algo + ') — this tool only handles RSA (1/2/3)');
+    }
+    let off = 6;
+    const n = zkRsaPgpMpi(body, off); off = n.next;
+    const e = zkRsaPgpMpi(body, off); off = e.next;
+    const material = body.subarray(0, off);
+    const result = {
+        format: isSecret ? 'pgp-secret' : 'pgp-public',
+        n: n.v, e: e.v, material,
+    };
+    if (isSecret) {
+        if (off >= body.length) throw new Error('secret key packet missing the s2k usage octet');
+        const usage = body[off];
+        if (usage !== 0) {
+            throw new Error('this secret key is PASSPHRASE-PROTECTED (s2k usage ' + usage + '). This tool refuses to handle passphrases by design: export an unencrypted copy on a trusted machine with `gpg --pinentry-mode loopback --passphrase \'\' --export-secret-keys --armor NAME`, use it here, then delete it.');
+        }
+        off++;
+        const d = zkRsaPgpMpi(body, off); off = d.next;
+        const p = zkRsaPgpMpi(body, off); off = p.next;
+        const q = zkRsaPgpMpi(body, off); off = q.next;
+        result.d = d.v; result.p = p.v; result.q = q.v;
+    }
+    return result;
+}
+async function zkRsaPgpFingerprintHex(material) {
+    const pre = new Uint8Array(material.length + 3);
+    pre[0] = 0x99;
+    pre[1] = (material.length >> 8) & 0xff;
+    pre[2] = material.length & 0xff;
+    pre.set(material, 3);
+    return zkRsaSha1Hex(pre);
+}
+
+// ---------- raw n/e ---------------------------------------------------------
+function zkRsaParseRaw(text) {
+    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+    let nHex = null, eVal = null;
+    for (const l of lines) {
+        let m = /^n\s*[=:]\s*(0x)?([0-9a-fA-F]+)$/.exec(l);
+        if (m) { nHex = m[2]; continue; }
+        m = /^e\s*[=:]\s*(\d+)$/.exec(l);
+        if (m) { eVal = m[1]; continue; }
+        m = /^modulus\s*=\s*([0-9a-fA-F]+)$/i.exec(l);
+        if (m) { nHex = m[1]; continue; }
+        if (!nHex && /^[0-9a-fA-F]{256,}$/.test(l)) { nHex = l; continue; }
+    }
+    if (!nHex) throw new Error('no modulus found — paste `n=<hex>` and `e=65537` lines (or `openssl rsa -noout -modulus` output)');
+    return { n: BigInt('0x' + nHex), e: BigInt(eVal || '65537') };
+}
+
+// ---------- unified key entry ------------------------------------------------
+async function zkRsaParseAny(text) {
+    const t = (text || '').trim();
+    if (!t) throw new Error('empty key input');
+    let key = null;
+    if (/-----BEGIN PGP /.test(t)) {
+        key = zkRsaParsePgp(t);
+        key.pgp_fingerprint = await zkRsaPgpFingerprintHex(key.material);
+        delete key.material;
+    } else if (/-----BEGIN CERTIFICATE-----/.test(t)) {
+        const blk = zkRsaPemBlock(t);
+        if (!blk) throw new Error('bad PEM certificate');
+        key = { ...zkRsaParseX509(blk.der), format: 'x509' };
+    } else if (/-----BEGIN (RSA )?PRIVATE KEY-----/.test(t)) {
+        const blk = zkRsaPemBlock(t);
+        if (!blk) throw new Error('bad PEM private key');
+        const inner = /PKCS8/.test(blk.label) || blk.label === 'PRIVATE KEY'
+            ? zkRsaParsePkcs8(blk.der) : zkRsaParsePkcs1(blk.der);
+        key = { ...inner, format: blk.label.includes('RSA') ? 'pkcs1' : 'pkcs8' };
+    } else {
+        key = { ...zkRsaParseRaw(t), format: 'raw' };
+    }
+    if (!key.n || !key.e) throw new Error('key parse produced no RSA modulus/exponent');
+    const bits = zkRsaBitLen(key.n);
+    if (bits < 1024) throw new Error('RSA modulus is only ' + bits + ' bits — refusing (minimum 1024, 2048+ expected)');
+    if (key.e < 3n || (key.e & 1n) === 0n || key.e > 0xffffffffn) throw new Error('implausible public exponent e=' + key.e);
+    const nHex = zkRsaBigToHex(key.n);
+    const eStr = key.e.toString(10);
+    key.bits = bits;
+    key.e_str = eStr;
+    key.fp = await zkRsaSha256Hex('pav-rsa-fp/v1\n' + nHex + ':' + eStr);
+    key.hasPrivate = !!key.d;
+    return key;
+}
+
+// ---------- canonical identity ----------------------------------------------
+function zkRsaBuildIdentity(key, attrsText) {
+    let attrs;
+    try { attrs = JSON.parse(attrsText || '{}'); } catch (e) {
+        throw new Error('attributes are not valid JSON: ' + e.message);
+    }
+    if (!attrs || typeof attrs !== 'object' || Array.isArray(attrs)) {
+        throw new Error('attributes must be a JSON object like {"label": "…"}');
+    }
+    const json = JSON.stringify({
+        v: 1,
+        key: { alg: 'RSA', n: zkRsaBigToHex(key.n), e: key.e_str, fp: key.fp, pgp_fp: key.pgp_fingerprint || null },
+        attrs,
+    });
+    return { json, bytes: zkRsaUtf8(json) };
+}
+
+// ---------- credential: challenge + prove -----------------------------------
+function zkRsaChallengePayload(cred) {
+    return JSON.stringify({
+        p: 'pav-rsa-escrow-gq/v1',
+        k: { n: cred.issuer_key.n, e: cred.issuer_key.e, fp: cred.issuer_key.fp },
+        idh: cred.identity_hash,
+        esc: {
+            r: cred.escrow.recipient_fp,
+            a: cred.escrow.alg,
+            ek: cred.escrow.ek,
+            iv: cred.escrow.iv,
+            ct: cred.escrow.ct,
+        },
+        st: { d: cred.statement.domain, n: cred.statement.nonce, u: cred.statement.purpose },
+        cm: { g: cred.proof.g, t: cred.proof.t },
+    });
+}
+async function zkRsaChallengeHex(cred) {
+    return zkRsaSha256Hex(zkRsaChallengePayload(cred));
+}
+
+async function zkRsaEscrowEncrypt(recipKey, identityBytes) {
+    const jwk = {
+        kty: 'RSA',
+        n: zkRsaB64url(zkRsaBigToBytes(recipKey.n)),
+        e: zkRsaB64url(zkRsaBigToBytes(recipKey.e)),
+    };
+    const pub = await crypto.subtle.importKey('jwk', jwk, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['encrypt']);
+    const ek = crypto.getRandomValues(new Uint8Array(32));
+    const wrapped = new Uint8Array(await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, pub, ek));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const aes = await crypto.subtle.importKey('raw', ek, 'AES-GCM', false, ['encrypt']);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aes, identityBytes));
+    return { recipient_fp: recipKey.fp, alg: 'RSA-OAEP-256+AES-256-GCM', ek: zkRsaB64(wrapped), iv: zkRsaB64(iv), ct: zkRsaB64(ct) };
+}
+
+async function zkRsaProve(opts) {
+    const key = opts.key;
+    if (!key || !key.hasPrivate) throw new Error('the parsed key has no private part — paste your SECRET key / private PEM to prove');
+    if (!key.p || !key.q) throw new Error('private key is missing its primes (p/q) — PGP secret keys and PEM keys carry them; re-export the key');
+    const identity = zkRsaBuildIdentity(key, opts.attrsText);
+    if (!opts.recipientKey) throw new Error('a recipient public key is required — this is an ESCROW credential (paste it in step 2)');
+    const n = key.n, e = key.e, d = key.d, p = key.p, q = key.q;
+
+    const cred = {
+        type: 'pav-rsa-escrow',
+        version: 1,
+        created_utc: new Date().toISOString(),
+        issuer_key: {
+            alg: 'RSA', bits: key.bits,
+            n: zkRsaBigToHex(n), e: key.e_str, fp: key.fp,
+            pgp_fingerprint: key.pgp_fingerprint || null,
+        },
+        identity_hash: await zkRsaSha256Hex(identity.bytes),
+        escrow: await zkRsaEscrowEncrypt(opts.recipientKey, identity.bytes),
+        statement: {
+            domain: String(opts.domain || ''),
+            nonce: String(opts.nonce || ''),
+            purpose: String(opts.purpose || ''),
+        },
+        proof: { g: '', t: '', c: '', z: '' },
+    };
+
+    // s = g^d mod n — CRT (two 1024-bit modexps instead of one 2048-bit one)
+    const g = zkRsaRandGroupElem(n);
+    const dp = d % (p - 1n), dq = d % (q - 1n);
+    const qinv = zkRsaModInv(q, p);
+    const sp = zkRsaModPow(g % p, dp, p);
+    const sq = zkRsaModPow(g % q, dq, q);
+    let h = (qinv * (((sp - sq) % p) + p)) % p;
+    const s = sq + q * h;
+    if (zkRsaModPow(s, e, n) !== g) throw new Error('internal check failed: d does not match the public key (wrong private key for this modulus)');
+
+    const w = zkRsaRandGroupElem(n);
+    const t = zkRsaModPow(w, e, n);
+    cred.proof.g = zkRsaBigToHex(g);
+    cred.proof.t = zkRsaBigToHex(t);
+    cred.proof.c = await zkRsaChallengeHex(cred);
+    const c = BigInt('0x' + cred.proof.c);
+    const z = (w * zkRsaModPow(s, c, n)) % n;
+    cred.proof.z = zkRsaBigToHex(z);
+    return cred;
+}
+
+// ---------- verify -----------------------------------------------------------
+async function zkRsaVerify(cred, expected) {
+    const rows = [];
+    const yes = (t, d) => rows.push({ cls: 'verified', icon: '✅', title: t, detail: d });
+    const no = (t, d) => rows.push({ cls: 'failed', icon: '❌', title: t, detail: d });
+    const warn = (t, d) => rows.push({ cls: 'warning', icon: '⚠️', title: t, detail: d });
+    expected = expected || {};
+
+    if (!cred || typeof cred !== 'object') return { ok: false, rows: [{ cls: 'failed', icon: '❌', title: 'not a credential', detail: 'expected a JSON object' }] };
+    if (cred.type !== 'pav-rsa-escrow' || cred.version !== 1) no('credential type/version', 'expected type "pav-rsa-escrow" v1, got ' + JSON.stringify(cred.type) + ' v' + cred.version);
+    else yes('credential shape', 'pav-rsa-escrow v1');
+
+    let n, e;
+    try {
+        if (!cred.issuer_key || !/^[0-9a-f]{64,}$/.test(cred.issuer_key.fp || '')) throw new Error('missing issuer fingerprint');
+        n = BigInt('0x' + cred.issuer_key.n);
+        e = BigInt(cred.issuer_key.e);
+        const bits = zkRsaBitLen(n);
+        if (bits < 1024) throw new Error('modulus only ' + bits + ' bits');
+        yes('issuer key well-formed', 'RSA-' + bits + ', e=' + e + ', fp ' + cred.issuer_key.fp.slice(0, 24) + '…');
+        if (bits < 2048) warn('key strength', 'only ' + bits + ' bits — below the 2048-bit floor expected for whistleblower-grade keys');
+    } catch (err) { no('issuer key well-formed', err.message); return { ok: false, rows }; }
+
+    const fp = await zkRsaSha256Hex('pav-rsa-fp/v1\n' + cred.issuer_key.n + ':' + cred.issuer_key.e);
+    if (fp !== cred.issuer_key.fp) no('fingerprint re-derives from n,e', 'stored ' + cred.issuer_key.fp.slice(0, 20) + '… ≠ recomputed ' + fp.slice(0, 20) + '…');
+    else yes('fingerprint re-derives from n,e', fp.slice(0, 32) + '…');
+
+    if (!/^[0-9a-f]{64}$/.test(cred.identity_hash || '')) no('identity hash', 'not a SHA-256 hex digest');
+    else yes('identity hash present (public)', cred.identity_hash.slice(0, 32) + '… — decrypting the escrow must reproduce it');
+
+    if (!cred.escrow || !cred.escrow.ct) no('escrow ciphertext', 'missing — this is not an escrow credential');
+    else yes('escrow ciphertext', cred.escrow.alg + ' → recipient ' + (cred.escrow.recipient_fp || '').slice(0, 24) + '…');
+
+    let cRecomputed = null;
+    try {
+        if (!cred.proof || !cred.proof.g || !cred.proof.t || !cred.proof.c || !cred.proof.z) throw new Error('proof fields missing');
+        const g = BigInt('0x' + cred.proof.g);
+        const t = BigInt('0x' + cred.proof.t);
+        const z = BigInt('0x' + cred.proof.z);
+        const c = BigInt('0x' + cred.proof.c);
+        if (g <= 1n || g >= n || z <= 0n || z >= n || t <= 0n || t >= n) throw new Error('proof element out of range [1, n)');
+
+        cRecomputed = await zkRsaChallengeHex(cred);
+        if (cRecomputed !== cred.proof.c) {
+            no('challenge binds the full statement', 'recomputed c ≠ embedded c — a field (nonce, domain, ciphertext, hash, commitments) was altered after proving');
+        } else {
+            yes('challenge binds the full statement', 'SHA-256 over n, e, fp, identity hash, ciphertext, domain, nonce, purpose, commitments g‖t');
+        }
+
+        const lhs = zkRsaModPow(z, e, n);
+        const rhs = (t * zkRsaModPow(g, c, n)) % n;
+        if (lhs !== rhs) no('Guillou–Quisquater relation (z^e ≡ t·g^c mod n)', 'equation fails — proof is invalid or was not produced for this key');
+        else yes('Guillou–Quisquater relation (z^e ≡ t·g^c mod n)', 'holds for this modulus — only the private exponent could have produced z');
+    } catch (err) { no('proof structure', err.message); }
+
+    if (cRecomputed === cred.proof.c) {
+        if (expected.nonce != null && expected.nonce !== '') {
+            if (cred.statement.nonce !== expected.nonce) no('nonce matches what you expected', 'credential carries ' + JSON.stringify(cred.statement.nonce).slice(0, 48));
+            else yes('nonce matches what you expected', cred.statement.nonce.slice(0, 48));
+        }
+        if (expected.domain != null && expected.domain !== '') {
+            if (cred.statement.domain !== expected.domain) no('domain matches what you expected', 'credential carries ' + JSON.stringify(cred.statement.domain).slice(0, 64));
+            else yes('domain matches what you expected', cred.statement.domain);
+        }
+        if (expected.fp != null && expected.fp !== '') {
+            const want = expected.fp.replace(/[\s:]/g, '').toLowerCase();
+            const got = [cred.issuer_key.fp, cred.issuer_key.pgp_fingerprint || '']
+                .map((x) => String(x).replace(/[\s:]/g, '').toLowerCase());
+            if (!got.some((x) => x === want || x.startsWith(want))) no('key fingerprint matches the expected key', 'expected ' + want.slice(0, 32) + '…');
+            else yes('key fingerprint matches the expected key', want.slice(0, 32) + '…');
+        }
+        yes('statement', 'domain=' + JSON.stringify(cred.statement.domain) + ' purpose=' + JSON.stringify(cred.statement.purpose) + ' nonce=' + JSON.stringify(cred.statement.nonce).slice(0, 40));
+        warn('binding completeness (by design, no circuit)', 'the proof binds YOU to this exact ciphertext+hash pair; the plaintext↔hash tie is completed by the RECIPIENT after decrypting (use the check below)');
+    }
+
+    const ok = rows.every((r) => r.cls !== 'failed');
+    return { ok, rows };
+}
+
+// ---------- escrow open (recipient-side binding completion) ------------------
+async function zkRsaEscrowOpen(cred, recipientPrivText) {
+    const key = await zkRsaParseAny(recipientPrivText);
+    if (!key.hasPrivate) throw new Error('the pasted recipient key has no private part — paste the RECIPIENT\'S private key (only they can open the escrow)');
+    const jwk = {
+        kty: 'RSA',
+        n: zkRsaB64url(zkRsaBigToBytes(key.n)),
+        e: zkRsaB64url(zkRsaBigToBytes(key.e)),
+        d: zkRsaB64url(zkRsaBigToBytes(key.d)),
+        p: zkRsaB64url(zkRsaBigToBytes(key.p)),
+        q: zkRsaB64url(zkRsaBigToBytes(key.q)),
+        dp: zkRsaB64url(zkRsaBigToBytes(key.d % (key.p - 1n))),
+        dq: zkRsaB64url(zkRsaBigToBytes(key.d % (key.q - 1n))),
+        qi: zkRsaB64url(zkRsaBigToBytes(zkRsaModInv(key.q, key.p))),
+    };
+    const priv = await crypto.subtle.importKey('jwk', jwk, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['decrypt']);
+    const ek = new Uint8Array(await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, priv, zkRsaB64ToBytes(cred.escrow.ek)));
+    const aes = await crypto.subtle.importKey('raw', ek, 'AES-GCM', false, ['decrypt']);
+    const pt = new Uint8Array(await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: zkRsaB64ToBytes(cred.escrow.iv) }, aes, zkRsaB64ToBytes(cred.escrow.ct)));
+    const json = new TextDecoder().decode(pt);
+    const hash = await zkRsaSha256Hex(pt);
+    return { json, bytes: pt, hash, matches: hash === cred.identity_hash };
+}
+
+// ===========================================================================
+// UI wiring (all guarded — the security harness evals this script headlessly)
+// ===========================================================================
+function zkRsa$(id) { return (typeof document !== 'undefined' && document.getElementById) ? document.getElementById(id) : null; }
+function zkRsaSet(id, msg, color) {
+    const el = zkRsa$(id);
+    if (el) { el.innerText = msg; el.style.color = color || 'var(--text-dim)'; }
+}
+function zkRsaFileInto(input, targetId) {
+    const f = input && input.files && input.files[0];
+    if (!f) return;
+    f.text().then((t) => { const el = zkRsa$(targetId); if (el) el.value = t; });
+}
+function zkRsaNewNonce() {
+    const el = zkRsa$('zkRsaNonceIn');
+    if (el) el.value = zkRsaBytesHex(crypto.getRandomValues(new Uint8Array(16)));
+}
+
+let zkRsaParsedSigner = null;
+let zkRsaParsedRecipient = null;
+
+async function zkRsaParseKeyBox() {
+    const el = zkRsa$('zkRsaKeyIn');
+    try {
+        zkRsaParsedSigner = await zkRsaParseAny(el ? el.value : '');
+        const k = zkRsaParsedSigner;
+        zkRsaSet('zkRsaKeyStatus',
+            '✅ ' + k.format + ' · RSA-' + k.bits + ' · e=' + k.e_str +
+            ' · fp ' + k.fp.slice(0, 24) + '…' +
+            (k.pgp_fingerprint ? ' · PGP fp ' + k.pgp_fingerprint : '') +
+            (k.hasPrivate ? ' · 🔑 private — ready to prove' : ' · 📖 public only — parses for recipient/verify, cannot prove'),
+            k.hasPrivate ? '#3fb950' : '#d29922');
+        return k;
+    } catch (err) {
+        zkRsaParsedSigner = null;
+        zkRsaSet('zkRsaKeyStatus', '❌ ' + err.message, '#f85149');
+        return null;
+    }
+}
+async function zkRsaParseRecipientBox() {
+    const el = zkRsa$('zkRsaRecipientIn');
+    if (!el || !el.value.trim()) { zkRsaParsedRecipient = null; return null; }
+    try {
+        const k = await zkRsaParseAny(el.value);
+        zkRsaParsedRecipient = k;
+        zkRsaSet('zkRsaRecipientStatus', '✅ recipient ' + k.format + ' · RSA-' + k.bits + ' · fp ' + k.fp.slice(0, 24) + '…', '#3fb950');
+        return k;
+    } catch (err) {
+        zkRsaParsedRecipient = null;
+        zkRsaSet('zkRsaRecipientStatus', '❌ ' + err.message, '#f85149');
+        return null;
+    }
+}
+
+async function zkRsaGenerateCredential() {
+    const status = (m, c) => zkRsaSet('zkRsaGenStatus', m, c || 'var(--text-dim)');
+    try {
+        if (!crypto || !crypto.subtle) throw new Error('WebCrypto unavailable — open the Pages (https://) copy in a current browser');
+        status('⏳ parsing keys…');
+        if (!zkRsaParsedSigner) zkRsaParsedSigner = await zkRsaParseKeyBox();
+        if (!zkRsaParsedSigner) throw new Error('fix the key in step 1 first');
+        const recipientKey = await zkRsaParseRecipientBox();
+        if (!recipientKey) throw new Error('paste the recipient public key in step 2 (escrow target)');
+
+        const attrsEl = zkRsa$('zkRsaAttrsIn');
+        const domainEl = zkRsa$('zkRsaDomainIn');
+        const nonceEl = zkRsa$('zkRsaNonceIn');
+        const purposeEl = zkRsa$('zkRsaPurposeIn');
+        let nonce = nonceEl ? nonceEl.value.trim() : '';
+        if (!nonce) {
+            nonce = zkRsaBytesHex(crypto.getRandomValues(new Uint8Array(16)));
+            if (nonceEl) nonceEl.value = nonce;
+        }
+
+        status('⏳ proving (RSA modexp in this tab)…');
+        const cred = await zkRsaProve({
+            key: zkRsaParsedSigner,
+            attrsText: attrsEl ? attrsEl.value : '{}',
+            recipientKey,
+            domain: domainEl ? domainEl.value.trim() : '',
+            nonce,
+            purpose: purposeEl ? purposeEl.value.trim() : '',
+        });
+
+        const out = zkRsa$('zkRsaCredentialOut');
+        if (out) out.value = JSON.stringify(cred, null, 2);
+        const card = zkRsa$('zkRsaResultCard');
+        if (card) card.style.display = 'block';
+        status('✅ credential ready — proof by ' + zkRsaParsedSigner.format + ', identity encrypted to fp ' +
+            cred.escrow.recipient_fp.slice(0, 24) + '…. Nothing left this tab.', '#3fb950');
+        return cred;
+    } catch (err) {
+        status('❌ ' + err.message, '#f85149');
+        return null;
+    }
+}
+
+function zkRsaRenderRows(containerId, rows) {
+    const box = zkRsa$(containerId);
+    if (!box) return;
+    box.innerHTML = rows.map((r) =>
+        '<div class="check-item ' + r.cls + '"><div class="check-icon">' + r.icon + '</div>' +
+        '<div class="check-text"><h4>' + r.title + '</h4><p>' + String(r.detail).replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</p></div></div>'
+    ).join('');
+}
+
+async function zkRsaVerifyCredential() {
+    const el = zkRsa$('zkRsaVerifyIn');
+    try {
+        if (!el || !el.value.trim()) throw new Error('paste a credential JSON first');
+        const cred = JSON.parse(el.value);
+        const res = await zkRsaVerify(cred, {
+            nonce: (zkRsa$('zkRsaExpectNonce') || {}).value || '',
+            domain: (zkRsa$('zkRsaExpectDomain') || {}).value || '',
+        });
+        zkRsaRenderRows('zkRsaVerifyRows', res.rows);
+        return res;
+    } catch (err) {
+        zkRsaRenderRows('zkRsaVerifyRows', [{ cls: 'failed', icon: '❌', title: 'credential not readable', detail: err.message }]);
+        return { ok: false };
+    }
+}
+
+async function zkRsaCheckBinding() {
+    try {
+        const credEl = zkRsa$('zkRsaVerifyIn');
+        const privEl = zkRsa$('zkRsaRecipientPriv');
+        if (!credEl || !credEl.value.trim()) throw new Error('paste the credential above first');
+        if (!privEl || !privEl.value.trim()) throw new Error('paste the recipient PRIVATE key to open the escrow');
+        const cred = JSON.parse(credEl.value);
+        const opened = await zkRsaEscrowOpen(cred, privEl.value);
+        const rows = [];
+        if (opened.matches) rows.push({ cls: 'verified', icon: '✅', title: 'binding completed: plaintext hash == identity_hash', detail: opened.hash.slice(0, 32) + '…' });
+        else rows.push({ cls: 'failed', icon: '❌', title: 'binding FAILED: decrypted bytes hash to ' + opened.hash.slice(0, 24) + '…', detail: 'credential claims ' + String(cred.identity_hash).slice(0, 24) + '… — the ciphertext and hash disagree (or wrong recipient key)' });
+        let idDesc;
+        try {
+            const id = JSON.parse(opened.json);
+            idDesc = 'key fp ' + String((id.key && id.key.fp) || '?').slice(0, 24) + '…' +
+                (id.key && id.key.pgp_fp ? ' · PGP fp ' + id.key.pgp_fp : '') +
+                ' · attrs ' + JSON.stringify(id.attrs || {}).slice(0, 220);
+        } catch { idDesc = opened.json.slice(0, 220); }
+        rows.push({ cls: 'verified', icon: '📦', title: 'decrypted identity (recipient eyes only)', detail: idDesc });
+        zkRsaRenderRows('zkRsaBindingRows', rows);
+        return opened;
+    } catch (err) {
+        zkRsaRenderRows('zkRsaBindingRows', [{ cls: 'failed', icon: '❌', title: 'could not open the escrow', detail: err.message }]);
+        return null;
+    }
+}
+
+function zkRsaCopyOut() {
+    const el = zkRsa$('zkRsaCredentialOut');
+    if (el && navigator.clipboard) navigator.clipboard.writeText(el.value);
+}
+function zkRsaDownloadOut() {
+    const el = zkRsa$('zkRsaCredentialOut');
+    if (!el) return;
+    const blob = new Blob([el.value], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'rsa-escrow-credential.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+}
+
+if (typeof document !== 'undefined' && document.addEventListener) {
+    document.addEventListener('DOMContentLoaded', function () {
+        const dom = (typeof location !== 'undefined' && location.host) ? location.host : '';
+        const d = zkRsa$('zkRsaDomainIn');
+        if (d && !d.value) d.placeholder = dom || 'drop.example.org';
+        if (typeof crypto === 'undefined' || !crypto.subtle) {
+            zkRsaSet('zkRsaGenStatus', '❌ WebCrypto unavailable — serve over https:// (GitHub Pages) or use a current browser', '#f85149');
+        }
+    });
+}
+</script>
+</body>
+</html>
