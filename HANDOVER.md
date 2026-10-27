@@ -507,6 +507,53 @@ fail-loud guard).
 
 ---
 
+## 0.19 v195 deploy cycle — the ESP-only split deploy + the handoff-origin fix the gate caught (2026-10-27)
+
+**The deploy** (user directive: run the ESP-only cycle so the enclave serves
+the split auditor). No pin rotation by design: rebuilt binary
+`b0dd6180…` + initramfs `529358c9…` **byte-identical to live**, disk
+`11ce5b59…` differs from the deployed ESP **only in `verify.html`** (parity
+5 same → after deploy `check-manifest-parity` **PARITY OK, 6 same, 0
+mismatched**). Chain: HK staging `paypal-auth-vm/disk194.raw` (ETag==md5) →
+relay188 RunCommand hop (HK GET → Beijing **intranet** PUT → read-back md5
+verified, `relay-ok-v194.txt`) → `ImportImage` (flat `--DiskDeviceMapping.1.Format`,
+task `t-2ze27p6937at3pm0vvrs`) → image **`m-2ze27p6937at3pm0763t`** Available
+→ flat-wire RPC `Features.NvmeSupport=supported` (verified in DescribeImages)
+→ prod in-place swap: `StopInstance` → `ReplaceSystemDisk` → system disk
+**`d-2ze15nhjh4dvrs1ghwi4`** (20 G cloud_auto) → **user_data byte-identical to
+the pre-swap backup (5,836 B b64 — no re-push needed this cycle)** → `StartInstance`
+→ TLS 200 at ~t+180 s. **§0.18's prediction is now discharged: `served ==
+repo == README` for `verify.html` = `5fd32b9e…`** — the enclave copy is the
+slim split auditor.
+
+**The gate caught a real defect** (first run of `/tmp/dbg5.mjs`, 9/1): zk.html's
+handoff origin gate (`ev.origin !== 'https://leonardopedro.github.io'`) dropped
+every postMessage from the enclave, so the deployed auditor's "⚡ Open the ZK
+escrow prover" button ALWAYS spun out its 10 s timeout and forced the manual
+paste path. **Fix (commit `c076e01`, pushed `alibabacloud` + `main` → Pages
+`1beb6b78…`)**: `ZK_HANDOFF_ORIGINS = [Pages, https://login.airma.de]` — the
+measured enclave is a pinned opener; `zkStashIdentity` still re-verifies every
+handed-over identity fail-closed (band, hash re-derivation, SIGNED raw-hash)
+regardless of origin. Pages-only change: **no enclave rebuild, no pin rotation**
+— exactly what the split was built for. README `zk.html` row rotated same-commit
+(**111,684 B, `1beb6b78…`**). Regression measurement (dbg4 stress, same day):
+the OLD raw 32-byte scalar draw failed **6/20 (30%)**, the fixed `zkRandomScalar`
+draw **10/10** + **5/5** consecutive browser proves (~3.3 s each).
+
+**v195 final gates (all on the deployed cycle build)** · harness **380/0** plain
+· **390/0** strict (`REAL_REPORT` + `PAGES_PARITY=1`) · `check-manifest-parity`
+**PARITY OK** (6 same incl. verify.html) · served == repo == README
+`5fd32b9e…`, Pages `zk.html` == repo `1beb6b78…` · heartbeat `boot/latest.json`
+`{kind:ok, stage:serving, uptime_s:181}` from the current boot · dbg1 HTTP
+surface **34/0** (section D re-pointed at the split's zk.html) · dbg4 Pages split
+**18/0** (handoff-seeded proof + 5× prove + tampered-hash refused) · **dbg5
+enclave-copy split 14/0** (handoff ACKED from `login.airma.de`, real proof,
+versioned `?v=` fetches, paste fallback green) · **live PayPal sandbox e2e PASS
+×2** (verified 09:06:41Z + full 09:07:18Z, F6 single-prepare = 1) · CI on
+`c076e01` pushed both branches.
+
+---
+
 ## 2. Where things stand right now (2026-10-20 14:30 UTC)
 
 ### 2.1 Code & CI — round 1 complete, all green
