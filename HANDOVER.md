@@ -455,6 +455,58 @@ non-fix — no deploy.**
 
 ---
 
+## 0.18 v194 cycle — verify.html/zk.html SPLIT + the live witness failure fixed (2026-10-27)
+
+Two user requests, shipped together because the second one IS the reason for
+the first: the ZK layer needs debugging (a live circom witness failure), and
+after the split it iterates on **GitHub Pages alone — no enclave rebuild, no
+pin rotation, no ceremony**.
+
+### The split (commit `a499555`, pushed to `alibabacloud` + `main`)
+
+| Item | Value |
+|---|---|
+| **New `zk.html`** (Pages origin, README-digested) | The WHOLE ZK engine moved verbatim: `#zkCard` (escrow x/y, authority key + keygen, ⚡ prove, credential verify), versioned artifact pins (`?v=`), embedded Groth16 vkey, `zkFetchArtifact`/`zkFetchZkey`, curve math, prove/verify. **Two fail-closed identity loaders** land in the same stash the engine proves from: (1) **postMessage handoff** — accepts ONLY from `https://leonardopedro.github.io`, re-verifies band [248,300] + hash re-derivation + the report's SIGNED `paypal_user_info_raw_hash`, acks `pavZkAck` back; (2) **paste fallback** — the same preimage gate recomputed locally (for file:// auditors and cold opens; a `file://` opener cannot authenticate itself in a message → paste by design). `reportFileText` renamed `zkReportFileText` (each page keeps its own copy — harness co-evals both). |
+| **`verify.html` (slim, 261,710 → 177,053 B, `5fd32b9e…`)** | Keeps the GATE: preimage-gate staging + green-audit stash. The card is now `#zkHandoffCard` (revealed ONLY by a green audit) with `#zkOpenBtn` → `openZkProver()`: opens the pinned zk.html, posts `{pavZkHandoff, identityJson, identityHashHex, reportText}` every 250 ms until the ack (pinned origin OUT, pinned origin IN, both fail closed). vkey + engine + ZK constants deleted. `index.html` re-synced byte-identical; README digest table carries BOTH files (byte counts — the first attempt published JS string lengths, caught by the harness size check). |
+| **Enclave copy = deliberately STALE (user decision: Pages-first)** | `login.airma.de/verify.html` still serves the pre-split auditor (self-contained, its inline ZK card still works — artifacts unchanged). `served == repo` therefore holds only after the NEXT ESP deploy (one ESP-only cycle, no pin rotation — binary/initrd unchanged). The old inline engine still contains the unreduced-r bug below ⇒ the next ESP deploy is also what fixes the enclave copy's prove path. |
+| **Harness** | Co-evals both scripts (verify first, zk second — zk's bindings win, as on the real page). Test 39: handoff card reveal + pinned-link pins + `zkStashIdentity` accept/tamper/wrong-report/refuse-keeps-stash cases. Tests 40/42/43: the auditor copies must NOT carry `zkCard`/`zkCredVkey`/ZK controls (split assertions). Test 46: byte-compares **Pages' `zk.html`** against the repo (the stale-branch trap applies to it too) + reads the artifact pins from `zk.html`. |
+
+### The witness failure — root cause + fix (commit `723e3a0`, pushed both branches)
+
+User's live error, reproduced VERBATIM against the committed build (same
+template/instance IDs):
+
+```
+❌ Error: Assert Failed. Error in template Num2Bits_103 line: 38
+   Error in template BabyPbk_114 line: 97
+   Error in template IdentityEscrow_191 line: 267
+```
+
+| | |
+|---|---|
+| **Root cause** | The prove path built the ECDH ephemeral scalar from 32 RAW Web-Crypto bytes (`r ∈ [0, 2^256)`), but the circuit decomposes it with `Num2Bits(253)` — in `BabyPbk` (line 267 `rG.in`) AND `rBits` (line 271). Whenever `r mod p ≥ 2^253` the witness calculator dies at `lc1 === in` (bitify.circom:38). Empirically ~1/3 of browser draws fail (mod-p folding makes some ≥2^253 draws pass — hence intermittent: it hit the user, then passed in 3 of 5 local trials before failing). The mocked harness prover can NEVER see this (HANDOVER lesson re-confirmed). |
+| **Fix (input side)** | `var r = zkRandomScalar();` — the page's existing draw (32 bytes → `% ZK_BB_SUBORDER`, refuse 0, retry). SubOrder < 2^253 always, and `R = r·G` is mathematically unchanged by the reduction (`L·G = 0`) so escrow decryption still agrees. **No circuit change ⇒ no rebuild, no new zkey/vkey, no pin rotation** — zk.html + README digest + push to Pages only. |
+| **Regression gates (REAL witness calc)** | `zk/test-witness.mjs`: unreduced `2^253+12345` scalar → REJECTED with the documented chain (match on stdout+stderr — snarkjs splits them), reduced scalar → PASS (both new checks green). Harness Test 44: the same two `wtns calculate` checks + source pin `var r = zkRandomScalar();` with no raw 32-byte draw left in `zk.html`. |
+
+### Gates (all on the pushed build)
+
+✅ harness **380/0** (`PAGES_PARITY=1` strict) · **390/0** with
+`REAL_REPORT=/tmp/claimed-report.json` · `zk/test-witness.mjs` **PASS** (now
+includes the input-contract pair) · **browser split e2e 15/0** (`/tmp/dbg4.mjs`:
+Pages auditor green audit → handoff card → popup zk.html accepts+acks → REAL
+Groth16 proof from versioned URLs, no INTEGRITY FAILURE; cold zk.html paste
+path green + tampered signed-hash refused) · **live PayPal sandbox e2e PASS ×2**
+(verified + full, F6 single-prepare = 1) · Pages serves `verify.html`
+`5fd32b9e…` + `zk.html` `3f70a1ea…` byte-identical to repo · README digests
+match both files · CI runs on `a499555` and `723e3a0` success.
+
+**Builds are byte-reproducible**: `zk.html` is assembled from verify.html's
+exact slices by `/tmp/mk-zk.mjs` + `/tmp/zk-glue.js` (ephemeral `/tmp` tools —
+if gone, the markers are documented in the commit; every replacement has a
+fail-loud guard).
+
+---
+
 ## 2. Where things stand right now (2026-10-20 14:30 UTC)
 
 ### 2.1 Code & CI — round 1 complete, all green
