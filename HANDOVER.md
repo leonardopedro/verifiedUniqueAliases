@@ -554,6 +554,29 @@ versioned `?v=` fetches, paste fallback green) · **live PayPal sandbox e2e PASS
 
 ---
 
+## 0.20 v195b — `zk-rsa.html`: an RSA ZK escrow prover for PGP/S-MIME keys (2026-10-27)
+
+User request: an ALTERNATIVE zero-knowledge proof generator (separate file)
+that works with the RSA keys used on encrypted police/whistleblower mail.
+Scope confirmed via choice cards: **escrow credential like zk.html** ·
+**pure-JS Fiat–Shamir, no trusted setup** · **PGP/GPG + X.509/S-MIME + raw
+n/e** input formats.
+
+| Item | Value |
+|---|---|
+| **New `zk-rsa.html`** (repo root + Pages, 51,405 B, `ce763e20…`) | Parses OpenPGP v4 transferable keys (old+new packet formats, CRC24 armor check, fingerprint = `SHA1(0x99‖len16‖material)`), X.509 certs (DER→SPKI), PKCS#1/PKCS#8 PEM, raw `n=/e=` — all hand-rolled, no library. **Proof = Guillou–Quisquater Σ-protocol, Fiat–Shamir over SHA-256**: `t = w^e`, `c = H(domain‖nonce‖purpose‖fp‖idh‖ciphertext‖g‖t)`, `z = w·(g^d)^c`; verify `z^e ≡ t·g^c (mod n)`. Private exponentiation runs OUTSIDE any circuit (CRT, ~ms). Escrow = hybrid RSA-OAEP-SHA256 + AES-256-GCM to the recipient; `identity_hash` public and challenge-bound. **Honest no-circuit caveat in-UI + as a warning row**: plaintext↔hash tie completed by the RECIPIENT after decrypt (the in-page binding checker does it). Passphrase-protected secret keys refused by design (export guidance in the UI). **Zero network by construction** — no external scripts/fonts/artifacts (system font stack, unlike zk.html's Google Fonts), asserted by the e2e. |
+| **`zk/rsa-test/` fixtures** | TEST-ONLY RSA-2048 pair: PKCS#8 + self-signed X.509 + raw lines + hand-packed PGP pub/sec armors (no gpg on the build host — `mk-pgp.mjs` packs v4 packets, s2k usage 0, CRC24; fingerprint round-trip verified against the fixture generator's own value) + `gen-fixtures.sh`. Fixture README states the keys are throwaway. |
+| **Harness Test 47** (21 checks) | Co-evals the page script (everything `zkRsa`-prefixed → no collision with verify/zk): five-encoding agreement on one fingerprint, PGP fingerprint shape, 2048-bit floor, public-key-can't-prove, **s2k-usage-flip ⇒ PASSPHRASE-PROTECTED refusal**, prove→verify green with expected nonce/domain, no-circuit caveat row present, tamper refusal ×4 (nonce/ciphertext/z/modulus), expected-mismatch flagged, escrow round-trip + attrs + wrong-key rejection, README digest current, no external subresources. |
+| **Browser e2e `/tmp/dbg6.mjs`** | file:// run **19/0**, Pages-origin run **18/0**: real UI parse→prove→verify (zero failed rows)→binding decrypt (attrs recovered)→tamper red row→4 formats via the page parser→**no request outside the page origin**. |
+| **Gates** | harness plain **401/0**, strict (`REAL_REPORT`+`PAGES_PARITY=1`) **411/0** · Pages serves `zk-rsa.html` byte-identical (`200:51405`, `ce763e20…`) · dbg1 **34/0** (regression canary; its section D was re-pointed at the v194 split earlier today) · commit `de973e2` pushed `alibabacloud`+`main`. |
+
+Threat-model note carried in the page itself: a key typed into any web page
+is only as safe as the machine rendering it (Tails/Tor Browser guidance,
+unencrypted-session-key export command, delete-after-use) — the tool never
+sees a passphrase and never makes a request.
+
+---
+
 ## 2. Where things stand right now (2026-10-20 14:30 UTC)
 
 ### 2.1 Code & CI — round 1 complete, all green
