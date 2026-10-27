@@ -436,6 +436,25 @@ sanctioned procedure. All gates below ran on the deployed cycle-B build.
 
 ---
 
+## 0.17 v193 debug cycle — webservice + verify.html e2e, fix-until-green (2026-10-27)
+
+User request: debug the new webservice + `verify.html` end to end and fix in a
+loop until no more fixes are possible. Result: **every gate green; the only
+defect found (a favicon 404) was dispositioned by the user as a justified
+non-fix — no deploy.**
+
+| Item | Value |
+|---|---|
+| **v193 change under test** | ZK artifact URLs **versioned by their pin** (`?v=<sha256>`) + the stale-cache “Hard-reload” hint — the durable fix for the v192-era `INTEGRITY FAILURE` incident (a `force-cache` copy of the OLD unversioned URL). Commits `240040a` + `6e01d63` (Test 46 hardening). |
+| **Four-copy parity** | local == enclave-served == GitHub Pages == README digest == `index.html` mirror = **`a7e6fdb6a181c27ecce39d7e0b6c50ee1f3472554c55d1b2655af9d080265d54`**; served page carries `?v=` links. |
+| **Debug round 1 — HTTP surface** (`/tmp/dbg1.mjs`) | **31/0**: `/`, `/verify.html` (byte-identical to repo, HSTS, HTML), `/debug/envelope` (Intel TDX, binary pin `b0dd6180…`), `/tls-cert.pem` (attachment), legacy `GET /report` + `POST /generate` stay **404**, `GET /attest/login-session` → **405**, empty contract POST + bare `/callback` → controlled **4xx** (never 5xx), HEAD 200, unknown route 404, port-80 Alibaba ICP gate (`403 Server: Beaver`) with HTTPS+HSTS unaffected, all three ZK artifacts fetch **200 from `?v=` URLs with bytes == repo**. |
+| **Debug round 2 — real browser** (`/tmp/dbg2.mjs`, Nix chromium) | **16/0**: live report pasted into the enclave-served auditor → `runAudit()` = `sandbox` (declared env), identity/enclave/firmware rows verified, ZK identity stashed; ⚡ Generate ZK credential → wasm + both zkey parts fetched from **VERSIONED** `?v=<64-hex>` URLs on the pinned Pages origin, **no INTEGRITY FAILURE**, proof produced. The v193 fix demonstrably executes in a browser. |
+| **Debug round 3 — subresource sweep** (`/tmp/dbg3.mjs`) | Plain `networkidle` load of BOTH origins: no bad responses, no failed requests — the **sole** console error is the favicon 404 (see disposition). |
+| **Full gates re-run on the fresh capture** | harness **367/0** plain (CI path) · **377/0** with `REAL_REPORT=/tmp/claimed-report.json` **+ `PAGES_PARITY=1` strict** · `check-manifest-parity` **PARITY OK** (6 same incl. `verify.html`, 0 mismatched) · heartbeat `boot/latest.json` `{"ok":true,"stage":"serving"}` · **live PayPal sandbox e2e PASS ×2** — `verified` (04:46:13Z) and `full` (04:46:49Z): callback auto-download, audit green, report downloaded, **F6 single-prepare = 1**. |
+| **Favicon finding + disposition** | `/favicon.ico` → **404 on both origins** (enclave AND Pages): no page declares `<link rel="icon">` — not `verify.html`/`index.html`, not `CALLBACK_CONTENT` (src/main.rs:1067). It is the only console error during load. **User decision (2026-10-27): document, do NOT deploy for it.** Justification: browsers fall back to a default tab icon, zero security impact, and every route outside the v180 router table is *deliberately* 404. Fix path if ever wanted: inline `data:` icon in `verify.html` + `index.html` → ESP-only rebuild+swap (**no pin rotation**, binary/initrd unchanged); silencing it on the transient `/callback` tab additionally needs a `CALLBACK_CONTENT` edit → binary change → sanctioned **two-cycle** RTMR2/`EXPECTED_ENCLAVE_SHA256` rotation. |
+
+---
+
 ## 2. Where things stand right now (2026-10-20 14:30 UTC)
 
 ### 2.1 Code & CI — round 1 complete, all green
@@ -592,10 +611,25 @@ E2E + harness + PII all passing.**
   any config change = `StopInstance` → `ModifyInstanceAttribute UserData`
   (base64) → start; any EIP/egress change = reboot afterwards.
 - **TLS check**: `curl -k --resolve login.airma.de:443:101.200.178.251
-  https://login.airma.de/` (expect `200/ssl=0`; `:80` → `308`).
-- **Report endpoint**: `GET /report` just redirects to `/`; the JSON is
-  produced by **`POST /generate`** from the landing page (one-time) — the e2e
-  harness intercepts it from the page traffic.
+  https://login.airma.de/` (expect `200/ssl=0`). **Port 80 reality (probed
+  2026-10-27, v193 debug round 1): `http://` is NOT ours anymore.** Alibaba's
+  edge intercepts port 80 for this mainland EIP/domain and answers its own
+  `403 Server: Beaver` “Non-compliance ICP Filing” page — verified from the
+  raw IP with a forged `Host:` header too, so the enclave's `0.0.0.0:80`
+  listener (main.rs:2482) is simply never reached. Nothing load-bearing:
+  ACME is DNS-01, the flows are HTTPS-only, HSTS is pinned on every HTTPS
+  response. A cold `http://` visit shows the block page until the browser
+  has seen the HSTS header once; the real fix would be an ICP filing (a
+  business decision, not a code change). The old `:80 → 308` expectation is
+  retired.
+- **Route table (v180+ router, main.rs:2457-2464)**: `/`, `/verify.html`,
+  `/attest/login-session`, `/debug/envelope`, `/tls-cert.pem`, `/callback`,
+  `/e2ee-blob` — **there is no `GET /report` and no `POST /generate`** (both
+  retired with the v180/v187 flow rewrites; the next runbook line that says
+  otherwise was stale). A report is produced ONLY by the login flow:
+  `POST /attest/login-session` → PayPal → `/callback` auto-downloads the
+  ciphertext. Unknown routes → 404, wrong method → 405, empty contract POST
+  → 4xx — never 5xx (probed v193).
 - **Attestation lookup**: `api.github.com/repos/<o>/<r>/attestations/sha256:<hex>`
   (unauthenticated path form; the `?subject=` query form 404s unauthenticated).
 - **`DescribeInstances` ignores a singular `InstanceId` param** — it silently
