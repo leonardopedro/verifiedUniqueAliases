@@ -96,13 +96,13 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 186,117 bytes | `383a3d88ac549d31d95c9770cf536fd9ec85dbdbc206ed4e9f5b2546700abccc` |
+| `verify.html` | 186,117 bytes | `8c1b5c42b241d9acc4a6b6ac86618e2e479f5dd021efd0c6a6275575187516d1` |
 | `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
 | `zk-rsa.html` | 100,001 bytes | `a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40` |
 
 ```bash
 sha256sum verify.html zk.html zk-rsa.html
-# 383a3d88ac549d31d95c9770cf536fd9ec85dbdbc206ed4e9f5b2546700abccc  verify.html
+# 8c1b5c42b241d9acc4a6b6ac86618e2e479f5dd021efd0c6a6275575187516d1  verify.html
 # 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
 # a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40  zk-rsa.html
 ```
