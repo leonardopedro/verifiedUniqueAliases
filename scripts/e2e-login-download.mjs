@@ -28,7 +28,52 @@
 // Exit code 0 = ciphertext auto-downloaded, paste-decrypt audited green AND
 // the plain report file downloaded.
 import { readFileSync, writeFileSync } from 'fs';
+import { createHash } from 'crypto';
 import { createRequire } from 'module';
+
+// v197 — fingerprint(s) of an armored PGP public key, exactly as the enclave's
+// `pgp_escrow::parse_public_key` and the auditor's `pgpPublicFingerprints`
+// compute them: SHA-1(0x99 ‖ len16(key material)) over each v4 key packet,
+// uppercase hex. Used to prove the second download was sealed to the key the
+// login actually pasted (no private key needed for an addressing proof).
+function armorFingerprints(armor) {
+  const m = /-----BEGIN PGP PUBLIC KEY BLOCK-----([\s\S]*?)-----END PGP PUBLIC KEY BLOCK-----/.exec(armor);
+  if (!m) throw new Error('not a PGP PUBLIC KEY BLOCK');
+  const blank = m[1].indexOf('\n\n');
+  if (blank < 0) throw new Error('missing armor blank line');
+  const b64 = m[1].slice(blank + 2).replace(/\s+$/, '').replace(/\n=[A-Za-z0-9+/]{4}$/, '').replace(/\s+/g, '');
+  const buf = Buffer.from(b64, 'base64');
+  const out = [];
+  let i = 0;
+  while (i < buf.length) {
+    const ctb = buf[i++];
+    if (!(ctb & 0x80)) throw new Error('malformed packet header');
+    let tag, len;
+    if (ctb & 0x40) {
+      tag = ctb & 0x3f;
+      if (buf[i] < 192) { len = buf[i]; i += 1; }
+      else if (buf[i] < 224) { len = (((buf[i] - 192) << 8) + buf[i + 1] + 192); i += 2; }
+      else if (buf[i] === 255) { len = buf.readUInt32BE(i + 1); i += 5; }
+      else throw new Error('partial-body lengths unsupported');
+    } else {
+      tag = (ctb >> 2) & 0xf;
+      if ((ctb & 3) === 0) { len = buf[i]; i += 1; }
+      else if ((ctb & 3) === 1) { len = buf.readUInt16BE(i); i += 2; }
+      else if ((ctb & 3) === 2) { len = buf.readUInt32BE(i); i += 4; }
+      else { len = buf.length - i; }
+    }
+    if (i + len > buf.length) throw new Error('packet overruns buffer');
+    const material = buf.subarray(i, i + len);
+    i += len;
+    if (tag === 6 || tag === 14) {
+      out.push(createHash('sha1')
+        .update(Buffer.concat([Buffer.from([0x99, (material.length >> 8) & 0xff, material.length & 0xff]), material]))
+        .digest('hex').toUpperCase());
+    }
+  }
+  if (!out.length) throw new Error('no OpenPGP key packets found');
+  return out;
+}
 
 const require = createRequire(import.meta.url);
 let chromium;
@@ -59,6 +104,7 @@ const page = await ctx.newPage();
 
 let downloaded = null;     // final plain attestation-report-*.json
 let encDownload = null;    // callback's automatic encrypted-attestation-report.json
+let sealedDownload = null; // v197: the callback's SECOND auto-download (Police escrow)
 // F6 (production race detector): exactly ONE prepare per login. The double-
 // prepare race sealed the callback ciphertext to a nonce that a second,
 // racing round had already overwritten (live GCM OperationError on every
@@ -98,7 +144,9 @@ try {
     ctx.waitForEvent('page', { timeout: 30000 }).catch(() => null),
     page.click(flowLink),
   ]);
-  log('2. step-1 status:', (await page.textContent('#secureLoginStatus').catch(() => '')).slice(0, 240));
+  // v197: capture the login status NOW — the audit below overwrites it.
+  const escrowStatus = (await page.textContent('#secureLoginStatus').catch(() => '')) || '';
+  log('2. step-1 status:', escrowStatus.slice(0, 240));
 
   const pp = popup;
   if (!pp) throw new Error('no PayPal tab opened from the flow link (login-session failed?)');
@@ -108,6 +156,7 @@ try {
     const f = d.suggestedFilename();
     log('  [DOWNLOAD:popup]', f);
     if (f === 'encrypted-attestation-report.json') encDownload = { d, f };
+    else if (f === 'pgp-sealed-attestation.json') sealedDownload = { d, f };
     else downloaded = f;
   });
   await pp.waitForLoadState('domcontentloaded').catch(() => {});
@@ -214,16 +263,47 @@ try {
     log('   decrypted report saved → /tmp/claimed-report.json (' + rep.length + ' bytes)');
   }
 
+  // ── v197 — the SECOND auto-download (Police escrow) ──────────────────
+  // The auditor ships the BKA key PREFILLED, so this login must have sealed
+  // a copy to it. Assert the addressing (fingerprint + clear hashes), which
+  // needs no private key: the ciphertext is only readable by whoever holds
+  // that key, so proving it is *addressed to it* is the observable claim.
+  const bkaArmor = readFileSync(new URL('../zk/rsa-test/police-bka-pub.asc', import.meta.url), 'utf8');
+  const wantFp = armorFingerprints(bkaArmor);
+  let sealedOk = false;
+  if (!sealedDownload) throw new Error('v197: callback did NOT auto-download pgp-sealed-attestation.json (escrow box prefilled, enclave should have sealed a copy)');
+  const sealedPath = await sealedDownload.d.path();
+  const sealed = JSON.parse(readFileSync(sealedPath, 'utf8'));
+  writeFileSync('/tmp/pgp-sealed-attestation.json', JSON.stringify(sealed, null, 2));
+  const reportObj = rep && rep.trim().startsWith('{') ? JSON.parse(rep) : null;
+  const signedRawHash = reportObj?.attestation_report?.paypal_user_info_raw_hash || '';
+  const fp = String(sealed.recipient_fingerprint || '').toUpperCase();
+  sealedOk = sealed.type === 'pav-pgp-sealed-attestation/v1'
+    && wantFp.includes(fp)
+    && !!signedRawHash && sealed.paypal_user_info_raw_hash === signedRawHash
+    && /^[0-9a-f]{64}$/i.test(String(sealed.paypal_id_sha256 || ''))
+    && /^-----BEGIN PGP MESSAGE-----/.test(String(sealed.ciphertext || ''))
+    && /-----END PGP MESSAGE-----\s*$/.test(String(sealed.ciphertext || '').trim());
+  log('   sealed copy → /tmp/pgp-sealed-attestation.json', JSON.stringify({
+    type: sealed.type, fp: fp.slice(0, 16) + '…',
+    addressedToBka: wantFp.includes(fp),
+    clearHashMatchesSigned: !!signedRawHash && sealed.paypal_user_info_raw_hash === signedRawHash,
+    idHash: sealed.paypal_id_sha256,
+    ctBytes: String(sealed.ciphertext || '').length,
+  }));
+  const escrowNoted = /Police escrow ON/.test(escrowStatus);
+  log('   login status escrow note:', escrowNoted ? 'yes ✓' : 'MISSING');
+
   // Step 3 — the green audit unlocks the plain-report download (v164).
   await page.click('#reportDownloadBtn');
   await page.waitForTimeout(3000);
   await browser.close();
 
   log('9. prepare POSTs to /attest/login-session:', preparePosts, preparePosts === 1 ? '(F6 single-prepare ✓)' : '← F6 VIOLATION (must be exactly 1)');
-  const ok = !!encDownload && green && !!downloaded && /^attestation-report-/.test(downloaded) && preparePosts === 1;
+  const ok = !!encDownload && green && !!downloaded && /^attestation-report-/.test(downloaded) && preparePosts === 1 && sealedOk && escrowNoted;
   log('\n' + (ok
-    ? `RESULT: PASS — callback auto-download ✓, audit green ✓, report downloaded (${downloaded}), single-prepare ✓`
-    : `RESULT: FAIL — enc=${encDownload ? 'yes' : 'no'} green=${green} downloaded=${downloaded || 'none'} preparePosts=${preparePosts} status=${String(status).slice(0, 120)}`));
+    ? `RESULT: PASS — callback auto-download ✓, audit green ✓, report downloaded (${downloaded}), single-prepare ✓, police-sealed copy ✓`
+    : `RESULT: FAIL — enc=${encDownload ? 'yes' : 'no'} green=${green} downloaded=${downloaded || 'none'} preparePosts=${preparePosts} sealed=${sealedOk} escrowNoted=${escrowNoted} status=${String(status).slice(0, 120)}`));
   process.exit(ok ? 0 : 1);
 } catch (e) {
   await browser.close().catch(() => {});
