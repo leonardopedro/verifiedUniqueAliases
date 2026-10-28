@@ -3340,6 +3340,26 @@ console.log('\nTest 47: zk-rsa.html — RSA ZK escrow credential (PGP / X.509 / 
   } catch (e) { refusedPub = e.message; }
   check('proving with a PUBLIC key fails closed', /no private part/.test(String(refusedPub)), String(refusedPub).slice(0, 70));
 
+  // Compression-unwrap gate: bzip2 (Compressed Data algo 3) is the one
+  // algorithm we refuse to inflate — fail-closed, never best-effort. The
+  // message below carries a VALID PKESK + SEIPD + MDC (built with the same
+  // builders the escrow uses), so the only reason decryption can fail is the
+  // algo-3 gate itself: the refusal must name it.
+  {
+    const sk = crypto.getRandomValues(new Uint8Array(32));
+    const pkesk = zkRsaPgpPkesk(sec.pgp_enc, sk);
+    const bzipInner = zkRsaConcatBytes(
+      Uint8Array.from([0xa3, 3]),                    // old-format tag 8, algo 3 = bzip2
+      Uint8Array.from([0x42, 0x5a, 0x68, 0x39]));    // 'BZh9' magic — never reached
+    const armored = zkRsaPgpArmorMessage(
+      zkRsaConcatBytes(pkesk, await zkRsaPgpSeipd(sk, bzipInner)));
+    let refused = null;
+    try { await zkRsaPgpDecryptMessage(armored, sec); } catch (e) { refused = e.message; }
+    check('bzip2-compressed (algo 3) inner packet refused fail-closed',
+      !!refused && /compressed data algorithm 3 unsupported/.test(refused),
+      String(refused).slice(0, 90));
+  }
+
   const rsaDigest = sha256(readFileSync(join(repoRoot, 'zk-rsa.html'))).toString('hex');
   const readmeNow = readFileSync(join(repoRoot, 'README.md'), 'utf8');
   check('README publishes the CURRENT zk-rsa.html sha256',

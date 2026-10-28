@@ -181,10 +181,18 @@
         Guillou–Quisquater-style Fiat–Shamir proof (SHA-256 challenge, no trusted
         setup, no circuit, no ceremony); nobody can forge it without the private
         key, and it reveals nothing about the key beyond its public part;
-        (b) your <b>identity payload</b> (fingerprint + attributes) encrypted
-        <b>hybrid RSA-OAEP + AES-256-GCM to the recipient's key</b>, plus its
-        SHA-256 hash in the clear, so anyone can see <i>which</i> identity is
-        committed while only the recipient can read it.
+        (b) your <b>identity payload</b> encrypted <b>to the recipient's key</b> —
+        as a JSON envelope (RSA-OAEP + AES-256-GCM), a <b>real OpenPGP message</b>
+        the police can open with <span class="mono">gpg --decrypt</span>, or a
+        <b>real S/MIME CMS</b> blob for <span class="mono">openssl cms -decrypt</span>
+        — plus its SHA-256 hash in the clear, so anyone can see <i>which</i>
+        identity is committed while only the recipient can read it.<br><br>
+        (c) optionally, the payload is <b>the enclave-SIGNED PayPal identity</b>
+        from a green verify.html audit (attested mode): the escrow then holds
+        “valid verified PayPal data about some user” that <b>only the recipient
+        can read</b> — while you learn nothing, the public challenge pins
+        <span class="mono">report_sha256</span> + the signed user hash, so anyone
+        holding the report can tie the ciphertext to that hardware quote.
         Everything — parsing, proving, encrypting, verifying — happens in this
         tab. <b>No network requests are made at all</b> (this file loads no
         scripts, fonts or artifacts; disconnect and it still works).
@@ -225,6 +233,13 @@
         <label>2️⃣ Identity, statement &amp; escrow recipient</label>
 
         <div style="margin-bottom:14px;">
+            <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">🛈 Identity source — OPTIONAL: escrow the <b>ATTESTED</b> PayPal identity from a green audit report</label>
+            <textarea id="zkRsaAttestPaste" spellcheck="false" style="height:70px;" placeholder='Paste the DECRYPTED attestation report JSON (auto-downloaded after login, or 💾 after a passing verify.html audit). The escrow then holds EXACTLY the enclave-signed PayPal identity — readable only by the recipient — and the credential proves it: report sha256 + signed user hash are challenge-pinned. Leave empty for manual mode.'></textarea>
+            <button type="button" onclick="zkRsaLoadAttestBox()" style="padding:8px 14px; font-size:0.85rem; border-radius:8px;">🧾 Load report (fail-closed preimage gate)</button>
+            <p id="zkRsaAttestStatus" style="margin:6px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);">Manual mode: the attributes below get escrowed. Load a report to escrow the attested identity instead.</p>
+        </div>
+
+        <div style="margin-bottom:14px;">
             <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Attributes (JSON object — encrypted to the recipient; never shown in the clear)</label>
             <textarea id="zkRsaAttrsIn" spellcheck="false" style="height:70px;">{"label": "anonymous handle", "note": ""}</textarea>
         </div>
@@ -251,6 +266,15 @@
             <textarea id="zkRsaRecipientIn" spellcheck="false" style="height:90px;" placeholder="-----BEGIN PGP PUBLIC KEY BLOCK----- … or CERTIFICATE / n=hex …"></textarea>
             <input type="file" class="file-input" id="zkRsaRecipientFile" accept=".asc,.pgp,.pem,.crt,.cer,.key,.txt" onchange="zkRsaFileInto(this, 'zkRsaRecipientIn')">
             <p id="zkRsaRecipientStatus" style="margin:6px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);"></p>
+            <div style="margin-top:14px;">
+                <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Escrow output format — how the recipient opens the ciphertext</label>
+                <select id="zkRsaEscrowFmt" style="width:100%; background:#0d1117; border:1px solid #30363d; border-radius:8px; color:#58a6ff; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:0.85rem; padding:10px 12px; outline:none;">
+                    <option value="json">JSON envelope — opened by this page / scripts (RSA-OAEP + AES-256-GCM)</option>
+                    <option value="pgp">OpenPGP message — `gpg --decrypt` (recipient: PGP key)</option>
+                    <option value="cms">S/MIME CMS — `openssl cms -decrypt` (recipient: X.509 certificate)</option>
+                </select>
+                <p id="zkRsaFmtHint" style="margin:6px 0 0; font-size:0.82rem; color:var(--text-dim);">auto-selected from the recipient key above</p>
+            </div>
         </div>
     </div>
 
@@ -280,6 +304,10 @@
                 <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Expected domain (optional)</label>
                 <input type="text" id="zkRsaExpectDomain" spellcheck="false">
             </div>
+        </div>
+        <div style="margin-top:12px;">
+            <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Expected report (attested-mode credentials: paste the report JSON or its sha256 digest — ties the credential to your exact green-audit report)</label>
+            <input type="text" id="zkRsaExpectReport" spellcheck="false" placeholder='report JSON or 64-hex sha256 (optional)'>
         </div>
         <button type="button" onclick="zkRsaVerifyCredential()" style="width:100%;">✅ Verify proof + statement</button>
         <div id="zkRsaVerifyRows" style="margin-top:6px;"></div>
@@ -491,9 +519,13 @@ function zkRsaParseX509(der) {
     let i = tbs.s;
     // optional [0] version; then serial, sig, issuer, validity, subject, SPKI
     if (der[i] === 0xa0) i = zkRsaDerSkip(der, i);
+    const serialStart = i;
     i = zkRsaDerIntAt(der, i).next;                 // serial
+    const serial_tlv = der.slice(serialStart, i);   // DER copy for CMS rid
     i = zkRsaDerSeq(der, i).next;                   // signature alg
+    const issuerStart = i;
     i = zkRsaDerSeq(der, i).next;                   // issuer
+    const issuer_tlv = der.slice(issuerStart, i);   // DER copy for CMS rid
     i = zkRsaDerSeq(der, i).next;                   // validity
     i = zkRsaDerSeq(der, i).next;                   // subject
     const spki = zkRsaDerSeq(der, i);               // subjectPublicKeyInfo
@@ -510,7 +542,7 @@ function zkRsaParseX509(der) {
     const bl = zkRsaDerLen(der, bitStr + 1);
     const inner = zkRsaDerSeq(der, bl.start + 1);   // +1: unused-bits octet
     const [n, e] = zkRsaDerInts(der, inner.s, inner.e, 2);
-    return { n, e };
+    return { n, e, issuer_tlv, serial_tlv, cert_der: der.slice(0) };
 }
 
 // ---------- OpenPGP ---------------------------------------------------------
@@ -526,7 +558,7 @@ function zkRsaCrc24(u8) {
     return crc & 0xffffff;
 }
 function zkRsaPgpPackets(text) {
-    const m = /-----BEGIN PGP ([A-Z ]+) BLOCK-----([\s\S]*?)-----END PGP \1 BLOCK-----/.exec(text);
+    const m = /-----BEGIN PGP ([A-Z ]+?)(?: BLOCK)?-----([\s\S]*?)-----END PGP \1(?: BLOCK)?-----/.exec(text);
     if (!m) throw new Error('not an OpenPGP armored block');
     const kind = m[1];
     const body = m[2];
@@ -572,13 +604,14 @@ function zkRsaPgpMpi(buf, off) {
     if (off + 2 + nb > buf.length) throw new Error('MPI value overruns packet');
     return { v: zkRsaBytesToBig(buf.subarray(off + 2, off + 2 + nb)), next: off + 2 + nb };
 }
-function zkRsaParsePgp(text) {
-    const { kind, packets } = zkRsaPgpPackets(text);
-    const keyPacket = packets.find((p) => p.tag === 6 || p.tag === 5);
-    if (!keyPacket) throw new Error('no OpenPGP key packet found in this block');
-    const isSecret = keyPacket.tag === 5;
-    const body = keyPacket.body;
-    if (body[0] !== 4) throw new Error('unsupported OpenPGP key version ' + body[0] + ' (v4 only — v2/v3 keys are obsolete)');
+// Parse ONE public/secret key packet (tags 6/5 primary, 14/15 subkey).
+function zkRsaParsePgpKeyPacket(p, isPrimary) {
+    const isSecret = p.tag === 5 || p.tag === 7;          // 5 = secret key, 7 = secret subkey
+    const body = p.body;
+    if (body[0] !== 4) {
+        if (isPrimary) throw new Error('unsupported OpenPGP key version ' + body[0] + ' (v4 only — v2/v3 keys are obsolete)');
+        throw new Error('unsupported OpenPGP subkey version ' + body[0]);
+    }
     const algo = body[5];
     if (algo !== 1 && algo !== 2 && algo !== 3) {
         throw new Error('not an RSA OpenPGP key (algorithm id ' + algo + ') — this tool only handles RSA (1/2/3)');
@@ -587,10 +620,7 @@ function zkRsaParsePgp(text) {
     const n = zkRsaPgpMpi(body, off); off = n.next;
     const e = zkRsaPgpMpi(body, off); off = e.next;
     const material = body.subarray(0, off);
-    const result = {
-        format: isSecret ? 'pgp-secret' : 'pgp-public',
-        n: n.v, e: e.v, material,
-    };
+    const result = { tag: p.tag, isSecret, algo, n: n.v, e: e.v, material };
     if (isSecret) {
         if (off >= body.length) throw new Error('secret key packet missing the s2k usage octet');
         const usage = body[off];
@@ -598,12 +628,83 @@ function zkRsaParsePgp(text) {
             throw new Error('this secret key is PASSPHRASE-PROTECTED (s2k usage ' + usage + '). This tool refuses to handle passphrases by design: export an unencrypted copy on a trusted machine with `gpg --pinentry-mode loopback --passphrase \'\' --export-secret-keys --armor NAME`, use it here, then delete it.');
         }
         off++;
+        const secStart = off;
         const d = zkRsaPgpMpi(body, off); off = d.next;
-        const p = zkRsaPgpMpi(body, off); off = p.next;
+        const pp = zkRsaPgpMpi(body, off); off = pp.next;
         const q = zkRsaPgpMpi(body, off); off = q.next;
-        result.d = d.v; result.p = p.v; result.q = q.v;
+        const u = zkRsaPgpMpi(body, off); off = u.next;
+        if (off + 2 > body.length) throw new Error('secret key packet is missing its two-octet checksum (RFC 4880 §5.5.3) — corrupt export');
+        let sum = 0;
+        for (let i = secStart; i < off; i++) sum = (sum + body[i]) & 0xffff;
+        const want = (body[off] << 8) | body[off + 1];
+        if (sum !== want) throw new Error('secret key checksum mismatch — the export is corrupt or was altered');
+        result.d = d.v; result.p = pp.v; result.q = q.v;
     }
     return result;
+}
+// Key flags (0x04 comms-encrypt, 0x08 storage-encrypt) from the binding
+// signature that FOLLOWS a subkey packet — best-effort, no sig verification
+// (the flags only steer which packet we encrypt to; gpg still does the real
+// check when the recipient decrypts).
+function zkRsaPgpKeyFlags(packets, idx) {
+    for (let i = idx + 1; i < packets.length; i++) {
+        const t = packets[i].tag;
+        if (t === 5 || t === 6 || t === 7 || t === 14) return null;   // next key packet first
+        if (t !== 2) continue;
+        const b = packets[i].body;
+        if (b[0] !== 4 || b.length < 6) return null;
+        const hlen = (b[4] << 8) | b[5];
+        let p = 6;
+        const end = 6 + hlen;
+        while (p < end) {
+            let sl;
+            if (b[p] < 192) { sl = b[p]; p += 1; }
+            else if (b[p] < 254) { sl = ((b[p] - 192) << 8) + b[p + 1] + 192; p += 2; }
+            else { sl = (b[p + 1] << 24) | (b[p + 2] << 16) | (b[p + 3] << 8) | b[p + 4]; p += 5; }
+            if (sl < 1 || p + sl > b.length) return null;
+            const stype = b[p];
+            if (stype === 27 && sl >= 2) return b[p + 1];   // key flags
+            p += sl;
+        }
+        return null;                                          // only the first sig after the packet
+    }
+    return null;
+}
+function zkRsaParsePgp(text) {
+    const { kind, packets } = zkRsaPgpPackets(text);
+    const kpIdx = [];
+    for (let i = 0; i < packets.length; i++) {
+        const t = packets[i].tag;
+        if (t === 5 || t === 6 || t === 7 || t === 14) kpIdx.push(i);
+    }
+    if (!kpIdx.length) throw new Error('no OpenPGP key packet found in this block');
+    const primary = zkRsaParsePgpKeyPacket(packets[kpIdx[0]], true);
+    const subs = [];
+    for (let j = 1; j < kpIdx.length; j++) {
+        try {
+            const en = zkRsaParsePgpKeyPacket(packets[kpIdx[j]], false);
+            en.flags = zkRsaPgpKeyFlags(packets, kpIdx[j]);
+            subs.push(en);
+        } catch (e) {
+            if (String(e.message).indexOf('PASSPHRASE-PROTECTED') !== -1) throw e;
+            // non-RSA subkey (ECDH/EdDSA etc.): skipped — we only use RSA packets
+        }
+    }
+    // Encryption target: prefer a subkey carrying encrypt key flags, else the
+    // LAST subkey (OpenPGP convention: the [E] subkey is issued last), else the
+    // primary itself (single-packet keys, e.g. the test fixtures).
+    let enc = primary;
+    if (subs.length) {
+        const flagged = subs.filter((s) => s.flags !== null && (s.flags & 0x0c) !== 0);
+        enc = flagged.length ? flagged[flagged.length - 1] : subs[subs.length - 1];
+    }
+    const out = {
+        format: primary.isSecret ? 'pgp-secret' : 'pgp-public',
+        n: primary.n, e: primary.e, material: primary.material,
+        entries: [primary].concat(subs), enc,
+    };
+    if (primary.d) { out.d = primary.d; out.p = primary.p; out.q = primary.q; }
+    return out;
 }
 async function zkRsaPgpFingerprintHex(material) {
     const pre = new Uint8Array(material.length + 3);
@@ -639,7 +740,17 @@ async function zkRsaParseAny(text) {
     if (/-----BEGIN PGP /.test(t)) {
         key = zkRsaParsePgp(t);
         key.pgp_fingerprint = await zkRsaPgpFingerprintHex(key.material);
-        delete key.material;
+        for (const en of key.entries) {
+            en.fingerprint = await zkRsaPgpFingerprintHex(en.material);
+            en.keyid = en.fingerprint.slice(-16);          // last 8 bytes of the 20
+            delete en.material;
+        }
+        key.pgp_keys = key.entries;                        // for recipient-side decrypt
+        key.pgp_enc = {
+            fingerprint: key.enc.fingerprint, keyid: key.enc.keyid,
+            algo: key.enc.algo, n: key.enc.n, e: key.enc.e,
+        };
+        delete key.entries; delete key.enc; delete key.material;
     } else if (/-----BEGIN CERTIFICATE-----/.test(t)) {
         const blk = zkRsaPemBlock(t);
         if (!blk) throw new Error('bad PEM certificate');
@@ -683,6 +794,493 @@ function zkRsaBuildIdentity(key, attrsText) {
     return { json, bytes: zkRsaUtf8(json) };
 }
 
+// ===========================================================================
+// ESCROW FORMATS  — the identity can be encrypted to the recipient as:
+//   json (default)  RSA-OAEP-256 + AES-256-GCM, carried inside the credential
+//   pgp             a REAL OpenPGP message (PKESK v3 + SEIPD v1) that
+//                   `gpg --decrypt` opens with the recipient's key
+//   cms             a REAL CMS AuthEnvelopedData (RFC 5652 + RFC 5084) that
+//                   `openssl cms -decrypt` opens with the recipient's cert
+// The format is pinned by `escrow.alg` (part of the Fiat–Shamir challenge),
+// so a credential cannot be re-labelled after proving.
+// ===========================================================================
+
+// ---------- AES-256 block cipher (encryption direction only) ---------------
+// WebCrypto exposes no raw block cipher and no CFB mode, so OpenPGP's CFB
+// (RFC 4880 §13.9) needs an in-page AES primitive. Encrypt-only suffices:
+// CFB decryption XORs plaintext against E(ciphertext) — same direction.
+// Verified in the harness against NIST ECB known-answer vectors and against
+// OpenSSL (Node crypto) byte-for-byte.
+const ZK_RSA_AES_SBOX = (function () {
+    const s = new Uint8Array(256);
+    const rotl8 = (x, n) => ((x << n) | (x >> (8 - n))) & 0xff;
+    let p = 1, q = 1;
+    do {
+        p = (p ^ (p << 1) ^ (p & 0x80 ? 0x1b : 0)) & 0xff;
+        q = (q ^ (q << 1)) & 0xff;
+        q = (q ^ (q << 2)) & 0xff;
+        q = (q ^ (q << 4)) & 0xff;
+        q = (q ^ (q & 0x80 ? 0x09 : 0)) & 0xff;
+        const x = (q ^ rotl8(q, 1) ^ rotl8(q, 2) ^ rotl8(q, 3) ^ rotl8(q, 4)) & 0xff;
+        s[p] = (x ^ 0x63) & 0xff;
+    } while (p !== 1);
+    s[0] = 0x63;
+    return s;
+})();
+function zkRsaAesXtime(a) { return ((a << 1) ^ (a & 0x80 ? 0x1b : 0)) & 0xff; }
+function zkRsaAesSubWord(w) {
+    const s = ZK_RSA_AES_SBOX;
+    return (((s[(w >>> 24) & 0xff] << 24) | (s[(w >>> 16) & 0xff] << 16) |
+        (s[(w >>> 8) & 0xff] << 8) | s[w & 0xff]) >>> 0);
+}
+function zkRsaAesExpandKey(key) {                 // 32 bytes → 60 words (AES-256)
+    const w = new Uint32Array(60);
+    for (let i = 0; i < 8; i++) {
+        w[i] = ((key[4 * i] << 24) | (key[4 * i + 1] << 16) |
+            (key[4 * i + 2] << 8) | key[4 * i + 3]) >>> 0;
+    }
+    let rcon = 1;
+    for (let i = 8; i < 60; i++) {
+        let t = w[i - 1];
+        if (i % 8 === 0) {
+            t = ((t << 8) | (t >>> 24)) >>> 0;               // RotWord
+            t = (zkRsaAesSubWord(t) ^ (rcon << 24)) >>> 0;   // SubWord ^ Rcon
+            rcon = zkRsaAesXtime(rcon);
+        } else if (i % 8 === 4) {
+            t = zkRsaAesSubWord(t);
+        }
+        w[i] = (w[i - 8] ^ t) >>> 0;
+    }
+    return w;
+}
+function zkRsaAesEncryptBlock(w, b) {             // 16 bytes in place
+    const s = ZK_RSA_AES_SBOX;
+    for (let i = 0; i < 16; i++) b[i] ^= (w[i >> 2] >>> (24 - 8 * (i & 3))) & 0xff;
+    for (let r = 1; r <= 14; r++) {
+        for (let i = 0; i < 16; i++) b[i] = s[b[i]];          // SubBytes
+        let t;                                                // ShiftRows
+        t = b[1]; b[1] = b[5]; b[5] = b[9]; b[9] = b[13]; b[13] = t;
+        t = b[2]; b[2] = b[10]; b[10] = t; t = b[6]; b[6] = b[14]; b[14] = t;
+        t = b[15]; b[15] = b[11]; b[11] = b[7]; b[7] = b[3]; b[3] = t;
+        if (r < 14) {                                         // MixColumns
+            for (let c = 0; c < 4; c++) {
+                const i = c * 4;
+                const a0 = b[i], a1 = b[i + 1], a2 = b[i + 2], a3 = b[i + 3];
+                const x = a0 ^ a1 ^ a2 ^ a3;
+                b[i] ^= x ^ zkRsaAesXtime(a0 ^ a1);
+                b[i + 1] ^= x ^ zkRsaAesXtime(a1 ^ a2);
+                b[i + 2] ^= x ^ zkRsaAesXtime(a2 ^ a3);
+                b[i + 3] ^= x ^ zkRsaAesXtime(a3 ^ a0);
+            }
+        }
+        for (let i = 0; i < 16; i++)                          // AddRoundKey
+            b[i] ^= (w[r * 4 + (i >> 2)] >>> (24 - 8 * (i & 3))) & 0xff;
+    }
+}
+function zkRsaAesEcbEncrypt(key32, block16) {
+    const w = zkRsaAesExpandKey(key32);
+    const b = Uint8Array.from(block16);
+    zkRsaAesEncryptBlock(w, b);
+    return b;
+}
+
+// ---------- OpenPGP CFB for SEIPD v1 (RFC 4880 §5.13) -----------------------
+// Zero IV, plain aligned CFB-128 over the byte stream — §5.13 explicitly says
+// "no special CFB resynchronization is done after encrypting this prefix"
+// (the §13.9 resync belongs to the old Symmetrically Encrypted Data packet).
+// So the 18-byte prefix (16 random + copies of 14th/15th) is simply the first
+// 18 plaintext bytes: block 2 carries prefix-tail octets 16..17 AND the first
+// 14 data octets. Works for encrypt AND decrypt (keystream depends only on ct).
+function zkRsaOpenpgpCfb(key32, input, encrypt) {
+    const w = zkRsaAesExpandKey(key32);
+    const out = new Uint8Array(input.length);
+    const ct = encrypt ? out : input;               // ciphertext reference
+    const fr = new Uint8Array(16);                  // IV = all zeros
+    const fre = new Uint8Array(16);
+    let i = 0;
+    while (i < input.length) {
+        zkRsaAesEncryptBlock(w, fr);                 // fre = E(fr)
+        fre.set(fr);
+        const n = Math.min(16, input.length - i);
+        for (let j = 0; j < n; j++) out[i + j] = input[i + j] ^ fre[j];
+        fr.set(ct.subarray(i, i + n));               // FR = this block's ciphertext
+        i += n;
+    }
+    return out;
+}
+
+// ---------- OpenPGP message emission ---------------------------------------
+function zkRsaConcatBytes(...arrs) {
+    let len = 0;
+    for (const a of arrs) len += a.length;
+    const out = new Uint8Array(len);
+    let o = 0;
+    for (const a of arrs) { out.set(a, o); o += a.length; }
+    return out;
+}
+function zkRsaPgpNewPacket(tag, body) {
+    const h = [0xc0 | tag];
+    const l = body.length;
+    if (l < 192) h.push(l);
+    else if (l < 8384) { const v = l - 192; h.push((v >> 8) + 192, v & 0xff); }
+    else h.push(0xff, (l >>> 24) & 0xff, (l >>> 16) & 0xff, (l >>> 8) & 0xff, l & 0xff);
+    return zkRsaConcatBytes(Uint8Array.from(h), body);
+}
+function zkRsaPgpArmorMessage(bytes) {
+    const b64 = zkRsaB64(bytes).replace(/(.{64})/g, '$1\n').replace(/\n$/, '');
+    let crc = zkRsaCrc24(bytes);
+    const crcB64 = zkRsaB64(Uint8Array.from([(crc >> 16) & 0xff, (crc >> 8) & 0xff, crc & 0xff]));
+    return '-----BEGIN PGP MESSAGE-----\n\n' + b64 + '\n=' + crcB64 +
+        '\n-----END PGP MESSAGE-----\n';
+}
+function zkRsaMpiFromBig(v) {
+    const bytes = zkRsaBigToBytes(v);
+    const bits = v === 0n ? 0 : zkRsaBitLen(v);
+    const out = new Uint8Array(2 + bytes.length);
+    out[0] = (bits >> 8) & 0xff; out[1] = bits & 0xff;
+    out.set(bytes, 2);
+    return out;
+}
+// PKCS#1 v1.5 (EME-PKCS1-v1_5) encode for RSA key transport.
+function zkRsaPkcs1v15Encode(n, payload) {
+    const k = Math.ceil(zkRsaBitLen(n) / 8);
+    if (k < 11 || payload.length > k - 11) throw new Error('PKCS#1 v1.5 payload too large for this key');
+    const psLen = k - 3 - payload.length;
+    const em = new Uint8Array(k);
+    em[1] = 0x02;
+    const ps = crypto.getRandomValues(new Uint8Array(psLen));
+    for (let i = 0; i < ps.length; i++) if (ps[i] === 0) ps[i] = 1;   // PS must be nonzero
+    em.set(ps, 2);
+    em[2 + psLen] = 0x00;
+    em.set(payload, 3 + psLen);
+    return em;
+}
+// Decrypt an RSA PKCS#1 v1.5 block with the private exponent (BigInt).
+function zkRsaPkcs1v15Decode(key, c) {
+    const m = zkRsaModPow(c, key.d, key.n);
+    const em = zkRsaBigToBytes(m);
+    const k = Math.ceil(zkRsaBitLen(key.n) / 8);
+    const pad = new Uint8Array(k - em.length).fill(0);
+    const full = zkRsaConcatBytes(pad, em);
+    if (full[0] !== 0x00 || full[1] !== 0x02) throw new Error('PKCS#1 v1.5: bad block type');
+    let sep = -1;
+    for (let i = 2; i < full.length; i++) if (full[i] === 0x00) { sep = i; break; }
+    if (sep < 10) throw new Error('PKCS#1 v1.5: no separator (or padding < 8 bytes)');
+    return full.subarray(sep + 1);
+}
+// Public-key encrypted session key: RFC 4880 §5.1 (v3 PKESK). The algorithm
+// octet must be the RECIPIENT KEY's algorithm ID (1 = RSA Encrypt-or-Sign —
+// what gpg 2.4 emits and what agents accept; 2 = deprecated RSA Encrypt-Only)
+// followed by PKCS#1 v1.5 encoding of (symalg ‖ session key ‖ checksum).
+function zkRsaPgpPkesk(encKey, sk) {
+    let sum = 0;
+    for (const b of sk) sum = (sum + b) & 0xffff;
+    const payload = Uint8Array.from([9, ...sk, (sum >> 8) & 0xff, sum & 0xff]);   // 9 = AES-256
+    const em = zkRsaPkcs1v15Encode(encKey.n, payload);
+    const c = zkRsaModPow(zkRsaBytesToBig(em), encKey.e, encKey.n);
+    const body = zkRsaConcatBytes(
+        Uint8Array.from([3]),
+        zkRsaHexToBytes(encKey.keyid),               // 8-octet key ID of the target
+        Uint8Array.from([encKey.algo || 1]),          // key's own algorithm ID
+        zkRsaMpiFromBig(c));
+    return zkRsaPgpNewPacket(1, body);
+}
+// Sym. Encrypted Integrity Protected Data (tag 18, v1) over a literal packet.
+async function zkRsaPgpSeipd(sk, literalPacket) {
+    const prefix = new Uint8Array(18);
+    crypto.getRandomValues(prefix.subarray(0, 16));
+    prefix[16] = prefix[14]; prefix[17] = prefix[15];
+    const mdcHeader = Uint8Array.from([0xd3, 0x14]);           // tag 19, 1-octet length
+    const preMdc = zkRsaConcatBytes(prefix, literalPacket, mdcHeader);
+    const sha1 = new Uint8Array(await crypto.subtle.digest('SHA-1', preMdc));
+    const pt = zkRsaConcatBytes(preMdc, sha1);
+    const ct = zkRsaOpenpgpCfb(sk, pt, true);
+    return zkRsaPgpNewPacket(18, zkRsaConcatBytes(Uint8Array.from([1]), ct));
+}
+function zkRsaPgpLiteralPacket(data) {
+    return zkRsaPgpNewPacket(11, zkRsaConcatBytes(
+        Uint8Array.from([0x62, 0x00, 0, 0, 0, 0]),   // 'b', 0-name, mtime 0
+        data));
+}
+// Full message: PKESK + SEIPD, armored. `gpg --decrypt` opens this.
+async function zkRsaPgpEncryptMessage(recipKey, plaintextBytes) {
+    const enc = recipKey.pgp_enc;
+    if (!enc) throw new Error('recipient key carries no RSA encryption key packet');
+    const sk = crypto.getRandomValues(new Uint8Array(32));       // AES-256 session key
+    const pkesk = zkRsaPgpPkesk(enc, sk);
+    const seipd = await zkRsaPgpSeipd(sk, zkRsaPgpLiteralPacket(plaintextBytes));
+    return zkRsaPgpArmorMessage(zkRsaConcatBytes(pkesk, seipd));
+}
+// Decrypt our (or any v3-PKESK+SEIPDv1) message with a pasted recipient
+// private key — tries every key packet (primary + subkeys) by key ID.
+async function zkRsaPgpDecryptMessage(armored, recipientPrivKey) {
+    const { packets } = zkRsaPgpPackets(armored);
+    const pkesks = packets.filter((p) => p.tag === 1);
+    const seipd = packets.find((p) => p.tag === 18);
+    if (!pkesks.length || !seipd) throw new Error('not an encrypted OpenPGP message (needs PKESK + SEIPD packets)');
+    if (seipd.body[0] !== 1) throw new Error('SEIPD version ' + seipd.body[0] + ' unsupported (only v1)');
+    let sk = null, lastErr = null;
+    for (const kp of pkesks) {
+        const b = kp.body;
+        if (b[0] !== 3) continue;                          // v3 PKESK only
+        const keyid = zkRsaBytesHex(b.subarray(1, 9)).toUpperCase();   // fingerprints are upper-cased
+        if (b[9] !== 1 && b[9] !== 2 && b[9] !== 3) { lastErr = new Error('PKESK algorithm ' + b[9] + ' not RSA'); continue; }
+        const cand = (recipientPrivKey.pgp_keys || []).find((k) => k.keyid === keyid);
+        if (!cand || !cand.d) continue;
+        try {
+            const mpi = zkRsaPgpMpi(b, 10);
+            const payload = zkRsaPkcs1v15Decode(cand, mpi.v);
+            if (payload.length !== 35 || payload[0] !== 9) throw new Error('unexpected session key block');
+            const key = payload.subarray(1, 33);
+            let sum = 0;
+            for (const x of key) sum = (sum + x) & 0xffff;
+            if (sum !== ((payload[33] << 8) | payload[34])) throw new Error('session key checksum mismatch');
+            sk = key;
+            break;
+        } catch (e) { lastErr = e; }
+    }
+    if (!sk) throw new Error('no session key decrypts with this recipient key (' + (lastErr ? lastErr.message : 'key ID not among its key packets') + ')');
+    const ct = seipd.body.subarray(1);
+    if (ct.length < 18 + 6 + 2 + 20) throw new Error('SEIPD payload too short');
+    const pt = zkRsaOpenpgpCfb(sk, ct, false);
+    if (pt[16] !== pt[14] || pt[17] !== pt[15])
+        throw new Error('OpenPGP quick check failed — wrong session key or corrupted ciphertext');
+    const body = pt.subarray(18, pt.length - 22);          // strip prefix + MDC packet
+    const mdcSha1 = pt.subarray(pt.length - 20);
+    const pre = pt.subarray(0, pt.length - 20);            // prefix…D3 14
+    const want = new Uint8Array(await crypto.subtle.digest('SHA-1', pre));
+    for (let i = 0; i < 20; i++) if (want[i] !== mdcSha1[i])
+        throw new Error('OpenPGP MDC (SHA-1) mismatch — message was modified');
+    // body = literal packet(s) — unwrap ours (tag 11), or a Compressed Data
+    // packet (tag 8) that gpg 2.4 wraps it in (default zlib/ZIP compression).
+    const inner = zkRsaPgpPackets('-----BEGIN PGP MESSAGE-----\n\n' +
+        zkRsaB64(body) + '\n-----END PGP MESSAGE-----');
+    let lit = inner.packets.find((p) => p.tag === 11);
+    if (!lit) {
+        const comp = inner.packets.find((p) => p.tag === 8);
+        if (comp) {
+            const algo = comp.body[0];                       // 1 = ZIP, 2 = ZLIB
+            const fmt = algo === 1 ? 'deflate-raw' : algo === 2 ? 'deflate' : null;
+            if (!fmt) throw new Error('compressed data algorithm ' + algo + ' unsupported (only uncompressed/ZIP/ZLIB)');
+            if (typeof DecompressionStream === 'undefined') throw new Error('DecompressionStream unavailable in this runtime');
+            const stream = new Blob([comp.body.subarray(1)]).stream().pipeThrough(new DecompressionStream(fmt));
+            const plain = new Uint8Array(await new Response(stream).arrayBuffer());
+            const inner2 = zkRsaPgpPackets('-----BEGIN PGP MESSAGE-----\n\n' +
+                zkRsaB64(plain) + '\n-----END PGP MESSAGE-----');
+            lit = inner2.packets.find((p) => p.tag === 11);
+        }
+    }
+    if (!lit) throw new Error('no literal data packet inside the decrypted message');
+    if (lit.body[0] !== 0x62 && lit.body[0] !== 0x75 && lit.body[0] !== 0x74)
+        throw new Error('unexpected literal packet format byte');
+    const nameLen = lit.body[1];
+    const start = 2 + nameLen + 4;
+    return lit.body.subarray(start);
+}
+
+// ---------- CMS / PKCS#7 AuthEnvelopedData (RFC 5652 + RFC 5084) ------------
+// DER encoding helpers (we already parse DER; emitting is symmetric).
+function zkRsaDerEncLen(n) {
+    if (n < 0x80) return Uint8Array.from([n]);
+    const bytes = [];
+    while (n > 0) { bytes.unshift(n & 0xff); n >>= 8; }
+    return Uint8Array.from([0x80 | bytes.length, ...bytes]);
+}
+function zkRsaDerTlv(tag, content) {
+    return zkRsaConcatBytes(Uint8Array.from([tag]), zkRsaDerEncLen(content.length), content);
+}
+function zkRsaDerEncSeq(content) { return zkRsaDerTlv(0x30, content); }
+function zkRsaDerEncInt(v) {
+    let hex = v.toString(16);
+    if (hex.length % 2) hex = '0' + hex;
+    let bytes = zkRsaHexToBytes(hex);
+    if (bytes.length && bytes[0] & 0x80) bytes = zkRsaConcatBytes(Uint8Array.from([0]), bytes);
+    return zkRsaDerTlv(0x02, bytes);
+}
+function zkRsaDerEncOctet(u8) { return zkRsaDerTlv(0x04, u8); }
+function zkRsaDerEncNull() { return Uint8Array.from([0x05, 0x00]); }
+const ZK_RSA_OID_AUTHENV = Uint8Array.from([0x06, 0x0b, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x01, 0x17]);
+const ZK_RSA_OID_IDDATA = Uint8Array.from([0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01]);
+const ZK_RSA_OID_RSAENC = Uint8Array.from([0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]);
+const ZK_RSA_OID_AES256GCM = Uint8Array.from([0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2e]);
+// EncryptedContent of AuthEnvelopedData: [0] IMPLICIT OCTET STRING.
+function zkRsaDerEncImplicit0(u8) { return zkRsaDerTlv(0x80, u8); }
+// Build AuthEnvelopedData (asynchronous: GCM runs in WebCrypto).
+async function zkRsaCmsEncryptMessage(recipKey, plaintextBytes) {
+    if (!recipKey.issuer_tlv || !recipKey.serial_tlv) {
+        throw new Error('CMS output needs the recipient as an X.509 CERTIFICATE (for issuer+serial); paste a CERTIFICATE rather than a bare key');
+    }
+    const cek = crypto.getRandomValues(new Uint8Array(32));
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const aes = await crypto.subtle.importKey('raw', cek, 'AES-GCM', false, ['encrypt']);
+    const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, aes, plaintextBytes));
+    const ct = sealed.subarray(0, sealed.length - 16);
+    const mac = sealed.subarray(sealed.length - 16);
+    const em = zkRsaPkcs1v15Encode(recipKey.n, cek);
+    const encKey = zkRsaModPow(zkRsaBytesToBig(em), recipKey.e, recipKey.n);
+    const ktri = zkRsaDerEncSeq(zkRsaConcatBytes(
+        zkRsaDerEncInt(0n),
+        zkRsaDerEncSeq(zkRsaConcatBytes(recipKey.issuer_tlv, recipKey.serial_tlv)),
+        zkRsaDerEncSeq(zkRsaConcatBytes(ZK_RSA_OID_RSAENC, zkRsaDerEncNull())),
+        zkRsaDerEncOctet(zkRsaBigToBytes(encKey))));
+    const gcmParams = zkRsaDerEncSeq(zkRsaConcatBytes(zkRsaDerEncOctet(nonce), zkRsaDerEncInt(16n)));
+    const authEci = zkRsaDerEncSeq(zkRsaConcatBytes(
+        ZK_RSA_OID_IDDATA,
+        zkRsaDerEncSeq(zkRsaConcatBytes(ZK_RSA_OID_AES256GCM, gcmParams)),
+        zkRsaDerEncImplicit0(ct)));
+    const authEnv = zkRsaDerEncSeq(zkRsaConcatBytes(
+        zkRsaDerEncInt(0n),
+        zkRsaDerTlv(0x31, ktri),                       // SET OF RecipientInfo
+        authEci,
+        zkRsaDerEncOctet(mac)));
+    const contentInfo = zkRsaDerEncSeq(zkRsaConcatBytes(ZK_RSA_OID_AUTHENV,
+        zkRsaDerTlv(0xa0, authEnv)));
+    return zkRsaB64(contentInfo);
+}
+// Decrypt AuthEnvelopedData produced by openssl or by zkRsaCmsEncryptMessage.
+async function zkRsaCmsDecryptMessage(b64, recipientPrivKey) {
+    const der = zkRsaB64ToBytes(b64);
+    try {
+        const ci = zkRsaDerSeq(der, 0);
+        if (der[ci.s] !== 0x06) throw new Error('ContentInfo: missing OID');
+        const oidLen = zkRsaDerLen(der, ci.s + 1);
+        const oid = der.subarray(oidLen.start, oidLen.start + oidLen.len);
+        let off = oidLen.start + oidLen.len;
+        if (der[off] !== 0xa0) throw new Error('ContentInfo: missing [0] content');
+        const expl = zkRsaDerLen(der, off + 1);
+        // OID content-only views (the constants above are full TLVs)
+        const OID_AUTHENV = ZK_RSA_OID_AUTHENV.subarray(2);
+        const OID_IDDATA = ZK_RSA_OID_IDDATA.subarray(2);
+        const isAuth = oid.length === OID_AUTHENV.length && oid.every((v, i) => v === OID_AUTHENV[i]);
+        const isEnv = oid.length === 9 && oid[7] === 0x07 && oid[8] === 0x03;   // 1.2.840.113549.1.7.3
+        if (!isAuth && !isEnv) throw new Error('not a CMS enveloped-data ContentInfo');
+        let p = expl.start;
+        const envSeq = zkRsaDerSeq(der, p);             // EnvelopedData / AuthEnvelopedData
+        p = envSeq.s;
+        p = zkRsaDerSkip(der, p);                       // version
+        if (der[p] === 0xa0) p = zkRsaDerSkip(der, p);  // originatorInfo (auth only)
+        if (der[p] !== 0x31) throw new Error('missing recipientInfos SET');
+        const set = zkRsaDerLen(der, p + 1);
+        // first RecipientInfo (ktri)
+        if (der[set.start] !== 0x30) throw new Error('RecipientInfo not a SEQUENCE');
+        const ktri = zkRsaDerLen(der, set.start + 1);
+        let k = ktri.start;
+        k = zkRsaDerSkip(der, k);                       // ktri version
+        const rid = zkRsaDerSeq(der, k);                // issuerAndSerialNumber
+        k = rid.next;
+        const kalg = zkRsaDerSeq(der, k);               // keyEncryptionAlgorithm
+        const kalgOid = zkRsaDerLen(der, kalg.s + 1);   // +1: skip the OID tag byte
+        const koid = der.subarray(kalgOid.start, kalgOid.start + kalgOid.len);
+        const isOaep = koid.length === 9 && koid[8] === 0x07;    // 1.2.840.113549.1.1.7
+        const isRsaEnc = koid.length === 9 && koid[8] === 0x01;  // 1.2.840.113549.1.1.1
+        if (!isOaep && !isRsaEnc) throw new Error('keyEncryptionAlgorithm is not RSA');
+        k = kalg.next;
+        if (der[k] !== 0x04) throw new Error('missing encryptedKey');
+        const ekLen = zkRsaDerLen(der, k + 1);
+        const encKey = zkRsaBytesToBig(der.subarray(ekLen.start, ekLen.start + ekLen.len));
+        // encryptedContentInfo
+        const setEnd = set.start + set.len;
+        const eci = zkRsaDerSeq(der, setEnd);
+        let e = eci.s;
+        e = zkRsaDerSkip(der, e);                       // contentType OID
+        const calg = zkRsaDerSeq(der, e);               // contentEncryptionAlgorithm
+        const calgOid = zkRsaDerLen(der, calg.s + 1);   // +1: skip the OID tag byte
+        const coid = der.subarray(calgOid.start, calgOid.start + calgOid.len);
+        const isGcm = coid.length === 9 && coid[8] === 0x2e;
+        const isCbc = coid.length === 9 && coid[8] === 0x02;      // aes-256-CBC = …4.1.2
+        if (!isGcm && !isCbc) throw new Error('content cipher is not AES-256-GCM/CBC');
+        let nonce = null;
+        if (isGcm) {
+            const params = zkRsaDerSeq(der, calgOid.start + calgOid.len);
+            if (der[params.s] !== 0x04) throw new Error('GCMParameters: missing nonce');
+            const nLen = zkRsaDerLen(der, params.s + 1);
+            nonce = der.subarray(nLen.start, nLen.start + nLen.len);
+        }
+        e = calg.next;
+        if (der[e] !== 0x80 && der[e] !== 0xa0) throw new Error('missing encryptedContent');
+        const ecLen = zkRsaDerLen(der, e + 1);
+        const ct = der.subarray(ecLen.start, ecLen.start + ecLen.len);
+        // mac: last OCTET STRING inside authEnvelopedData (GCM only)
+        let mac = null;
+        if (isAuth) {
+            // find the OCTET STRING (mac) right after authEci within authEnv
+            const eciSeq = zkRsaDerSeq(der, setEnd);
+            let m = eciSeq.next;
+            if (der[m] === 0xa1) m = zkRsaDerSkip(der, m);       // authAttrs
+            if (der[m] === 0x04) {
+                const ml = zkRsaDerLen(der, m + 1);
+                mac = der.subarray(ml.start, ml.start + ml.len);
+            }
+        }
+        // private-key unwrap (PKCS#1 v1.5 via BigInt; OAEP via WebCrypto)
+        let cek;
+        const cand = recipientPrivKey;
+        if (isOaep) {
+            const jwk = {
+                kty: 'RSA',
+                n: zkRsaB64url(zkRsaBigToBytes(cand.n)), e: zkRsaB64url(zkRsaBigToBytes(cand.e)),
+                d: zkRsaB64url(zkRsaBigToBytes(cand.d)), p: zkRsaB64url(zkRsaBigToBytes(cand.p)),
+                q: zkRsaB64url(zkRsaBigToBytes(cand.q)),
+                dp: zkRsaB64url(zkRsaBigToBytes(cand.d % (cand.p - 1n))),
+                dq: zkRsaB64url(zkRsaBigToBytes(cand.d % (cand.q - 1n))),
+                qi: zkRsaB64url(zkRsaBigToBytes(zkRsaModInv(cand.q, cand.p))),
+            };
+            const priv = await crypto.subtle.importKey('jwk', jwk, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['decrypt']);
+            cek = new Uint8Array(await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, priv, zkRsaBigToBytes(encKey)));
+        } else {
+            cek = zkRsaPkcs1v15Decode(cand, encKey);
+        }
+        if (cek.length !== 32) throw new Error('unwrapped content key is ' + cek.length + ' bytes (expected 32)');
+        if (isGcm) {
+            const aes = await crypto.subtle.importKey('raw', cek, 'AES-GCM', false, ['decrypt']);
+            const tag = mac || ct.subarray(ct.length - 16);
+            const body = mac ? ct : ct.subarray(0, ct.length - 16);
+            const sealed = zkRsaConcatBytes(body, tag);
+            return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nonce }, aes, sealed));
+        }
+        // CBC fallback (not produced by us; for openssl -aes-256-cbc shaped output)
+        const jwkCbc = { kty: 'oct', k: zkRsaB64url(cek) };
+        const aesCbc = await crypto.subtle.importKey('raw', jwkCbc, 'AES-CBC', false, ['decrypt']);
+        return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-CBC' }, aesCbc, ct));
+    } catch (e) {
+        throw new Error('CMS open failed: ' + e.message);
+    }
+}
+
+// ---------- attestation report gate (mirrors verify.html / zk.html) --------
+// The escrow payload in ATTTESTED MODE is the enclave-signed PayPal identity
+// byte-for-byte: SHA-256(identityJson) must equal the report's signed
+// `paypal_user_info_raw_hash` — fail closed otherwise. Nothing is uploaded.
+function zkRsaIdentityFromReportText(text) {
+    let env = null;
+    try { env = JSON.parse(text); } catch (e) { throw new Error('report is not valid JSON'); }
+    const rep = (env && env.attestation_report) ? env.attestation_report : env;
+    const pui = (rep && rep.paypal_user_info && typeof rep.paypal_user_info === 'object') ? rep.paypal_user_info : null;
+    if (!pui) throw new Error('report carries no paypal_user_info — there is no login identity to escrow');
+    const declared = String(rep.paypal_user_info_raw_hash || '').trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(declared)) throw new Error('report has no valid paypal_user_info_raw_hash — fail closed');
+    const idJson = JSON.stringify({
+        user_id: pui.user_id,
+        sub: pui.sub ?? null,
+        verified_account: pui.verified_account,
+        payer_id: pui.payer_id ?? null,
+    });
+    return { identityJson: idJson, declaredHash: declared, env: env };
+}
+let zkRsaParsedReport = null;      // { text, identityJson, declaredHash }
+async function zkRsaLoadReportText(text) {
+    const parsed = zkRsaIdentityFromReportText(String(text || '').trim());
+    const recomputed = await zkRsaSha256Hex(parsed.identityJson);
+    if (recomputed !== parsed.declaredHash)
+        throw new Error('the report\u2019s SIGNED paypal_user_info_raw_hash does not match the identity it carries — tampered report, refused');
+    zkRsaParsedReport = {
+        text: String(text).trim(),
+        identityJson: parsed.identityJson,
+        declaredHash: parsed.declaredHash,
+    };
+    return zkRsaParsedReport;
+}
+
 // ---------- credential: challenge + prove -----------------------------------
 function zkRsaChallengePayload(cred) {
     return JSON.stringify({
@@ -696,6 +1294,14 @@ function zkRsaChallengePayload(cred) {
             iv: cred.escrow.iv,
             ct: cred.escrow.ct,
         },
+        // Attestation binding (present only for ATTESTED-mode credentials):
+        // pins the escrowed plaintext to the enclave-signed PayPal identity
+        // and to the exact report bytes that carried it. `undefined` keys are
+        // dropped by JSON.stringify, so manual-mode credentials verify byte-
+        // identically to before this field existed.
+        att: cred.attestation
+            ? { r: cred.attestation.report_sha256, u: cred.attestation.user_hash }
+            : undefined,
         st: { d: cred.statement.domain, n: cred.statement.nonce, u: cred.statement.purpose },
         cm: { g: cred.proof.g, t: cred.proof.t },
     });
@@ -704,7 +1310,25 @@ async function zkRsaChallengeHex(cred) {
     return zkRsaSha256Hex(zkRsaChallengePayload(cred));
 }
 
-async function zkRsaEscrowEncrypt(recipKey, identityBytes) {
+async function zkRsaEscrowEncrypt(recipKey, identityBytes, fmt) {
+    if (fmt === 'pgp') {
+        if (!recipKey.pgp_enc) throw new Error('OpenPGP output needs the recipient as a PGP PUBLIC KEY BLOCK');
+        const armored = await zkRsaPgpEncryptMessage(recipKey, identityBytes);
+        return {
+            recipient_fp: recipKey.pgp_fingerprint || recipKey.fp,
+            alg: 'OpenPGP:PKESKv3(RSA)+SEIPDv1(AES-256-CFB,MDC)',
+            ct: armored,
+        };
+    }
+    if (fmt === 'cms') {
+        if (!recipKey.issuer_tlv) throw new Error('S/MIME (CMS) output needs the recipient as an X.509 CERTIFICATE — paste the CERTIFICATE, not a bare key');
+        const b64 = await zkRsaCmsEncryptMessage(recipKey, identityBytes);
+        return {
+            recipient_fp: recipKey.fp,
+            alg: 'CMS:AuthEnvelopedData(RSA-PKCS1v1.5)+AES-256-GCM',
+            ct: b64,
+        };
+    }
     const jwk = {
         kty: 'RSA',
         n: zkRsaB64url(zkRsaBigToBytes(recipKey.n)),
@@ -723,9 +1347,25 @@ async function zkRsaProve(opts) {
     const key = opts.key;
     if (!key || !key.hasPrivate) throw new Error('the parsed key has no private part — paste your SECRET key / private PEM to prove');
     if (!key.p || !key.q) throw new Error('private key is missing its primes (p/q) — PGP secret keys and PEM keys carry them; re-export the key');
-    const identity = zkRsaBuildIdentity(key, opts.attrsText);
-    if (!opts.recipientKey) throw new Error('a recipient public key is required — this is an ESCROW credential (paste it in step 2)');
     const n = key.n, e = key.e, d = key.d, p = key.p, q = key.q;
+
+    // Identity source: (a) ATTESTED mode — the enclave-signed PayPal identity
+    // from a green report, byte-for-byte, with the signed raw-hash re-checked;
+    // (b) manual mode — key fingerprint + operator-supplied attributes.
+    let identity, attestation = null;
+    if (opts.report) {
+        identity = { json: opts.report.identityJson, bytes: zkRsaUtf8(opts.report.identityJson) };
+        const idh = await zkRsaSha256Hex(identity.bytes);
+        if (idh !== opts.report.declaredHash) throw new Error('report identity hash does not re-derive — refused');
+        attestation = {
+            report_sha256: await zkRsaSha256Hex(opts.report.text),
+            user_hash: opts.report.declaredHash,
+            source: 'pav-attestation-report/v1',
+        };
+    } else {
+        identity = zkRsaBuildIdentity(key, opts.attrsText);
+    }
+    if (!opts.recipientKey) throw new Error('a recipient public key is required — this is an ESCROW credential (paste it in step 2)');
 
     const cred = {
         type: 'pav-rsa-escrow',
@@ -737,7 +1377,8 @@ async function zkRsaProve(opts) {
             pgp_fingerprint: key.pgp_fingerprint || null,
         },
         identity_hash: await zkRsaSha256Hex(identity.bytes),
-        escrow: await zkRsaEscrowEncrypt(opts.recipientKey, identity.bytes),
+        ...(attestation ? { attestation } : {}),
+        escrow: await zkRsaEscrowEncrypt(opts.recipientKey, identity.bytes, opts.fmt || 'json'),
         statement: {
             domain: String(opts.domain || ''),
             nonce: String(opts.nonce || ''),
@@ -775,6 +1416,15 @@ async function zkRsaVerify(cred, expected) {
     const warn = (t, d) => rows.push({ cls: 'warning', icon: '⚠️', title: t, detail: d });
     expected = expected || {};
 
+    // Optional expected report: a SHA-256 hex digest OR the report JSON text
+    // (its digest is computed here) — compared against attestation.report_sha256.
+    let expReportHash = null;
+    if (expected.report) {
+        const s = String(expected.report).trim();
+        if (/^[0-9a-f]{64}$/i.test(s)) expReportHash = s.toLowerCase();
+        else if (s) expReportHash = await zkRsaSha256Hex(s);
+    }
+
     if (!cred || typeof cred !== 'object') return { ok: false, rows: [{ cls: 'failed', icon: '❌', title: 'not a credential', detail: 'expected a JSON object' }] };
     if (cred.type !== 'pav-rsa-escrow' || cred.version !== 1) no('credential type/version', 'expected type "pav-rsa-escrow" v1, got ' + JSON.stringify(cred.type) + ' v' + cred.version);
     else yes('credential shape', 'pav-rsa-escrow v1');
@@ -796,6 +1446,26 @@ async function zkRsaVerify(cred, expected) {
 
     if (!/^[0-9a-f]{64}$/.test(cred.identity_hash || '')) no('identity hash', 'not a SHA-256 hex digest');
     else yes('identity hash present (public)', cred.identity_hash.slice(0, 32) + '… — decrypting the escrow must reproduce it');
+
+    if (cred.attestation) {
+        const a = cred.attestation;
+        if (!/^[0-9a-f]{64}$/.test(a.report_sha256 || '') || !/^[0-9a-f]{64}$/.test(a.user_hash || '')) {
+            no('attestation binding', 'attestation block present but its digests are not SHA-256 hex');
+        } else if (a.user_hash !== cred.identity_hash) {
+            no('attested user hash == identity_hash', 'attestation claims user hash ' + a.user_hash.slice(0, 20) + '… but the credential commits ' + String(cred.identity_hash).slice(0, 20) + '… — the escrow does NOT hold the attested identity');
+        } else {
+            yes('attested PayPal identity == escrow plaintext hash', 'user hash ' + a.user_hash.slice(0, 24) + '… matches identity_hash — decrypting the escrow must reproduce exactly the enclave-signed identity');
+            yes('report binding', 'report sha256 ' + a.report_sha256.slice(0, 24) + '… — recompute it on YOUR copy of the report (green verify.html audit) to tie this credential to that hardware quote');
+            if (expReportHash !== null) {
+                if (expReportHash === a.report_sha256)
+                    yes('report matches the one you expected', 'this credential was bound to your exact report bytes');
+                else
+                    no('report matches the one you expected', 'expected ' + expReportHash.slice(0, 24) + '… ≠ credential\u2019s ' + a.report_sha256.slice(0, 24) + '… — different report');
+            }
+        }
+    } else {
+        warn('no attestation binding (manual mode)', 'this credential escrows operator-supplied attributes — it does NOT claim the plaintext is enclave-attested PayPal data');
+    }
 
     if (!cred.escrow || !cred.escrow.ct) no('escrow ciphertext', 'missing — this is not an escrow credential');
     else yes('escrow ciphertext', cred.escrow.alg + ' → recipient ' + (cred.escrow.recipient_fp || '').slice(0, 24) + '…');
@@ -850,7 +1520,14 @@ async function zkRsaVerify(cred, expected) {
 async function zkRsaEscrowOpen(cred, recipientPrivText) {
     const key = await zkRsaParseAny(recipientPrivText);
     if (!key.hasPrivate) throw new Error('the pasted recipient key has no private part — paste the RECIPIENT\'S private key (only they can open the escrow)');
-    const jwk = {
+    const alg = String((cred.escrow && cred.escrow.alg) || '');
+    let pt;
+    if (alg.startsWith('OpenPGP')) {
+        pt = await zkRsaPgpDecryptMessage(cred.escrow.ct, key);
+    } else if (alg.startsWith('CMS')) {
+        pt = await zkRsaCmsDecryptMessage(cred.escrow.ct, key);
+    } else {
+        const jwk = {
         kty: 'RSA',
         n: zkRsaB64url(zkRsaBigToBytes(key.n)),
         e: zkRsaB64url(zkRsaBigToBytes(key.e)),
@@ -860,12 +1537,12 @@ async function zkRsaEscrowOpen(cred, recipientPrivText) {
         dp: zkRsaB64url(zkRsaBigToBytes(key.d % (key.p - 1n))),
         dq: zkRsaB64url(zkRsaBigToBytes(key.d % (key.q - 1n))),
         qi: zkRsaB64url(zkRsaBigToBytes(zkRsaModInv(key.q, key.p))),
-    };
-    const priv = await crypto.subtle.importKey('jwk', jwk, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['decrypt']);
-    const ek = new Uint8Array(await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, priv, zkRsaB64ToBytes(cred.escrow.ek)));
-    const aes = await crypto.subtle.importKey('raw', ek, 'AES-GCM', false, ['decrypt']);
-    const pt = new Uint8Array(await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: zkRsaB64ToBytes(cred.escrow.iv) }, aes, zkRsaB64ToBytes(cred.escrow.ct)));
+    };        const priv = await crypto.subtle.importKey('jwk', jwk, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['decrypt']);
+        const ek = new Uint8Array(await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, priv, zkRsaB64ToBytes(cred.escrow.ek)));
+        const aes = await crypto.subtle.importKey('raw', ek, 'AES-GCM', false, ['decrypt']);
+        pt = new Uint8Array(await crypto.subtle.decrypt(
+            { name: 'AES-GCM', iv: zkRsaB64ToBytes(cred.escrow.iv) }, aes, zkRsaB64ToBytes(cred.escrow.ct)));
+    }
     const json = new TextDecoder().decode(pt);
     const hash = await zkRsaSha256Hex(pt);
     return { json, bytes: pt, hash, matches: hash === cred.identity_hash };
@@ -917,10 +1594,43 @@ async function zkRsaParseRecipientBox() {
         const k = await zkRsaParseAny(el.value);
         zkRsaParsedRecipient = k;
         zkRsaSet('zkRsaRecipientStatus', '✅ recipient ' + k.format + ' · RSA-' + k.bits + ' · fp ' + k.fp.slice(0, 24) + '…', '#3fb950');
+        // Offer every format the recipient key can actually open:
+        //   PGP key → OpenPGP + JSON ; certificate → CMS + JSON ; bare n/e → JSON only
+        const sel = zkRsa$('zkRsaEscrowFmt');
+        if (sel) {
+            const isPgp = k.format === 'pgp-public' || k.format === 'pgp-secret';
+            const isCert = k.format === 'x509';
+            for (const o of sel.options) {
+                o.disabled = !(o.value === 'json' || (o.value === 'pgp' && isPgp) || (o.value === 'cms' && isCert));
+            }
+            sel.value = isPgp ? 'pgp' : (isCert ? 'cms' : 'json');
+            zkRsaSet('zkRsaFmtHint', isPgp
+                ? 'selected: a real OpenPGP message — the recipient runs `gpg --decrypt secret.asc > identity.json`'
+                : isCert
+                    ? 'selected: S/MIME AuthEnvelopedData — the recipient runs `openssl cms -decrypt -inform DER -inkey key.pem -in escrow.der`'
+                    : 'JSON envelope selected (only format this bare key can open)', 'var(--text-dim)');
+        }
         return k;
     } catch (err) {
         zkRsaParsedRecipient = null;
         zkRsaSet('zkRsaRecipientStatus', '❌ ' + err.message, '#f85149');
+        return null;
+    }
+}
+
+// ATTESTED mode: load the green report, re-run the fail-closed preimage gate.
+async function zkRsaLoadAttestBox() {
+    const ta = zkRsa$('zkRsaAttestPaste');
+    try {
+        const r = await zkRsaLoadReportText(ta ? ta.value : '');
+        zkRsaSet('zkRsaAttestStatus',
+            '✅ attested identity loaded — signed hash ' + r.declaredHash.slice(0, 16) +
+            '… The escrow will hold EXACTLY this PayPal identity (manual attributes below are ignored), and the credential pins report_sha256 + user hash into the proof.',
+            '#3fb950');
+        return r;
+    } catch (err) {
+        zkRsaParsedReport = null;
+        zkRsaSet('zkRsaAttestStatus', '❌ ' + err.message, '#f85149');
         return null;
     }
 }
@@ -946,10 +1656,14 @@ async function zkRsaGenerateCredential() {
         }
 
         status('⏳ proving (RSA modexp in this tab)…');
+        const fmtEl = zkRsa$('zkRsaEscrowFmt');
+        const fmt = (fmtEl && fmtEl.value) || 'json';
         const cred = await zkRsaProve({
             key: zkRsaParsedSigner,
             attrsText: attrsEl ? attrsEl.value : '{}',
             recipientKey,
+            fmt,
+            report: zkRsaParsedReport || undefined,
             domain: domainEl ? domainEl.value.trim() : '',
             nonce,
             purpose: purposeEl ? purposeEl.value.trim() : '',
@@ -959,8 +1673,15 @@ async function zkRsaGenerateCredential() {
         if (out) out.value = JSON.stringify(cred, null, 2);
         const card = zkRsa$('zkRsaResultCard');
         if (card) card.style.display = 'block';
-        status('✅ credential ready — proof by ' + zkRsaParsedSigner.format + ', identity encrypted to fp ' +
-            cred.escrow.recipient_fp.slice(0, 24) + '…. Nothing left this tab.', '#3fb950');
+        const howOpen = cred.escrow.alg.startsWith('OpenPGP')
+            ? 'recipient: `gpg --decrypt` the armored ct'
+            : cred.escrow.alg.startsWith('CMS')
+                ? 'recipient: `openssl cms -decrypt -inform DER`'
+                : 'recipient: paste credential + private key into the verifier below';
+        status('✅ credential ready — proof by ' + zkRsaParsedSigner.format +
+            (cred.attestation ? ', ATTESTED identity (' + cred.attestation.user_hash.slice(0, 16) + '…)' : ', manual attributes') +
+            ', escrow ' + fmt + ' → fp ' + cred.escrow.recipient_fp.slice(0, 24) +
+            '…. ' + howOpen + '. Nothing left this tab.', '#3fb950');
         return cred;
     } catch (err) {
         status('❌ ' + err.message, '#f85149');
@@ -985,6 +1706,7 @@ async function zkRsaVerifyCredential() {
         const res = await zkRsaVerify(cred, {
             nonce: (zkRsa$('zkRsaExpectNonce') || {}).value || '',
             domain: (zkRsa$('zkRsaExpectDomain') || {}).value || '',
+            report: (zkRsa$('zkRsaExpectReport') || {}).value || '',
         });
         zkRsaRenderRows('zkRsaVerifyRows', res.rows);
         return res;

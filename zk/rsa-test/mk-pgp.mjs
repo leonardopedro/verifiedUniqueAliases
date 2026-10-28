@@ -120,11 +120,15 @@ const recip = rsaNumbers(readFileSync(join(dir, 'recipient-key.pem'), 'utf8'));
 
 function secBody(k) {
   const u = modInv(k.p, k.q); // p^-1 mod q (RFC 4880 §5.5.1.3)
-  return Buffer.concat([
-    pubMaterial(k.n, k.e),
-    Buffer.from([0]), // s2k usage 0 = cleartext
-    mpi(k.d), mpi(k.p), mpi(k.q), mpi(u),
-  ]);
+  const secret = Buffer.concat([mpi(k.d), mpi(k.p), mpi(k.q), mpi(u)]);
+  // RFC 4880 §5.5.3: with s2k usage 0 a two-octet checksum (sum mod 65536 of
+  // ALL algorithm-specific octets, MPI prefix + data) follows the secret MPIs —
+  // gpg REJECTS the packet without it ("read error: Invalid packet").
+  let sum = 0;
+  for (const b of secret) sum = (sum + b) & 0xffff;
+  const csum = Buffer.alloc(2);
+  csum.writeUInt16BE(sum);
+  return Buffer.concat([pubMaterial(k.n, k.e), Buffer.from([0]), secret, csum]);
 }
 const modInv = (a, m) => { let [old_r, r] = [a % m, m]; let [old_s, s] = [1n, 0n]; while (r !== 0n) { const q = old_r / r; [old_r, r] = [r, old_r - q * r]; [old_s, s] = [s, old_s - q * s]; } return ((old_s % m) + m) % m; };
 
