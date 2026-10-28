@@ -1416,13 +1416,29 @@ async function zkRsaVerify(cred, expected) {
     const warn = (t, d) => rows.push({ cls: 'warning', icon: '⚠️', title: t, detail: d });
     expected = expected || {};
 
-    // Optional expected report: a SHA-256 hex digest OR the report JSON text
-    // (its digest is computed here) — compared against attestation.report_sha256.
+    // Optional expected report: a SHA-256 hex digest OR the report JSON text.
+    // A full report is run through the SAME fail-closed preimage gate the
+    // prover uses (pure parser + raw-hash re-derivation — deliberately NOT
+    // zkRsaLoadReportText, which would clobber the prover's loaded report),
+    // so its SIGNED paypal_user_info_raw_hash becomes available for the
+    // enclave-origin tie below. A bare digest can only prove byte-equality,
+    // never contents.
     let expReportHash = null;
+    let expReportRawHash = null;
+    let expReportGateErr = null;
     if (expected.report) {
         const s = String(expected.report).trim();
         if (/^[0-9a-f]{64}$/i.test(s)) expReportHash = s.toLowerCase();
-        else if (s) expReportHash = await zkRsaSha256Hex(s);
+        else if (s) {
+            expReportHash = await zkRsaSha256Hex(s);
+            try {
+                const parsedExp = zkRsaIdentityFromReportText(s);
+                const recomputedExp = await zkRsaSha256Hex(parsedExp.identityJson);
+                if (recomputedExp !== parsedExp.declaredHash)
+                    throw new Error('the report’s SIGNED paypal_user_info_raw_hash does not match the identity it carries — tampered report');
+                expReportRawHash = parsedExp.declaredHash;
+            } catch (e) { expReportGateErr = e.message; }
+        }
     }
 
     if (!cred || typeof cred !== 'object') return { ok: false, rows: [{ cls: 'failed', icon: '❌', title: 'not a credential', detail: 'expected a JSON object' }] };
@@ -1455,12 +1471,37 @@ async function zkRsaVerify(cred, expected) {
             no('attested user hash == identity_hash', 'attestation claims user hash ' + a.user_hash.slice(0, 20) + '… but the credential commits ' + String(cred.identity_hash).slice(0, 20) + '… — the escrow does NOT hold the attested identity');
         } else {
             yes('attested PayPal identity == escrow plaintext hash', 'user hash ' + a.user_hash.slice(0, 24) + '… matches identity_hash — decrypting the escrow must reproduce exactly the enclave-signed identity');
-            yes('report binding', 'report sha256 ' + a.report_sha256.slice(0, 24) + '… — recompute it on YOUR copy of the report (green verify.html audit) to tie this credential to that hardware quote');
+            // Report-binding row: state exactly what IS and ISN'T machine-
+            // checked at each input level (nothing / digest / full report).
+            yes('report binding', expReportHash === null
+                ? 'report sha256 ' + a.report_sha256.slice(0, 24) + '… — NO report supplied: recompute this digest on your own copy (green verify.html audit), or paste the full report below to machine-check byte digest AND enclave-origin tie'
+                : 'report sha256 ' + a.report_sha256.slice(0, 24) + '… — your copy is compared below: byte digest, then (full report only) the enclave-origin tie');
             if (expReportHash !== null) {
                 if (expReportHash === a.report_sha256)
                     yes('report matches the one you expected', 'this credential was bound to your exact report bytes');
                 else
                     no('report matches the one you expected', 'expected ' + expReportHash.slice(0, 24) + '… ≠ credential\u2019s ' + a.report_sha256.slice(0, 24) + '… — different report');
+                // Enclave-origin tie (needs the FULL report, not just its
+                // digest): the report's SIGNED paypal_user_info_raw_hash must
+                // equal this credential's identity_hash. The attestation block
+                // is prover-authored — a hostile prover can pair a REAL
+                // report's digest with a fake hash under a valid GQ proof —
+                // so byte-digest equality alone never proves origin; only this
+                // comparison does. Fail closed on anything unparseable.
+                if (expReportRawHash !== null) {
+                    if (expReportRawHash === cred.identity_hash)
+                        yes('enclave-origin tie: report’s signed raw hash == identity_hash',
+                            'raw hash ' + expReportRawHash.slice(0, 24) + '… extracted from YOUR report copy matches identity_hash — the escrow commits to the enclave-signed identity');
+                    else
+                        no('enclave-origin tie: report’s signed raw hash == identity_hash',
+                            'report’s raw hash ' + expReportRawHash.slice(0, 24) + '… ≠ identity_hash ' + String(cred.identity_hash).slice(0, 24) + '… — the escrow does NOT hold this report’s attested identity (forged attestation block)');
+                } else if (expReportGateErr) {
+                    no('enclave-origin tie: report’s signed raw hash == identity_hash',
+                        'expected report failed the preimage gate — ' + expReportGateErr);
+                } else {
+                    warn('enclave-origin tie not machine-checked',
+                        'you supplied only the report’s sha256 — a digest proves byte-equality, not contents: paste the FULL report JSON to compare its signed raw hash against identity_hash');
+                }
             }
         }
     } else {

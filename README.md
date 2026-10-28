@@ -98,13 +98,13 @@ the file it describes:
 |---|---|---|
 | `verify.html` | 177,053 bytes | `5fd32b9e1438bee9fecd399834c84d8b733df12a2069a56b24ee11277987fcbb` |
 | `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
-| `zk-rsa.html` | 92,172 bytes | `9241b7e259b39513523e6357631714b9e4b839f5c7d1a891b09ed5a40c5a38b3` |
+| `zk-rsa.html` | 95,341 bytes | `a6f7d12f89b24238e025d017ffa8d05fcd16fd56bad8c77b53375aff5d45053b` |
 
 ```bash
 sha256sum verify.html zk.html zk-rsa.html
 # 5fd32b9e1438bee9fecd399834c84d8b733df12a2069a56b24ee11277987fcbb  verify.html
 # 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
-# 9241b7e259b39513523e6357631714b9e4b839f5c7d1a891b09ed5a40c5a38b3  zk-rsa.html
+# a6f7d12f89b24238e025d017ffa8d05fcd16fd56bad8c77b53375aff5d45053b  zk-rsa.html
 ```
 
 (`zk.html` is the standalone zero-knowledge prover — split out of

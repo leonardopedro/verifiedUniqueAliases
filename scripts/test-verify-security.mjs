@@ -3360,6 +3360,44 @@ console.log('\nTest 47: zk-rsa.html — RSA ZK escrow credential (PGP / X.509 / 
       String(refused).slice(0, 90));
   }
 
+  // Enclave-origin tie: with the FULL report text supplied, zkRsaVerify must
+  // extract the report's SIGNED paypal_user_info_raw_hash and compare it to
+  // identity_hash. The attestation block is prover-authored: a hostile prover
+  // can pair a REAL report's digest with a fake identity hash under a valid
+  // GQ proof — byte-digest equality alone never catches it, only this row.
+  {
+    const idJson = JSON.stringify({ user_id: 'https://www.paypal.com/user/ORIGIN', sub: null, verified_account: true, payer_id: 'P-ORIGIN' });
+    const rawHash = sha256(Buffer.from(idJson)).toString('hex');
+    const reportText = JSON.stringify({ attestation_report: { paypal_user_info: JSON.parse(idJson), paypal_user_info_raw_hash: rawHash } }, null, 2);
+    const parsedReport = await zkRsaLoadReportText(reportText);
+
+    const honest = await zkRsaProve({ key: sec, report: parsedReport, recipientKey: recip, domain: 'harness.test', nonce, purpose: 'origin tie' });
+    const h1 = await zkRsaVerify(honest, { report: reportText });
+    check('origin tie machine-checked with full report (honest credential green)',
+      h1.ok === true && h1.rows.some((r) => r.cls === 'verified' && /enclave-origin tie/.test(r.title)),
+      h1.rows.filter((r) => r.cls === 'failed').map((r) => r.title).join('; '));
+
+    // The forgery: real report digest + fake identity hash, proof still VALID.
+    const fakeId = JSON.stringify({ user_id: 'FAKE-IDENTITY', sub: null, verified_account: true, payer_id: 'X' });
+    const fakeHash = sha256(Buffer.from(fakeId)).toString('hex');
+    const hostile = await zkRsaProve({ key: sec, report: { text: reportText, identityJson: fakeId, declaredHash: fakeHash }, recipientKey: recip, domain: 'harness.test', nonce, purpose: 'hostile' });
+    const h2 = await zkRsaVerify(hostile, {});
+    check('hostile credential is self-consistent WITHOUT the report (the gap this row closes)',
+      h2.ok === true, h2.rows.filter((r) => r.cls === 'failed').map((r) => r.title).join('; '));
+    const h3 = await zkRsaVerify(hostile, { report: reportText });
+    check('hostile forgery (real report digest + fake hash) refused by the origin tie',
+      h3.ok === false && h3.rows.some((r) => r.cls === 'failed' && /enclave-origin tie/.test(r.title)),
+      h3.rows.filter((r) => r.cls === 'failed').map((r) => r.title).join('; ') || 'all rows green — FORGERY ACCEPTED');
+    const h4 = await zkRsaVerify(hostile, { report: sha256(Buffer.from(reportText)).toString('hex') });
+    check('digest-only input flags the gap (origin-tie warn row, not a pass claim)',
+      h4.ok === true && h4.rows.some((r) => r.cls === 'warning' && /origin tie not machine-checked/.test(r.title)),
+      h4.rows.filter((r) => r.cls === 'failed').map((r) => r.title).join('; '));
+    const h5 = await zkRsaVerify(honest, { report: 'this is not an attestation report' });
+    check('unparseable expected report fails the origin tie closed',
+      h5.ok === false && h5.rows.some((r) => r.cls === 'failed' && /enclave-origin tie/.test(r.title)),
+      h5.rows.filter((r) => r.cls === 'failed').map((r) => r.title).join('; '));
+  }
+
   const rsaDigest = sha256(readFileSync(join(repoRoot, 'zk-rsa.html'))).toString('hex');
   const readmeNow = readFileSync(join(repoRoot, 'README.md'), 'utf8');
   check('README publishes the CURRENT zk-rsa.html sha256',
