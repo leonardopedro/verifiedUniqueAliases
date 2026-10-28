@@ -1723,16 +1723,27 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
   // answers with the audited FULL-flow app no matter what flow was asked for
   // (every signature/pin/app allow-list check legitimately passes).
   let substituteFlow = false;
+  // v197: what the stub signs back for the Police-escrow recipient
+  // fingerprint — 'echo' (honest enclave), 'wrong' (hostile substitution),
+  // 'omit' (legacy pre-v197 enclave).
+  let escrowMode = 'echo';
+  let lastLoginBody = '{}';
   const requests = [];
   const origFetch = globalThis.fetch;
   globalThis.fetch = async (url, opts) => {
     requests.push(String(url));
     if (String(url).endsWith('/attest/login-session')) {
       const body = JSON.parse(opts.body);
+      lastLoginBody = opts.body;
       const pubDer = Buffer.from(body.client_ecdh_pub_b64, 'base64');
       const binding = await clientSessionBindingHex(pubDer, body.client_nonce_hex);
       const app = globalThis.EXPECTED_APPS.find(a => a.flow ===
         (substituteFlow ? 'full' : (body.flow || 'verified')));
+      const escrowFp = (body.pgp_recipient && escrowMode !== 'omit')
+        ? (escrowMode === 'wrong'
+            ? '0'.repeat(40)
+            : (await pgpPublicFingerprints(body.pgp_recipient))[0])
+        : null;
       const sf = reorder({
         binding: 'v180', state: 'teststate-abc', flow: app.flow,
         paypal_client_id: app.client_id, paypal_environment: 'sandbox',
@@ -1741,6 +1752,7 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
         custom_info: (body.custom_info || '').trim() || 'NONE',
         client_session_binding_hex: binding,
         ...(omitPkce ? {} : { code_challenge: PKCE_CHALLENGE, code_challenge_method: 'S256' }),
+        ...(escrowFp ? { pgp_recipient_fingerprint: escrowFp } : {}),
       });
       const sig = createSign('sha256').update(JSON.stringify(sf)).sign(enc.privateKey).toString('base64');
       return { ok: true, status: 200, json: async () => ({
@@ -1760,6 +1772,8 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
       requests.length === 1 && requests[0].endsWith('/attest/login-session'), JSON.stringify(requests));
     check('no pre-login audit ran (report textarea untouched)',
       elements['attestationInput'].value === '', elements['attestationInput'].value.slice(0, 60));
+    check('no escrow key in the box → pgp_recipient travels empty (v197)',
+      JSON.parse(lastLoginBody).pgp_recipient === '', lastLoginBody.slice(-140));
     const href = elements['loginVerifiedLink'].href || '';
     check('flow link becomes the authorize handoff (v188 two explicit links)',
       typeof href === 'string' && href.startsWith('https://www.sandbox.paypal.com'),
@@ -1842,6 +1856,66 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
       (elements['secureLoginStatus'].innerText || '').slice(0, 160));
     check('oversized custom_info made no network call',
       requests.length === 3, JSON.stringify(requests));
+
+    // ========================================================================
+    // v197 — Police-escrow PGP (second auto-download). The prefilled BKA key
+    // must travel with the request, come back SIGNED as a recipient
+    // fingerprint, and be re-verified against THIS tab's armor before PayPal
+    // (substitution defense). Harness DOM is synthetic, so the prefilled
+    // armor is read out of verify.html exactly as the textarea ships it.
+    // ========================================================================
+    const prefilledPgp = (verifySrc.match(/id="policePgpInput"[^>]*>([\s\S]*?)<\/textarea>/) || [])[1] || '';
+    check('v197: the auditor ships a prefilled Police escrow key',
+      prefilledPgp.startsWith('-----BEGIN PGP PUBLIC KEY BLOCK-----')
+        && prefilledPgp.trimEnd().endsWith('-----END PGP PUBLIC KEY BLOCK-----')
+        && prefilledPgp.length > 3000,
+      prefilledPgp.slice(0, 60) + ' … ' + prefilledPgp.length + ' B');
+
+    elements['loginVerifiedLink'].href = '';       // F6: force a fresh prepare
+    elements['policePgpInput'].value = prefilledPgp;
+    await executePreflightAndLogin('verified');
+    const sentBody = JSON.parse(lastLoginBody);
+    check('v197: default prefilled Police key travels as pgp_recipient',
+      typeof sentBody.pgp_recipient === 'string'
+        && sentBody.pgp_recipient.includes('-----BEGIN PGP PUBLIC KEY BLOCK-----'),
+      JSON.stringify({ len: (sentBody.pgp_recipient || '').length }));
+    check('v197: honest signed fingerprint accepted (status says escrow ON)',
+      /Police escrow ON/.test(elements['secureLoginStatus'].innerText || ''),
+      (elements['secureLoginStatus'].innerText || '').slice(0, 240));
+
+    // Hostile substitution: the enclave signs a fingerprint for a DIFFERENT
+    // key than this tab pasted → abort BEFORE PayPal, link reset.
+    elements['loginVerifiedLink'].href = '';
+    escrowMode = 'wrong';
+    await executePreflightAndLogin('verified');
+    escrowMode = 'echo';
+    check('v197: substituted escrow fingerprint fails closed before PayPal',
+      /ESCROW KEY SUBSTITUTION/.test(elements['secureLoginStatus'].innerText || ''),
+      (elements['secureLoginStatus'].innerText || '').slice(0, 240));
+    check('v197: substitution refusal left no authorize link',
+      !elements['loginVerifiedLink'].href, String(elements['loginVerifiedLink'].href).slice(0, 120));
+
+    // Legacy (pre-v197) enclave: no fingerprint signed back → warn, proceed
+    // (deploy-window safety: an old enclave ignores the field entirely).
+    elements['loginVerifiedLink'].href = '';
+    escrowMode = 'omit';
+    await executePreflightAndLogin('verified');
+    escrowMode = 'echo';
+    check('v197: legacy enclave (no signed fingerprint) warns but proceeds',
+      /pre-v197 enclave/.test(elements['secureLoginStatus'].innerText || '')
+        && String(elements['loginVerifiedLink'].href || '').includes('authorize'),
+      (elements['secureLoginStatus'].innerText || '').slice(0, 240));
+
+    // Garbage in the escrow box must fail closed client-side, with NO request.
+    elements['loginVerifiedLink'].href = '';
+    elements['policePgpInput'].value = 'not a PGP key';
+    const reqsBeforeBad = requests.length;
+    await executePreflightAndLogin('verified');
+    elements['policePgpInput'].value = '';
+    check('v197: non-PGP content in the escrow box fails before any request',
+      /does not contain a PGP PUBLIC KEY BLOCK/.test(elements['secureLoginStatus'].innerText || '')
+        && requests.length === reqsBeforeBad,
+      JSON.stringify({ newRequests: requests.length - reqsBeforeBad, status: (elements['secureLoginStatus'].innerText || '').slice(0, 140) }));
   } finally {
     globalThis.fetch = origFetch;
     setLoc(null);

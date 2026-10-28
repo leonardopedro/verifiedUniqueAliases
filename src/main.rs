@@ -1010,11 +1010,668 @@ const MAX_TRACKED_IPS: usize = 1000;
 const MAX_CONCURRENT_CONNECTIONS: usize = 50;
 /// Ceiling on sealed, not-yet-claimed E2EE reports (see callback).
 const MAX_PENDING_E2EE_BLOBS: usize = 4096;
+// ============================================================================
+// v197 — Police-escrow PGP sealing (user request): a second auto-download
+// whose payload is a real OpenPGP message (PKESK v3 + SEIPD v1) readable only
+// by the recipient's PRIVATE key, plus the attested hashes in CLEAR. Crypto
+// runs HERE (server-side) so the callback tab stays ciphertext-only. The
+// algorithm set is byte-for-byte the stack proven against gpg 2.4.9 in the
+// zk-rsa.html four-leg interop (20b1ceb): no CFB resync (RFC 4880 §5.13),
+// MDC SHA-1, PKCS#1 v1.5 session-key wrap. No new dependencies
+// (openssl / rand / sha2 / hex / base64 / serde_json are all present).
+// ============================================================================
+mod pgp_escrow {
+    use base64::Engine as _;
+
+    const PGP_SYM_AES256: u8 = 9; // RFC 4880 §9.2
+
+    struct Packet {
+        tag: u8,
+        body: Vec<u8>,
+    }
+
+    struct Target {
+        #[allow(dead_code)]
+        fingerprint: String,
+        keyid: String,
+        n: Vec<u8>,
+        e: Vec<u8>,
+    }
+
+    fn crc24(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xb704ce;
+        for &b in data {
+            crc ^= (b as u32) << 16;
+            for _ in 0..8 {
+                crc <<= 1;
+                if crc & 0x100_0000 != 0 {
+                    crc ^= 0x1864cfb;
+                }
+            }
+        }
+        crc & 0xff_ffff
+    }
+
+    /// Armored block → raw bytes. Regex-free: locate the BEGIN/END markers,
+    /// the first blank line ends the header and starts the base64, and a
+    /// lone `=XXXX` last line is the optional CRC-24 (verified when present).
+    /// Mirrors `zkRsaPgpPackets`' b64 handling in zk-rsa.html.
+    fn dearmor(armor: &str) -> Result<Vec<u8>, String> {
+        dearmor_block(
+            armor,
+            "-----BEGIN PGP PUBLIC KEY BLOCK-----",
+            "-----END PGP PUBLIC KEY BLOCK-----",
+        )
+    }
+
+    fn dearmor_block(armor: &str, begin: &str, end: &str) -> Result<Vec<u8>, String> {
+        // Tolerate CRLF armor (mail transports) — the marker/blank-line search
+        // below is line-based.
+        let s = armor.replace("\r\n", "\n");
+        let s = s.trim();
+        let b = s.find(begin).ok_or("not a PGP PUBLIC KEY BLOCK")? + begin.len();
+        let e = s[b..].find(end).ok_or("missing armor end")? + b;
+        let body = &s[b..e];
+        let body = body
+            .split_once("\n\n")
+            .map(|(_, r)| r)
+            .ok_or("missing armor blank line")?
+            .trim_end();
+        // Optional CRC line: exactly `=` + 4 base64 chars on its own last line.
+        let (data, crc_line) = match body.rsplit_once('\n') {
+            Some((head, last)) if last.len() == 5 && last.starts_with('=') => (head, Some(&last[1..])),
+            _ => (body, None),
+        };
+        let clean: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+        // base64 only accepts correctly padded input; armor lines are arbitrary
+        // multiples of 4 once whitespace is stripped, so re-pad if needed.
+        let mut padded = clean.trim_end_matches('=').to_string();
+        while padded.len() % 4 != 0 {
+            padded.push('=');
+        }
+        let bin = base64::engine::general_purpose::STANDARD
+            .decode(padded)
+            .map_err(|e| format!("armor base64: {e}"))?;
+        if let Some(c) = crc_line {
+            let want = base64::engine::general_purpose::STANDARD
+                .decode(c.trim())
+                .map_err(|e| format!("armor CRC base64: {e}"))?;
+            if want.len() != 3
+                || crc24(&bin) != ((want[0] as u32) << 16 | (want[1] as u32) << 8 | want[2] as u32)
+            {
+                return Err("armor CRC mismatch — truncated or tampered".into());
+            }
+        }
+        Ok(bin)
+    }
+
+    fn parse_packets(bin: &[u8]) -> Result<Vec<Packet>, String> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < bin.len() {
+            let ctb = bin[i];
+            i += 1;
+            if ctb & 0x80 == 0 {
+                return Err("malformed packet header".into());
+            }
+            let (tag, len) = if ctb & 0x40 != 0 {
+                // new-format header
+                let tag = ctb & 0x3f;
+                if i >= bin.len() {
+                    return Err("truncated packet length".into());
+                }
+                let l = if bin[i] < 192 {
+                    let l = bin[i] as usize;
+                    i += 1;
+                    l
+                } else if bin[i] < 224 {
+                    if i + 1 >= bin.len() {
+                        return Err("truncated packet length".into());
+                    }
+                    let l = (((bin[i] as usize) - 192) << 8) + bin[i + 1] as usize + 192;
+                    i += 2;
+                    l
+                } else if bin[i] == 255 {
+                    if i + 4 >= bin.len() {
+                        return Err("truncated packet length".into());
+                    }
+                    let l = u32::from_be_bytes([bin[i + 1], bin[i + 2], bin[i + 3], bin[i + 4]]) as usize;
+                    i += 5;
+                    l
+                } else {
+                    return Err("partial-body lengths unsupported".into());
+                };
+                (tag, l)
+            } else {
+                // old-format header
+                let tag = (ctb >> 2) & 0x0f;
+                let l = match ctb & 0x03 {
+                    0 => {
+                        let l = bin.get(i).copied().ok_or("truncated packet length")? as usize;
+                        i += 1;
+                        l
+                    }
+                    1 => {
+                        if i + 1 >= bin.len() {
+                            return Err("truncated packet length".into());
+                        }
+                        let l = u16::from_be_bytes([bin[i], bin[i + 1]]) as usize;
+                        i += 2;
+                        l
+                    }
+                    2 => {
+                        if i + 3 >= bin.len() {
+                            return Err("truncated packet length".into());
+                        }
+                        let l = u32::from_be_bytes([bin[i], bin[i + 1], bin[i + 2], bin[i + 3]]) as usize;
+                        i += 4;
+                        l
+                    }
+                    _ => bin.len() - i, // indeterminate length → rest of stream
+                };
+                (tag, l)
+            };
+            if i + len > bin.len() {
+                return Err("packet overruns buffer".into());
+            }
+            out.push(Packet { tag, body: bin[i..i + len].to_vec() });
+            i += len;
+        }
+        Ok(out)
+    }
+
+    fn read_mpi(b: &[u8], off: &mut usize) -> Result<(usize, Vec<u8>), String> {
+        if *off + 2 > b.len() {
+            return Err("truncated MPI".into());
+        }
+        let bits = u16::from_be_bytes([b[*off], b[*off + 1]]) as usize;
+        let n = (bits + 7) / 8;
+        if *off + 2 + n > b.len() {
+            return Err("MPI overruns packet".into());
+        }
+        let v = b[*off + 2..*off + 2 + n].to_vec();
+        *off += 2 + n;
+        Ok((bits, v))
+    }
+
+    /// v4 public-key material: version(1) created(4) algo(1) [RSA: n MPI, e
+    /// MPI] → (material-including-mpis, n, e). Rejects non-RSA keys exactly
+    /// like the JS parser (`zkRsaParsePgpKeyPacket`); the Bayern/BKA key is
+    /// RSA (algo 1 = encrypt-or-sign, algo 3 = encrypt-only).
+    fn rsa_key(body: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+        if body.len() < 6 || body[0] != 4 {
+            return Err("not a v4 key packet".into());
+        }
+        let algo = body[5];
+        if algo != 1 && algo != 3 {
+            return Err(format!("key algo {algo} is not RSA encrypt-or-sign"));
+        }
+        let mut off = 6usize;
+        let (nbits, n) = read_mpi(body, &mut off)?;
+        let (_ebits, e) = read_mpi(body, &mut off)?;
+        if n.is_empty() || e.is_empty() || nbits < 1024 {
+            return Err("implausible RSA modulus".into());
+        }
+        Ok((body[..off].to_vec(), n, e))
+    }
+
+    /// Key-fork subpacket (RFC 4880 §5.2.3.29): the FIRST signature packet
+    /// after this key packet; type 27 carries the key flags byte (0x04/0x08 =
+    /// may encrypt). Byte-exact port of `zkRsaPgpKeyFlags` (zk-rsa.html).
+    fn key_flags(pks: &[Packet], idx: usize) -> Option<u8> {
+        for p in pks.iter().skip(idx + 1) {
+            match p.tag {
+                5 | 6 | 7 | 14 => return None,
+                2 => {
+                    let b = &p.body;
+                    if b.is_empty() || b[0] != 4 || b.len() < 6 {
+                        return None;
+                    }
+                    let hlen = u16::from_be_bytes([b[4], b[5]]) as usize;
+                    let mut pt = 6usize;
+                    let end = 6 + hlen;
+                    while pt < end && pt < b.len() {
+                        // RFC 4880 §5.2.3.1: subpacket = length, THEN type,
+                        // THEN data — the type octet sits AFTER the length
+                        // octets (byte-exact parity with zkRsaPgpKeyFlags).
+                        let hdr = if b[pt] < 192 {
+                            1
+                        } else if b[pt] < 254 {
+                            2
+                        } else {
+                            5
+                        };
+                        if pt + hdr > b.len() {
+                            return None;
+                        }
+                        let sl = if b[pt] < 192 {
+                            b[pt] as usize
+                        } else if b[pt] < 254 {
+                            (((b[pt] as usize) - 192) << 8) + b[pt + 1] as usize + 192
+                        } else {
+                            u32::from_be_bytes([b[pt + 1], b[pt + 2], b[pt + 3], b[pt + 4]]) as usize
+                        };
+                        pt += hdr;
+                        if sl < 1 || pt + sl > b.len() {
+                            return None;
+                        }
+                        if b[pt] == 27 && sl >= 2 {
+                            return Some(b[pt + 1]);
+                        }
+                        pt += sl;
+                    }
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// OpenPGP v4 fingerprint: SHA-1(0x99 ‖ len16(material)) — over the
+    /// primary key material (primary) or the subkey material (target).
+    fn fingerprint(material: &[u8]) -> String {
+        let mut v = Vec::with_capacity(material.len() + 3);
+        v.push(0x99u8);
+        v.push((material.len() >> 8) as u8);
+        v.push((material.len() & 0xff) as u8);
+        v.extend_from_slice(material);
+        hex::encode(openssl::sha::sha1(&v)).to_uppercase()
+    }
+
+    pub struct ParsedRecipient {
+        /// Primary-key fingerprint (40 upper hex) — what the auditor pins.
+        pub fingerprint: String,
+        target: Target,
+    }
+
+    /// Parse an armored OpenPGP public key and pick the ENCRYPTION target —
+    /// identical selection rule to zk-rsa: RSA subkey with encrypt flags
+    /// (0x04|0x08) → else the LAST RSA subkey (the OpenPGP [E]-subkey
+    /// convention) → else the primary.
+    pub fn parse_public_key(armor: &str) -> Result<ParsedRecipient, String> {
+        let bin = dearmor(armor)?;
+        let pks = parse_packets(&bin)?;
+        // (index in pks, key material, n, e, is_primary, flags)
+        let mut keys: Vec<(usize, Vec<u8>, Vec<u8>, Vec<u8>, bool, Option<u8>)> = Vec::new();
+        for (i, p) in pks.iter().enumerate() {
+            if p.tag == 6 {
+                let (mat, n, e) = rsa_key(&p.body)?;
+                keys.push((i, mat, n, e, true, None));
+            } else if p.tag == 14 {
+                // A non-RSA subkey simply isn't selectable — skip it rather
+                // than fail the whole (possibly valid) key.
+                if let Ok((mat, n, e)) = rsa_key(&p.body) {
+                    keys.push((i, mat, n, e, false, key_flags(&pks, i)));
+                }
+            }
+        }
+        if keys.is_empty() {
+            return Err("no RSA key packet found".into());
+        }
+        if !keys[0].4 {
+            return Err("first key packet is not a primary key".into());
+        }
+        let fp = fingerprint(&keys[0].1);
+        let pick: &(usize, Vec<u8>, Vec<u8>, Vec<u8>, bool, Option<u8>) = {
+            let subs: Vec<&(usize, Vec<u8>, Vec<u8>, Vec<u8>, bool, Option<u8>)> =
+                keys.iter().filter(|k| !k.4).collect();
+            if subs.is_empty() {
+                &keys[0]
+            } else {
+                let flagged: Vec<&&_>
+                    = subs.iter().filter(|s| matches!(s.5, Some(f) if f & 0x0c != 0)).collect();
+                if !flagged.is_empty() {
+                    flagged[flagged.len() - 1]
+                } else {
+                    subs[subs.len() - 1]
+                }
+            }
+        };
+        let target_fp = fingerprint(&pick.1);
+        Ok(ParsedRecipient {
+            fingerprint: fp,
+            target: Target {
+                fingerprint: target_fp.clone(),
+                keyid: target_fp[24..40].to_string(),
+                n: pick.2.clone(),
+                e: pick.3.clone(),
+            },
+        })
+    }
+
+    /// New-format packet: tag CTB, RFC 4880 §4.2.2 length, body.
+    fn new_packet(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(body.len() + 6);
+        v.push(0xc0 | tag);
+        let l = body.len();
+        if l < 192 {
+            v.push(l as u8);
+        } else if l <= 8383 {
+            let x = l - 192;
+            v.push(((x >> 8) as u8) + 192);
+            v.push((x & 0xff) as u8);
+        } else {
+            v.push(255);
+            v.extend_from_slice(&(l as u32).to_be_bytes());
+        }
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// AES-256 in CFB-128 with a ZERO IV and NO §13.9 resync — exactly RFC
+    /// 4880 §5.13 for a SEIPD v1 packet (the resync only applies to the old
+    /// SED packet). `pad(false)` is essential: OpenPGP ciphertext is exactly
+    /// as long as its plaintext. The gpg roundtrip test pins this behaviour.
+    fn cfb_encrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+        let iv = [0u8; 16];
+        let mut c = openssl::symm::Crypter::new(
+            openssl::symm::Cipher::aes_256_cfb128(),
+            openssl::symm::Mode::Encrypt,
+            key,
+            Some(&iv),
+        )
+        .map_err(|e| format!("CFB init: {e}"))?;
+        c.pad(false);
+        let mut out = vec![0u8; data.len() + 32];
+        let n = c.update(data, &mut out).map_err(|e| format!("CFB update: {e}"))?;
+        let m = c.finalize(&mut out[n..]).map_err(|e| format!("CFB finalize: {e}"))?;
+        out.truncate(n + m);
+        if out.len() != data.len() {
+            return Err(format!(
+                "CFB produced {} bytes for {} input — OpenPGP ciphertext must be length-preserving",
+                out.len(),
+                data.len()
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Full message: PKESK v3 (target keyid, algo 1, PKCS#1 v1.5 of
+    /// [0x09 ‖ sk ‖ checksum]) + SEIPD v1 (zero-IV AES-256-CFB-128, no
+    /// resync, prefix ‖ literal ‖ MDC) + standard armor. `plaintext` is the
+    /// full envelope JSON.
+    pub fn encrypt_message(armor_pub: &str, plaintext: &[u8]) -> Result<String, String> {
+        let parsed = parse_public_key(armor_pub)?;
+        let rsa = openssl::rsa::Rsa::from_public_components(
+            openssl::bn::BigNum::from_slice(&parsed.target.n)
+                .map_err(|e| format!("RSA modulus: {e}"))?,
+            openssl::bn::BigNum::from_slice(&parsed.target.e)
+                .map_err(|e| format!("RSA exponent: {e}"))?,
+        )
+        .map_err(|e| format!("RSA public key: {e}"))?;
+
+        // --- PKESK (RFC 4880 §5.1) ---
+        let mut sk = [0u8; 32];
+        openssl::rand::rand_bytes(&mut sk).map_err(|e| format!("rng: {e}"))?;
+        let mut payload = Vec::with_capacity(35);
+        payload.push(PGP_SYM_AES256);
+        payload.extend_from_slice(&sk);
+        let sum: u16 = sk.iter().fold(0u16, |a, &b| a.wrapping_add(b as u16));
+        payload.extend_from_slice(&sum.to_be_bytes());
+        let k = rsa.size() as usize;
+        let mut wrapped = vec![0u8; k];
+        let wlen = rsa
+            .public_encrypt(&payload, &mut wrapped, openssl::rsa::Padding::PKCS1)
+            .map_err(|e| format!("PKCS#1 v1.5 wrap: {e}"))?;
+        wrapped.truncate(wlen);
+        debug_assert_eq!(wlen, k);
+
+        let mut pkesk_body = Vec::with_capacity(10 + wrapped.len());
+        pkesk_body.push(3); // version
+        pkesk_body.extend_from_slice(&hex::decode(&parsed.target.keyid).map_err(|e| e.to_string())?);
+        pkesk_body.push(1); // algo 1 = RSA (encrypt-or-sign)
+        // The "MPI" length MUST cover the full key size: PKCS#1 v1.5 output
+        // often starts with a 0x00 octet, and gpg reads ceil(bits/8) bytes
+        // verbatim, so declaring rsa.size()*8 keeps all k octets on the wire.
+        let bits = (rsa.size() * 8) as u16;
+        pkesk_body.extend_from_slice(&bits.to_be_bytes());
+        pkesk_body.extend_from_slice(&wrapped);
+        let pkesk = new_packet(1, &pkesk_body);
+
+        // --- Literal data packet (RFC 4880 §5.9): format 'b', 0-length name
+        // ---
+        let mut lit_body = Vec::with_capacity(6 + plaintext.len());
+        lit_body.push(b'b');
+        lit_body.push(0x00); // filename length
+        lit_body.extend_from_slice(&[0, 0, 0, 0]); // mtime = 0
+        lit_body.extend_from_slice(plaintext);
+        let literal = new_packet(11, &lit_body);
+
+        // --- SEIPD v1 (RFC 4880 §5.13) ---
+        let mut prefix = [0u8; 18];
+        openssl::rand::rand_bytes(&mut prefix[..16]).map_err(|e| format!("rng: {e}"))?;
+        prefix[16] = prefix[14];
+        prefix[17] = prefix[15];
+        let mut pre_mdc: Vec<u8> = Vec::with_capacity(18 + literal.len() + 22);
+        pre_mdc.extend_from_slice(&prefix);
+        pre_mdc.extend_from_slice(&literal);
+        pre_mdc.extend_from_slice(&[0xd3, 0x14]); // MDC packet: tag 19, len 20
+        let digest = openssl::sha::sha1(&pre_mdc);
+        pre_mdc.extend_from_slice(&digest);
+        let ct = cfb_encrypt(&sk, &pre_mdc)?;
+        sk.iter_mut().for_each(|b| *b = 0); // zeroize only now: PKESK + SEIPD
+
+        let mut seipd_body = Vec::with_capacity(1 + ct.len());
+        seipd_body.push(1); // SEIPD version 1
+        seipd_body.extend_from_slice(&ct);
+        let seipd = new_packet(18, &seipd_body);
+
+        let mut out = pkesk;
+        out.extend_from_slice(&seipd);
+        Ok(armor_message(&out))
+    }
+
+    fn armor_message(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let wrapped: String = b64
+            .as_bytes()
+            .chunks(64)
+            .map(|c| String::from_utf8(c.to_vec()).unwrap() + "\n")
+            .collect();
+        let c = crc24(bytes);
+        let crc = base64::engine::general_purpose::STANDARD
+            .encode([(c >> 16) as u8, (c >> 8) as u8, c as u8]);
+        format!("-----BEGIN PGP MESSAGE-----\n\n{wrapped}={crc}\n-----END PGP MESSAGE-----\n")
+    }
+
+    /// The second file: ciphertext + visible hashes. The envelope JSON goes
+    /// in ENCRYPTED; the attested hashes sit in CLEAR (user request).
+    pub fn build_sealed_report(
+        armor_pub: &str,
+        report_json: &str,
+        raw_hash: &str,  // paypal_user_info_raw_hash (signed identity hash)
+        id_hash: &str,   // SHA-256(user_id) — the "hash of the PayPal id"
+    ) -> Result<String, String> {
+        let parsed = parse_public_key(armor_pub)?;
+        let ciphertext = encrypt_message(armor_pub, report_json.as_bytes())?;
+        let sealed = serde_json::json!({
+            "type": "pav-pgp-sealed-attestation/v1",
+            "note": "CIPHERTEXT: the full attestation envelope encrypted to recipient_fingerprint. Only the holder of that PGP key's private half can open it (`gpg --decrypt`). The two hashes below are CLEAR by design so anyone can match this file to the plain attestation without reading its contents.",
+            "recipient_fingerprint": parsed.fingerprint,
+            "recipient_target_fingerprint": parsed.target.fingerprint,
+            "paypal_user_info_raw_hash": raw_hash,
+            "paypal_id_sha256": id_hash,
+            "ciphertext": ciphertext,
+        });
+        serde_json::to_string_pretty(&sealed).map_err(|e| e.to_string())
+    }
+
+    // ---- tests (dev profile only; the gpg leg skips itself if gpg is absent) ----
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn repo(p: &str) -> std::path::PathBuf {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(p)
+        }
+
+        #[test]
+        fn parses_police_bka_key_and_selects_encrypt_subkey() {
+            let armor = std::fs::read_to_string(repo("zk/rsa-test/police-bka-pub.asc"))
+                .expect("police-bka-pub.asc must exist (commit it)");
+            let r = parse_public_key(&armor).expect("police key must parse");
+            assert_eq!(r.fingerprint.len(), 40);
+            assert_eq!(r.fingerprint, r.fingerprint.to_uppercase());
+            assert_eq!(r.target.keyid.len(), 16);
+            assert_eq!(r.target.fingerprint[24..40], r.target.keyid);
+            // The selected target must be a subkey of the primary (an
+            // encryption-capable [E] subkey, not the certify primary).
+            let bin = dearmor(&armor).unwrap();
+            let pks = parse_packets(&bin).unwrap();
+            let sub_idxs: Vec<usize> = pks
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.tag == 14)
+                .map(|(i, _)| i)
+                .collect();
+            assert!(!sub_idxs.is_empty(), "BKA key must have a subkey");
+            let flags: Vec<Option<u8>> = sub_idxs.iter().map(|&i| key_flags(&pks, i)).collect();
+            assert!(
+                flags.iter().any(|f| matches!(f, Some(x) if x & 0x0c != 0)),
+                "an encrypt-capable subkey must exist: {flags:?}"
+            );
+            assert_ne!(r.target.fingerprint, r.fingerprint,
+                "the encryption target must be the subkey, not the certify primary");
+        }
+
+        #[test]
+        fn rejects_garbage_keys() {
+            for bad in [
+                "not a key",
+                "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nAAAA\n-----END PGP PUBLIC KEY BLOCK-----",
+                "",
+                "-----BEGIN PGP PUBLIC KEY BLOCK-----\n-----END PGP PUBLIC KEY BLOCK-----",
+            ] {
+                assert!(parse_public_key(bad).is_err(), "must reject: {bad:?}");
+            }
+        }
+
+        /// Round-trip against real gpg, both directions. Skips itself (with a
+        /// loud message) when gpg is not on PATH — run via
+        /// `nix shell nixpkgs#gnupg -c cargo test pgp -- --nocapture`.
+        #[test]
+        fn gpg_interop_roundtrip_or_skipped() {
+            match std::process::Command::new("gpg").arg("--version").output() {
+                Ok(o) if o.status.success() => {}
+                _ => {
+                    eprintln!("SKIP: gpg not on PATH (run via `nix shell nixpkgs#gnupg -c cargo test pgp`)" );
+                    return;
+                }
+            }
+            let dir = std::env::temp_dir().join(format!("pav-pgp-test-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let homedir = dir.join("gnupg");
+            let _ = std::fs::create_dir_all(&homedir);
+            // gpg refuses a world-readable homedir.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&homedir, std::fs::Permissions::from_mode(0o700));
+            }
+            let gh = homedir.to_str().unwrap().to_string();
+            let gpg = |args: &[&str]| -> Vec<u8> {
+                let out = std::process::Command::new("gpg")
+                    .args(["--homedir", &gh, "--batch", "--pinentry-mode", "loopback", "--yes"])
+                    .args(args)
+                    .output()
+                    .expect("gpg spawn");
+                assert!(
+                    out.status.success(),
+                    "gpg {:?}: {}",
+                    args,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                out.stdout
+            };
+            gpg(&[
+                "--passphrase",
+                "",
+                "--quick-generate-key",
+                "Pav Test <pav@test.invalid>",
+                "rsa2048",
+                "default",
+                "never",
+            ]);
+            // `default` usage only yields a certify/sign primary — add a real
+            // [E] subkey so BOTH legs exercise the subkey-selection rule.
+            let list = String::from_utf8(gpg(&["--with-colons", "--list-keys"])).unwrap();
+            let primary_fpr = list
+                .lines()
+                .find_map(|l| l.strip_prefix("fpr:::::::::"))
+                .map(|s| s.trim_end_matches(':'))
+                .expect("primary fingerprint")
+                .to_string();
+            gpg(&[
+                "--passphrase",
+                "",
+                "--quick-add-key",
+                &primary_fpr,
+                "rsa2048",
+                "encr",
+                "never",
+            ]);
+            let pubr = String::from_utf8(gpg(&["--armor", "--export", "pav@test.invalid"])).unwrap();
+            let payload = br#"{"user_id":"TEST","sub":null,"verified_account":"true","payer_id":"P"}"#;
+            let armored = encrypt_message(&pubr, payload).expect("encrypt");
+
+            // (1) gpg decrypts OUR message:
+            let ctfile = dir.join("msg.asc");
+            std::fs::write(&ctfile, &armored).unwrap();
+            let pt = gpg(&["--decrypt", ctfile.to_str().unwrap()]);
+            assert_eq!(pt, payload, "gpg must recover our plaintext");
+
+            // (2) our parser handles a gpg-produced message: PKESK + SEIPD,
+            // addressed to the same recipient we would have picked.
+            let plainfile = dir.join("plain.txt");
+            std::fs::write(&plainfile, payload).unwrap();
+            gpg(&[
+                "--trust-model",
+                "always",
+                "--armor",
+                "--encrypt",
+                "--recipient",
+                "pav@test.invalid",
+                "--output",
+                dir.join("gpgmsg.asc").to_str().unwrap(),
+                plainfile.to_str().unwrap(),
+            ]);
+            let garm = std::fs::read_to_string(dir.join("gpgmsg.asc")).unwrap();
+            let bin = dearmor_block(
+                &garm,
+                "-----BEGIN PGP MESSAGE-----",
+                "-----END PGP MESSAGE-----",
+            )
+            .unwrap();
+            let pks = parse_packets(&bin).unwrap();
+            assert!(pks.iter().any(|p| p.tag == 1), "gpg message must contain a PKESK");
+            assert!(pks.iter().any(|p| p.tag == 18), "gpg message must contain a SEIPD");
+            // The PKESK's key id must equal the target we select for that key.
+            let ours = parse_public_key(&pubr).unwrap();
+            let pkesk = pks.iter().find(|p| p.tag == 1).unwrap();
+            let kid = hex::encode(&pkesk.body[1..9]).to_uppercase();
+            assert_eq!(kid, ours.target.keyid, "PKESK key id must match our selection");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // NOTE: openssl's one-shot/CFB-128 with a zero IV and NO resync is
+        // exactly RFC 4880 §5.13 — proven by the gpg roundtrip above. Do NOT
+        // "fix" this by adding a §13.9 resync (that was the 20b1ceb bug).
+    }
+}
+
 /// R3-1 (audit round 3 — payment-flow abuse): ceiling + TTL for the PKCE
 /// verifier table — one 43-char verifier per minted login state, held ONLY
 /// in enclave RAM until its exchange completes (see attest_login_session).
 const MAX_PENDING_PKCE: usize = 4096;
 const PKCE_TTL_SECS: u64 = 600;
+// v197 — optional Police-escrow key per state: same TTL as PKCE, smaller
+// ceiling (only escrow logins occupy an entry; each ≤ PGP_RECIPIENT_MAX_BYTES).
+const MAX_PENDING_PGP: usize = 1024;
+const PGP_RECIPIENT_MAX_BYTES: usize = 16_384;
 const GLOBAL_EGRESS_BYTES_PER_HOUR: u64 = 512 * 1024 * 1024;
 const IP_EGRESS_BYTES_PER_HOUR: u64 = 25 * 1024 * 1024;
 const ZEROSSL_CA_DIRECTORY: &str = "https://acme.zerossl.com/v2/DV90";
@@ -1072,9 +1729,15 @@ const CALLBACK_CONTENT: &str = r#"<h1>Authentication Succeeded</h1>
                 <p><b>⬅️ 3/3 — go back to the PREVIOUS (local) tab</b> — your <code>verify.html</code> (file:// or the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color:#64b5f6;">GitHub Pages auditor</a>) that started this login. Load <code>encrypted-attestation-report.json</code> with the “Attestation JSON report” picker and the certificate you just exported with the “Browser TLS certificate” picker, then run the audit. That trusted copy decrypts with the key it generated on load and runs the full hardware audit; with a certificate supplied, the channel row proves the CA-validated endpoint you actually reached served exactly the chain recorded inside the hardware-signed report. This tab holds nothing else — close it with the ✖ button whenever you like.</p>
                 <p id="cert-reminder" style="margin:12px 0 0; padding:10px 12px; border-radius:6px; background:#0d1117; border:1px solid #d29922; color:#d29922; font-size:0.9rem;">🔒 Export this tab's certificate <b>before</b> closing it — a closed tab's certificate cannot be retrieved. Nothing is held here: the ciphertext above is useless without the key that only ever existed in your other tab.</p>
                 <textarea id="e2ee-blob-view" readonly style="width:100%; height:180px; background:#0d1117; color:#9e9e9e; font-size:12px; border:1px solid #30363d; border-radius:6px; padding:10px; box-sizing:border-box;"></textarea>
-                <p><button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); t.select(); try{document.execCommand('copy');this;}catch(e){} try{navigator.clipboard.writeText(t.value);}catch(e){} this.textContent='✅ Copied — paste it into a trusted auditor';})()" style="margin-top:10px;">📋 Copy encrypted report</button> <button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); var blob=new Blob([t.value],{type:'application/json'}); var url=URL.createObjectURL(blob); var a=document.createElement('a'); a.href=url; a.download='encrypted-attestation-report.json'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){URL.revokeObjectURL(url);},5000);})()" style="margin-top:10px;">💾 Download encrypted report (.json)</button> <button class="btn" onclick="window.close()" style="margin-top:10px;">✖ Close this tab</button></p>
+                <p><button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); t.select(); try{document.execCommand('copy');this;}catch(e){} try{navigator.clipboard.writeText(t.value);}catch(e){} this.textContent='✅ Copied — paste it into a trusted auditor';})()" style="margin-top:10px;">📋 Copy encrypted report</button> <button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); var blob=new Blob([t.value],{type:'application/json'}); var url=URL.createObjectURL(blob); var a=document.createElement('a'); a.href=url; a.download='encrypted-attestation-report.json'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){URL.revokeObjectURL(url);},5000);})()" style="margin-top:10px;">💾 Download encrypted report (.json)</button> <button class="btn" onclick="window.close()" style="margin-top:10px;"> ✖ Close this tab</button></p>
+                <div id="pgp-sealed-box" style="display:none; margin-top:12px; padding:10px 12px; border:1px dashed #3fb950; border-radius:6px;">
+                    <p style="margin:0 0 8px 0; font-size:0.9rem; color:#3fb950;">🚔 <b>Second download — Police-escrowed copy:</b> <code>pgp-sealed-attestation.json</code> saves alongside the first file: your attestation ENCRYPTED to the PGP public key you supplied at login (only that private key can open it), plus the PayPal-id hash and the signed identity hash in CLEAR so anyone can match this file to your attestation without reading it. If your browser blocked the second automatic download (Chrome asks about multiple downloads), use the 💾 button below.</p>
+                    <textarea id="pgp-sealed-view" readonly style="width:100%; height:140px; background:#0d1117; color:#9e9e9e; font-size:12px; border:1px solid #30363d; border-radius:6px; padding:10px; box-sizing:border-box;"></textarea>
+                    <p><button class="btn" onclick="(function(){var t=document.getElementById('pgp-sealed-view'); t.select(); try{document.execCommand('copy');}catch(e){} try{navigator.clipboard.writeText(t.value);}catch(e){} this.textContent='✅ Copied';})()" style="margin-top:10px;">📋 Copy Police-sealed file</button> <button class="btn" onclick="(function(){var t=document.getElementById('pgp-sealed-view'); var blob=new Blob([t.value],{type:'application/json'}); var url=URL.createObjectURL(blob); var a=document.createElement('a'); a.href=url; a.download='pgp-sealed-attestation.json'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){URL.revokeObjectURL(url);},5000);})()" style="margin-top:10px;">💾 Download Police-sealed file (.json)</button></p>
+                </div>
             </div>
             <script type="application/json" id="e2ee-blob">__E2EE_BLOB__</script>
+            <script type="application/json" id="pgp-sealed">__PGP_SEALED__</script>
             <script>try{
 var __b=document.getElementById('e2ee-blob').textContent;
 document.getElementById('e2ee-blob-view').value=__b;
@@ -1086,6 +1749,19 @@ var __u=URL.createObjectURL(new Blob([__b],{type:'application/json'}));
 var __a=document.createElement('a'); __a.href=__u; __a.download='encrypted-attestation-report.json';
 document.body.appendChild(__a); __a.click(); __a.remove();
 setTimeout(function(){URL.revokeObjectURL(__u);},10000);
+// v197 AUTO-DOWNLOAD #2 (Police escrow): the sealed copy only exists when the
+// login carried a valid PGP recipient — an empty placeholder means nothing
+// renders and nothing downloads (zero behaviour change for plain logins).
+var __se=document.getElementById('pgp-sealed');
+var __s=__se?(__se.textContent||'').trim():'';
+if(__s){
+  document.getElementById('pgp-sealed-box').style.display='block';
+  document.getElementById('pgp-sealed-view').value=__s;
+  var __u2=URL.createObjectURL(new Blob([__s],{type:'application/json'}));
+  var __a2=document.createElement('a'); __a2.href=__u2; __a2.download='pgp-sealed-attestation.json';
+  document.body.appendChild(__a2); __a2.click(); __a2.remove();
+  setTimeout(function(){URL.revokeObjectURL(__u2);},10000);
+}
 // v192 (user request): NO AUTO-CLOSE. This tab is the only place its own TLS
 // certificate can still be read from the browser's certificate panel, and
 // that panel is the ONE channel a hostile host cannot fake — no page can read
@@ -1147,6 +1823,9 @@ struct AppState {
     // PayPal and read the user's identity in plaintext — bypassing this
     // enclave, the hardware gates and the E2EE layer entirely.
     pending_pkce: Arc<RwLock<std::collections::HashMap<String, (String, Instant)>>>,
+    /// v197 — optional Police-escrow PGP key per state (armored), parked at
+    /// login-session and consumed by /callback; bounded + TTL like PKCE.
+    pending_pgp: Arc<RwLock<std::collections::HashMap<String, (String, Instant)>>>,
     // v180 (user directive — no pre-login attestation / DoS surface): the
     // standalone auditor envelope is minted ONCE per cache window and served
     // from this cache, so no request path can trigger quote generation at
@@ -1499,6 +2178,10 @@ pub struct LoginSessionRequest {
     pub client_nonce_hex: String,
     pub flow: Option<String>,
     pub custom_info: Option<String>,
+    /// v197 (optional Police escrow): armored PGP PUBLIC KEY the caller wants
+    /// a SECOND, escrow-sealed copy of the attestation encrypted to. Empty /
+    /// absent = no escrow (old auditor copies keep working unchanged).
+    pub pgp_recipient: Option<String>,
 }
 
 /// v169 (independent audit): every response that carries attestation data,
@@ -1664,9 +2347,35 @@ async fn attest_login_session(
     use base64::engine::general_purpose::{STANDARD as B64STD, URL_SAFE_NO_PAD as B64URL};
     use base64::Engine as _;
 
-    if let Err(status) = state.record_egress(addr.ip(), 4096) {
+    // v197: the escrow key is caller input, so it is charged like any other
+    // request body (v186 lesson — charge BEFORE validating), then validated
+    // FAIL-CLOSED: an invalid key must never silently produce a login with
+    // no second file.
+    let pgp_input = payload.pgp_recipient.as_deref().map(str::trim).unwrap_or("");
+    if let Err(status) = state.record_egress(addr.ip(), 4096 + pgp_input.len() as u64) {
         return status.into_response();
     }
+    if pgp_input.len() > PGP_RECIPIENT_MAX_BYTES {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("pgp_recipient exceeds {PGP_RECIPIENT_MAX_BYTES} bytes"),
+        )
+            .into_response();
+    }
+    let pgp_stored: Option<(String, String)> = if pgp_input.is_empty() {
+        None
+    } else {
+        match pgp_escrow::parse_public_key(pgp_input) {
+            Ok(r) => Some((pgp_input.to_string(), r.fingerprint)),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("pgp_recipient is not a valid OpenPGP public key: {e}"),
+                )
+                    .into_response()
+            }
+        }
+    };
 
     let client_pub = match B64STD.decode(payload.client_ecdh_pub_b64.trim()) {
         Ok(v) => v,
@@ -1737,8 +2446,20 @@ async fn attest_login_session(
     }
     zeroize_str(&mut code_verifier);
 
+    // v197: park this state's optional escrow key (bounded + TTL, like PKCE).
+    if let Some((armor, _)) = &pgp_stored {
+        let mut table = state.pending_pgp.write();
+        table.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(PKCE_TTL_SECS));
+        if table.len() >= MAX_PENDING_PGP {
+            if let Some(k) = table.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| k.clone()) {
+                table.remove(&k);
+            }
+        }
+        table.insert(state_token.clone(), (armor.clone(), Instant::now()));
+    }
+
     let auth_base = if state.staging { PAYPAL_SANDBOX_AUTH } else { PAYPAL_PRODUCTION_AUTH };
-    let signed_fields = serde_json::json!({
+    let mut signed_fields = serde_json::json!({
         "binding": "v180",
         "state": state_token,
         // R3-1: PKCE challenge — required by the trusted auditor BEFORE it
@@ -1760,6 +2481,13 @@ async fn attest_login_session(
         // only — the quote bytes are the source of trust, v179 semantics).
         "client_session_binding_hex": hex::encode(client_session_binding(&client_pub, &client_nonce)),
     });
+    // v197: signed fingerprint of the escrow TARGET (the key actually used
+    // for encryption) so the auditor can recompute it from the armor it
+    // pasted — substitution defense: a hostile enclave cannot quietly reseal
+    // the copy to a key of its own choosing.
+    if let Some((_, fp)) = &pgp_stored {
+        signed_fields["pgp_recipient_fingerprint"] = serde_json::Value::String(fp.clone());
+    }
 
     let signed_fields_str = serde_json::to_string(&signed_fields).unwrap();
     let signature = {
@@ -2068,6 +2796,14 @@ async fn callback(
         }
         _ => return (StatusCode::INTERNAL_SERVER_ERROR, "Token exchange failed with PayPal").into_response(),
     };
+    // v197: same keep-on-failure semantics as PKCE — the escrow armor is
+    // retired only alongside a SUCCESSFUL exchange (the failure arm above
+    // returns, so reaching this line means the exchange succeeded).
+    let pgp_armor: Option<String> = state
+        .pending_pgp
+        .write()
+        .remove(state_param.trim())
+        .map(|(a, _)| a);
     zeroize_str(&mut code_verifier);
 
     let mut userinfo: PayPalUserInfo = match hardened_client()
@@ -2094,6 +2830,12 @@ async fn callback(
     let paypal_user_raw_hash = hex::encode(sha2::Sha256::digest(
         serde_json::to_string(&minimized).unwrap_or_default().as_bytes(),
     ));
+    // v197: captured BEFORE `minimized` moves into report_payload — the
+    // "visible hash obtained from the PayPal id" (id-only, independent of
+    // the attested identity-record hash above) and a clone of the latter,
+    // because json! below consumes it.
+    let paypal_id_sha256 = hex::encode(sha2::Sha256::digest(minimized.user_id.as_bytes()));
+    let seal_raw_hash = paypal_user_raw_hash.clone();
     let custom_info = custom_info_str;
 
     let nonce = sec02_nonce(
@@ -2230,11 +2972,26 @@ async fn callback(
         blobs.insert(state_param.clone(), (e2ee_blob.clone(), Instant::now()));
     }
 
+    // v197 — SECOND download (Police escrow): built NEXT TO the plaintext
+    // envelope, then handed to the page. The optional escrow never blocks the
+    // primary attestation — on any failure we log a warning and ship without
+    // the sealed copy (the login itself is unaffected).
+    let pgp_sealed_json: Option<String> = pgp_armor.as_deref().and_then(|armor| {
+        match pgp_escrow::build_sealed_report(armor, &report_json, &seal_raw_hash, &paypal_id_sha256) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(error = %e, "pgp escrow sealed copy skipped");
+                None
+            }
+        }
+    });
+
     // Never render plaintext user info: only return the encrypted blob
     // container (v164: the page then stashes it into sessionStorage and
     // hands decryption/audit/download to verify.html in the user's tab).
     let content = CALLBACK_CONTENT
-        .replace("__E2EE_BLOB__", &e2ee_blob.to_string().replace("</", "<\\/"));
+        .replace("__E2EE_BLOB__", &e2ee_blob.to_string().replace("</", "<\\/"))
+        .replace("__PGP_SEALED__", &pgp_sealed_json.unwrap_or_default().replace("</", "<\\/"));
     let html = HTML_TEMPLATE.replace("{{CONTENT}}", &content);
 
     let _ = state.record_egress(addr.ip(), html.len() as u64);
@@ -2438,6 +3195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             boot_manifest,
             pending_e2ee_blobs: Arc::new(RwLock::new(std::collections::HashMap::new())),
             pending_pkce: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            pending_pgp: Arc::new(RwLock::new(std::collections::HashMap::new())),
             boot_envelope: Arc::new(RwLock::new(None)),
         });
 
@@ -2449,6 +3207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 interval.tick().await;
                 cleanup_state.pending_e2ee_blobs.write().retain(|_, (_, t)| t.elapsed() < Duration::from_secs(600));
                 cleanup_state.pending_pkce.write().retain(|_, (_, at)| at.elapsed() < Duration::from_secs(PKCE_TTL_SECS));
+                cleanup_state.pending_pgp.write().retain(|_, (_, at)| at.elapsed() < Duration::from_secs(PKCE_TTL_SECS));
             }
         });
 

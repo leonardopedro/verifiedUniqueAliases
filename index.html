@@ -240,6 +240,58 @@
             <input type="text" id="customInfoInput" maxlength="512"
                 placeholder="Optional: your public key / wallet / nonce — bound into the hardware quote and the report"
                 style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
+            <label style="font-weight:400; color:var(--text-dim); font-size:0.85rem;">🚔 Optional Police escrow key (PGP public key — the enclave encrypts a SECOND copy of your attestation to it at login; leave empty for none; prefilled = Bundeskriminalamt)</label>
+            <textarea id="policePgpInput" spellcheck="false" style="width:100%; height:90px; margin-top:6px; border-radius:4px; border:1px solid #30363d; background:#0d1117; color:#e6edf3; font-family:monospace; font-size:11px;">-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+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
+Wmw2oAio9A==
+=NvOn
+-----END PGP PUBLIC KEY BLOCK-----</textarea>
             <p id="secureLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
         </div>
         <div class="input-card" style="grid-column: span 2;">
@@ -653,6 +705,17 @@
             }
             sessionStorage.setItem('pav_custom_info', customInfo);
 
+            // v197 — optional Police-escrow key. Validated HERE, before a
+            // session is minted: an unparsable key must fail closed in this
+            // tab (the enclave rejects it too, but better not to spend a
+            // round on it), and an empty box simply means "no escrow".
+            const pgpEl = document.getElementById('policePgpInput');
+            const pgpKeyText = String((pgpEl || {}).value || '').trim();
+            const pgpWasSet = !!pgpKeyText;
+            if (pgpWasSet && pgpKeyText.indexOf('-----BEGIN PGP PUBLIC KEY BLOCK-----') === -1) {
+                throw new Error('the Police escrow box does not contain a PGP PUBLIC KEY BLOCK — fix it or clear it');
+            }
+
             say('🔐 Requesting login session (no pre-login attestation — the PayPal login IS the filter)…');
             // v180 (user directive — no pre-login attestation): the enclave no
             // longer mints a TD quote before login. An unauthenticated quote
@@ -666,9 +729,13 @@
             const resp = await fetch(enclaveBase + '/attest/login-session', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ client_ecdh_pub_b64: pubB64, client_nonce_hex: nonceHex, flow: flow || 'verified', custom_info: customInfo === 'NONE' ? '' : customInfo })
+                body: JSON.stringify({ client_ecdh_pub_b64: pubB64, client_nonce_hex: nonceHex, flow: flow || 'verified', custom_info: customInfo === 'NONE' ? '' : customInfo, pgp_recipient: pgpKeyText })
             });
-            if (!resp.ok) throw new Error('login-session request rejected (HTTP ' + resp.status + ')' + (resp.status === 404 ? ' — this deployment still exposes the old pre-flight endpoint; refresh this page from the project GitHub' : ''));
+            if (!resp.ok) {
+                let errBody = '';
+                try { errBody = await resp.text(); } catch (e2) { errBody = ''; }
+                throw new Error('login-session request rejected (HTTP ' + resp.status + ')' + (errBody ? ' — ' + String(errBody).slice(0, 200) : '') + (resp.status === 404 ? ' — this deployment still exposes the old pre-flight endpoint; refresh this page from the project GitHub' : ''));
+            }
             const pf = await resp.json();
 
             say('🔏 Verifying enclave signature over the login fields…');
@@ -710,6 +777,26 @@
                 throw new Error('Session fields do NOT match what this browser generated — the enclave or the transport lied. Aborting.');
             }
 
+            // v197 — escrow target must be the key THIS tab pasted (substitution
+            // defense): the enclave signs the recipient fingerprint, so recompute
+            // it from the armor in this tab and compare. An ABSENT fingerprint
+            // with a key sent means a legacy (pre-v197) enclave — warn, don't
+            // fail: that combination only exists inside the deploy window.
+            let escrowNote = '';
+            const escrowFpRaw = String(sf.pgp_recipient_fingerprint || '').trim();
+            if (pgpWasSet) {
+                if (escrowFpRaw) {
+                    const want = (await pgpPublicFingerprints(pgpKeyText)).map(x => x.toLowerCase());
+                    const got = escrowFpRaw.replace(/[\s:]/g, '').toLowerCase();
+                    if (want.indexOf(got) === -1) {
+                        throw new Error('ESCROW KEY SUBSTITUTION: the enclave signed a recipient fingerprint (' + got.slice(0, 24) + '…) that does not match the PGP key pasted in this tab — aborting before PayPal.');
+                    }
+                    escrowNote = ' 🚔 Police escrow ON → ' + got.toUpperCase() + ' (a SECOND, PGP-sealed copy of your attestation downloads with the first).';
+                } else {
+                    escrowNote = ' ⚠️ Police key sent to a pre-v197 enclave — no second file expected until the enclave is redeployed.';
+                }
+            }
+
             // Pin the enclave signing key for KEY-CONTINUITY across the PayPal
             // round-trip: the post-login report must be signed by THIS key.
             // (There is no pre-login hardware quote any more — the hardware
@@ -749,7 +836,7 @@
                 link.rel = 'noopener';
                 link.textContent = '✅ Continue to PayPal → (' + (flow === 'full' ? 'full profile' : 'verified only') + ')';
             }
-            say('✅ Login session ready — click “✅ Continue to PayPal →” above (opens in a NEW tab) and log in there. No hardware attestation happens until AFTER PayPal verifies you. When PayPal returns, the enclave’s callback page downloads your ENCRYPTED attestation automatically — bring that file back to THIS tab and load it with the “Attestation JSON report” file picker above: it decrypts with the key generated when this page loaded, audits here, and then offers the plain JSON download.');
+            say('✅ Login session ready — click “✅ Continue to PayPal →” above (opens in a NEW tab) and log in there.' + escrowNote + ' No hardware attestation happens until AFTER PayPal verifies you. When PayPal returns, the enclave’s callback page downloads your ENCRYPTED attestation automatically — bring that file back to THIS tab and load it with the “Attestation JSON report” file picker above: it decrypts with the key generated when this page loaded, audits here, and then offers the plain JSON download.');
         } catch (e) {
             say('❌ ' + e.message);
             // Fail closed: reset THIS flow's link to its idle label (no orphaned URL).
@@ -782,6 +869,62 @@
             throw new Error('PKCE MISSING OR WEAK (R3-1): the enclave did not sign a valid S256 code_challenge into the login fields (method="' + m + '"). Without PKCE the authorization code can be exchanged by anyone holding the PayPal client secret — including the webservice owner — before this enclave ever sees it. Aborting. (If the enclave is healthy, THIS auditor copy may be stale — refresh verify.html from the project GitHub.)');
         }
         return c;
+    }
+
+    // ========================================================================
+    // v197 — fingerprints of an armored PGP public key: SHA-1(0x99 ‖
+    // len16(key material)) over each v4 key packet (primary first), uppercase
+    // hex. Mirrors the enclave's `pgp_escrow::parse_public_key`, so the key
+    // this tab pasted and the fingerprint the enclave SIGNED can be compared
+    // byte-for-byte before the user is sent to PayPal.
+    // ========================================================================
+    async function pgpPublicFingerprints(armor) {
+        const src = String(armor || '').replace(/\r\n/g, '\n');
+        const m = /-----BEGIN PGP PUBLIC KEY BLOCK-----([\s\S]*?)-----END PGP PUBLIC KEY BLOCK-----/.exec(src);
+        if (!m) throw new Error('not a PGP PUBLIC KEY BLOCK');
+        const body = m[1];
+        const blank = body.indexOf('\n\n');
+        if (blank < 0) throw new Error('missing armor blank line');
+        // base64, minus an optional trailing CRC-24 line (=XXXX alone).
+        const b64 = body.slice(blank + 2)
+            .replace(/\s+$/, '')
+            .replace(/\n=[A-Za-z0-9+/]{4}$/, '')
+            .replace(/\s+/g, '');
+        const bin = Uint8Array.from(atob(b64.replace(/=+$/, '')), c => c.charCodeAt(0));
+        const out = [];
+        let i = 0;
+        while (i < bin.length) {
+            const ctb = bin[i++];
+            if (!(ctb & 0x80)) throw new Error('malformed packet header');
+            let tag, len;
+            if (ctb & 0x40) {
+                tag = ctb & 0x3f;
+                if (bin[i] < 192) { len = bin[i]; i += 1; }
+                else if (bin[i] < 224) { len = (((bin[i] - 192) << 8) + bin[i + 1] + 192); i += 2; }
+                else if (bin[i] === 255) { len = ((bin[i + 1] << 24) >>> 0) + (bin[i + 2] << 16) + (bin[i + 3] << 8) + bin[i + 4]; i += 5; }
+                else throw new Error('partial-body lengths unsupported');
+            } else {
+                tag = (ctb >> 2) & 0xf;
+                if ((ctb & 3) === 0) { len = bin[i]; i += 1; }
+                else if ((ctb & 3) === 1) { len = (bin[i] << 8) | bin[i + 1]; i += 2; }
+                else if ((ctb & 3) === 2) { len = ((bin[i] << 24) >>> 0) + (bin[i + 1] << 16) + (bin[i + 2] << 8) + bin[i + 3]; i += 4; }
+                else { len = bin.length - i; }
+            }
+            if (i + len > bin.length) throw new Error('packet overruns buffer');
+            const body2 = bin.subarray(i, i + len);
+            i += len;
+            if (tag === 6 || tag === 14) {
+                const pre = new Uint8Array(body2.length + 3);
+                pre[0] = 0x99;
+                pre[1] = (body2.length >> 8) & 0xff;
+                pre[2] = body2.length & 0xff;
+                pre.set(body2, 3);
+                const d = await crypto.subtle.digest('SHA-1', pre);
+                out.push(Array.from(new Uint8Array(d)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase());
+            }
+        }
+        if (!out.length) throw new Error('no OpenPGP key packets found');
+        return out;
     }
 
     // ========================================================================
