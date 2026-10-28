@@ -309,6 +309,10 @@
             <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Expected report (attested-mode credentials: paste the report JSON or its sha256 digest — ties the credential to your exact green-audit report)</label>
             <input type="text" id="zkRsaExpectReport" spellcheck="false" placeholder='report JSON or 64-hex sha256 (optional)'>
         </div>
+        <div style="margin-top:12px;">
+            <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Expected recipient PGP public key (optional — machine-checks that the ciphertext's PKESK key-id really belongs to this key: the “Police can read it” goal, checkable by anyone with the public key)</label>
+            <textarea id="zkRsaExpectRecipient" spellcheck="false" style="height:70px;" placeholder="-----BEGIN PGP PUBLIC KEY BLOCK----- (optional)"></textarea>
+        </div>
         <button type="button" onclick="zkRsaVerifyCredential()" style="width:100%;">✅ Verify proof + statement</button>
         <div id="zkRsaVerifyRows" style="margin-top:6px;"></div>
 
@@ -1511,6 +1515,60 @@ async function zkRsaVerify(cred, expected) {
     if (!cred.escrow || !cred.escrow.ct) no('escrow ciphertext', 'missing — this is not an escrow credential');
     else yes('escrow ciphertext', cred.escrow.alg + ' → recipient ' + (cred.escrow.recipient_fp || '').slice(0, 24) + '…');
 
+    // PGP addressing row (goal 3): PARSE the armored ciphertext's PKESK and
+    // machine-check its key-id against the challenge-pinned recipient_fp —
+    // and, when the recipient's public key block is supplied, against that
+    // exact key's key-id set (primary + subkeys). The fingerprint inside the
+    // credential is prover-claimed; only parsing the ciphertext against a
+    // checker-supplied public key proves the message is addressed where it
+    // claims. No supplied key → primary-key convention + prompt (a subkey
+    // key-id is indistinguishable from a foreign key without the public key).
+    if (cred.escrow && cred.escrow.ct && /^OpenPGP/.test(String(cred.escrow.alg || ''))) {
+        const rowTitle = 'ciphertext addressed to the pinned recipient (PKESK key-id)';
+        let pkeskKeyid = null, pkeskErr = null;
+        try {
+            const { packets } = zkRsaPgpPackets(String(cred.escrow.ct));
+            const pk = packets.find((p) => p.tag === 1);
+            if (!pk) throw new Error('no Public-Key Encrypted Session Key (PKESK) packet in the ciphertext');
+            if (pk.body[0] !== 3) throw new Error('unsupported PKESK version ' + pk.body[0] + ' (v3 expected)');
+            pkeskKeyid = zkRsaBytesHex(pk.body.subarray(1, 9)).toUpperCase();
+        } catch (e) { pkeskErr = e.message; }
+        if (pkeskErr) {
+            no(rowTitle, 'ciphertext unreadable as OpenPGP — ' + pkeskErr);
+        } else {
+            const wantFp = String(cred.escrow.recipient_fp || '').replace(/[\s:]/g, '').toUpperCase();
+            const primaryLast8 = /^[0-9A-F]{40}$/.test(wantFp) ? wantFp.slice(-16) : null;
+            const expText = String(expected.recipient || '').trim();
+            let expKey = null, expErr = null;
+            if (expText) {
+                try {
+                    expKey = await zkRsaParseAny(expText);
+                    if (!expKey.pgp_fingerprint) throw new Error('not an OpenPGP public key block — paste the recipient\u2019s PGP PUBLIC KEY BLOCK');
+                } catch (e) { expErr = e.message; }
+            }
+            if (expErr) {
+                no(rowTitle, 'expected recipient key unreadable — ' + expErr);
+            } else if (expKey) {
+                const expFp = String(expKey.pgp_fingerprint).toUpperCase();
+                if (expFp !== wantFp) {
+                    no(rowTitle, 'expected key fingerprint ' + expFp.slice(0, 24) + '… ≠ credential\u2019s pinned recipient ' + wantFp.slice(0, 24) + '… — the credential claims a different recipient than the key you supplied');
+                } else {
+                    const ids = (expKey.pgp_keys || []).map((k) => String(k.keyid).toUpperCase());
+                    if (ids.indexOf(pkeskKeyid) !== -1)
+                        yes(rowTitle, 'PKESK targets ' + pkeskKeyid + ' — a key-id of the supplied recipient key (fp ' + wantFp.slice(0, 24) + '…) — re-checkable by anyone with the public key');
+                    else
+                        no(rowTitle, 'PKESK targets ' + pkeskKeyid + ' — NOT among the supplied recipient\u2019s key-ids (' + ids.join(', ') + ') — the ciphertext is addressed to some other key');
+                }
+            } else if (primaryLast8 && pkeskKeyid === primaryLast8) {
+                yes(rowTitle, 'PKESK targets ' + pkeskKeyid + ' — the primary key-id of pinned recipient fp ' + wantFp.slice(0, 24) + '… (paste the recipient\u2019s PGP public key above to confirm subkey-addressed messages too)');
+            } else if (primaryLast8) {
+                warn(rowTitle, 'PKESK targets ' + pkeskKeyid + ' ≠ pinned primary key-id ' + primaryLast8 + ' — possibly the recipient\u2019s encryption SUBKEY (normal for gpg), possibly a foreign key: paste the recipient\u2019s PGP public key above to machine-check');
+            } else {
+                warn(rowTitle, 'PKESK targets ' + pkeskKeyid + ' — recipient_fp is not a 40-hex fingerprint, so no convention check is possible: paste the recipient\u2019s PGP public key above');
+            }
+        }
+    }
+
     let cRecomputed = null;
     try {
         if (!cred.proof || !cred.proof.g || !cred.proof.t || !cred.proof.c || !cred.proof.z) throw new Error('proof fields missing');
@@ -1748,6 +1806,7 @@ async function zkRsaVerifyCredential() {
             nonce: (zkRsa$('zkRsaExpectNonce') || {}).value || '',
             domain: (zkRsa$('zkRsaExpectDomain') || {}).value || '',
             report: (zkRsa$('zkRsaExpectReport') || {}).value || '',
+            recipient: (zkRsa$('zkRsaExpectRecipient') || {}).value || '',
         });
         zkRsaRenderRows('zkRsaVerifyRows', res.rows);
         return res;

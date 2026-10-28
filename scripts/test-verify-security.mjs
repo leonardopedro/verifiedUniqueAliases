@@ -3398,6 +3398,43 @@ console.log('\nTest 47: zk-rsa.html — RSA ZK escrow credential (PGP / X.509 / 
       h5.rows.filter((r) => r.cls === 'failed').map((r) => r.title).join('; '));
   }
 
+  // PGP addressing row (goal 3): PARSE the PKESK key-id out of the ciphertext
+  // and machine-check it against a checker-supplied recipient public key. The
+  // fingerprint inside the credential is prover-claimed, so only parsing the
+  // ciphertext against the real key proves "addressed to the Police".
+  {
+    const rowT = /PKESK key-id/;
+    const fails = (res) => res.rows.filter((r) => r.cls === 'failed').map((r) => r.title).join('; ');
+    const honest = await zkRsaProve({ key: sec, attrsText: JSON.stringify({ label: 'pkesk' }), recipientKey: recip, fmt: 'pgp', domain: 'harness.test', nonce, purpose: 'pkesk row' });
+    const p1 = await zkRsaVerify(honest, { recipient: fix('recipient-pub.asc') });
+    check('PKESK key-id matches the supplied recipient public key (honest)',
+      p1.ok === true && p1.rows.some((r) => r.cls === 'verified' && rowT.test(r.title) && /re-checkable by anyone/.test(r.detail)),
+      fails(p1) || 'PKESK row missing/not verified');
+    const p2 = await zkRsaVerify(honest, {});
+    check('without a supplied key, single-key fixture resolves on the primary key-id convention',
+      p2.ok === true && p2.rows.some((r) => r.cls === 'verified' && rowT.test(r.title) && /primary key-id/.test(r.detail)),
+      fails(p2) || 'PKESK row missing/not verified');
+
+    // Hostile: ciphertext addressed to the SIGNER's key while the credential
+    // pins the RECIPIENT's fingerprint — built by handing zkRsaProve a mixed
+    // recipient object (signer's encryption target, recipient's claimed fp),
+    // which yields a fully valid proof over a forged addressing claim.
+    const mixed = { pgp_enc: pub.pgp_enc, pgp_fingerprint: recip.pgp_fingerprint };
+    const hostile = await zkRsaProve({ key: sec, attrsText: JSON.stringify({ label: 'pkesk-hostile' }), recipientKey: mixed, fmt: 'pgp', domain: 'harness.test', nonce, purpose: 'pkesk hostile' });
+    const p3 = await zkRsaVerify(hostile, { recipient: fix('recipient-pub.asc') });
+    check('foreign PKESK key-id refused against the real recipient key (must-refuse)',
+      p3.ok === false && p3.rows.some((r) => r.cls === 'failed' && rowT.test(r.title) && /NOT among the supplied/.test(r.detail)),
+      fails(p3) || 'ALL GREEN — foreign-key forgery accepted');
+    const p4 = await zkRsaVerify(hostile, { recipient: fix('signer-pub.asc') });
+    check('credential claiming the wrong recipient fingerprint refused',
+      p4.ok === false && p4.rows.some((r) => r.cls === 'failed' && rowT.test(r.title) && /≠ credential.s pinned recipient/.test(r.detail)),
+      fails(p4) || 'ALL GREEN — fingerprint mismatch accepted');
+    const p5 = await zkRsaVerify(hostile, {});
+    check('without a supplied key the forgery is only flagged (subkey-ambiguity warn row)',
+      p5.ok === true && p5.rows.some((r) => r.cls === 'warning' && rowT.test(r.title) && /possibly a foreign key/.test(r.detail)),
+      fails(p5) || 'expected a warning row');
+  }
+
   const rsaDigest = sha256(readFileSync(join(repoRoot, 'zk-rsa.html'))).toString('hex');
   const readmeNow = readFileSync(join(repoRoot, 'README.md'), 'utf8');
   check('README publishes the CURRENT zk-rsa.html sha256',
