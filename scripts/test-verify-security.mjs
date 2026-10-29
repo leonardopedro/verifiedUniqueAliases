@@ -1739,11 +1739,17 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
       const binding = await clientSessionBindingHex(pubDer, body.client_nonce_hex);
       const app = globalThis.EXPECTED_APPS.find(a => a.flow ===
         (substituteFlow ? 'full' : (body.flow || 'verified')));
-      const escrowFp = (body.pgp_recipient && escrowMode !== 'omit')
-        ? (escrowMode === 'wrong'
-            ? '0'.repeat(40)
-            : (await pgpPublicFingerprints(body.pgp_recipient))[0])
-        : null;
+      // v198: mirror main.rs — the enclave signs the ENCRYPTION TARGET (the
+      // key the ciphertext's PKESK key-id names), not the primary.
+      let escrowFp = null;
+      if (body.pgp_recipient && escrowMode !== 'omit') {
+        if (escrowMode === 'wrong') {
+          escrowFp = '0'.repeat(40);
+        } else {
+          const all = await pgpPublicFingerprints(body.pgp_recipient);
+          escrowFp = all.length ? all[all.length - 1] : null;
+        }
+      }
       const sf = reorder({
         binding: 'v180', state: 'teststate-abc', flow: app.flow,
         paypal_client_id: app.client_id, paypal_environment: 'sandbox',
@@ -3518,6 +3524,84 @@ console.log('\nTest 47: zk-rsa.html — RSA ZK escrow credential (PGP / X.509 / 
     'external <script src> or <link href> found');
   const rsaRes = await zkRsaVerify(JSON.parse(JSON.stringify(cred)), { nonce, domain: 'harness.test' });
   check('fresh verify of a re-parsed credential (JSON round-trip)', rsaRes.ok === true);
+}
+
+console.log('\nTest 48: v198 escrow CIPHERTEXT addressing — PKESK key-id vs the S_enc-signed target');
+{
+  // The second, PGP-sealed copy the callback downloads is CIPHERTEXT: the
+  // only claim an auditor without the private key can prove is that it is
+  // addressed to the key the enclave SIGNED at session time. v198 reads the
+  // PKESK (OpenPGP tag 1) recipient key-id straight out of the ciphertext and
+  // requires ciphertext == file-declared target == S_enc-signed target — any
+  // disagreement (rewritten clear field, hostile reseal, missing signature)
+  // is fail-closed, never a warning.
+  const storage = () => { const m = new Map(); return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: k => m.delete(k) }; };
+  globalThis.localStorage = storage();
+  globalThis.sessionStorage = storage();
+  const setLoc = (loc) => { if (loc === null) delete globalThis.location; else globalThis.location = loc; };
+  setLoc({ protocol: 'file:', host: '', origin: 'null' });
+  try {
+    const sample = JSON.parse(readFileSync(join(repoRoot, 'zk/rsa-test/sealed-sample.json'), 'utf8'));
+    const bka = readFileSync(join(repoRoot, 'zk/rsa-test/police-bka-pub.asc'), 'utf8');
+    const fps = await pgpPublicFingerprints(bka);          // [primary, encryption subkey]
+    const target = fps[1];                                  // the enclave's parsed.target.fingerprint
+    const kid = pkeskKeyIdHex(sample.ciphertext);
+    check('v198: ciphertext PKESK key-id == last 16 hex of the encryption-subkey fingerprint',
+      kid === target.slice(-16), `${kid} vs ${target.slice(-16)}`);
+    check('v198: key-id is the one the fixture declares (7DE765EF79EFF86C)',
+      kid === '7DE765EF79EFF86C', kid);
+    check('v198: fixture\u2019s declared target is that subkey fingerprint',
+      String(sample.recipient_target_fingerprint).toUpperCase() === target, sample.recipient_target_fingerprint);
+
+    // No signed target in this copy → a pass would be unfounded → refuse.
+    let threw = '';
+    try { await verifySealedEscrow(sample); } catch (e) { threw = e.message; }
+    check('v198: without the S_enc-signed target the check refuses to pass (UNVERIFIABLE)',
+      /UNVERIFIABLE/.test(threw), threw.slice(0, 160));
+
+    // Honest session: ciphertext key-id == file target == signed target.
+    globalThis.localStorage.setItem('pav_local_session', JSON.stringify({ pgpTargetFp: target }));
+    const r = await verifySealedEscrow(sample);
+    check('v198: all three agree → addressing verified',
+      r.keyId === kid && r.target === target, JSON.stringify(r));
+
+    lastAlert = null;
+    const res = await runAuditWith(sample);
+    check('v198: runAudit on the pasted sealed copy returns true + ADDRESSED CORRECTLY',
+      res.ok === true && !res.alert && /ADDRESSED CORRECTLY/.test(elements['secureLoginStatus'].innerText || ''),
+      JSON.stringify({ ok: res.ok, alert: res.alert, status: (elements['secureLoginStatus'].innerText || '').slice(0, 140) }));
+
+    // Hostile: the clear target field in the FILE was rewritten.
+    const rewritten = { ...sample, recipient_target_fingerprint: '0'.repeat(39) + '1' };
+    threw = ''; try { await verifySealedEscrow(rewritten); } catch (e) { threw = e.message; }
+    check('v198: rewritten file-declared target fails closed (key-id mismatch)',
+      /ADDRESSING VIOLATION/.test(threw), threw.slice(0, 160));
+
+    // Hostile: the enclave signed a DIFFERENT target than the ciphertext is
+    // addressed to (reseal to an attacker key) — signed fp is authoritative.
+    globalThis.localStorage.setItem('pav_local_session', JSON.stringify({ pgpTargetFp: fps[0] }));
+    threw = ''; try { await verifySealedEscrow(sample); } catch (e) { threw = e.message; }
+    check('v198: signed target \u2260 ciphertext target → SUBSTITUTION, fail-closed',
+      /SUBSTITUTION/.test(threw), threw.slice(0, 160));
+
+    // Anonymous (all-zero) key id declares no target at all.
+    const arm = (bytes) => '-----BEGIN PGP MESSAGE-----\n\n'
+      + Buffer.from(bytes).toString('base64').replace(/(.{64})/g, '$1\n').replace(/\n$/, '')
+      + '\n-----END PGP MESSAGE-----\n';
+    const anonBody = [3, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1];
+    threw = ''; try { pkeskKeyIdHex(arm([0xc1, anonBody.length, ...anonBody])); } catch (e) { threw = e.message; }
+    check('v198: anonymous (zero) key id refused — addressing cannot be proven',
+      /ANONYMOUS/.test(threw), threw.slice(0, 160));
+
+    // First packet that is not PKESK (here tag 18, the SEIPD body) → refused.
+    threw = ''; try { pkeskKeyIdHex(arm([0xd2, 4, 1, 2, 3, 4])); } catch (e) { threw = e.message; }
+    check('v198: a non-PKESK first packet is refused with the tag named',
+      /tag 18/.test(threw), threw.slice(0, 160));
+  } finally {
+    setLoc(null);
+    delete globalThis.localStorage;
+    delete globalThis.sessionStorage;
+  }
 }
 
 rmSync(dir, { recursive: true, force: true });;;

@@ -577,6 +577,205 @@ sees a passphrase and never makes a request.
 
 ---
 
+## 0.21 v197 cycle — Police-escrow SECOND download (PGP-sealed copy) + two-cycle deploy (2026-10-28/29)
+
+User request: at `/callback`, alongside the E2EE ciphertext, emit a **second,
+PGP-sealed copy of the attestation addressed to the police (BKA) key** so the
+recipient can open it with plain `gpg --decrypt` — no browser, no ECDH.
+
+### What shipped (commits `e94f305`, `4662475`, `f69f86f`, pushed `alibabacloud` + `main`)
+
+| Layer | Detail |
+|---|---|
+| **Enclave** `src/main.rs` `mod pgp_escrow` | Armor dearmor + CRC-24, OpenPGP packet/MPI parsing, encrypt-capable **subkey** selection (`0x04\|0x08` → last subkey → primary), then a real OpenPGP message: **PKESK v3** (PKCS#1 v1.5 of `0x09‖sk‖checksum`) + **SEIPD v1** (zero-IV AES-256-CFB-128, **no** §13.9 resync, SHA-1 MDC). **No new dependencies.** Wiring: `pgp_recipient` on `POST /attest/login-session` (validated fail-closed, egress-charged, ≤16 KiB), armored key parked in a bounded TTL `pending_pgp` table retired only on a successful exchange (PKCE semantics), **recipient fingerprint signed into `signed_fields`** (substitution defense), `/callback` mints `pgp-sealed-attestation.json` next to the ciphertext. A failed seal only warns — it never blocks the primary attestation. |
+| **Clear fields by design** | `paypal_user_info_raw_hash` (signed identity hash) + `paypal_id_sha256` (SHA-256 of the raw PayPal id, captured before `minimized` moves) sit in **clear** so anyone can match the sealed file to the plain attestation without reading it. |
+| **Auditor** `verify.html` (⇒ `index.html`) | Prefilled `#policePgpInput`, `pgpPublicFingerprints()` (same SHA-1 rule as the enclave), key sent as `pgp_recipient`, and the **signed fingerprint re-checked against the pasted armor BEFORE PayPal** (`ESCROW KEY SUBSTITUTION` aborts; a missing fingerprint from a pre-v197 enclave warns instead) + the callback page's second auto-download box with copy/manual fallback. |
+| **Deliberate deviation** | The sealed JSON does **NOT** claim `"recipient": "Bundeskriminalamt (BKA)"` — the box accepts any key, so that label could be false. It ships `recipient_fingerprint` + `recipient_target_fingerprint` (both verified by the e2e) instead. |
+
+### Verification
+
+- `cargo test` **25/25**, including `gpg_interop_roundtrip_or_skipped` — gpg 2.4.9 decrypts our message **and** our parser handles a gpg-produced one (the test caught two real bugs: session key zeroized before SEIPD used it, and a `key_flags` port that read the length octet as the subpacket type).
+- `npm test` harness **420/0** (baseline 412 + 8 escrow checks). README digest/size rotated **in the same commit** (Test 28 rule): `verify.html` = `8c1b5c42b241d9acc4a6b6ac86618e2e479f5dd021efd0c6a6275575187516d1`, 186,117 B.
+- **Live e2e both flows PASS** (`scripts/e2e-login-download.mjs`, extended to assert the 2nd download): type `pav-pgp-sealed-attestation/v1`, `recipient_fingerprint` == fingerprint computed from `police-bka-pub.asc`, clear `paypal_user_info_raw_hash` == the signed report's (addressing proof, needs no private key), `idHash` = `17a1022f…`, ct 34,195 B. Captures: `/tmp/pgp-sealed-attestation.json`, `/tmp/claimed-report.json`.
+
+### Build + deploy lineage (two cycles, in-place disk rewrites ONLY — no instance was ever created)
+
+| Artifact / pin | Value |
+|---|---|
+| `output-alibaba/disk-alibaba.raw` (49,283,072 B) | `5c1c1ba867de06e5cf141987065f8bf0923cb2dc759b631131757a816c7b6529` |
+| `initramfs-alibaba.img` | `92b1476ad990c0e90812bb1df4b9677938587a6ae2f8e3445dee67b2d1ec7e6c` |
+| binary (`EXPECTED_ENCLAVE_SHA256`) | `b0dd61804936…` → **`11932297902a4cdc05607c3d5444222c6af918786af17d9bc90512fa21c064c2`** (rotated `4662475`) |
+| `EXPECTED_RTMR2` | `ae57a30457fe…` → **`86784f375604fceecadaf02ebf4556c7ef397103cbbc852ba7f1cb832fe8461ef1f4f49a1dd72228bf61a528680d0e8f`** (rotated `4662475` from the cycle-A live envelope) |
+| `EXPECTED_MRTD` / `RTMR0` / `RTMR1` / `RTMR3` | **byte-held** (no rotation — cycle B rebuilt the binary + initramfs bit-identical) |
+| Deployed image | `m-2zef5rtftylwooqx1a9b` (cycle B; cycle A's image superseded) |
+| Prod instance | `i-2zed3wq8aubeph9na28i` (paypal-auth-vm, created 2026-10-26 — **untouched by this cycle**) |
+| Prod system disk | `d-2ze5juogkfarmx5c16hr`, 20 GiB `cloud_auto`, created 2026-10-28T18:32:07Z by the cycle-A `ReplaceSystemDisk` |
+| Relay | `i-2zefiag79exwsshidi3z` (relay188), Stopped + `StopCharging` after both legs |
+| Parity | `node scripts/check-manifest-parity.mjs https://login.airma.de <disk>.raw` → **PARITY OK** (deployed ESP == report, incl. `verify.html`) |
+
+**Transfer legs** both green: presigned PUT → HK bucket, relay `RunCommand`
+(HK GET → Beijing intranet PUT, ETag/md5 verified), `ImportImage`
+(`DiskDeviceMapping.1.Format=raw`), flat `Features.NvmeSupport=supported`,
+then `Stop` → `ReplaceSystemDisk` → `Start` on the SAME instance with the
+user_data preserved. Second relay marker: `relay-ok197b`.
+
+### Incidents & gotchas hit this cycle
+
+1. **Cycle B booted dark for ~13 min**: self-report `stage=acme,
+   reason="acme: error decoding response body"` (ZeroSSL hiccup). The ACME
+   retry loop recovered on its own — first live sighting of that exact reason;
+   no action taken, none needed.
+2. **`ReplaceSystemDisk --SystemDisk.Size=1` fails** with
+   `InvalidSystemDiskSize.ValueNotSupported` — the documented irreversible
+   overshoot from an earlier cycle. Kept at 20 GiB `cloud_auto` rather than
+   role-swapping instances (role swap = new instance, which the operator has
+   forbidden). NOTE: the disk image itself is only 47 MiB, so 1 GiB would fit
+   — the refusal is a platform-side floor on shrinking, not an image-size issue.
+3. **`DescribeUserData` returns `UserData` as a bare string** in CLI 3.3.15,
+   not `UserData.Value` (and it needs `--RegionId`), and `DescribeDisks` wants
+   the SINGULAR `--InstanceId` while `DescribeInstances` wants the plural.
+   ECS tagging is exposed as `add-tags` (kebab-case), not `CreateTags`.
+4. **Two disk ids exist in the account and only two** — `ReplaceSystemDisk`
+   always mints a new system-disk id (that IS the in-place rewrite) and the
+   old one is released; no stray disks and no new instances were created.
+
+### New this cycle: `watchdog/` — self-healing replacement (code done, deploy BLOCKED)
+
+`watchdog/` implements the operator's request: an idle serverless function
+that notices the enclave is **released** (spot eviction) and keeps trying
+until an equivalent confidential VM exists. FC 5-minute timer **+**
+EventBridge rule on `ecs:Instance:StateChange` /
+`PreemptibleInstanceInterruption` / `SystemFailure.Delete`, both feeding one
+idempotent `ensure()`. It **never touches a Stopped instance** (operator
+safety), never steals a bound EIP, and uses an hour-bucketed `ClientToken` so
+retries cannot fan out into several boxes. 13 unit tests green
+(`node watchdog/test-watchdog.mjs`).
+
+**Blocked on two account-level gates (hit 2026-10-29):**
+- `CreateFunction` → `AccessDenied: Current user is in debt overdue.` — FC
+  will not provision until the account's overdue balance is settled.
+- EventBridge → `ServiceNotEnable` — the event bus product is not activated.
+
+Already done and persisting across re-runs: RAM user `pav-watchdog` + policy
+`pav-watchdog-ecs` + access key (`/tmp/pav-watchdog-ak.json`, 600), the
+`pav-watchdog=prod` tag on the enclave, `dist/config.json` (captured spec +
+`user_data` + delivery token, gitignored), the built package
+(`dist/pav-watchdog.zip`). **Resume with `bash watchdog/deploy-watchdog.sh
+deploy`** once the balance is settled and EventBridge is activated.
+
+### Full private-key proof of the sealed copy (2026-10-29)
+
+The BKA key has no private half in this repo (correctly — it is the recipient's),
+so the proof was run against a **fixture key whose secret we hold**, through the
+LIVE enclave:
+
+1. `gpg --quick-generate-key` fixture (`5BD70750F05476878CDC71B1F7181F4BF4F6E4B2`,
+homedir `/tmp/pav-fixture-gpg`, pub exported to `/tmp/pav-fixture-pub.asc`).
+2. New e2e override: `PAV_E2E_PGP_KEY_PATH` (paste that key into
+   `#policePgpInput` instead of the page's prefilled BKA key) +
+   `PAV_E2E_SEALED_OUT`. Live run **PASS** — status line showed
+   `🚔 Police escrow ON → 5BD70750…`, sealed copy captured to
+   `/tmp/pgp-sealed-fixture.json` (ct 33,837 B).
+3. `gpg --decrypt` → **`encrypted with rsa2048 key, ID F7181F4BF4F6E4B2`**,
+   24,612 B plaintext, exit 0. Then **10/10 consistency checks**:
+   plaintext `attestation_report` == the auditor-decrypted report; clear
+   `paypal_user_info_raw_hash` == the value inside == SHA-256 of the canonical
+   identity preimage (`{user_id, sub, verified_account, payer_id}` — the
+   struct order, not the report's alphabetical json! order); clear
+   `paypal_id_sha256` == SHA-256(`user_id`); `binary_sha256` inside == pinned
+   `11932297…`; `verified_account: "true"`; recipient == target == fixture
+   key; and **MRTD/RTMR0/1/2 all present byte-for-byte inside the signed TDX
+   quote** in that plaintext, matching verify.html's pins.
+
+Note: `zk/rsa-test/signer-sec.asc` (hand-packed by `mk-pgp.mjs`) is **rejected
+by gpg** (import exits 2, nothing stored) — it is fine for the Rust parser
+tests but useless as a gpg decrypt fixture. Generate fixture secrets with gpg.
+
+---
+
+## 0.22 v199 cycle — escrow TARGET now signed + Alibaba-priced egress budget, two-cycle deploy (2026-10-29)
+
+Two requests, one deploy cycle each of them needing the same pin rotation:
+
+1. **Auditor must verify the sealed copy's PKESK key-id against the SIGNED
+   escrow target.** The e2e caught the real bug behind the request: the
+   enclave signed `r.fingerprint` (the **primary**, `081910AD…`) while
+   `build_sealed_report` encrypts to `r.target.fingerprint` (the **encryption
+   subkey**, `183BA8C8…`, key-id `7DE765EF79EFF86C`) — so there was no signed
+   value the ciphertext could be matched against. `main.rs` now signs the
+   target (`ParsedRecipient::target_fingerprint()`); the auditor reads the
+   PKESK (OpenPGP tag 1) recipient key-id straight out of the armor and
+   requires **ciphertext key-id == file-declared target == S_enc-signed
+   target**, fail-closed on every disagreement (rewritten clear field,
+   hostile reseal, missing signature, anonymous zero key-id, non-PKESK first
+   packet). The signed target is remembered in `pav_local_session.pgpTargetFp`
+   at prepare time.
+2. **Egress protections re-priced for Alibaba.** The caps were GCP-era
+   leftovers. Live EIP facts (`DescribeEipAddresses`):
+   `PayByTraffic` · BGP · cn-beijing · **5 Mbps peak** · bound to the ECS
+   instance (no config fee); price **¥0.80/GB, egress only, billed hourly**;
+   saturated line = 2.20 GB/h ≈ ¥1,270/month (the bill the caps exist to
+   prevent). Caps are now *derived*: `¥30/month ÷ ¥0.80/GB ÷ 730 h` →
+   `GLOBAL_EGRESS_BYTES_PER_HOUR = 55,157,970` (52.6 MiB/h) and per-IP
+   `÷13` = 4,242,920 B/h (4.05 MiB/h ≈ ¥2.34/month per client). The window stays
+   exactly 1 h to match Alibaba's billing period, and the FIRST rejection of
+   each window logs one `warn!` (bounded so a flood can't bury the 64 KiB
+   serial console).
+
+### Verification
+
+- `cargo test` **26/26** — new `egress_budget_matches_alibaba_price_v199`
+  pins the price/budget/line-rate arithmetic (a tweak that silently unbounds
+  the ¥30 ceiling fails the test).
+- `npm test` harness **422 passed / 1 failed** — the 1 is Test 46 (GitHub
+  Pages byte-parity), red only until this commit is pushed and Pages rebuilds.
+  New **Test 48**: 10 checks over `zk/rsa-test/sealed-sample.json` (a real
+  gpg-produced ciphertext to the BKA key, committed as a fixture).
+- **Live e2e PASS** (`scripts/e2e-login-download.mjs`, extended with the
+  sealed-paste step): status now shows `Police escrow ON → 183BA8C8…` (the
+  TARGET), the audit is green, the report downloads, single-prepare holds,
+  and step 10 reports
+  `✅ Police-escrow copy ADDRESSED CORRECTLY — the ciphertext's PKESK key-id is
+  7DE765EF79EFF86C, exactly the last 16 hex of the S_enc-signed escrow target
+  183BA8C8492359736B9E015E7DE765EF79EFF86C`.
+
+### Build + deploy lineage (two cycles, in-place disk rewrites ONLY)
+
+| Artifact / pin | Value |
+|---|---|
+| Cycle A `disk-alibaba.raw` (49,283,072 B) | `e1bce1d847e871cc17f0e4a6b6496a8a4bc0c6effc2b59b3cba968a790fcb40c` (md5 `afb998080833d9ae59adf529098d558e`, HK `paypal-auth-vm/disk199a.raw`) |
+| Cycle B `disk-alibaba.raw` | `3382e9ef65d4dba1ea84f55f79d98a998f475642b8c8c6c3293bb0e9d4678485` (md5 `81d9eebfbeefbe6a2c407e09b800f49a`, HK `disk199b.raw`) — differs from A **only** by the rotated `verify.html` on the ESP |
+| binary (`EXPECTED_ENCLAVE_SHA256`) | `11932297902a4cdc…` → **`4933005adfbebbfcf586dda87640f6d9c83f720c4794869fbe701165ed11900f`** — built twice, byte-identical both cycles |
+| `initramfs-alibaba.img` | `73f30b13cfb8702b3072296d174584a732fe85d1ea70cb2d7ebad3ded373b2e3` (both cycles) |
+| `EXPECTED_RTMR2` | `86784f375604fce…` → **`e79cce72a685c9459c0a31e740e3ca0fcfd9321087d6dbd90a148903272895d9575b7bd2433c84d253080df5f23293fc`** (cycle-A live envelope; cycle-B live envelope **byte-matches** it) |
+| `EXPECTED_MRTD` / `RTMR0` / `RTMR1` / `RTMR3` | **byte-held** (MRTD `e0199499…`, RTMR0 `06a32a2f…`, RTMR1 `6fa03523…`, RTMR3 zeros) |
+| `verify.html` | `dd18e9b50b97eeda7f7661bcfab63bc8d68599bd53d556105e5b7ee828c36323`, **195,027 B** (README table + `sha256sum` block rotated in the same commit; `index.html` re-synced) |
+| Images | A `m-2ze34rkx4y8pl6ve0wag` → B **`m-2ze2z92s2ewrax782f2i`** (both `Features.NvmeSupport=supported` via the flat RPC) |
+| Prod system disks | A `d-2zecfx57tvws37hbb8eh` → B **`d-2ze58xtopd0s2o4g5fjr`** (20 GiB `cloud_auto`, `SystemDisk.Size=20` sent explicitly) |
+| Parity | `node scripts/check-manifest-parity.mjs https://login.airma.de output-alibaba/disk-alibaba.raw` → **PARITY OK** (6 same, 1 excluded `NvVars`; live `disk_manifest.verify.html == dd18e9b5…`) |
+
+### Gotchas hit this cycle
+
+1. **The self-report prefix is `boot/`, not `boot/prod/`** — the old
+   `boot/prod/latest.json` object still exists (a 2026-10-23 heartbeat) and
+   reads as a stale `stage=config`, which looks exactly like "the new boot is
+   stuck at config". Poll `boot/latest.json`.
+2. The serial console stayed the frozen 64 KiB pre-stop buffer again —
+   `LastUpdateTime` advanced while the content was days old. Self-report +
+   `curl https://…/` were the only live signals (as documented).
+3. A `set -e` script where a node one-liner dies mid-way silently skips the
+   steps after it — cycle B's first attempt never re-pushed `user_data` or
+   started the instance. Re-run the tail steps explicitly and verify the
+   readback (`DescribeUserData` → 5836 b64 chars).
+4. Generating the relay script with `python3 … || node -e` mangled the file
+   (no python3 here; env vars were not exported). Generate with node only and
+   check `bash -n` + `grep -c undefined` **before** base64-ing it into
+   `RunCommand`.
+5. `aliyun oss ls oss://bucket/boot/` (object listing) is 403 even on the HK
+   bucket — only presigned GETs work; bucket-level `aliyun oss ls` is fine.
+
+---
+
 ## 2. Where things stand right now (2026-10-20 14:30 UTC)
 
 ### 2.1 Code & CI — round 1 complete, all green

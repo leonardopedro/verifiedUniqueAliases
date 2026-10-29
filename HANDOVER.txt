@@ -1,0 +1,662 @@
+HANDOVER — Police-escrow second download (PGP-sealed attestation)
+
+> Session date: 2026-10-28 · Branch:  alibabacloud  (default) · Status: PLANNED & RESEARCHED — no feature code written yet. This document contains the complete implementation plan, exact edit anchors, crypto specs, test plan and deploy procedure so a new session can execute without re-research.
+
+
+────────────────────────────────────────────────────────────────────────────────
+
+1. Objective (user's verbatim request)
+
+> "I want to add to the Confidential VM another text box for an optional PGP public key (with default filled with the key I gave you from the Police from Bayern) and then when the attestation downloads automatically, a second attestation is also downloaded with its contents encrypted such that only the optional PGP key (if it is a valid key) can decrypt it (that is, the private key that the Police has) and a visible hash obtained from the Paypal id"
+
+
+2. Scope decisions (already answered via ask_user — DO NOT re-ask)
+
+1. Crypto runs IN THE ENCLAVE (server-side), not in the browser: the callback page stays ciphertext-only; encryption uses the already-present  openssl  crate. Plaintext never enters the callback tab.
+2. Full deploy cycle: implement → verify locally (cargo test with gpg interop + npm harness) → rebuild image → import → deploy to live enclave → live e2e (old instance kept as rollback).
+
+3. Current state
+
+- Harness baseline: 412/0 ( npm test ). Recent commits all pushed to both  origin/alibabacloud  and  origin/main  (both at  87092a6 ); GitHub Pages verified serving current  zk-rsa.html  ( a6ef4495… , 100,001 B).
+-  20b1ceb  OpenPGP interop fixes (SEIPD CFB no-resync, compressed-packet unwrap, bzip2 fail-closed)
+-  e2d71f8  origin-tie verifier row (report raw hash vs identity_hash)
+-  87092a6  PKESK key-id vs recipient check row + expected-recipient input
+- README digests current:  verify.html  =  5fd32b9e…  177,053 B (will change with this feature — rotate in the same commit),  zk.html  =  1beb6b78… ,  zk-rsa.html  =  a6ef4495… .
+- Untracked:  .freebuff/  (never commit),  zk/rsa-test/bayern-pki-smime-sample.cer  (unreferenced, leave),  zk/rsa-test/police-bka-pub.asc  — ADD it (tests + default key reference it).
+- TODO list state: step 1 (code research) done; steps 2–10 below pending.
+
+4. Flow architecture (file:line map, verified this session)
+
+verify.html IS the Confidential VM's page — served at  /  and  /verify.html  from the ESP ( src/main.rs:1551-1567 ,  serve_verify_html  reads  /boot/efi/verify.html ).  index.html  in repo root is a byte-identical mirror (harness Test 40  scripts/test-verify-security.mjs:2621  — after editing verify.html do  cp verify.html index.html ).
+
+Login flow:
+1.  verify.html:605   executePreflightAndLogin(flow)  — trusted-context only; builds POST to  /attest/login-session  at verify.html:666-670 with body  {client_ecdh_pub_b64, client_nonce_hex, flow, custom_info} .
+2.  src/main.rs:1659   attest_login_session ; request struct  LoginSessionRequest  at main.rs:1497 (fields:  client_ecdh_pub_b64, client_nonce_hex, flow: Option, custom_info: Option ). First line charges egress fixed 4096 ( main.rs:1668  area). State token = base64url JSON  {v,p,n,f,c,r}  (main.rs:1735 area) carried through PayPal  state .  signed_fields  json! block main.rs:1748-1764 (ends  client_session_binding_hex ), signed with S_enc. PKCE verifier parked in  state.pending_pkce  (bounded, TTL 600 s,  MAX_PENDING_PKCE=4096  at main.rs:1016-1017; remove-on-success inside callback token match).
+3. verify.html verifies signature,  checkExpectedApp ,  requirePkceChallenge , flow binding, then the session-fields match at verify.html:706-711; success message at ~745 ( say('✅ Login session ready …') );  catch  at 746-754 prints  ❌ e.message  and resets link.href (harness-assertable).
+4.  /callback  —  src/main.rs:1914 . Order: parse state → resolve  pending_pkce  → token exchange → userinfo →  verified_account  gate →  minimized = userinfo.verified_only()  → compute  paypal_user_raw_hash  (main.rs:2077-2081) →  report_payload  json! (moves  minimized !) →  sign_report  →  full_envelope  →  report_json = serde_json::to_string(&full_envelope)  → E2EE AES-256-GCM →  e2ee_blob  json! → vault  pending_e2ee_blobs  insert → content build:
+// rust
+let content = CALLBACK_CONTENT
+    .replace("__E2EE_BLOB__", &e2ee_blob.to_string().replace("</", "<\\/"));
+let html = HTML_TEMPLATE.replace("{{CONTENT}}", &content);
+
+( src/main.rs:2234-2238 ). Token-success match arm that removes PKCE:  src/main.rs:2063-2071 .
+5.  CALLBACK_CONTENT  raw string: main.rs:1066-1096. Contains steps 1/3–3/3,  textarea#e2ee-blob-view , buttons ( 📋 Copy ,  💾 Download encrypted report (.json) ,  ✖ Close ), then  <script type="application/json" id="e2ee-blob">__E2EE_BLOB__</script>  and the inline script that stashes the blob to sessionStorage and auto-downloads  encrypted-attestation-report.json  ( URL.createObjectURL(new Blob([__b])…)  + anchor click).
+6.  AppState  struct main.rs:1121,  pending_pkce  field main.rs:1149, init main.rs:2440, cleanup tick main.rs:2451.
+
+PayPal id visibility:  paypal_user_info_raw_hash = SHA-256(compact JSON of minimized {user_id, sub, verified_account, payer_id})  — this is the attested identity hash (goal 2). Raw  user_id  lives only inside  report_json  (never rendered). So the "visible hash" for the second file = this raw hash (+ optionally a dedicated id-only hash computed before  minimized  is moved).
+
+Police key:  zk/rsa-test/police-bka-pub.asc  — armored transferable public key, primary UID  Bundescriminalamt <pgp-key4k@bka.bund.de>  + RSA encryption subkey (so key selection MUST prefer the encrypt-capable subkey — JS parity rule in §5.1). Fingerprint will be surfaced by tests.
+
+5. Implementation plan
+
+5.1 NEW Rust module  mod pgp_escrow  in  src/main.rs 
+
+Insert just before  const MAX_PENDING_PKCE: usize = 4096;  (main.rs:1016). Ports the gpg-interop-proven JS stack (zk-rsa.html) to openssl. Full draft (compile-fix small details, noted below):
+
+// rust
+// ============================================================================
+// v197 — Police-escrow PGP sealing (user request): a second auto-download
+// whose payload is a real OpenPGP message (PKESK v3 + SEIPD v1) readable only
+// by the recipient's PRIVATE key, plus the attested hashes in CLEAR. Crypto
+// runs HERE (server-side) so the callback tab stays ciphertext-only. The
+// algorithm set is byte-for-byte the stack proven against gpg 2.4.9 in the
+// zk-rsa.html four-leg interop (20b1ceb): no CFB resync (§5.13), MDC SHA-1,
+// PKCS#1 v1.5 session-key wrap. No new dependencies (openssl/rand/sha2/hex
+// are all present).
+// ============================================================================
+mod pgp_escrow {
+    use sha2::Digest;
+ 
+    const PGP_SYM_AES256: u8 = 9; // RFC 4880 §9.2
+ 
+    struct Packet { tag: u8, body: Vec<u8> }
+    struct Target { fingerprint: String, keyid: String, n: Vec<u8>, e: Vec<u8> }
+ 
+    fn crc24(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xb704ce;
+        for &b in data {
+            crc ^= (b as u32) << 16;
+            for _ in 0..8 {
+                crc <<= 1;
+                if crc & 0x100_0000 != 0 { crc ^= 0x1864cfb; }
+            }
+        }
+        crc & 0xff_ffff
+    }
+ 
+    // Armored block → raw bytes (regex-free: find BEGIN/END markers, first
+    // blank line starts base64, an "=XXXX" line is the optional CRC —
+    // mirroring zkRsaPgpPackets' b64 handling; CRC-verified when present).
+    fn dearmor(armor: &str) -> Result<Vec<u8>, String> {
+        let begin = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
+        let end = "-----END PGP PUBLIC KEY BLOCK-----";
+        let s = armor.trim();
+        let b = s.find(begin).ok_or("not a PGP PUBLIC KEY BLOCK")? + begin.len();
+        let e = s[b..].find(end).ok_or("missing armor end")? + b;
+        let body = &s[b..e];
+        let body = body.split_once("\n\n").map(|(_, r)| r).ok_or("missing armor blank line")?;
+        let (data, crc_line) = match body.rsplit_once("\n=") {
+            Some((d, c)) => (d, Some(c.lines().next().unwrap_or(""))),
+            None => (body, None),
+        };
+        let clean: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+        let bin = base64::engine::general_purpose::STANDARD
+            .decode(clean.trim_end_matches('='))
+            .map_err(|e| format!("armor base64: {e}"))?;
+        if let Some(c) = crc_line {
+            let want = base64::engine::general_purpose::STANDARD
+                .decode(c.trim().trim_start_matches('='))?;
+            if want.len() != 3 || crc24(&bin)
+                != ((want[0] as u32) << 16 | (want[1] as u32) << 8 | want[2] as u32) {
+                return Err("armor CRC mismatch — truncated or tampered".into());
+            }
+        }
+        Ok(bin)
+    }
+ 
+    fn parse_packets(bin: &[u8]) -> Result<Vec<Packet>, String> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < bin.len() {
+            let ctb = bin[i]; i += 1;
+            if ctb & 0x80 == 0 { return Err("malformed packet header".into()); }
+            let (tag, len) = if ctb & 0x40 != 0 {
+                let tag = ctb & 0x3f;
+                let l = if i >= bin.len() { return Err("truncated".into()); }
+                    else if bin[i] < 192 { let l = bin[i] as usize; i += 1; l }
+                    else if bin[i] < 224 {
+                        if i + 1 >= bin.len() { return Err("truncated".into()); }
+                        let l = (((bin[i] as usize) - 192) << 8) + bin[i + 1] as usize + 192;
+                        i += 2; l
+                    } else if bin[i] == 255 {
+                        if i + 4 >= bin.len() { return Err("truncated".into()); }
+                        let l = u32::from_be_bytes([bin[i+1], bin[i+2], bin[i+3], bin[i+4]]) as usize;
+                        i += 5; l
+                    } else { return Err("partial-body lengths unsupported".into()); };
+                (tag, l)
+            } else {
+                let tag = (ctb >> 2) & 0x0f;
+                let len = match ctb & 0x03 {
+                    0 => { let l = bin.get(i).copied().ok_or("truncated")? as usize; i += 1; l }
+                    1 => { if i + 1 >= bin.len() { return Err("truncated".into()); }
+                           let l = u16::from_be_bytes([bin[i], bin[i+1]]) as usize; i += 2; l }
+                    2 => { if i + 3 >= bin.len() { return Err("truncated".into()); }
+                           let l = u32::from_be_bytes([bin[i], bin[i+1], bin[i+2], bin[i+3]]) as usize; i += 4; l }
+                    _ => bin.len() - i, // indeterminate
+                };
+                (tag, len)
+            };
+            if i + len > bin.len() { return Err("packet overruns buffer".into()); }
+            out.push(Packet { tag, body: bin[i..i + len].to_vec() });
+            i += len;
+        }
+        Ok(out)
+    }
+ 
+    // v4 public-key material: created(4) algo(1) [RSA: n MPI, e MPI] →
+    // (material-without-mpis, n, e). Rejects non-RSA primaries exactly like
+    // the JS parser (zkRsaParsePgpKeyPacket) — the Bayern key is RSA.
+    fn rsa_key(body: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+        if body.len() < 6 || body[0] != 4 { return Err("not a v4 key packet".into()); }
+        let algo = body[5];
+        if algo != 1 && algo != 2 && 3 != algo && algo != 3 { return Err(format!("non-RSA key algo {algo}")); }
+        if algo != 1 && algo != 3 { return Err(format!("key algo {algo} is not RSA encrypt-or-sign")); }
+        let mut off = 6;
+        let (nbits, n) = read_mpi(body, &mut off)?;
+        let (_ebits, e) = read_mpi(body, &mut off)?;
+        if n.is_empty() || e.is_empty() || nbits < 1024 { return Err("implausible RSA modulus".into()); }
+        Ok((body[..off].to_vec(), n, e))
+    }
+    fn read_mpi(b: &[u8], off: &mut usize) -> Result<(usize, Vec<u8>), String> {
+        if *off + 2 > b.len() { return Err("truncated MPI".into()); }
+        let bits = u16::from_be_bytes([b[*off], b[*off + 1]]) as usize;
+        let n = (bits + 7) / 8;
+        if *off + 2 + n > b.len() { return Err("MPI overruns".into()); }
+        let v = b[*off + 2..*off + 2 + n].to_vec();
+        *off += 2 + n;
+        Ok((bits, v))
+    }
+ 
+    // Key-fork subpacket (RFC 4880 §5.2.3.29): FIRST signature packet after
+    // this key packet; type 27 carries the key flags byte (0x04/0x08 = may
+    // encrypt). Byte-exact port of zkRsaPgpKeyFlags (zk-rsa.html ~646).
+    fn key_flags(pks: &[Packet], idx: usize) -> Option<u8> {
+        for p in pks.iter().skip(idx + 1) {
+            match p.tag {
+                5 | 6 | 7 | 14 => return None,
+                2 => {
+                    let b = &p.body;
+                    if b[0] != 4 || b.len() < 6 { return None; }
+                    let hlen = u16::from_be_bytes([b[4], b[5]]) as usize;
+                    let mut pt = 6usize;
+                    let end = 6 + hlen;
+                    while pt < end && pt < b.len() {
+                        let sl = if b[pt] < 192 { b[pt] as usize }
+                            else if b[pt] < 254 { (((b[pt] as usize) - 192) << 8) + b[pt + 1] as usize + 192 }
+                            else { u32::from_be_bytes([b[pt+1], b[pt+2], b[pt+3], b[pt+4]]) as usize };
+                        if sl < 1 || pt + sl > b.len() { return None; }
+                        if b[pt] == 27 && sl >= 2 { return Some(b[pt + 1]); }
+                        pt += sl;
+                    }
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+ 
+    pub struct ParsedRecipient { pub fingerprint: String, target: Target }
+ 
+    /// Parse an armored OpenPGP public key and pick the ENCRYPTION target —
+    /// identical selection rule to zk-rsa: RSA subkey with encrypt flags
+    /// (0x04|0x08) → else LAST RSA subkey (OpenPGP [E]-subkey convention) →
+    /// else the primary. Returns primary fingerprint (40 upper hex) + target
+    /// (fingerprint, keyid, n, e).
+    pub fn parse_public_key(armor: &str) -> Result<ParsedRecipient, String> {
+        let bin = dearmor(armor)?;
+        let pks = parse_packets(&bin)?;
+        let mut keys: Vec<(usize, Vec<u8>, Vec<u8>, Vec<u8>, bool, Option<u8>)> = Vec::new(); // idx, material, n, e, is_primary, flags
+        for (i, p) in pks.iter().enumerate() {
+            match p.tag {
+                6 | 14 => {
+                    let (mat, n, e) = rsa_key(&p.body)?;
+                    let is_primary = p.tag == 6;
+                    let flags = if is_primary { None } else { key_flags(&pks, i) };
+                    keys.push((i, mat, n, e, is_primary, flags));
+                }
+                _ => {}
+            }
+        }
+        if keys.is_empty() { return Err("no RSA key packet found".into()); }
+        let first = &keys[0];
+        if !first.4 { return Err("first key packet is not a primary key".into()); }
+        let fp = hex::encode(openssl::sha::sha1(&{
+            let mut v = vec![0x99u8, (first.1.len() >> 8) as u8, first.1.len() as u8];
+            v.extend_from_slice(&first.1);
+            v
+        })).to_uppercase();
+        let pick = {
+            let subs: Vec<&_> = keys.iter().filter(|k| !k.4).collect();
+            if !subs.is_empty() {
+                let flagged: Vec<&_> = subs.iter()
+                    .filter(|s| matches!(s.5, Some(f) if f & 0x0c != 0)).collect();
+                if !flagged.is_empty() { *flagged[flagged.len() - 1] } else { *subs[subs.len() - 1] }
+            } else { first }
+        };
+        let keyid = fp[24..40].to_string(); // primary-keyid convention fallback (JS parity)
+        let target_fp = {
+            let mut v = vec![0x99u8, (pick.1.len() >> 8) as u8, pick.1.len() as u8];
+            v.extend_from_slice(&pick.1);
+            hex::encode(openssl::sha::sha1(&v)).to_uppercase()
+        };
+        Ok(ParsedRecipient {
+            fingerprint: fp,
+            target: Target { fingerprint: target_fp, keyid: target_fp[24..40].to_string(), n: pick.2.clone(), e: pick.3.clone() },
+        })
+    }
+ 
+    /// Full message: PKESK v3 (target keyid, algo 1, PKCS#1 v1.5 of
+    /// [0x09 ‖ sk ‖ checksum]) + SEIPD v1 (zero-IV AES-256-CFB-128 with NO
+    /// §13.9 resync, prefix+literal+MDC) + standard armor. `plaintext` is the
+    /// full envelope JSON.
+    pub fn encrypt_message(armor_pub: &str, plaintext: &[u8]) -> Result<String, String> {
+        let parsed = parse_public_key(armor_pub)?;
+        let rsa = openssl::rsa::Rsa::public_public_components(
+                openssl::bn::BigNum::from_slice(&parsed.target.n),
+                openssl::bn::BigNum::from_slice(&parsed.target.e))
+            .map_err(|e| format!("RSA public key: {e}"))?;
+        let mut sk = [0u8; 32];
+        openssl::rand::rand_bytes(&mut sk).map_err(|e| format!("rng: {e}"))?;
+        let mut payload = Vec::with_capacity(35);
+        payload.push(PGP_SYM_AES256);
+        payload.extend_from_slice(&sk);
+        let sum: u16 = sk.iter().fold(0u16, |a, &b| a.wrapping_add(b as u16));
+        payload.extend_from_slice(&sum.to_be_bytes());
+        let wrapped = rsa.public_encrypt(&payload, openssl::rsa::Padding::PKCS1)
+            .map_err(|e| format!("PKCS#1 v1.5 wrap: {e}"))?;
+ 
+        let mut pkesk = vec![0xc0u8 | 1, 3];          // new-format tag 1
+        let kid = hex::decode(&parsed.target.keyid).map_err(|e| e.to_string())?;
+        pkesk.extend_from_slice(&kid);
+        pkesk.push(1);                                  // algo 1 = RSA (encrypt-or-sign)
+        pkesk.extend_from_slice(&{
+            let bits = rsa.size() * 8;
+            let mut v = ((bits >> 8) as u16).to_be_bytes().to_vec();
+            v.extend_from_slice(&wrapped);
+            v
+        });
+ 
+        let mut literal = vec![0xc0u8 | 11, (6 + plaintext.len()) as u8 /*placeholder*/];
+        // proper 2-byte length (6..8383 → two-octet form):
+        let ll = 6 + plaintext.len();
+        literal = if ll < 192 {
+            vec![0xc0u8 | 11, ll as u8]
+        } else {
+            let v = ll - 192;
+            vec![0xc0u8 | 11, ((v >> 8) + 192) as u8, (v & 0xff) as u8]
+        };
+        literal.extend_from_slice(&[0x62, 0x00, 0, 0, 0, 0]); // 'b', 0-name, mtime 0
+        literal.extend_from_slice(plaintext);
+ 
+        let mut prefix = [0u8; 18];
+        openssl::rand::rand_bytes(&mut prefix[..16]).map_err(|e| format!("rng: {e}"))?;
+        prefix[16] = prefix[14];
+        prefix[17] = prefix[15];
+        let mut pre_mdc: Vec<u8> = Vec::with_capacity(18 + literal.len() + 2);
+        pre_mdc.extend_from_slice(&prefix);
+        pre_mdc.extend_from_slice(&literal);
+        pre_mdc.extend_from_slice(&[0xd3, 0x14]);        // MDC packet header (tag 19, len 20)
+        let digest = openssl::sha::sha1(&pre_mdc);
+        pre_mdc.extend_from_slice(&digest);
+        let ct = openssl::symm::encrypt(openssl::symm::Cipher::aes_256_cfb128(), &sk, None, &pre_mdc)
+            .map_err(|e| format!("CFB: {e}"))?;         // zero IV = no IV ⇒ zero IV ✓
+ 
+        let mut seipd_body = vec![1u8];                  // SEIPD v1
+        seipd_body.extend_from_slice(&ct);
+        let mut seipd = vec![0xc0u8 | 18];
+        seipd.extend_from_slice(&{
+            let l = seipd_body.len();
+            if l < 192 { vec![l as u8] }
+            else { let v = l - 192; vec![((v >> 8) + 192) as u8, (v & 0xff) as u8] }
+        });
+        seipd.extend_from_slice(&seipd_body);
+ 
+        let mut out = pkesk.clone();
+        out.extend_from_slice(&seipd);
+        Ok(armor_message(&out))
+    }
+ 
+    fn armor_message(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let wrapped: String = b64.as_bytes().chunks(64)
+            .map(|c| String::from_utf8(c.to_vec()).unwrap() + "\n").collect();
+        let c = crc24(bytes);
+        let crc = base64::engine::general_purpose::STANDARD.encode([(c >> 16) as u8, (c >> 8) as u8, c as u8]);
+        format!("-----BEGIN PGP MESSAGE-----\n\n{wrapped}={crc}\n-----END PGP MESSAGE-----\n")
+    }
+ 
+    /// The second file: ciphertext + visible hashes. Envelope JSON goes in
+    /// ENCRYPTED; the attested hashes sit in CLEAR (user request).
+    pub fn build_sealed_report(
+        armor_pub: &str,
+        report_json: &str,
+        raw_hash: &str,           // paypal_user_info_raw_hash (attested identity hash)
+        id_hash: &str,            // SHA-256(user_id) — the literal "hash of the Paypal id"
+    ) -> Result<String, String> {
+        let parsed = parse_public_key(armor_pub)?;
+        let ciphertext = encrypt_message(armor_pub, report_json.as_bytes())?;
+        let sealed = serde_json::json!({
+            "type": "pav-pgp-sealed-attestation/v1",
+            "note": "CIPHERTEXT: the attestation envelope encrypted to recipient_fp. Only the holder of that PGP key's private half can decrypt (`gpg --decrypt`). The two hashes below are CLEAR by design so anyone can match this file to the plain attestation without reading its contents.",
+            "recipient_fingerprint": parsed.fingerprint,
+            "paypal_user_info_raw_hash": raw_hash,
+            "paypal_id_sha256": id_hash,
+            "recipient": "Bundeskriminalamt (BKA) — pgp-key4k@bka.bund.de",
+            "ciphertext": ciphertext,
+        });
+        serde_json::to_string_pretty(&sealed).map_err(|e| e.to_string())
+    }
+ 
+    // ---- tests (dev profile only; gpg interop skipped if gpg not on PATH) ----
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn repo(p: &str) -> std::path::PathBuf {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(p)
+        }
+        #[test]
+        fn parses_police_bka_key_and_selects_encrypt_subkey() {
+            let armor = std::fs::read_to_string(repo("zk/rsa-test/police-bka-pub.asc")).unwrap();
+            let r = parse_public_key(&armor).expect("police key must parse");
+            assert_eq!(r.fingerprint.len(), 40);
+            assert_ne!(r.target.fingerprint, "".to_string());
+            // selected target must carry ENCRYPT flags (the subkey, not the
+            // certify primary) — assert via flags:
+            let bin = dearmor(&armor).unwrap();
+            let pks = parse_packets(&bin).unwrap();
+            let sub_idxs: Vec<usize> = pks.iter().enumerate()
+                .filter(|(_, p)| p.tag == 14).map(|(i, _)| i).collect();
+            assert!(!sub_idxs.is_empty(), "BKA key must have a subkey");
+            let flags: Vec<Option<u8>> = sub_idxs.iter().map(|&i| key_flags(&pks, i)).collect();
+            assert!(flags.iter().any(|f| matches!(f, Some(x) if x & 0x0c != 0)),
+                "an encrypt-capable subkey must exist: {flags:?}");
+        }
+        #[test]
+        fn rejects_garbage_keys() {
+            for bad in ["not a key", "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nAAAA\n-----END PGP PUBLIC KEY BLOCK-----"] {
+                assert!(parse_public_key(bad).is_err(), "must reject: {bad:?}");
+            }
+            assert!(parse_public_key("").is_err());
+        }
+        #[test]
+        fn gpg_interop_roundtrip_or_skipped() {
+            let gpg = match std::process::Command::new("gpg").arg("--version").output() {
+                Ok(o) if o.status.success() => (),
+                _ => { eprintln!("SKIP: gpg not on PATH (run via `nix shell nixpkgs#gnupg -c cargo test …`)"); return; }
+            };
+            let dir = std::env::temp_dir().join(format!("pav-pgp-test-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let homedir = dir.join("gnupg");
+            std::fs::create_dir_all(&homedir).unwrap();
+            let gh = homedir.to_str().unwrap();
+            let gpg = |args: &[&str]| -> Vec<u8> {
+                let out = std::process::Command::new("gpg")
+                    .args(["--homedir", gh, "--batch", "--pinentry-mode", "loopback", "--yes"])
+                    .args(args).output().expect("gpg spawn");
+                assert!(out.status.success(), "gpg {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+                out.stdout
+            };
+            gpg(&["--passphrase", "", "--quick-generate-key", "Pav Test <pav@test.invalid>", "rsa2048", "default", "never"]);
+            let pubr = gpg(&["--armor", "--export", "pav@test.invalid"]);
+            let pubr = String::from_utf8(pubr).unwrap();
+            let payload = br#"{"user_id":"TEST","sub":null,"verified_account":true,"payer_id":"P"}"#;
+            let armored = encrypt_message(&pubr, payload).expect("encrypt");
+            // 1) gpg decrypts OUR message:
+            let ctfile = dir.join("msg.asc");
+            std::fs::write(&ctfile, &armored).unwrap();
+            let pt = gpg(&["--decrypt", ctfile.to_str().unwrap()]);
+            assert_eq!(pt, payload, "gpg must recover our plaintext");
+            // 2) we decrypt a gpg-produced message (uses same parser path):
+            let plainfile = dir.join("plain.txt");
+            std::fs::write(&plainfile, payload).unwrap();
+            gpg(&["--trust-model", "always", "--encrypt", "--recipient", "pav@test.invalid",
+                  "--output", dir.join("gpgmsg.asc").to_str().unwrap(), plainfile.to_str().unwrap()]);
+            let garm = std::fs::read_to_string(dir.join("gpgmsg.asc")).unwrap();
+            let bin = dearmor(&garm).unwrap();
+            let pks = parse_packets(&bin).unwrap();
+            assert!(pks.iter().any(|p| p.tag == 1 && p.tag == 18 || p.tag == 1 || p.tag == 18),
+                    "gpg message must parse into PKESK+SEIPD");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // NOTE: openssl one-shot aes_256_cfb128 with None iv == zero IV, and
+        // its CFB-128 shift matches RFC 4880 §5.13 (NO resync) — proven by
+        // the gpg roundtrip above; do NOT "fix" by adding a resync.
+    }
+}
+
+Compile-fix notes:  BigNum::from_slice  return type (Result vs direct — fix on first build);  rsa_key  algo check lines have a duplicated condition — clean to  if algo != 1 && algo != 3 { … } ;  public_public_components  is  openssl::rsa::Rsa::public_public_components(BigNum, BigNum) . The gpg test's second  assert!  is sloppy ( any(... || true)  pattern) — tighten to  pks.iter().any(|p| p.tag == 1) && pks.iter().any(|p| p.tag == 18) .
+
+5.2  main.rs  wiring hunks (exact anchors, verbatim old text)
+
+1. Constants — after  const PKCE_TTL_SECS: u64 = 600;  add:
+// rust
+// v197 — optional Police-escrow key per state: same TTL as PKCE, smaller
+// ceiling (only escrow logins occupy an entry; each ≤ PGP_RECIPIENT_MAX_BYTES).
+const MAX_PENDING_PGP: usize = 1024;
+const PGP_RECIPIENT_MAX_BYTES: usize = 16_384;
+2. Request struct —  LoginSessionRequest  gains  pub pgp_recipient: Option<String>,  (Option ⇒ absent = None, old auditors unaffected).
+3. login-session entry — REPLACE the fixed egress charge:
+// rust
+// old:
+    if let Err(status) = state.record_egress(addr.ip(), 4096) {
+        return status.into_response();
+    }
+// new (charge grows with the field — v186 lesson; then validate fail-closed):
+    let pgp_input = payload.pgp_recipient.as_deref().map(str::trim).unwrap_or("");
+    if let Err(status) = state.record_egress(addr.ip(), 4096 + pgp_input.len() as u64) {
+        return status.into_response();
+    }
+    if pgp_input.len() > PGP_RECIPIENT_MAX_BYTES {
+        return (StatusCode::BAD_REQUEST, format!("pgp_recipient exceeds {PGP_RECIPIENT_MAX_BYTES} bytes")).into_response();
+    }
+    let pgp_stored: Option<(String, String)> = if pgp_input.is_empty() { None } else {
+        match pgp_escrow::parse_public_key(pgp_input) {
+            Ok(r) => Some((pgp_input.to_string(), r.fingerprint)),
+            Err(e) => return (StatusCode::BAD_REQUEST,
+                format!("pgp_recipient is not a valid OpenPGP public key: {e}")).into_response(),
+        }
+    };
+4. signed_fields —  let signed_fields = serde_json::json!({  →  let mut signed_fields = … , and right after its closing  });  (before  let signed_fields_str ):
+// rust
+// v197: signed fingerprint of the escrow TARGET so the auditor can
+// recompute it from the pasted armor (substitution defense).
+if let Some((_, fp)) = &pgp_stored {
+    signed_fields["pgp_recipient_fingerprint"] = serde_json::Value::String(fp.clone());
+}
+5. state table — after the pkce insert +  zeroize_str(&mut code_verifier);  and before  let auth_base = … :
+// rust
+// v197: park this state's optional escrow key (bounded + TTL, like PKCE).
+if let Some((armor, _)) = &pgp_stored {
+    let mut table = state.pending_pgp.write();
+    table.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(PKCE_TTL_SECS));
+    if table.len() >= MAX_PENDING_PGP {
+        if let Some(k) = table.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| k.clone()) { table.remove(&k); }
+    }
+    table.insert(state_token.clone(), (armor.clone(), Instant::now()));
+}
+6. AppState — after  pending_pkce:  field (main.rs:1149):
+// rust
+    /// v197 — optional Police-escrow PGP key per state (armored), parked at
+/// login-session and consumed by /callback; bounded + TTL like PKCE.
+    pending_pgp: Arc<RwLock<std::collections::HashMap<String, (String, Instant)>>>,
+7. Init (main.rs:2440) — add  pending_pgp: Arc::new(RwLock::new(std::collections::HashMap::new())), 
+8. Cleanup tick (main.rs:2451) — add  cleanup_state.pending_pgp.write().retain(|_, (_, at)| at.elapsed() < Duration::from_secs(PKCE_TTL_SECS)); 
+9. Callback capture — in the token-success match arm (main.rs:2063-2071), before the match declare  let mut pgp_armor: Option<String> = None;  and inside the  Ok(r) if …  arm after the pkce removal:
+// rust
+pgp_armor = state.pending_pgp.write().remove(state_param.trim()).map(|(a, _)| a);
+
+(keep-on-failure semantics identical to PKCE: retired only on successful exchange)
+10. Hashes before  minimized  moves — after the  paypal_user_raw_hash  computation (main.rs:2077-2081):
+// rust
+let paypal_id_sha256 = hex::encode(sha2::Sha256::digest(minimized.user_id.as_bytes()));
+let seal_raw_hash = paypal_user_raw_hash.clone();   // json! below moves it
+11. Sealed build — insert before  // Never render plaintext user info  (main.rs:2233):
+// rust
+// v197 — SECOND download (Police escrow): built NEXT TO the plaintext,
+// then dropped; the optional escrow never blocks the primary attestation
+// (warn + ship without it).
+let pgp_sealed_json: Option<String> = pgp_armor.as_deref().and_then(|armor| {
+    match pgp_escrow::build_sealed_report(armor, &report_json, &seal_raw_hash, &paypal_id_sha256) {
+        Ok(s) => Some(s),
+        Err(e) => { tracing::warn!(error = %e, "pgp escrow sealed copy skipped"); None }
+    }
+});
+12. Content replace (main.rs:2234):
+// rust
+let content = CALLBACK_CONTENT
+    .replace("__E2EE_BLOB__", &e2ee_blob.to_string().replace("</", "<\\/"))
+    .replace("__PGP_SEALED__", &pgp_sealed_json.unwrap_or_default().replace("</", "<\\/"));
+
+5.3  CALLBACK_CONTENT  additions (main.rs:1066-1096, raw string — no escapes needed)
+
+- After the buttons line ending  ✖ Close this tab</button></p>  and before  </div>  insert:
+// html
+<div id="pgp-sealed-box" style="display:none; margin-top:12px; padding:10px 12px; border:1px dashed #3fb950; border-radius:6px;">
+<p style="margin:0 0 8px 0; font-size:0.9rem; color:#3fb950;">🚔 <b>Second download — Police-escrowed copy:</b> <code>pgp-sealed-attestation.json</code> saves alongside the first file: your attestation ENCRYPTED to the Police PGP key supplied at login (only their private key can open it), plus the PayPal-id hash and the signed identity hash in CLEAR so anyone can match this file to your attestation without reading it. If your browser blocked the second automatic download (Chrome asks about multiple downloads), use the 💾 button.</p>
+<textarea id="pgp-sealed-view" readonly style="width:100%; height:140px; background:#0d1117; color:#9e9e9e; font-size:12px; border:1px solid #30363d; border-radius:6px; padding:10px; box-sizing:border-box;"></textarea>
+<p><button class="btn" onclick="(function(){var t=document.getElementById('pgp-sealed-view'); t.select(); try{document.execCommand('copy');this;}catch(e){} try{navigator.clipboard.writeText(t.value);}catch(e){} this.textContent='✅ Copied';})()" style="margin-top:10px;">📋 Copy Police-sealed file</button> <button class="btn" onclick="(function(){var t=document.getElementById('pgp-sealed-view'); var blob=new Blob([t.value],{type:'application/json'}); var url=URL.createObjectURL(blob); var a=document.createElement('a'); a.href=url; a.download='pgp-sealed-attestation.json'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){URL.revokeObjectURL(url);},5000);})()" style="margin-top:10px;">💾 Download Police-sealed file (.json)</button></p>
+</div>
+- After  <script type="application/json" id="e2ee-blob">__E2EE_BLOB__</script>  add:
+ <script type="application/json" id="pgp-sealed">__PGP_SEALED__</script> 
+- Inside the existing inline script, right after  setTimeout(function(){URL.revokeObjectURL(__u);},10000);  add:
+// js
+var __s=(document.getElementById('pgp-sealed').textContent||'').trim();
+if(__s){
+  document.getElementById('pgp-sealed-box').style.display='block';
+  document.getElementById('pgp-sealed-view').value=__s;
+  var __u2=URL.createObjectURL(new Blob([__s],{type:'application/json'}));
+  var __a2=document.createElement('a'); __a2.href=__u2; __a2.download='pgp-sealed-attestation.json';
+  document.body.appendChild(__a2); __a2.click(); __a2.remove();
+  setTimeout(function(){URL.revokeObjectURL(__u2);},10000);
+}
+
+(No-seal case ⇒ empty script tag ⇒ nothing renders, nothing downloads — zero behavior change.)
+
+5.4  verify.html  edits (+  cp verify.html index.html )
+
+1. Textarea after  customInfoInput  (verify.html:238-243), content = full  police-bka-pub.asc  text:
+// html
+<label style="font-weight:400; color:var(--text-dim); font-size:0.85rem;">🚔 Optional Police escrow key (PGP public key — the enclave encrypts a SECOND copy of your attestation to it at login; leave empty for none; prefilled = Bundeskriminalamt)</label>
+<textarea id="policePgpInput" spellcheck="false" style="width:100%; height:90px; margin-top:6px; border-radius:4px; border:1px solid #30363d; background:#0d1117; color:#e6edf3; font-family:monospace; font-size:11px;">-----BEGIN PGP PUBLIC KEY BLOCK-----
+…exact file contents…
+-----END PGP PUBLIC KEY BLOCK-----</textarea>
+2. Helper (place near  requirePkceChallenge ):
+// js
+// v197 — fingerprint(s) of an armored PGP public key: SHA-1(0x99‖len‖material)
+// over each v4 key packet (primary first), lowercase hex. Mirrors the
+// enclave's pgp_escrow::parse_public_key so signer and auditor agree.
+async function pgpPublicFingerprints(armor) {
+    const m = /-----BEGIN PGP PUBLIC KEY BLOCK-----([\s\S]*?)-----END PGP PUBLIC KEY BLOCK-----/.exec(String(armor || ''));
+    if (!m) throw new Error('not a PGP PUBLIC KEY BLOCK');
+    const b64 = (m[1].split(/\n=/)[0].replace(/^[\s\S]*?\n\n/, '') || '').replace(/\s+/g, '');
+    const bin = Uint8Array.from(atob(b64.replace(/=+$/, '')), c => c.charCodeAt(0));
+    const out = []; let i = 0;
+    while (i < bin.length) {
+        const ctb = bin[i++]; let tag, len;
+        if (ctb & 0x40) { tag = ctb & 0x3f;
+            if (bin[i] < 192) { len = bin[i]; i += 1; }
+            else if (bin[i] < 224) { len = (((bin[i] - 192) << 8) + bin[i + 1] + 192); i += 2; }
+            else if (bin[i] === 255) { len = ((bin[i+1]<<24)>>>0) + (bin[i+2]<<16) + (bin[i+3]<<8) + bin[i+4]; i += 5; }
+            else throw new Error('partial-body lengths unsupported');
+        } else { tag = (ctb >> 2) & 0xf;
+            if ((ctb & 3) === 0) { len = bin[i]; i += 1; }
+            else if ((ctb & 3) === 1) { len = (bin[i] << 8) | bin[i + 1]; i += 2; }
+            else if ((ctb & 3) === 2) { len = ((bin[i]<<24)>>>0) + (bin[i+1]<<16) + (bin[i+2]<<8) + bin[i+3]; i += 4; }
+            else len = bin.length - i;
+        }
+        const body = bin.subarray(i, i + len); i += len;
+        if (tag === 6 || tag === 14) {
+            const pre = new Uint8Array(body.length + 3);
+            pre[0] = 0x99; pre[1] = body.length >> 8; pre[2] = body.length & 0xff;
+            pre.set(body, 3);
+            const d = await crypto.subtle.digest('SHA-1', pre);
+            out.push(Array.from(new Uint8Array(d)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase());
+        }
+    }
+    if (!out.length) throw new Error('no OpenPGP key packets found');
+    return out;
+}
+3. Pre-check in  executePreflightAndLogin  (after  customInfo  handling ~line 660): read textarea; if non-empty and lacks  -----BEGIN PGP PUBLIC KEY BLOCK-----  →  throw new Error('the Police escrow box does not contain a PGP PUBLIC KEY BLOCK — fix it or clear it') ; store  const pgpKeyText = …; const pgpWasSet = !!pgpKeyText; 
+4. POST body (verify.html:669): add  , pgp_recipient: pgpKeyText  (the harness stub parses whole body → compatible).
+5. Response check after the session-fields match (verify.html:706-711):
+// js
+// v197 — escrow target must be the key THIS tab pasted (substitution defense).
+const escrowFpRaw = String(sf.pgp_recipient_fingerprint || '').trim();
+if (pgpWasSet) {
+    if (escrowFpRaw) {
+        const want = (await pgpPublicFingerprints(pgpKeyText)).map(x => x.toLowerCase());
+        const got = escrowFpRaw.replace(/[\s:]/g, '').toLowerCase();
+        if (want.indexOf(got) === -1) {
+            throw new Error('ESCROW KEY SUBSTITUTION: the enclave signed a recipient fingerprint (' + got.slice(0, 24) + '…) that does not match the PGP key pasted in this tab — aborting before PayPal.');
+        }
+    }
+    // absent = legacy enclave (pre-v197 deploy window): proceed, warn in status.
+}
+6. Status note: capture a  let escrowNote = '';  before the final  say('✅ Login session ready …')  and append  escrowNote = pgpWasSet ? (escrowFpRaw ? ' 🚔 Police escrow ON → ' + escrowFpRaw.toUpperCase() : ' ⚠️ Police key sent to a pre-v197 enclave — no second file expected until redeploy.') : '';  — append  escrowNote  into the success message.
+7. Error body (optional UX): change  'login-session request rejected (HTTP ' + resp.status + ')'  to also append   — ' + (await resp.text().catch(() => '')).slice(0, 200)  so the enclave's 400 reason (invalid key) surfaces in the status line.
+8.  cp verify.html index.html  (Test 40 byte parity), then README: rotate the  verify.html  row + the  sha256sum  comment block (README.md:97-107) — harness fails if stale.
+
+5.5 Harness updates ( scripts/test-verify-security.mjs )
+
+- Test 32 stub (line ~1730  if (String(url).endsWith('/attest/login-session')) ): echo the fingerprint —  ...(body.pgp_recipient ? { pgp_recipient_fingerprint: (await pgpPublicFingerprints(body.pgp_recipient))[0] } : {})  inside the  reorder({...}) .
+- New checks: (a) with the default prefilled textarea, the POST body carries  pgp_recipient  containing  BEGIN PGP PUBLIC KEY BLOCK ; (b) stub variant returning a WRONG fp ⇒  executePreflightAndLogin  throws,  #loginVerifiedLink.href  reset,  #secureLoginStatus  starts with  ❌ ESCROW KEY SUBSTITUTION ; (c) stub omitting the fp ⇒ proceeds (legacy window). Reset  elements['loginVerifiedLink'].href = ''  between variants (F6 early-return otherwise skips the request). Element  document.getElementById('policePgpInput')  must be null-safe in code ( || {} ) — the harness DOM may or may not parse full HTML.
+- Existing tests must stay green: body shape changes are additive; custom_info logic untouched.
+
+6. Verification commands
+
+// bash
+# baseline first
+npm test                      # expect 412/0 before changes
+ 
+# cargo (PKG_CONFIG_PATH required on this NixOS host — HANDOVER.md:431)
+export PKG_CONFIG_PATH=$(ls -d /nix/store/*openssl*-dev/lib/pkgconfig 2>/dev/null | head -1)
+cargo test                    # all existing + pgp tests
+# gpg interop leg (gpg only exists via nix):
+nix shell nixpkgs#gnupg -c bash -c 'export PKG_CONFIG_PATH='"$PKG_CONFIG_PATH"'; cargo test pgp -- --nocapture'
+ 
+npm test                      # target: previous 412 + new stub/escrow checks, 0 failed
+cmp verify.html index.html    # byte-identical
+
+7. Deploy cycle + PIN ROTATION (critical, from HANDOVER.md:410/427/454)
+
+1.  bash build-alibaba-docker.sh  (binary + initramfs),  bash build-alibaba-image.sh  (mcopy  ./verify.html  onto the ESP → disk),  bash import-alibaba-image.sh  (ossutil +  ALI_OSS_BUCKET ; OSS data-plane blocked from outside mainland — script pushes via same-region ECS intranet),  bash deploy-alibaba.sh  (target  ecs.r9i.xlarge , spot  SpotAsPriceGo ).
+2. TWO-CYCLE pin rotation: binary and verify.html both change ⇒  EXPECTED_ENCLAVE_SHA256  (binary) and  EXPECTED_RTMR2  (ESP contents incl. verify.html) go stale. Cycle A: deploy as-is → read live  https://login.airma.de/debug/envelope  (or  scripts/calculate-golden-rtmr.mjs ) → rotate  EXPECTED_ENCLAVE_SHA256  +  EXPECTED_RTMR2  in verify.html →  cp verify.html index.html  → README digests → rebuild image+disk → deploy cycle B →  node scripts/check-manifest-parity.mjs  (expect  PARITY OK ) → served == repo == README.
+3. Push-both-branches rule: any commit touching verify.html/main.rs →  git push origin alibabacloud  and  git push origin alibabacloud:main  (Pages tracks  main ; CI tracks both) — Test 46 fails otherwise.
+
+8. Live e2e
+
+ scripts/e2e-login-download.mjs  with  CHROMIUM_PATH=$(command -v chromium)  (Nix chromium; Playwright's headless shell lacks libs). Both flows ( verified ,  full ). For the new feature: set  #policePgpInput  via  page.evaluate  to  zk/rsa-test/signer-pub.asc  before login ⇒ second file decryptable by the fixture secret key → full proof: both downloads fire (headless allows multiple), then  nix shell nixpkgs#gnupg -c gpg --homedir … --import signer-sec.asc …  — but note the fixture secret has no UID so gpg refuses to import it (historical) → decrypt with the JS side instead ( zkRsaPgpDecryptMessage  from zk-rsa.html, proven against gpg) or run one e2e with the default Bayern key and assert only: file exists +  recipient_fingerprint  == computed BKA fingerprint +  paypal_user_info_raw_hash  == the report's signed hash (addressing proof, no private key needed). Prefer the latter (simplest, uses no fixtures).
+
+9. Gotchas discovered (do not rediscover)
+
+- No CFB resync in SEIPD v1 (§5.13) — openssl  aes_256_cfb128  one-shot with  None  IV (zero) is already correct; the §13.9 resync is only for the old SED packet. This was THE bug fixed in  20b1ceb .
+- gpg wraps the literal in a tag-8 Compressed packet (zlib) when decrypting ours is unaffected, but our parser must not assume inner packets — irrelevant here since we only emit; gpg accepts our uncompressed message (proven).
+-  signed_fields  gained a key → old auditor copies still verify (they verify over the received object wholesale); new field is additive. Absent  pgp_recipient_fingerprint  with a key sent = legacy enclave → warn, don't fail (deploy-window safety).
+- Charge egress before validating (v186 lesson); body already capped ~2 MB by axum Json.
+-  minimized  is moved into  report_payload  — capture  paypal_id_sha256  +  seal_raw_hash  clone before that line.
+- Chrome blocks the second automatic download without the "Multiple automatic downloads" permission — the hidden box's manual 💾 button is the designed fallback; Playwright/headless captures both.
+-  CALLBACK_CONTENT  edit = binary change ⇒ the two-cycle rotation (§7.2) is unavoidable — budget for it.
+- README  verify.html  digest/size must rotate in the same commit (harness gate).
+- Harness Test 40 enforces  verify.html  ↔  index.html  byte parity; README has no index.html row.
+- Never commit  .freebuff/ ; DO commit  zk/rsa-test/police-bka-pub.asc .
+-  atob ,  crypto.subtle  SHA-1,  crypto.getRandomValues  are all already used by verify.html in the harness env — no shims needed.
+
+10. Out of scope / do not touch
+
+-  zk-rsa.html ,  zk.html  (their work is complete and pushed), enclave egress budgets, PayPal flow logic, anything on  oraclecloud .
+- No new cargo dependencies ( openssl ,  rand ,  sha2 ,  base64 ,  hex ,  serde_json  all present).
+
+Suggested first actions in the new session: (1)  npm test  for the 412/0 baseline; (2) paste the §5.1 module + §5.2 hunks into  src/main.rs ; (3)  cargo test  until green; (4) proceed down the plan.

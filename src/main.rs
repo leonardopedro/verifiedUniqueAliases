@@ -1285,6 +1285,18 @@ mod pgp_escrow {
         target: Target,
     }
 
+    impl ParsedRecipient {
+        /// Fingerprint of the ENCRYPTION target the sealed copy is actually
+        /// addressed to (its last 16 hex are the ciphertext's PKESK key-id).
+        /// v198: THIS is what gets S_enc-signed as `pgp_recipient_fingerprint`
+        /// — signing the primary instead left the auditor with no signed value
+        /// that matches the key the file is addressed to, so the ciphertext
+        /// could only be checked against the file's own clear fields.
+        pub fn target_fingerprint(&self) -> &str {
+            &self.target.fingerprint
+        }
+    }
+
     /// Parse an armored OpenPGP public key and pick the ENCRYPTION target —
     /// identical selection rule to zk-rsa: RSA subkey with encrypt flags
     /// (0x04|0x08) → else the LAST RSA subkey (the OpenPGP [E]-subkey
@@ -1672,8 +1684,45 @@ const PKCE_TTL_SECS: u64 = 600;
 // ceiling (only escrow logins occupy an entry; each ≤ PGP_RECIPIENT_MAX_BYTES).
 const MAX_PENDING_PGP: usize = 1024;
 const PGP_RECIPIENT_MAX_BYTES: usize = 16_384;
-const GLOBAL_EGRESS_BYTES_PER_HOUR: u64 = 512 * 1024 * 1024;
-const IP_EGRESS_BYTES_PER_HOUR: u64 = 25 * 1024 * 1024;
+// v199 — egress cost model, RE-DERIVED FOR ALIBABA CLOUD (these numbers were
+// inherited from the GCP-era build and never priced against the provider the
+// project actually runs on).
+//
+// Verified live against the reserved EIP (`aliyun vpc DescribeEipAddresses`,
+// eip-2zet05jbat6wr6rp7elrc = 101.200.178.251):
+//   InternetChargeType = PayByTraffic · ISP = BGP (multi-line) · Region =
+//   cn-beijing · Bandwidth (peak) = 5 Mbps · PostPaid · bound to the ECS
+//   instance (so no EIP configuration fee is charged while it is attached).
+//
+// Alibaba pricing these caps defend against:
+//   * ¥0.80 per GB — EGRESS ONLY; inbound traffic is FREE, so the entire
+//     exposure is us SERVING bytes (an inbound flood costs nothing, it can
+//     only exhaust the 5 Mbps peak we bought);
+//   * billed HOURLY by CDT (tiered traffic pricing) — hence the enforcement
+//     window below is exactly one hour, so no cap crossing can accumulate
+//     inside a single billable hour;
+//   * a saturated 5 Mbps line would push 2.20 GB/h = ¥1.76/h ≈ ¥1,270/month;
+//     THAT is the bill these caps exist to prevent.
+//
+// Budget (edit the two constants, the rest follows from Alibaba's price):
+//   ¥30.00/month ÷ ¥0.80/GB = 37.5 GB/month ÷ 730 h = 55,157,970 B/h
+//   (52.6 MiB/h — ~130 full audit sessions of ~400 KB each per hour).
+// Normal load is ~400 KB per full audit session (auditor + callback page +
+// the two ciphertext downloads), so this still allows ~130 sessions/hour
+// while capping a flood — and a single client to ~4 MiB/h (1/13 of global,
+// ≈ ¥2.34/month worst case) instead of being able to drain the whole budget.
+const EGRESS_PRICE_CNY_PER_GB_TENTHS: u64 = 8;         // ¥0.80 / GB (cn-beijing BGP)
+const EGRESS_BUDGET_CNY_PER_MONTH_TENTHS: u64 = 300;   // ¥30.00 / month ceiling
+const EGRESS_BILLING_HOURS_PER_MONTH: u64 = 730;       // Alibaba settles hourly
+const EGRESS_IP_SHARE_DIVISOR: u64 = 13;               // per-IP = global / 13
+
+const GLOBAL_EGRESS_BYTES_PER_HOUR: u64 =
+    (EGRESS_BUDGET_CNY_PER_MONTH_TENTHS * 1024 * 1024 * 1024)
+        / (EGRESS_PRICE_CNY_PER_GB_TENTHS * EGRESS_BILLING_HOURS_PER_MONTH);
+const IP_EGRESS_BYTES_PER_HOUR: u64 = GLOBAL_EGRESS_BYTES_PER_HOUR / EGRESS_IP_SHARE_DIVISOR;
+// Derived above: 55,157,970 B/h (52.6 MiB) global, 4,242,920 B/h (4.05 MiB)
+// per IP. security_tests::egress_budget_matches_alibaba_price_v199 pins the
+// arithmetic to the ¥30 budget and the ¥0.80/GB unit price.
 const ZEROSSL_CA_DIRECTORY: &str = "https://acme.zerossl.com/v2/DV90";
 const LETSENCRYPT_CA_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
 
@@ -1863,10 +1912,21 @@ impl AppState {
         }
         let current = self.global_egress_bytes.fetch_add(bytes, Ordering::Relaxed);
         if current + bytes >= GLOBAL_EGRESS_BYTES_PER_HOUR {
+            // Only the FIRST rejection of each window logs (fetch_add still
+            // returns the pre-increment value), so a flood cannot bury the
+            // 64 KiB serial console — the project's diagnosis channel.
+            if current < GLOBAL_EGRESS_BYTES_PER_HOUR {
+                warn!(ip = %ip, bytes = bytes,
+                    "global egress budget exhausted (Alibaba ¥0.80/GB, ¥30/month ceiling) — answering 429");
+            }
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
         let ip_bytes = stats.entry(ip).and_modify(|e| *e += bytes).or_insert(bytes);
         if *ip_bytes > IP_EGRESS_BYTES_PER_HOUR {
+            if *ip_bytes - bytes <= IP_EGRESS_BYTES_PER_HOUR {
+                warn!(ip = %ip, bytes = bytes,
+                    "per-IP egress cap reached (≈4 MiB/h — the client share of the ¥30/month budget) — answering 429");
+            }
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
         Ok(())
@@ -2366,7 +2426,7 @@ async fn attest_login_session(
         None
     } else {
         match pgp_escrow::parse_public_key(pgp_input) {
-            Ok(r) => Some((pgp_input.to_string(), r.fingerprint)),
+            Ok(r) => Some((pgp_input.to_string(), r.target_fingerprint().to_string())),
             Err(e) => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -2481,10 +2541,12 @@ async fn attest_login_session(
         // only — the quote bytes are the source of trust, v179 semantics).
         "client_session_binding_hex": hex::encode(client_session_binding(&client_pub, &client_nonce)),
     });
-    // v197: signed fingerprint of the escrow TARGET (the key actually used
-    // for encryption) so the auditor can recompute it from the armor it
-    // pasted — substitution defense: a hostile enclave cannot quietly reseal
-    // the copy to a key of its own choosing.
+    // v197/v198: signed fingerprint of the escrow TARGET (the encryption key
+    // actually used for the sealed copy — its last 16 hex are the ciphertext's
+    // PKESK key-id) so the auditor can prove the downloaded ciphertext is
+    // addressed to exactly this key: substitution defense — a hostile enclave
+    // cannot quietly reseal the copy to a key of its own choosing. (v198 fix:
+    // it used to sign `r.fingerprint`, the PRIMARY — see target_fingerprint().)
     if let Some((_, fp)) = &pgp_stored {
         signed_fields["pgp_recipient_fingerprint"] = serde_json::Value::String(fp.clone());
     }
@@ -3375,6 +3437,58 @@ mod security_tests {
             crate::prelogin_paypal_hash(),
             "703d1ea4a5131eef7089ca7c41d877ba32df741a7f24ab3d580e56f297c2fb52"
         );
+    }
+
+    /// v199 — the egress caps are a COST control, priced against the provider
+    /// this deployment actually runs on: a PayByTraffic BGP EIP in cn-beijing
+    /// bills ¥0.80 per GB of EGRESS (inbound is free) hourly, on a purchased
+    /// 5 Mbps peak. Pin the arithmetic so a casual tweak cannot silently turn
+    /// the ¥30/month ceiling into an unbounded one — and so the application
+    /// cap can never rise above what the line can physically push, which would
+    /// make the 429 gate unreachable and the DoS bill open again.
+    #[test]
+    fn egress_budget_matches_alibaba_price_v199() {
+        const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
+        const PRICE_CNY_PER_GB: f64 = 0.80; // cn-beijing BGP, PayByTraffic
+        const HOURS_PER_MONTH: f64 = 730.0; // Alibaba settles hourly
+        // Purchased peak: 5 Mbps (DescribeEipAddresses → Bandwidth: "5").
+        const LINE_RATE_BYTES_PER_HOUR: f64 = 5_000_000.0 / 8.0 * 3600.0;
+
+        let monthly_gb = GLOBAL_EGRESS_BYTES_PER_HOUR as f64 * HOURS_PER_MONTH / BYTES_PER_GB;
+        let monthly_cny = monthly_gb * PRICE_CNY_PER_GB;
+        assert!(
+            (29.0..=31.0).contains(&monthly_cny),
+            "global egress cap now costs ¥{monthly_cny:.2}/month at ¥0.80/GB — expected the ¥30 ceiling"
+        );
+
+        let ip_monthly_cny = IP_EGRESS_BYTES_PER_HOUR as f64 * HOURS_PER_MONTH / BYTES_PER_GB * PRICE_CNY_PER_GB;
+        assert!(
+            ip_monthly_cny <= 3.0,
+            "one client can now burn ¥{ip_monthly_cny:.2}/month — the per-IP share must stay within ¥3"
+        );
+        assert!(
+            IP_EGRESS_BYTES_PER_HOUR * EGRESS_IP_SHARE_DIVISOR <= GLOBAL_EGRESS_BYTES_PER_HOUR,
+            "per-IP cap must be a strict share of the global window"
+        );
+        assert!(
+            (GLOBAL_EGRESS_BYTES_PER_HOUR as f64) < LINE_RATE_BYTES_PER_HOUR,
+            "global cap exceeds the 5 Mbps line rate — the 429 gate would be unreachable"
+        );
+        // The enforcement window must match Alibaba's billing period (hourly),
+        // so no cap crossing can accumulate inside one billable hour — and the
+        // two inputs are what the budget arithmetic above is derived from:
+        // changing either one requires re-pricing against the EIP price table.
+        assert_eq!(
+            EGRESS_BUDGET_CNY_PER_MONTH_TENTHS,
+            300,
+            "monthly egress budget changed — re-price it against ¥0.80/GB before merging"
+        );
+        assert_eq!(
+            EGRESS_PRICE_CNY_PER_GB_TENTHS,
+            8,
+            "the cn-beijing BGP PayByTraffic unit price changed — re-check help.aliyun.com/zh/eip/pay-as-you-go"
+        );
+        assert_eq!(EGRESS_BILLING_HOURS_PER_MONTH, 730, "Alibaba settles traffic fees hourly");
     }
 
     #[test]

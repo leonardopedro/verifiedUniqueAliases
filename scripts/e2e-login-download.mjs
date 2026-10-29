@@ -127,6 +127,17 @@ try {
   await page.fill('#localEnclaveHost', 'https://login.airma.de');
   log('1. loaded', VERIFY, '(trusted copy)');
 
+  // v197b — optional escrow-key override: seal to a key WE hold the private
+  // half of (a fixture), so the captured ciphertext can be opened with gpg as
+  // a full private-key proof. Unset => the page's prefilled BKA key is used.
+  const PGP_KEY_PATH = process.env.PAV_E2E_PGP_KEY_PATH || '';
+  const SEALED_OUT = process.env.PAV_E2E_SEALED_OUT || '/tmp/pgp-sealed-attestation.json';
+  if (PGP_KEY_PATH) {
+    const armor = readFileSync(PGP_KEY_PATH, 'utf8');
+    await page.fill('#policePgpInput', armor);
+    log('1c. escrow key overridden ->', PGP_KEY_PATH);
+  }
+
   // Step 1 — login session (v180: NO pre-login attestation — S_enc-signed
   // fields only; the hardware audit runs on the post-login report).
   // v188: TWO EXPLICIT login links (#loginVerifiedLink / #loginFullLink);
@@ -268,13 +279,15 @@ try {
   // a copy to it. Assert the addressing (fingerprint + clear hashes), which
   // needs no private key: the ciphertext is only readable by whoever holds
   // that key, so proving it is *addressed to it* is the observable claim.
-  const bkaArmor = readFileSync(new URL('../zk/rsa-test/police-bka-pub.asc', import.meta.url), 'utf8');
+  const bkaArmor = PGP_KEY_PATH
+    ? readFileSync(PGP_KEY_PATH, 'utf8')
+    : readFileSync(new URL('../zk/rsa-test/police-bka-pub.asc', import.meta.url), 'utf8');
   const wantFp = armorFingerprints(bkaArmor);
   let sealedOk = false;
   if (!sealedDownload) throw new Error('v197: callback did NOT auto-download pgp-sealed-attestation.json (escrow box prefilled, enclave should have sealed a copy)');
   const sealedPath = await sealedDownload.d.path();
   const sealed = JSON.parse(readFileSync(sealedPath, 'utf8'));
-  writeFileSync('/tmp/pgp-sealed-attestation.json', JSON.stringify(sealed, null, 2));
+  writeFileSync(SEALED_OUT, JSON.stringify(sealed, null, 2));
   const reportObj = rep && rep.trim().startsWith('{') ? JSON.parse(rep) : null;
   const signedRawHash = reportObj?.attestation_report?.paypal_user_info_raw_hash || '';
   const fp = String(sealed.recipient_fingerprint || '').toUpperCase();
@@ -284,7 +297,7 @@ try {
     && /^[0-9a-f]{64}$/i.test(String(sealed.paypal_id_sha256 || ''))
     && /^-----BEGIN PGP MESSAGE-----/.test(String(sealed.ciphertext || ''))
     && /-----END PGP MESSAGE-----\s*$/.test(String(sealed.ciphertext || '').trim());
-  log('   sealed copy → /tmp/pgp-sealed-attestation.json', JSON.stringify({
+  log('   sealed copy → ' + SEALED_OUT, JSON.stringify({
     type: sealed.type, fp: fp.slice(0, 16) + '…',
     addressedToBka: wantFp.includes(fp),
     clearHashMatchesSigned: !!signedRawHash && sealed.paypal_user_info_raw_hash === signedRawHash,
@@ -297,13 +310,28 @@ try {
   // Step 3 — the green audit unlocks the plain-report download (v164).
   await page.click('#reportDownloadBtn');
   await page.waitForTimeout(3000);
+
+  // ── v198 — the auditor verifies the SECOND (sealed) copy itself ──────────
+  // Paste the PGP-sealed file into the trusted tab: the auditor must read the
+  // ciphertext's PKESK key-id and match it against the S_enc-signed escrow
+  // target it kept from this login (no private key needed — addressing is the
+  // only claim provable without it). Needs this SAME tab's session, which is
+  // exactly where the login started.
+  await page.fill('#attestationInput', JSON.stringify(sealed, null, 2));
+  await page.click('button:has-text("Perform Cryptographic Audit")');
+  await page.waitForTimeout(3000);
+  const escrowAudit = (await page.textContent('#secureLoginStatus').catch(() => '')).slice(0, 400);
+  log('10. sealed-copy audit in the auditor:', escrowAudit.slice(0, 200));
+  const escVerified = /ADDRESSED CORRECTLY/.test(escrowAudit)
+    && new RegExp('7DE765EF79EFF86C|' + fp.slice(-16)).test(escrowAudit);
+  log('   v198 PKESK key-id vs signed target:', escVerified ? 'verified ✓' : 'FAILED ✗');
   await browser.close();
 
   log('9. prepare POSTs to /attest/login-session:', preparePosts, preparePosts === 1 ? '(F6 single-prepare ✓)' : '← F6 VIOLATION (must be exactly 1)');
-  const ok = !!encDownload && green && !!downloaded && /^attestation-report-/.test(downloaded) && preparePosts === 1 && sealedOk && escrowNoted;
+  const ok = !!encDownload && green && !!downloaded && /^attestation-report-/.test(downloaded) && preparePosts === 1 && sealedOk && escrowNoted && escVerified;
   log('\n' + (ok
-    ? `RESULT: PASS — callback auto-download ✓, audit green ✓, report downloaded (${downloaded}), single-prepare ✓, police-sealed copy ✓`
-    : `RESULT: FAIL — enc=${encDownload ? 'yes' : 'no'} green=${green} downloaded=${downloaded || 'none'} preparePosts=${preparePosts} sealed=${sealedOk} escrowNoted=${escrowNoted} status=${String(status).slice(0, 120)}`));
+    ? `RESULT: PASS — callback auto-download ✓, audit green ✓, report downloaded (${downloaded}), single-prepare ✓, police-sealed copy ✓, escrow addressing verified in-auditor ✓`
+    : `RESULT: FAIL — enc=${encDownload ? 'yes' : 'no'} green=${green} downloaded=${downloaded || 'none'} preparePosts=${preparePosts} sealed=${sealedOk} escrowNoted=${escrowNoted} escrowAudit=${escVerified} status=${String(status).slice(0, 120)}`));
   process.exit(ok ? 0 : 1);
 } catch (e) {
   await browser.close().catch(() => {});

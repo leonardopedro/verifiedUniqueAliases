@@ -1,0 +1,9 @@
+{
+  "type": "pav-pgp-sealed-attestation/v1",
+  "note": "FIXTURE: a real OpenPGP ciphertext (gpg 2.4.9, RSA-4096, PKESK v3) addressed to the encryption subkey of zk/rsa-test/police-bka-pub.asc. It carries no attestation — it exists so scripts/test-verify-security.mjs can prove verify.html reads the ciphertext key-id (7DE765EF79EFF86C) and matches it against the S_enc-signed escrow target. Regenerate: gpg --armor --encrypt --recipient-file zk/rsa-test/police-bka-pub.asc.",
+  "recipient_fingerprint": "081910AD8FEF62A9BD7A9C52B3DB661A2928E65A",
+  "recipient_target_fingerprint": "183BA8C8492359736B9E015E7DE765EF79EFF86C",
+  "paypal_user_info_raw_hash": "53dd6264053f5dabd84d5b5382b536f7d84d5b5382b536f7d84d5b5382b536f7",
+  "paypal_id_sha256": "17a1022fd7acf4e7db6a854bb58a87dd6cd4d7fad3e1c7c1983870a02c865a1d",
+  "ciphertext": "-----BEGIN PGP MESSAGE-----\n\nhQIMA33nZe957/hsARAAnoMWQy9vwadvekSTUakPthzZvlVxGb+7AK2mUKlYn7NZ\nnnmkkMrOka7fBvL0ASN9zeYRG6/GZuh4wuE484jgDQunFLXWl7UZYBZymG3jGK+Z\n6d3wJq+SGmobCurCks4nP35U5SGkWRLhInzCkxjAVAM8laLrEobb7J9+Svy0dMMc\nRRYFTPUF6tsV7mS738WmIZFdLBGhBI3szc7FuIUtOulYqZgki9uRxqPkPUyvSl7G\n5BsjOJIK+iljquk4JkXzEmYS/D75/bTiKRbETdTg4Y3yZ3zX1D3+bQvP4JtOnpZq\nvwbAjpFVJcnqsNXn9vDfVIEdCtqWSmHkqa428Kn7qwNQ4yJifLGndmyLXChIg8N3\n//JEXE8HeVP7A07UJYJ9bb7hkIhF8g21t/JOXenv3DfiqaSi3k32gBmk0kEOb6z3\nSqmv/WN78FjScD0EYbM6c726wI4epP1MEtJaGsLT0bBVnvPNL/koDUBE3T/zQ4NQ\nliZlKxjxFtOXAI8IEXZ08PZAQ6NNhcmXf6C2i/+Hz5hEuGyI0bMtPL0sf+RiAkqI\nZ86duhJrbAybSnUX+WIViKeSFiZ1MVr1WWsPXtffT334I41EecERx5C2LJ0tijny\nqo/MFFMEUGEiEtYqKKhH61R8C/82AotQsQKrfNsoBI8QZaOlWGMf++dXIV4SVFHS\nhQEXE4IxhvB6YyvqIoWNMv41VN0CqXmVF06+OjDXzyV3uUuKf1sU1kr4Cn8eHZUU\nLB9XmJy3JiZjo3kVjqJHjo35HLOnFrIdUuiuIguqoHxIrG9HpIscl9PtMzVVcifp\niEAKjqvAuYq2J1AbTCtTxhSrLBLzef4Wz41tmgI+yH4hObRF5XA=\n=KvJl\n-----END PGP MESSAGE-----\n"
+}

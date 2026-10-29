@@ -811,7 +811,16 @@ Wmw2oAio9A==
                 p_enc: pf.enclave_signing_public_key, state: sf.state,
                 flow: sf.flow || flow || 'verified',
                 clientPubB64: pubB64, sessionBindingHex: auditorSessionBindingHex,
+                // v198: keep the S_enc-signed escrow TARGET (the subkey the
+                // enclave will actually encrypt the second copy to) so that
+                // when the sealed file comes back to this tab the auditor can
+                // prove the ciphertext's PKESK key-id == that signed value.
+                pgpTargetFp: escrowFpRaw || '',
             }));
+            try {
+                if (escrowFpRaw) sessionStorage.setItem('pav_pgp_target_fp', escrowFpRaw);
+                else sessionStorage.removeItem('pav_pgp_target_fp');
+            } catch (e) { /* no storage */ }
 
             // Client-built authorize URL from the S_enc-signed fields (scope
             // arrives pre-percent-encoded from the enclave — do not re-encode).
@@ -928,6 +937,103 @@ Wmw2oAio9A==
     }
 
     // ========================================================================
+    // v198 (escrow addressing proof). The SECOND, PGP-sealed copy the callback
+    // downloads is CIPHERTEXT: without the private key the ONLY claim an
+    // auditor can prove is that it is addressed to the right key — and that
+    // proof is meaningful only against the fingerprint the enclave SIGNED at
+    // session time (`pgp_recipient_fingerprint`, S_enc-signed and checked in
+    // this tab against the armor the user pasted), never against the sealed
+    // file's own clear fields (a hostile enclave writes those too).
+    //   pkeskKeyIdHex()        — dearmor the PGP MESSAGE, read its first
+    //                            packet (PKESK, OpenPGP tag 1), return the
+    //                            8-byte recipient key id as 16 hex;
+    //   signedEscrowTargetFp() — the signed target remembered by this session;
+    //   verifySealedEscrow()   — ciphertext key-id, file-declared target and
+    //                            signed target must all agree. Fail closed.
+    // ========================================================================
+    function pkeskKeyIdHex(ciphertext) {
+        const src = String(ciphertext || '').replace(/\r\n/g, '\n');
+        const m = /-----BEGIN PGP MESSAGE-----([\s\S]*?)-----END PGP MESSAGE-----/.exec(src);
+        if (!m) throw new Error('ESCROW ADDRESSING: no armored PGP MESSAGE in the pasted file — the recipient key id cannot be read, failing closed.');
+        const body = m[1];
+        const blank = body.indexOf('\n\n');
+        if (blank < 0) throw new Error('ESCROW ADDRESSING: malformed PGP armor (no blank line after the headers), failing closed.');
+        const b64 = body.slice(blank + 2)
+            .replace(/\s+$/, '')
+            .replace(/\n=[A-Za-z0-9+/]{4}$/, '')
+            .replace(/\s+/g, '');
+        const bin = Uint8Array.from(atob(b64.replace(/=+$/, '')), c => c.charCodeAt(0));
+        if (bin.length < 2) throw new Error('ESCROW ADDRESSING: ciphertext too short to hold a packet, failing closed.');
+        const ctb = bin[0];
+        if (!(ctb & 0x80)) throw new Error('ESCROW ADDRESSING: malformed OpenPGP packet header, failing closed.');
+        let i = 1, tag, len;
+        if (ctb & 0x40) {
+            tag = ctb & 0x3f;
+            if (bin[i] < 192) { len = bin[i]; i += 1; }
+            else if (bin[i] < 224) { len = (((bin[i] - 192) << 8) + bin[i + 1] + 192); i += 2; }
+            else if (bin[i] === 255) { len = ((bin[i + 1] << 24) >>> 0) + (bin[i + 2] << 16) + (bin[i + 3] << 8) + bin[i + 4]; i += 5; }
+            else throw new Error('ESCROW ADDRESSING: partial-body packet lengths unsupported, failing closed.');
+        } else {
+            tag = (ctb >> 2) & 0xf;
+            if ((ctb & 3) === 0) { len = bin[i]; i += 1; }
+            else if ((ctb & 3) === 1) { len = (bin[i] << 8) | bin[i + 1]; i += 2; }
+            else if ((ctb & 3) === 2) { len = ((bin[i] << 24) >>> 0) + (bin[i + 1] << 16) + (bin[i + 2] << 8) + bin[i + 3]; i += 4; }
+            else { len = bin.length - i; }
+        }
+        if (tag !== 1) {
+            throw new Error('ESCROW ADDRESSING: the ciphertext\u2019s first packet is OpenPGP tag ' + tag + ', not the PKESK (tag 1) recipient packet — the recipient key id cannot be read, failing closed.');
+        }
+        if (i + len > bin.length) throw new Error('ESCROW ADDRESSING: PKESK packet overruns the ciphertext, failing closed.');
+        const p = bin.subarray(i, i + len);
+        if (p.length < 9 || p[0] !== 3) {
+            throw new Error('ESCROW ADDRESSING: unsupported PKESK version ' + (p.length ? p[0] : 'n/a') + ' — only v3 (what gpg emits for a v4 key) can be checked here, failing closed.');
+        }
+        const kid = Array.from(p.subarray(1, 9)).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+        if (!/^[0-9A-F]{16}$/.test(kid) || kid === '0000000000000000') {
+            throw new Error('ESCROW ADDRESSING: the ciphertext carries an ANONYMOUS recipient key id (' + kid + '), so it declares no target at all — addressing cannot be proven, failing closed.');
+        }
+        return kid;
+    }
+
+    // The S_enc-signed escrow target stored by THIS tab's login-session step
+    // (localStorage primary, sessionStorage fallback for same-origin handoffs).
+    function signedEscrowTargetFp() {
+        let v = '';
+        try { const s = JSON.parse(localStorage.getItem('pav_local_session') || 'null'); v = (s && s.pgpTargetFp) || ''; } catch (e) { /* no storage */ }
+        if (!v) { try { v = sessionStorage.getItem('pav_pgp_target_fp') || ''; } catch (e) { /* no storage */ } }
+        v = String(v).replace(/[\s:]/g, '').toUpperCase();
+        return /^[0-9A-F]{40}$/.test(v) ? v : '';
+    }
+
+    async function verifySealedEscrow(sealed) {
+        const norm = v => String(v || '').replace(/[\s:]/g, '').toUpperCase();
+        const clearTarget = norm(sealed.recipient_target_fingerprint);
+        if (!/^[0-9A-F]{40}$/.test(clearTarget)) {
+            throw new Error('ESCROW ADDRESSING: the sealed copy does not declare a full 40-hex recipient_target_fingerprint, failing closed.');
+        }
+        const kid = pkeskKeyIdHex(sealed.ciphertext);
+        if (clearTarget.slice(-16) !== kid) {
+            throw new Error('ESCROW ADDRESSING VIOLATION: the ciphertext is addressed to key id ' + kid +
+                ' but the file declares target ' + clearTarget + ' (whose last 16 hex are ' + clearTarget.slice(-16) +
+                ') — one of the two was rewritten. Failing closed.');
+        }
+        const signed = signedEscrowTargetFp();
+        if (!signed) {
+            throw new Error('ESCROW ADDRESSING UNVERIFIABLE: this copy holds no S_enc-signed pgp_recipient_fingerprint, so a match against the file\u2019s OWN clear fields would prove nothing (a hostile enclave writes those). Paste this sealed file in the tab where the login was prepared — it keeps the signed session — or audit that session\u2019s plain attestation-report-*.json. Failing closed.');
+        }
+        if (signed !== clearTarget) {
+            throw new Error('ESCROW TARGET SUBSTITUTION: the S_enc-signed escrow target ' + signed +
+                ' does not match the target this ciphertext declares (' + clearTarget +
+                ') — the copy was resealed to another key. Failing closed.');
+        }
+        if (signed.slice(-16) !== kid) {
+            throw new Error('ESCROW ADDRESSING VIOLATION: the ciphertext\u2019s PKESK key-id is ' + kid +
+                ' but the SIGNED escrow target ' + signed + ' ends in ' + signed.slice(-16) + ' — Failing closed.');
+        }
+        return { keyId: kid, target: signed };
+    }
+
+    // ========================================================================
     // v162 (audit VULN-03): APP PIN — the audited PayPal applications.
     // The S_enc signature only proves the enclave said "use this app"; a
     // malicious owner controls the enclave's config and could swap in its
@@ -981,7 +1087,7 @@ Wmw2oAio9A==
     // ========================================================================
     var EXPECTED_RTMR0 = '06a32a2f92ea455dd628bc41be9bb5910c2782a2eb93c646c6a5ddebd70291839f197792d289cca528572b6d910294db';
     var EXPECTED_RTMR1 = '6fa0352319182f7ec8cb713223cbc1853506caf719c64d04475a26975ae8ebf72003f592dcf0aafe392cc74de33d3f90';
-    var EXPECTED_RTMR2 = '86784f375604fceecadaf02ebf4556c7ef397103cbbc852ba7f1cb832fe8461ef1f4f49a1dd72228bf61a528680d0e8f';
+    var EXPECTED_RTMR2 = 'e79cce72a685c9459c0a31e740e3ca0fcfd9321087d6dbd90a148903272895d9575b7bd2433c84d253080df5f23293fc';
     var EXPECTED_RTMR3 = '000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000';
 
     // ========================================================================
@@ -1009,7 +1115,12 @@ Wmw2oAio9A==
     // close-warnings) — digest of the pipeline build that produced disk
     // eccb2ec6…, live-confirmed by the post-swap envelope self-reporting
     // d1e288c6… (RTMR2 rotated 09e22230… → 0fda7c8a…; MRTD/RTMR0/1/3 held).
-    var EXPECTED_ENCLAVE_SHA256 = '11932297902a4cdc05607c3d5444222c6af918786af17d9bc90512fa21c064c2';
+    // v199 rotation (2026-10-29): the v199 binary (escrow TARGET now signed as
+    // pgp_recipient_fingerprint + Alibaba-priced egress budget) — digest of
+    // the podman build that produced disk e1bce1d8…, live-confirmed by the
+    // post-swap envelope self-reporting 4933005a… (RTMR2 rotated 86784f37… →
+    // e79cce72… because the initrd carries the new binary; MRTD/RTMR0/1/3 held).
+    var EXPECTED_ENCLAVE_SHA256 = '4933005adfbebbfcf586dda87640f6d9c83f720c4794869fbe701165ed11900f';
 
     // ========================================================================
     // v162 (audit VULN-04): GOLDEN PCR PINS — CI-captured constants for the
@@ -1848,6 +1959,21 @@ Wmw2oAio9A==
             // v181: pasted ENCRYPTED blob → decrypt in this trusted copy
             // (key material + fail-closed checks in decryptPastedBlob above),
             // then audit the plaintext envelope like any other report.
+            // v198: the PGP-SEALED second copy pasted here — ciphertext, not
+            // a report, so no other row of the audit can run on it. Verify the
+            // one claim provable without the private key: the ciphertext's
+            // PKESK key-id IS the S_enc-signed escrow target. Returns early on
+            // success; any mismatch throws → the normal fail-closed alert.
+            if (rawData && rawData.type === 'pav-pgp-sealed-attestation/v1') {
+                const esc = await verifySealedEscrow(rawData);
+                try {
+                    const st = document.getElementById('secureLoginStatus');
+                    if (st) st.innerText = '✅ Police-escrow copy ADDRESSED CORRECTLY — the ciphertext’s PKESK key-id is ' + esc.keyId +
+                        ', exactly the last 16 hex of the S_enc-signed escrow target ' + esc.target +
+                        '. Only the holder of that PGP key’s private half can read it (gpg --decrypt); the attestation itself is the plain attestation-report-*.json — put THAT file in this box for the full green verdict.';
+                } catch (e) { /* stub-safe */ }
+                return true;
+            }
             if (rawData && !rawData.attestation_report && !rawData.report
                 && rawData.ct_b64 && rawData.iv_b64 && rawData.enclave_ecdh_public_key_b64) {
                 rawData = await decryptPastedBlob(rawData);
