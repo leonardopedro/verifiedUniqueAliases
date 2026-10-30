@@ -209,6 +209,36 @@
         <p class="subtitle">Prove the machine handling your PayPal login is genuine confidential-computing hardware — then log in.</p>
     </header>
 
+    <!-- v202 (user request): LOCAL-COPY RESCUE CARD. Rendered ONLY on a
+         non-file:// origin (revealLocalCopyCard checks location.protocol):
+           * on the enclave's own origin it is the fix for the UNTRUSTED
+             AUDITOR ORIGIN refusal — the download button takes the page from
+             the project's GitHub (raw),
+           * the grey link is the file:// path where the copy lands, and
+           * the open-help explains the browser rules (a web page may NOT
+             navigate to file:// — Ctrl+O / paste-in-address-bar always work).
+         Nothing here generates keys or talks to the enclave: it only helps the
+         visitor reach the trusted local copy, which is where the key lives. -->
+    <div id="localCopyCard" style="display:none; margin:0 0 24px 0; background:#161b22; border:1px solid #d29922; border-radius:16px; padding:20px 24px;">
+        <label style="margin-bottom:6px;">💾 Run this auditor from YOUR machine — save it, then open the local file</label>
+        <p style="color:var(--text-dim); font-size:0.9rem; margin:0 0 14px;">You are viewing a copy served over the network (from <code id="localCopyOrigin">a server</code>). Whoever controls that origin can rewrite this script, and every browser deliberately refuses to follow a <code>file://</code> link clicked inside a web page — so take your own copy from the project's GitHub, then open it as a file. Three steps:</p>
+        <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+            <a id="localCopySave" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html" onclick="return saveLocalCopy(this)" style="display:inline-block; margin:0; padding:13px 18px; background:#238636; color:#fff; border-radius:8px; font-weight:600; text-decoration:none; cursor:pointer;">💾 1. Save verify.html (from the GitHub repo)</a>
+            <a id="localCopyLink" href="file:///Downloads/verify.html" onclick="return copyLocalLink(this)" style="display:inline-block; margin:0; padding:13px 18px; background:#21262d; color:#58a6ff; border:1px solid #30363d; border-radius:8px; font-weight:600; text-decoration:none; cursor:pointer;">2. file:///Downloads/verify.html</a>
+            <span id="localCopyStatus" style="font-size:0.82rem; color:var(--text-dim); flex:1; min-width:240px;"></span>
+        </div>
+        <details style="margin-top:14px;">
+            <summary style="cursor:pointer; color:#58a6ff; font-weight:600; font-size:0.95rem;">3. How to OPEN the local file (a click on a file:// link is blocked — do this instead)</summary>
+            <ol style="color:var(--text-dim); font-size:0.88rem; margin:10px 0 0; padding-left:20px;">
+                <li><b style="color:#e6edf3;">Fastest — keyboard:</b> press <b style="color:#e6edf3;">Ctrl+O</b> (<b style="color:#e6edf3;">⌘O</b> on macOS) and pick the <code>verify.html</code> you just saved (usually in <code>Downloads</code>). Chrome, Edge and Firefox all honour it; Safari uses File → Open File….</li>
+                <li><b style="color:#e6edf3;">Or paste the grey link above:</b> copy it, press <b style="color:#e6edf3;">Ctrl+L</b> (<b style="color:#e6edf3;">⌘L</b>) to jump to the address bar, and paste. <i>Clicking</i> it from this page is blocked by every browser on purpose — pasting it (or typing it) always works. If your file is elsewhere, edit the folder: <code>file:///C:/Users/&lt;you&gt;/Downloads/verify.html</code> on Windows, <code>file:///Users/&lt;you&gt;/Downloads/verify.html</code> on macOS.</li>
+                <li><b style="color:#e6edf3;">Firefox:</b> if Ctrl+O is greyed out, use File → Open File… in the menu bar. Firefox never follows a file:// link out of a web page — it only accepts the address once it is typed or pasted.</li>
+                <li><b style="color:#e6edf3;">Check it really is local:</b> the address bar must start with <code>file://</code>, and the green note under the login card must say the throwaway key was <b>GENERATED AUTOMATICALLY when this page loaded</b>. Only on that copy are logins enabled — nothing on any server can read your key.</li>
+                <li><b style="color:#e6edf3;">Phone (Android / iPhone):</b> mobile browsers cannot open a saved HTML file as a page — there is no file→page path there. Use the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a> (pinned, trusted by this project) on the phone, and do the local-file step on a computer.</li>
+            </ol>
+        </details>
+    </div>
+
     <div class="grid" style="margin-top: -10px;">
         <div class="input-card" style="grid-column: span 2; border-color: #4caf50;">
             <label>Log in with PayPal — the login IS the pre-flight check</label>
@@ -216,23 +246,10 @@
             <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow (two explicit links):</b> your throwaway encryption key is generated AUTOMATICALLY when this page loads — the green note below says exactly when — so there is nothing to click for that. Then pick ONE of the two links: minimal disclosure (“verified status only”) or the full profile. A click prepares the signed login session and that same link turns into “✅ Continue to PayPal →” (opens in a NEW tab); after PayPal returns, the enclave's callback page <b>downloads your still-ENCRYPTED attestation automatically</b> — no landing page. Bring that file back to THIS tab and load it with the “Attestation JSON report” file picker above: this trusted copy decrypts it with the key it generated on load, runs the full hardware audit, and offers the plain JSON for offline auditing. There is deliberately no “claim” button any more — one auto-generated key, two explicit links, one audit. If any step fails, nothing is saved, so you are safe to close the tab.</p>
             <!-- v188 (user request): the morphing workflow button is SUPPRESSED (removed) — two explicit login links replace it, the throwaway key is auto-generated on render (keyNotice announces it), and the claim step is gone: /callback AUTO-DOWNLOADS the ciphertext and this tab loads it with the file picker (decryptPastedBlob → runAudit). -->
             <div id="keyNotice" style="display:none; margin-top:12px; padding:10px 12px; border-radius:8px; font-size:0.85rem; background:rgba(63,185,80,0.08); border:1px solid #3fb950; color:#3fb950;"></div>
-            <!-- v189 (user request): the enclave's own TLS certificate, offered
-                 BEFORE the PayPal login. Browsers expose no JS API for "the
-                 certificate of this connection", so the enclave serves its own
-                 chain at GET /tls-cert.pem — the same bytes the report records
-                 as session_context.tls_certificate_pem. -->
-            <details id="tlsCertBox" style="margin-top:12px; border:1px dashed #30363d; border-radius:8px; padding:8px 12px; background:#0d1117;">
-                <summary style="cursor:pointer; color:#58a6ff; font-size:0.9rem; font-weight:600;">🔒 Save this enclave's TLS certificate (PEM) — recommended BEFORE logging in</summary>
-                <div style="color: var(--text-dim); font-size: 0.85rem; margin-top:10px;">
-                    <p style="margin:0 0 8px;">Downloads the exact certificate chain this enclave presented to <b>this</b> browser — the same bytes later recorded inside the report (<code>session_context.tls_certificate_pem</code>). The download connects only to the enclave address below; the PayPal login itself is a separate, <b>direct</b> connection from your browser to PayPal (the enclave never proxies it), so you can save the certificate first and keep your own copy of what you trusted.</p>
-                    <a id="tlsCertDownload" href="#" onclick="return downloadTlsCert();" style="display:inline-block; padding:10px 16px; background:#d29922; color:#0d1117; border-radius:6px; font-weight:600; text-decoration:none;">⬇️ Download TLS certificate (PEM)</a>
-                    <ol style="margin:10px 0 0 18px; padding:0; line-height:1.6;">
-                        <li>Save <code>enclave-tls-certificate.pem</code> next to your attestation report.</li>
-                        <li><b>Use it in the audit:</b> load that file with the “Browser TLS certificate (optional)” picker in the “Audit a report you already have” card below — the auditor then cross-checks the chain recorded in the report against this independent copy you fetched yourself.</li>
-                        <li><b>Inspect it yourself (optional):</b> <code>openssl x509 -in enclave-tls-certificate.pem -noout -subject -issuer -dates</code>, or compare it with a live handshake using <code>openssl s_client -connect enclave-host:443 -showcerts</code> — see the <a href="https://docs.openssl.org/master/apps/s_client/" style="color:#64b5f6;">openssl s_client documentation</a>.</li>
-                    </ol>
-                </div>
-            </details>
+            <!-- v201 (user request): the pre-login option that offered the
+                 enclave's own chain as a PEM was removed from this card. The
+                 enclave still serves GET /tls-cert.pem and the audit card's
+                 optional certificate picker below is untouched. -->
             <a id="loginVerifiedLink" onclick="executePreflightAndLogin('verified')" style="display:block; margin-top:12px; padding:14px; text-align:center; background:#4caf50; color:#fff; border-radius:10px; font-weight:600; text-decoration:none; cursor:pointer;">🔐 Log in with PayPal — verified status only (no extra info)</a>
             <a id="loginFullLink" onclick="executePreflightAndLogin('full')" style="display:block; margin-top:10px; padding:14px; text-align:center; background:#1f6feb; color:#fff; border-radius:10px; font-weight:600; text-decoration:none; cursor:pointer;">🔐 Log in with PayPal — share full profile (name, email, address)</a>
             <input type="text" id="localEnclaveHost" placeholder="https://login.airma.de"
@@ -427,27 +444,68 @@ Wmw2oAio9A==
         } catch (e) { /* harness without DOM — skip */ }
     })();
 
-    // v189 (user request): save the enclave's TLS chain as a file BEFORE the
-    // login. No browser API exposes "the certificate of this connection", so
-    // this points a plain anchor at the enclave origin the visitor already
-    // entered above (GET /tls-cert.pem → application/x-pem-file +
-    // Content-Disposition: attachment). Fail closed on a non-https origin,
-    // exactly like the login path does.
-    function downloadTlsCert() {
-        var hi = document.getElementById('localEnclaveHost');
-        var base = ((hi && hi.value) || '').trim().replace(/\/+$/, '');
-        if (!/^https:\/\/[^\/]+/.test(base)) {
-            alert('Enter the enclave origin (https://<enclave>) in the "enclave address" field first — the certificate is downloaded from that address.');
-            return false;
+    // v201 (user request): the pre-login TLS-certificate download option was
+    // removed from this card along with its helper function. The enclave still
+    // serves GET /tls-cert.pem; the audit card's optional certificate picker
+    // is untouched.
+
+    // ========================================================================
+    // v202 (user request): LOCAL-COPY RESCUE. Any copy that is NOT running
+    // from a local file (protocol !== 'file:') gets the save/open card above:
+    //   * saveLocalCopy() fetches the page from the project's GitHub (raw
+    //     serves CORS), writes it as verify.html via a blob download, and
+    //     falls back to opening the raw URL in a new tab (Ctrl+S there) when
+    //     the fetch is blocked;
+    //   * copyLocalLink() does NOT navigate — browsers refuse file:// out of a
+    //     web page — it copies the link and says where to paste it;
+    //   * the <details> block carries the real keystrokes (Ctrl+O / ⌘O, paste
+    //     in the address bar) plus the honest phone answer: no file→page path
+    //     on Android/iOS, use the pinned GitHub Pages copy there.
+    // ========================================================================
+    var LOCAL_COPY_RAW = 'https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html';
+    var LOCAL_COPY_FILE = 'file:///Downloads/verify.html';
+    function revealLocalCopyCard() {
+        try {
+            if (typeof location === 'undefined') return false; // headless harness
+            if (location.protocol === 'file:') return false;    // already local: no card
+            var card = document.getElementById('localCopyCard');
+            if (!card) return false;
+            var origin = document.getElementById('localCopyOrigin');
+            if (origin) origin.textContent = location.protocol + '//' + (location.host || '(server)');
+            card.style.display = 'block';
+            return true;
+        } catch (e) { return false; }
+    }
+    async function saveLocalCopy(el) {
+        var st = null; try { st = document.getElementById('localCopyStatus'); } catch (e) { st = null; }
+        var say = function (m) { if (st) st.innerText = m; };
+        try {
+            var r = await fetch(LOCAL_COPY_RAW, { cache: 'no-store' });
+            var text = await r.text();
+            if (!r.ok || text.indexOf('<!DOCTYPE') === -1 && text.indexOf('<html') === -1) {
+                throw new Error('unexpected response (HTTP ' + r.status + ')');
+            }
+            var url = URL.createObjectURL(new Blob([text], { type: 'text/html' }));
+            var a = document.createElement('a');
+            a.href = url; a.download = 'verify.html';
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+            say('✅ Saved as verify.html — now press Ctrl+O (⌘O) and open it, or paste the grey file:// link into the address bar (step 3).');
+        } catch (e) {
+            try { window.open(LOCAL_COPY_RAW, '_blank'); } catch (e2) { /* no window */ }
+            say('Opened the GitHub copy in a new tab — save it there with Ctrl+S / ⌘S (File → Save Page As…) under the name verify.html, then open it (step 3).');
         }
-        var a = document.createElement('a');
-        a.href = base + '/tls-cert.pem';
-        a.rel = 'noopener';
-        (document.body || document.head || document.documentElement).appendChild(a);
-        a.click();
-        a.remove();
         return false;
     }
+    function copyLocalLink(el) {
+        var href = LOCAL_COPY_FILE;
+        try { if (el && el.href) href = el.href; } catch (e) { /* keep default */ }
+        try { navigator.clipboard.writeText(href); } catch (e) { /* no clipboard */ }
+        var st = null; try { st = document.getElementById('localCopyStatus'); } catch (e) { st = null; }
+        if (st) st.innerText = 'Link copied — paste it into the address bar (Ctrl+L / ⌘L). Clicking a file:// link inside a web page is blocked by the browser; that is expected. Full steps in 3 below.';
+        return false; // never navigate from an https page to file://
+    }
+    revealLocalCopyCard();
 
     // v169: fail closed (with an actionable message) if the SRI-pinned forge
     // bundle did not load — a missing certificate parser must never degrade
@@ -589,7 +647,7 @@ Wmw2oAio9A==
         return TRUSTED_AUDITOR_HOSTS.indexOf(location.host) !== -1;
     }
     function untrustedOriginError() {
-        return new Error('UNTRUSTED AUDITOR ORIGIN: this page is served by the enclave\'s own webserver — its owner can rewrite this script at will, so keys generated here would be exposed (Web Auditor Tampering defense). Key generation and logins are REFUSED here. Download verify.html from the project GitHub (or use the GitHub Pages copy) and open it as a local file (file://) to run the secure login. Paste-report auditing on this copy is still safe.');
+        return new Error('UNTRUSTED AUDITOR ORIGIN: this page is served by the enclave\'s own webserver — its owner can rewrite this script at will, so keys generated here would be exposed (Web Auditor Tampering defense). Key generation and logins are REFUSED here. Download verify.html from the project GitHub (or use the GitHub Pages copy) and open it as a local file (file://) to run the secure login — the yellow card at the top of this page has the save button and the exact keystrokes. Paste-report auditing on this copy is still safe.');
     }
 
     // ========================================================================
@@ -681,7 +739,7 @@ Wmw2oAio9A==
         el.style.display = 'block';
         if (state === 'refused') {
             el.style.background = 'rgba(248,81,73,0.08)'; el.style.border = '1px solid #f85149'; el.style.color = '#f85149';
-            el.innerText = '⚠️ NO KEY GENERATED HERE — this copy is served by the enclave’s own origin, which its owner controls (Web Auditor Tampering defense), so key generation is REFUSED here. Save verify.html from the project GitHub (or use the GitHub Pages copy) and open it locally (file://): the key is then created on your machine only.';
+            el.innerText = '⚠️ NO KEY GENERATED HERE — this copy is served by the enclave’s own origin, which its owner controls (Web Auditor Tampering defense), so key generation is REFUSED here. Use the yellow card at the top of this page: 💾 save verify.html from the project GitHub, then open the saved file (Ctrl+O) — the key is then created on your machine only.';
             return;
         }
         if (state === 'failed') {

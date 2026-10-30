@@ -2251,11 +2251,22 @@ console.log('\nTest 37: /callback AUTO-DOWNLOADS the attestation, no landing pag
     'sources diverged');
   check('no landing page: the tab tries to close itself after the download',
     cbContent.includes('window.close()'), 'auto-close missing');
-  check('fallback keeps copy + re-download on the SAME ciphertext textarea',
+  check('fallback keeps the copy button on the SAME ciphertext textarea',
     cbContent.includes('📋 Copy encrypted report')
-      && cbContent.includes("a.download='encrypted-attestation-report.json'")
-      && cbContent.includes("getElementById('e2ee-blob-view'); var blob=new Blob"),
-    'fallback buttons missing');
+      && cbContent.includes("getElementById('e2ee-blob-view'); t.select()"),
+    'copy fallback missing');
+  // v202 (user directive): the two manual 💾 buttons are GONE — the files are
+  // saved automatically on load, so a second manual path was noise. The copy
+  // buttons stay (they are the fallback when a browser blocks download #2).
+  check('no manual 💾 download buttons left on the callback (v202)',
+    !cbContent.includes('💾 Download')
+      && !cbContent.includes('Download encrypted report (.json)')
+      && !cbContent.includes('Download Police-sealed file (.json)'),
+    'a manual download button is still rendered');
+  check('Police box still offers copy of its sealed file',
+    cbContent.includes('📋 Copy Police-sealed file'), 'copy button missing');
+  check('Police box text no longer points at a 💾 button',
+    !cbContent.includes('use the 💾 button below'), 'stale 💾 instruction');
   check('no claim reference on the callback page',
     !cbContent.includes('Claim Encrypted'), 'claim wording still present');
   check('callback content carries ONLY the __E2EE_BLOB__ ciphertext (no plaintext field introduced)',
@@ -2296,9 +2307,11 @@ console.log('\nTest 37: /callback AUTO-DOWNLOADS the attestation, no landing pag
     'cert reminder missing or below the close button');
 }
 
-console.log('\nTest 41: TLS certificate download offered BEFORE login (v189)');
+console.log('\nTest 41: pre-login TLS certificate save option REMOVED (v201)');
 {
   const rust = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+  // The enclave keeps serving the chain (it is the same bytes the report
+  // records), but the pre-login UI that offered to save it is gone.
   check('enclave routes GET /tls-cert.pem',
     rust.includes('.route("/tls-cert.pem", get(serve_tls_cert))'), 'route missing');
   check('handler serves application/x-pem-file with attachment disposition',
@@ -2310,19 +2323,119 @@ console.log('\nTest 41: TLS certificate download offered BEFORE login (v189)');
     rust.includes("TLS certificate not issued yet"), 'no not-ready branch');
   check('cert download is charged to the egress budget like every other GET',
     rust.includes('record_egress(addr.ip(), 4096)'), 'egress not charged');
-  check('verify.html offers the cert download BEFORE the PayPal login links',
-    html.indexOf('id="tlsCertDownload"') > -1
-      && html.indexOf('id="tlsCertDownload"') < html.indexOf('id="loginVerifiedLink"'),
-    'cert block missing or after the login links');
-  check('download targets the enclave origin (https-validated), not a hard-coded host',
-    html.includes("base + '/tls-cert.pem'") && html.includes("function downloadTlsCert()"),
-    'downloadTlsCert missing');
-  check('instructions cover the audit cert picker AND manual openssl inspection',
-    html.includes('Browser TLS certificate (optional)') && html.includes('openssl x509')
-      && html.includes('openssl s_client'), 'instructions incomplete');
+  check('verify.html no longer offers the cert download before the login links',
+    html.indexOf('id="tlsCertDownload"') === -1
+      && html.indexOf('id="tlsCertBox"') === -1,
+    'the pre-login cert box is still there');
+  check('downloadTlsCert() is gone from the auditor script',
+    !html.includes('function downloadTlsCert()') && !html.includes('downloadTlsCert('),
+    'downloadTlsCert still defined or referenced');
+  check('the audit card still accepts a saved certificate (picker untouched)',
+    html.includes('id="certInput"')
+      && html.includes('Browser TLS certificate (optional — extra safety)'),
+    'audit cert picker missing');
   const idx2 = readFileSync(join(repoRoot, 'index.html'), 'utf8');
-  check('index.html carries the cert block too (root page parity)',
-    idx2.includes('id="tlsCertDownload"'), 'index.html missing the block');
+  check('index.html dropped it too (root page parity)',
+    idx2.indexOf('id="tlsCertDownload"') === -1
+      && !idx2.includes('function downloadTlsCert()'),
+    'index.html still carries the block');
+}
+
+console.log('\nTest 51: local-copy rescue card — non-file:// origins get save + file:// link + open help (v202)');
+{
+  // The user asked: when the page is NOT local, offer a button that saves the
+  // page (from the GitHub repo), a link to where it lands as file://, and real
+  // help opening it — browsers refuse to follow a file:// link out of a web
+  // page, so "just click it" is not an answer.
+  const setLoc = (loc) => { if (loc === null) delete globalThis.location; else globalThis.location = loc; };
+  check('card exists and is hidden by default (only a non-file:// origin reveals it)',
+    /id="localCopyCard"[^>]*style="display:none/.test(html), 'card missing or visible by default');
+  check('step 1 saves verify.html from the project GitHub (raw)',
+    html.includes('id="localCopySave"')
+      && html.includes('https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html')
+      && html.includes('onclick="return saveLocalCopy(this)"'),
+    'save button missing');
+  check('step 2 offers the file:// link to the saved copy',
+    html.includes('id="localCopyLink"')
+      && html.includes('href="file:///Downloads/verify.html"')
+      && html.includes('onclick="return copyLocalLink(this)"'),
+    'file:// link missing');
+  check('step 3 spells out how to open the local file (Ctrl+O, paste-the-link, phone fallback)',
+    html.includes('Ctrl+O') && html.includes('Ctrl+L')
+      && html.includes('GitHub Pages copy')
+      && /mobile browsers cannot open a saved HTML file/.test(html),
+    'open-help missing');
+
+  // Reveal gating: file:// stays clean, every network origin gets the card.
+  setLoc({ protocol: 'file:', host: '', origin: 'null' });
+  const cardEl = document.getElementById('localCopyCard'); // materialise the stub
+  check('file:// copy does NOT show the rescue card',
+    revealLocalCopyCard() === false && cardEl.style.display === undefined,
+    'card revealed on a local file');
+  setLoc({ protocol: 'https:', host: 'login.airma.de', origin: 'https://login.airma.de' });
+  check('enclave-origin copy reveals the rescue card',
+    revealLocalCopyCard() === true && elements['localCopyCard'].style.display === 'block',
+    'card not revealed on the enclave origin');
+  check('the card names the origin serving it',
+    String(elements['localCopyOrigin'].textContent).includes('login.airma.de'),
+    String(elements['localCopyOrigin'].textContent));
+  setLoc({ protocol: 'https:', host: 'leonardopedro.github.io', origin: 'https://leonardopedro.github.io' });
+  check('GitHub Pages copy offers the local-file upgrade too',
+    revealLocalCopyCard() === true, 'card not revealed on Pages');
+  setLoc(null);
+
+  // The save button really writes verify.html (blob download), and the file://
+  // link copies instead of navigating (the navigation would be blocked anyway).
+  const origFetch = globalThis.fetch, origBody = document.body, origCreate = document.createElement;
+  const origSt = globalThis.setTimeout, origWin = globalThis.window;
+  const origOu = URL.createObjectURL, origRu = URL.revokeObjectURL;
+  let savedName = null;
+  globalThis.fetch = async () => ({
+    ok: true, status: 200,
+    text: async () => '<!DOCTYPE html><html><body>verify</body></html>',
+  });
+  document.body = { appendChild: (n) => n };
+  document.createElement = () => {
+    const n = { download: '', href: '', click() { savedName = n.download; }, remove() {} };
+    return n;
+  };
+  globalThis.setTimeout = () => 0; // no dangling revoke timer after the test
+  URL.createObjectURL = () => 'blob:local-copy';
+  URL.revokeObjectURL = () => {};
+  let saveThrew = null;
+  try { await saveLocalCopy(null); } catch (e) { saveThrew = e; }
+  if (origBody === undefined) delete document.body; else document.body = origBody;
+  if (origCreate === undefined) delete document.createElement; else document.createElement = origCreate;
+  if (origOu === undefined) delete URL.createObjectURL; else URL.createObjectURL = origOu;
+  if (origRu === undefined) delete URL.revokeObjectURL; else URL.revokeObjectURL = origRu;
+  globalThis.setTimeout = origSt;
+  check('save button downloads a file named verify.html',
+    saveThrew === null && savedName === 'verify.html',
+    saveThrew ? String(saveThrew) : String(savedName));
+  check('its status line tells the user what to do next',
+    /Ctrl\+O/.test(elements['localCopyStatus'].innerText),
+    elements['localCopyStatus'].innerText.slice(0, 140));
+
+  let copied = null, opened = null;
+  globalThis.window = { open: (u) => { opened = u; return null; } };
+  // defineProperty, not assignment: Node ≥ 21 already owns a getter-only
+  // `navigator` on globalThis and a strict-mode assignment would throw.
+  const hadNavigator = Object.prototype.hasOwnProperty.call(globalThis, 'navigator');
+  const origNavigator = hadNavigator ? Object.getOwnPropertyDescriptor(globalThis, 'navigator') : null;
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { clipboard: { writeText: async (t) => { copied = t; } } },
+    configurable: true, writable: true,
+  });
+  const nav = copyLocalLink({ href: 'file:///Downloads/verify.html' });
+  const statusAfterCopy = elements['localCopyStatus'].innerText;
+  if (origWin === undefined) delete globalThis.window; else globalThis.window = origWin;
+  if (origNavigator) Object.defineProperty(globalThis, 'navigator', origNavigator);
+  else delete globalThis.navigator;
+  check('file:// link does NOT navigate — it copies the link instead',
+    nav === false && copied === 'file:///Downloads/verify.html' && opened === null,
+    `nav=${nav} copied=${JSON.stringify(copied)} opened=${opened}`);
+  check('the copy status says where to paste it',
+    /Ctrl\+L/.test(statusAfterCopy), statusAfterCopy.slice(0, 140));
 }
 
 console.log('\nTest 39: ZK escrow credential card — prove/verify wiring (v188, circom.md §5)');
