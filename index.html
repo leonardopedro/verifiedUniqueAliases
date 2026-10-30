@@ -292,21 +292,47 @@ RJR+hEfiGMlFLEff9FOxcBdksgRKLnx/mWuElDW71X7p5CEZ2LFUgkuUvXgy4qQI
 Wmw2oAio9A==
 =NvOn
 -----END PGP PUBLIC KEY BLOCK-----</textarea>
+            <!-- v199 (user request): TEST-ONLY key generator. Produces an
+                 RSA-2048 OpenPGP keypair in this browser; the public half goes
+                 into the Police box above (so the enclave seals the second
+                 copy to it), the private half lands in the “PGP private key”
+                 field of the audit card, where it can decrypt that copy again. -->
+            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:8px;">
+                <button type="button" id="genTestPgpBtn" onclick="generateTestPgpKey()" style="margin:0; padding:8px 14px; background:#21262d; border:1px solid #30363d;">🔑 Generate test GPG key (for this test only)</button>
+                <span id="testPgpStatus" style="font-size:0.8rem; color:var(--text-dim); flex:1; min-width:220px;"></span>
+            </div>
             <p id="secureLoginStatus" style="margin: 12px 0 0; color: var(--text-dim); font-size: 0.9rem;"></p>
         </div>
         <div class="input-card" style="grid-column: span 2;">
             <label>Audit a report you already have</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem;">A saved report JSON (💾 auto-downloaded by the login success page, or the Download button after a passing audit) audits offline in <b>any</b> copy of this auditor, including the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a> or your own saved <code>verify.html</code>. The optional certificate field additionally binds a saved TLS certificate to the report (extra safety). The audit is fail-closed: any red row — including “No valid Silicon Root of Trust” — means the evidence in the report did not verify; a common benign cause is a stale auditor page, so always take the latest <code>verify.html</code> from the project's GitHub. Only trust a report that passes every check.</p>
-            <label style="margin-top: 8px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Attestation JSON report</label>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">A saved report JSON (💾 auto-downloaded by the login success page, or the Download button after a passing audit) audits offline in <b>any</b> copy of this auditor, including the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a> or your own saved <code>verify.html</code>. The optional certificate field additionally binds a saved TLS certificate to the report (extra safety). The audit is fail-closed: any red row — including “No valid Silicon Root of Trust” — means the evidence in the report did not verify; a common benign cause is a stale auditor page, so always take the latest <code>verify.html</code> from the project's GitHub. Only trust a report that passes every check.<br><b>🚔 Police copy — its own independent input:</b> <code>pgp-sealed-attestation.json</code> is <b>not</b> pasted into the raw-data box — it has the separate “PGP-encrypted attestation” box below. Load it there together with the test private key and the auditor decrypts it (PKESK key-id, session-key checksum and SHA-1 MDC all verified) and requires its plaintext to equal the attestation audited here, field for field.<br><b>🔒 At rest:</b> both boxes keep their content encrypted with THIS copy's local key (<code>pav-local-seal/v1</code>, derived from the throwaway key this page generated) — plain JSON is accepted on paste/load and re-sealed immediately; the 💾 button downloads the <b>unencrypted</b> file(s) of whichever box is loaded.</p>
+            <label style="margin-top: 8px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Attestation JSON report with raw data (report / envelope / encrypted blob)</label>
             <div style="margin-bottom: 15px;">
                 <input type="file" id="reportFile" accept=".json" class="file-input">
             </div>
-            <textarea id="attestationInput" placeholder="Paste report or use file upload above..."></textarea>
+            <textarea id="attestationInput" placeholder="Paste the attestation with RAW DATA (attestation-report-*.json, encrypted-attestation-report.json) or use the file upload above..."></textarea>
+            <p style="margin: 6px 0 0; color: var(--text-dim); font-size: 0.82rem;">Independent input #1. Held encrypted with this copy's local key while you are not auditing — the audit opens it in-page and the 💾 button saves its unencrypted version.</p>
+            <label style="margin-top: 12px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">PGP-encrypted attestation — Police-escrowed copy (independent input)</label>
+            <div style="margin-bottom: 15px;">
+                <input type="file" id="sealFile" accept=".json" class="file-input">
+            </div>
+            <textarea id="sealInput" placeholder="Paste pgp-sealed-attestation.json here (or use the file upload above) — independent of the raw-data box..."></textarea>
+            <p style="margin: 6px 0 0; color: var(--text-dim); font-size: 0.82rem;">Independent input #2. Also held encrypted with this copy's local key; with the test private key below it is opened in-page, compared field for field against input #1, and its unencrypted version downloads with the 💾 button.</p>
             <label style="margin-top: 12px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Browser TLS certificate (optional — extra safety)</label>
             <div style="margin-bottom: 15px;">
                 <input type="file" id="certFile" class="file-input">
             </div>
             <textarea id="certInput" placeholder="Paste .pem or use file upload above..."></textarea>
+            <!-- v199 (user request): OPTIONAL test private key for the
+                 Police-escrowed second copy. Auto-filled by the “Generate test
+                 GPG key” button in the login card; can also be loaded from a
+                 file or pasted. Only the unencrypted RSA keypairs this page
+                 generates are accepted — real GPG secrets stay in gpg. -->
+            <label style="margin-top: 12px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">PGP private key — decrypt the Police-escrowed copy (optional, test keys only)</label>
+            <div style="margin-bottom: 15px;">
+                <input type="file" id="pgpPrivFile" class="file-input">
+            </div>
+            <textarea id="pgpPrivInput" placeholder="Paste the test PGP PRIVATE KEY BLOCK (or generate one in the login card above) to decrypt and compare the Police-sealed attestation..."></textarea>
             <button onclick="runAudit()" style="margin-top: 15px;">Perform Cryptographic Audit</button>
         </div>
     </div>
@@ -358,6 +384,14 @@ Wmw2oAio9A==
                 <div class="check-text">
                     <h4>TLS Certificate Binding</h4>
                     <p id="tlsDesc">Proves your current browser connection is the one documented in the report.</p>
+                </div>
+            </div>
+
+            <div id="policeCheck" class="check-item">
+                <div class="check-icon">🚔</div>
+                <div class="check-text">
+                    <h4>Police-Escrowed Copy</h4>
+                    <p id="policeDesc">Optional: decrypts the PGP-sealed second copy with the test key and requires it to equal the audited PayPal attestation.</p>
                 </div>
             </div>
         </div>
@@ -469,6 +503,10 @@ Wmw2oAio9A==
     // verified — [0..32] stays strictly enforced, the slot is informational.
     var auditorSessionBindingHex = null;
     var lastAuditedPubKeyPem = null;
+    // v199: the envelope that last passed the audit, and the Police copy once
+    // it has been decrypted — whichever arrives second completes the compare.
+    var lastAuditedEnvelope = null;
+    var policeDecoded = null;
 
     // report_data[0..32] = SHA-256(P_enc_SPKI_DER ∥ session_nonce),
     // [32..64] zero — the v160 SNP binding formula. REMOVED in v180 (audit.md
@@ -951,6 +989,471 @@ Wmw2oAio9A==
     //   verifySealedEscrow()   — ciphertext key-id, file-declared target and
     //                            signed target must all agree. Fail closed.
     // ========================================================================
+    // ========================================================================
+    // v199 (user request): TEST PGP KEY + POLICE-COPY DECRYPTION.
+    //
+    // The Police-escrowed second copy is a real OpenPGP message: a PKESK
+    // (RSA PKCS#1 v1.5 over [0x09 ‖ 32-byte AES-256 key ‖ checksum]) followed
+    // by SEIPD v1 (AES-256-CFB, ZERO IV, no §13.9 resync, prefix ‖ literal ‖
+    // MDC). The enclave emits exactly that (src/main.rs `pgp_escrow`), so this
+    // auditor can test the whole promise with a key it generated itself:
+    //   pgpGenerateTestKey()  — RSA-2048 keypair; public half → Police box,
+    //                           secret half → the “PGP private key” field;
+    //   pgpDecryptSealed()    — decrypt the sealed copy with that key;
+    //   comparePoliceCopy()   — its plaintext must equal the audited PayPal
+    //                           attestation, field for field.
+    // FAIL-CLOSED SCOPE: only unencrypted (s2k usage 0) v4 RSA secret keys are
+    // understood — the shape this page generates. Passphrase-protected or
+    // ECDH keys are refused with the gpg command to use instead; nothing is
+    // ever silently “verified” on a key this code cannot parse.
+    // The pure half (markers below) has no DOM dependency so it can be tested
+    // outside a browser.
+    // --- BEGIN PGP DECRYPT (pure) ---
+    function pgpHex(bytes) {
+        return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function pgpBytesToB64(bytes) {
+        let s = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+            s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        }
+        return btoa(s);
+    }
+
+    function pgpB64ToBytes(text) {
+        const clean = String(text || '').replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/').replace(/=+$/, '');
+        const pad = '==='.slice(0, (4 - (clean.length % 4)) % 4);
+        return Uint8Array.from(atob(clean + pad), c => c.charCodeAt(0));
+    }
+
+    function pgpB64UrlToBytes(s) {
+        return pgpB64ToBytes(String(s || ''));
+    }
+
+    function pgpCrc24(bytes) {
+        let crc = 0xb704ce;
+        for (const b of bytes) {
+            crc ^= b << 16;
+            for (let i = 0; i < 8; i++) {
+                crc <<= 1;
+                if (crc & 0x1000000) crc ^= 0x1864cfb;
+            }
+        }
+        return crc & 0xffffff;
+    }
+
+    function pgpArmorBlock(label, bytes) {
+        const b64 = pgpBytesToB64(bytes).replace(/(.{64})/g, '$1\n').replace(/\n$/, '');
+        const c = pgpCrc24(bytes);
+        const crc = pgpBytesToB64(Uint8Array.of((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff));
+        return '-----BEGIN PGP ' + label + '-----\n\n' + b64 + '\n=' + crc + '\n-----END PGP ' + label + '-----\n';
+    }
+
+    function pgpDearmorBlock(armor, begin, end) {
+        const s = String(armor || '').replace(/\r\n/g, '\n').trim();
+        const bi = s.indexOf(begin);
+        if (bi < 0) throw new Error('not a ' + begin + ' block');
+        const si = bi + begin.length;
+        const ei = s.indexOf(end, si);
+        if (ei < 0) throw new Error('missing armor end marker');
+        const body = s.slice(si, ei);
+        const nl = body.indexOf('\n\n');
+        if (nl < 0) throw new Error('missing armor blank line');
+        const lines = body.slice(nl + 2).split('\n').map(l => l.trim()).filter(Boolean);
+        let crcLine = '';
+        if (lines.length && /^=[A-Za-z0-9+/]{4}$/.test(lines[lines.length - 1])) {
+            crcLine = lines.pop().slice(1);
+        }
+        const bytes = pgpB64ToBytes(lines.join(''));
+        if (crcLine) {
+            const want = pgpB64ToBytes(crcLine);
+            if (want.length !== 3
+                || (((want[0] << 16) | (want[1] << 8) | want[2]) >>> 0) !== pgpCrc24(bytes)) {
+                throw new Error('armor CRC mismatch — the block was truncated or modified');
+            }
+        }
+        return bytes;
+    }
+
+    function pgpPacket(tag, body) {
+        const out = [0xc0 | tag];
+        const l = body.length;
+        if (l < 192) out.push(l);
+        else if (l <= 8383) {
+            const x = l - 192;
+            out.push(((x >> 8) & 0xff) + 192, x & 0xff);
+        } else {
+            out.push(255, (l >>> 24) & 0xff, (l >>> 16) & 0xff, (l >>> 8) & 0xff, l & 0xff);
+        }
+        return Uint8Array.from(out.concat(Array.from(body)));
+    }
+
+    function pgpConcat(parts) {
+        const len = parts.reduce((n, p) => n + p.length, 0);
+        const out = new Uint8Array(len);
+        let off = 0;
+        for (const p of parts) { out.set(p, off); off += p.length; }
+        return out;
+    }
+
+    function pgpU32(n) {
+        return Uint8Array.of((n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff);
+    }
+
+    function pgpSplitPackets(bin) {
+        const out = [];
+        let i = 0;
+        while (i < bin.length) {
+            const ctb = bin[i++];
+            if (!(ctb & 0x80)) throw new Error('malformed OpenPGP packet header');
+            let tag, len;
+            if (ctb & 0x40) {
+                tag = ctb & 0x3f;
+                if (bin[i] < 192) { len = bin[i]; i += 1; }
+                else if (bin[i] < 224) { len = (((bin[i] - 192) << 8) + bin[i + 1] + 192); i += 2; }
+                else if (bin[i] === 255) { len = ((bin[i + 1] << 24) >>> 0) + (bin[i + 2] << 16) + (bin[i + 3] << 8) + bin[i + 4]; i += 5; }
+                else throw new Error('partial-body packet lengths unsupported');
+            } else {
+                tag = (ctb >> 2) & 0xf;
+                const lt = ctb & 3;
+                if (lt === 0) { len = bin[i]; i += 1; }
+                else if (lt === 1) { len = (bin[i] << 8) | bin[i + 1]; i += 2; }
+                else if (lt === 2) { len = ((bin[i] << 24) >>> 0) + (bin[i + 1] << 16) + (bin[i + 2] << 8) + bin[i + 3]; i += 4; }
+                else { len = bin.length - i; }
+            }
+            if (len < 0 || i + len > bin.length) throw new Error('packet overruns buffer');
+            out.push({ tag, body: bin.subarray(i, i + len) });
+            i += len;
+        }
+        return out;
+    }
+
+    function pgpMpiEncode(bytes) {
+        let i = 0;
+        while (i < bytes.length && bytes[i] === 0) i++;
+        const v = bytes.subarray(i);
+        if (!v.length) return Uint8Array.of(0, 0);
+        const bits = (v.length - 1) * 8 + (32 - Math.clz32(v[0]));
+        return pgpConcat([Uint8Array.of((bits >> 8) & 0xff, bits & 0xff), v]);
+    }
+
+    function pgpReadMpi(b, off) {
+        if (off + 2 > b.length) throw new Error('truncated MPI');
+        const bits = (b[off] << 8) | b[off + 1];
+        const n = Math.ceil(bits / 8);
+        if (off + 2 + n > b.length) throw new Error('MPI overruns its packet');
+        return { bytes: b.subarray(off + 2, off + 2 + n), next: off + 2 + n };
+    }
+
+    function pgpBytesToBig(bytes) {
+        let x = 0n;
+        for (const byte of bytes) x = (x << 8n) | BigInt(byte);
+        return x;
+    }
+
+    function pgpBigToBytes(value) {
+        let hex = value.toString(16);
+        if (hex.length % 2) hex = '0' + hex;
+        return Uint8Array.from(hex.match(/../g).map(h => parseInt(h, 16)));
+    }
+
+    function pgpModInverse(a, m) {
+        let oldR = ((a % m) + m) % m, r = m;
+        let oldS = 1n, s = 0n;
+        while (r !== 0n) {
+            const q = oldR / r;
+            [oldR, r] = [r, oldR - q * r];
+            [oldS, s] = [s, oldS - q * s];
+        }
+        if (oldR !== 1n) throw new Error('modular inverse does not exist');
+        return ((oldS % m) + m) % m;
+    }
+
+    async function pgpSha1(bytes) {
+        return new Uint8Array(await crypto.subtle.digest('SHA-1', bytes));
+    }
+
+    // OpenPGP v4 fingerprint: SHA-1(0x99 ‖ len16(material)) — the same rule the
+    // enclave uses, so a fingerprint computed here matches the one it signs.
+    async function pgpFingerprint(material) {
+        const pre = new Uint8Array(material.length + 3);
+        pre[0] = 0x99;
+        pre[1] = (material.length >> 8) & 0xff;
+        pre[2] = material.length & 0xff;
+        pre.set(material, 3);
+        return pgpHex(await pgpSha1(pre)).toUpperCase();
+    }
+
+    // The test key is GENERATED as an RSASSA-PKCS1-v1_5 key because that is the
+    // RSA keygen every WebCrypto implementation supports; only the exported
+    // RSA numbers (n, e, d, p, q) are used, and the raw RSA math below never
+    // goes through WebCrypto's padding, so the packet's declared algo (1 =
+    // RSA encrypt-or-sign) is what the enclave sees and uses.
+    async function pgpGenerateTestKey() {
+        const pair = await crypto.subtle.generateKey(
+            { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+            true, ['sign', 'verify']
+        );
+        const jwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+        const created = Math.floor(Date.now() / 1000);
+        const pub = await pgpPublicArmor(jwk, created);
+        const secretArmor = await pgpSecretArmor(jwk, created);
+        const fingerprint = await pgpFingerprint(pub.material);
+        return { publicArmor: pub.armor, secretArmor, fingerprint, keyId: fingerprint.slice(24), created };
+    }
+
+    async function pgpPublicArmor(jwk, created) {
+        const n = pgpB64UrlToBytes(jwk.n);
+        const e = pgpB64UrlToBytes(jwk.e);
+        const body = pgpConcat([
+            Uint8Array.of(4),
+            pgpU32(created),
+            Uint8Array.of(1),
+            pgpMpiEncode(n),
+            pgpMpiEncode(e),
+        ]);
+        return { armor: pgpArmorBlock('PUBLIC KEY BLOCK', pgpPacket(6, body)), material: body };
+    }
+
+    async function pgpSecretArmor(jwk, created) {
+        const n = pgpB64UrlToBytes(jwk.n);
+        const e = pgpB64UrlToBytes(jwk.e);
+        const d = pgpB64UrlToBytes(jwk.d);
+        const p = pgpB64UrlToBytes(jwk.p);
+        const q = pgpB64UrlToBytes(jwk.q);
+        // RFC 4880 §5.5.3: u = p^-1 mod q.
+        const u = pgpBigToBytes(pgpModInverse(pgpBytesToBig(p), pgpBytesToBig(q)));
+        const secretMpis = pgpConcat([d, p, q, u].map(pgpMpiEncode));
+        let sum = 0;
+        for (const b of secretMpis) sum = (sum + b) & 0xffff;
+        const body = pgpConcat([
+            Uint8Array.of(4),
+            pgpU32(created),
+            Uint8Array.of(1),
+            pgpMpiEncode(n),
+            pgpMpiEncode(e),
+            Uint8Array.of(0), // s2k usage 0 = secret MPIs are unencrypted
+            secretMpis,
+            Uint8Array.of((sum >> 8) & 0xff, sum & 0xff),
+        ]);
+        return pgpArmorBlock('PRIVATE KEY BLOCK', pgpPacket(5, body));
+    }
+
+    async function pgpParseSecretKey(armor) {
+        const bin = pgpDearmorBlock(armor, '-----BEGIN PGP PRIVATE KEY BLOCK-----', '-----END PGP PRIVATE KEY BLOCK-----');
+        const pks = pgpSplitPackets(bin);
+        const kp = pks.find(p => p.tag === 5);
+        if (!kp) throw new Error('no OpenPGP SECRET KEY packet (tag 5) in the pasted private key');
+        const b = kp.body;
+        if (b.length < 7 || b[0] !== 4) throw new Error('only v4 secret keys are supported here');
+        const algo = b[5];
+        if (algo !== 1 && algo !== 3) {
+            throw new Error('only RSA secret keys (algo 1/3) are supported here, this one is algo ' + algo + ' — decrypt with `gpg --decrypt` instead');
+        }
+        const n = pgpReadMpi(b, 6);
+        const e = pgpReadMpi(b, n.next);
+        const materialEnd = e.next;
+        const usage = b[materialEnd];
+        if (usage !== 0) {
+            throw new Error('this private key is passphrase-protected (s2k usage ' + usage + '); decrypt the sealed copy with `gpg --decrypt` instead');
+        }
+        let off = materialEnd + 1;
+        const d = pgpReadMpi(b, off); off = d.next;
+        const p = pgpReadMpi(b, off); off = p.next;
+        const q = pgpReadMpi(b, off); off = q.next;
+        const u = pgpReadMpi(b, off); off = u.next;
+        if (off + 2 > b.length) throw new Error('secret key MPIs are truncated');
+        const want = (b[off] << 8) | b[off + 1];
+        let sum = 0;
+        for (let i = materialEnd + 1; i < off; i++) sum = (sum + b[i]) & 0xffff;
+        if (sum !== want) throw new Error('secret-key checksum mismatch — the pasted private key is corrupt');
+        const fingerprint = await pgpFingerprint(b.subarray(0, materialEnd));
+        return {
+            fingerprint,
+            keyId: fingerprint.slice(24),
+            n: n.bytes,
+            e: e.bytes,
+            d: d.bytes,
+        };
+    }
+
+    // AES-256 in CFB-128: OpenPGP SEIPD v1 uses a ZERO IV and standard CFB (no
+    // §13.9 resync), so the feedback register is simply the previous 16-byte
+    // ciphertext block. WebCrypto has no AES-ECB, but AES-CBC over ONE block
+    // with a zero IV returns E(block) ‖ E(...) — the first 16 bytes are exactly
+    // the raw block encryption CFB needs, so no AES implementation is shipped.
+    async function pgpCfbDecrypt(keyBytes, ct) {
+        let key;
+        try {
+            key = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-CBC' }, false, ['encrypt']);
+        } catch (e) {
+            throw new Error('this browser cannot run AES-CBC, which the OpenPGP CFB layer needs here — use a current browser, or `gpg --decrypt`');
+        }
+        const zeroIv = new Uint8Array(16);
+        const out = new Uint8Array(ct.length);
+        let feedback = new Uint8Array(16);
+        for (let off = 0; off < ct.length; off += 16) {
+            const block = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-CBC', iv: zeroIv }, key, feedback));
+            const n = Math.min(16, ct.length - off);
+            for (let i = 0; i < n; i++) out[off + i] = ct[off + i] ^ block[i];
+            if (n === 16) feedback = ct.subarray(off, off + 16);
+        }
+        return out;
+    }
+
+    function pgpRsaPkcs1Decrypt(key, cBytes) {
+        const n = pgpBytesToBig(key.n);
+        const d = pgpBytesToBig(key.d);
+        const c = pgpBytesToBig(cBytes);
+        if (c >= n) throw new Error('PKESK ciphertext is not smaller than the modulus');
+        let m = 1n, base = c % n, exp = d;
+        while (exp > 0n) {
+            if (exp & 1n) m = (m * base) % n;
+            base = (base * base) % n;
+            exp >>= 1n;
+        }
+        const k = key.n.length;
+        const hex = m.toString(16).padStart(k * 2, '0');
+        if (hex.length > k * 2) throw new Error('RSA output is wider than the modulus');
+        const out = Uint8Array.from(hex.match(/../g).map(h => parseInt(h, 16)));
+        if (out[0] !== 0x00 || out[1] !== 0x02) throw new Error('PKCS#1 v1.5 block has a bad header (wrong key?)');
+        let i = 2;
+        while (i < out.length && out[i] !== 0x00) i++;
+        if (i >= out.length) throw new Error('PKCS#1 v1.5 separator missing (wrong key?)');
+        if (i - 2 < 8) throw new Error('PKCS#1 v1.5 padding is too short');
+        return out.subarray(i + 1);
+    }
+
+    // Full OpenPGP message → plaintext, with every integrity gate the format
+    // offers: PKESK key-id match, session-key checksum, SEIPD prefix check and
+    // the SHA-1 MDC. Any failure throws (fail closed).
+    async function pgpDecryptSealed(armor, secretArmor) {
+        const key = await pgpParseSecretKey(secretArmor);
+        const pks = pgpSplitPackets(pgpDearmorBlock(armor, '-----BEGIN PGP MESSAGE-----', '-----END PGP MESSAGE-----'));
+        const pkesk = pks.find(p => p.tag === 1);
+        const seipd = pks.find(p => p.tag === 18);
+        if (!pkesk) throw new Error('no PKESK (tag 1) — this is not an encrypted OpenPGP message');
+        if (pkesk.body[0] !== 3) throw new Error('unsupported PKESK version ' + pkesk.body[0]);
+        const keyId = pgpHex(pkesk.body.subarray(1, 9)).toUpperCase();
+        if (keyId !== key.keyId) {
+            throw new Error('the ciphertext is addressed to key id ' + keyId + ', but the pasted private key is ' + key.keyId + ' — this key cannot open this copy');
+        }
+        const algo = pkesk.body[9];
+        if (algo !== 1 && algo !== 2) throw new Error('unsupported PKESK key algorithm ' + algo);
+        const payload = pgpRsaPkcs1Decrypt(key, pgpReadMpi(pkesk.body, 10).bytes);
+        if (payload.length < 35 || payload[0] !== 9) {
+            throw new Error('the PKESK did not carry an AES-256 session key (algo ' + (payload[0] === undefined ? 'n/a' : payload[0]) + ')');
+        }
+        const sessionKey = payload.subarray(1, 33);
+        const wantSum = (payload[33] << 8) | payload[34];
+        let sum = 0;
+        for (const b of sessionKey) sum = (sum + b) & 0xffff;
+        if (sum !== wantSum) throw new Error('session-key checksum mismatch — wrong key or a modified PKESK');
+        if (!seipd) throw new Error('no SEIPD (tag 18) packet in the message');
+        if (seipd.body[0] !== 1) throw new Error('unsupported SEIPD version ' + seipd.body[0] + ' (only v1 is understood here)');
+        const pt = await pgpCfbDecrypt(sessionKey, seipd.body.subarray(1));
+        if (pt.length < 40) throw new Error('SEIPD plaintext is too short');
+        if (pt[14] !== pt[16] || pt[15] !== pt[17]) throw new Error('SEIPD prefix check failed — the session key is wrong');
+        const mdcAt = pt.length - 22;
+        if (pt[mdcAt] !== 0xd3 || pt[mdcAt + 1] !== 0x14) throw new Error('MDC header missing (not a SEIPD v1 message)');
+        // RFC 4880 §5.14: the hash runs over the plaintext INCLUDING the MDC
+        // packet's two header octets (0xD3 0x14), excluding only the digest —
+        // byte-for-byte the enclave's sha1(prefix ‖ literal ‖ d3 14).
+        const digest = await pgpSha1(pt.subarray(0, mdcAt + 2));
+        for (let i = 0; i < 20; i++) {
+            if (digest[i] !== pt[mdcAt + 2 + i]) throw new Error('MDC (SHA-1) mismatch — the ciphertext was modified');
+        }
+        const lit = pgpSplitPackets(pt.subarray(18, mdcAt)).find(p => p.tag === 11);
+        if (!lit) throw new Error('no literal data packet inside the message');
+        const lb = lit.body;
+        if (lb.length < 6) throw new Error('literal data packet is truncated');
+        const start = 2 + lb[1] + 4;
+        if (lb.length < start) throw new Error('literal data header is truncated');
+        return {
+            text: new TextDecoder().decode(lb.subarray(start)),
+            keyId,
+            keyFingerprint: key.fingerprint,
+            format: String.fromCharCode(lb[0]),
+        };
+    }
+
+    function pgpCanonicalJson(value) {
+        if (Array.isArray(value)) return value.map(pgpCanonicalJson);
+        if (value && typeof value === 'object') {
+            const out = {};
+            Object.keys(value).sort().forEach(k => { out[k] = pgpCanonicalJson(value[k]); });
+            return out;
+        }
+        return value;
+    }
+    // --- END PGP DECRYPT (pure) ---
+
+    async function generateTestPgpKey() {
+        const st = document.getElementById('testPgpStatus');
+        const btn = document.getElementById('genTestPgpBtn');
+        const say = (msg, color) => {
+            if (!st) return;
+            st.style.color = color;
+            st.innerText = msg;
+        };
+        try {
+            if (btn) btn.disabled = true;
+            say('Generating an RSA-2048 test key in this browser…', 'var(--text-dim)');
+            const k = await pgpGenerateTestKey();
+            const pubEl = document.getElementById('policePgpInput');
+            const privEl = document.getElementById('pgpPrivInput');
+            if (!pubEl || !privEl) throw new Error('this page copy is missing the key fields');
+            pubEl.value = k.publicArmor;
+            privEl.value = k.secretArmor;
+            say('✅ Test key generated — fingerprint ' + k.fingerprint + '. The PUBLIC half is in the Police box above (the enclave will seal the second copy to it); the PRIVATE half is in the “PGP private key” field of the audit card below. TEST ONLY — never a real deployment key.', '#3fb950');
+        } catch (e) {
+            say('❌ Key generation failed: ' + e.message, '#f85149');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    function setCheckText(id, html) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.className = 'check-item';
+        const p = el.querySelector('p');
+        if (p) p.innerHTML = html;
+    }
+
+    // The claim under test: the sealed copy is the SAME attestation, so its
+    // plaintext must equal the audited envelope field for field, and the two
+    // CLEAR hashes on the sealed file must match that envelope too.
+    async function comparePoliceCopy(sealed, decryptedEnv, auditedReport, auditedEnvelope) {
+        const issues = [];
+        const decReport = decryptedEnv && decryptedEnv.attestation_report;
+        if (!decReport) throw new Error('the decrypted Police copy has no attestation_report to compare');
+        if (JSON.stringify(pgpCanonicalJson(decReport)) !== JSON.stringify(pgpCanonicalJson(auditedReport))) {
+            issues.push('the attestation inside the Police copy is NOT the audited attestation (field contents differ)');
+        }
+        // When the baseline was itself a full envelope (the normal login path),
+        // the signature and enclave key must match too — not just the report.
+        if (auditedEnvelope && auditedEnvelope.attestation_report
+            && JSON.stringify(pgpCanonicalJson(decryptedEnv)) !== JSON.stringify(pgpCanonicalJson(auditedEnvelope))) {
+            issues.push('the decrypted envelope differs from the audited envelope (signature or enclave key material)');
+        }
+        const clearRaw = String(sealed.paypal_user_info_raw_hash || '').trim().toLowerCase();
+        const auditRaw = String((auditedReport && auditedReport.paypal_user_info_raw_hash) || '').trim().toLowerCase();
+        if (clearRaw && auditRaw && clearRaw !== auditRaw) {
+            issues.push('the file’s CLEAR paypal_user_info_raw_hash (' + esc(clearRaw.slice(0, 16)) + '…) is not the attestation’s (' + esc(auditRaw.slice(0, 16)) + '…)');
+        }
+        const clearId = String(sealed.paypal_id_sha256 || '').trim().toLowerCase();
+        const uid = auditedReport && auditedReport.paypal_user_info && auditedReport.paypal_user_info.user_id;
+        if (clearId && uid) {
+            const got = pgpHex(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(uid)))));
+            if (got !== clearId) {
+                issues.push('the file’s CLEAR paypal_id_sha256 does not hash the audited PayPal user_id');
+            }
+        }
+        return { ok: issues.length === 0, issues };
+    }
+
     function pkeskKeyIdHex(ciphertext) {
         const src = String(ciphertext || '').replace(/\r\n/g, '\n');
         const m = /-----BEGIN PGP MESSAGE-----([\s\S]*?)-----END PGP MESSAGE-----/.exec(src);
@@ -1251,6 +1754,116 @@ Wmw2oAio9A==
         return envelope;
     }
 
+    // ========================================================================
+    // v200 (user request) — AT-REST SEAL for the TWO independent attestation
+    // inputs (input #1: the attestation with raw data, input #2: the
+    // PGP-encrypted Police copy). Each box is kept ENCRYPTED with this copy's
+    // local key while nobody is auditing:
+    //   * paste / file-load accepts plain JSON and re-seals it immediately;
+    //   * the box (and the sessionStorage hand-off copy) then hold only
+    //     pav-local-seal/v1 ciphertext;
+    //   * runAudit() opens the seal in-page, the 💾 button downloads the
+    //     UNENCRYPTED file(s) of whichever box is loaded.
+    // The seal key is HKDF-SHA-256 over this copy's own throwaway key string
+    // (sessionStorage pav_client_jwk, else the local session's jwk) with a
+    // fixed salt/info — no new key material, and it never leaves the copy that
+    // generated it. Fail-closed: a copy without that key cannot open the
+    // ciphertext and says so instead of auditing garbage.
+    // ========================================================================
+    var LOCAL_SEAL_TYPE = 'pav-local-seal/v1';
+    var attPlain = { raw: '', police: '' };   // plaintext resolved from the boxes (transient)
+
+    function localSealJwkStr() {
+        let s = null;
+        try { s = sessionStorage.getItem('pav_client_jwk'); } catch (e) { /* no storage */ }
+        if (!s) {
+            try {
+                const sess = JSON.parse(localStorage.getItem('pav_local_session') || 'null');
+                s = (sess && sess.jwk) || null;
+            } catch (e) { /* no storage */ }
+        }
+        return s;
+    }
+
+    async function localSealKey(usage) {
+        const jwkStr = localSealJwkStr();
+        if (!jwkStr) return null;
+        const enc = new TextEncoder();
+        const base = await crypto.subtle.importKey('raw', enc.encode(jwkStr), 'HKDF', false, ['deriveKey']);
+        return crypto.subtle.deriveKey(
+            { name: 'HKDF', hash: 'SHA-256', salt: enc.encode('paypal-auth-vm/local-seal/v1'), info: enc.encode('attestation-at-rest') },
+            base, { name: 'AES-GCM', length: 256 }, false, [usage]);
+    }
+
+    function b64e(u8) {
+        let s = '';
+        for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+        return btoa(s);
+    }
+
+    // Sealed form of `text`, or null when this copy has no local key (an
+    // untrusted/fixture copy) — the caller then keeps the plaintext so
+    // paste-report auditing still works there.
+    async function localSeal(text) {
+        try {
+            const key = await localSealKey('encrypt');
+            if (!key) return null;
+            const iv = crypto.getRandomValues(new Uint8Array(12));
+            const ct = await crypto.subtle.encrypt(
+                { name: 'AES-GCM', iv: iv, additionalData: new TextEncoder().encode(LOCAL_SEAL_TYPE) },
+                key, new TextEncoder().encode(text));
+            return JSON.stringify({ type: LOCAL_SEAL_TYPE, iv_b64: b64e(iv), ct_b64: b64e(new Uint8Array(ct)) }, null, 2);
+        } catch (e) { return null; }
+    }
+
+    async function localOpen(obj) {
+        const key = await localSealKey('decrypt');
+        if (!key) throw new Error('AT-REST SEALED input: this copy holds no local key for it — reload it from the original file (attestation-report-*.json / pgp-sealed-attestation.json) in the copy that has it.');
+        try {
+            const b64d = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+            const pt = await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv: b64d(obj.iv_b64), additionalData: new TextEncoder().encode(LOCAL_SEAL_TYPE) },
+                key, b64d(obj.ct_b64));
+            return new TextDecoder().decode(pt);
+        } catch (e) {
+            throw new Error('AT-REST SEALED input: the local key of THIS copy could not open it (it was sealed by a different copy/login round, or it was tampered with) — fail closed, load the original file instead.');
+        }
+    }
+
+    function parseJsonQuiet(v) { try { return JSON.parse(v); } catch (e) { return null; } }
+    function isLocalSealObj(o) { return !!(o && o.type === LOCAL_SEAL_TYPE && o.ct_b64 && o.iv_b64); }
+    function isE2eeBlobObj(o) {
+        return !!(o && !o.attestation_report && !o.report && o.ct_b64 && o.iv_b64 && o.enclave_ecdh_public_key_b64);
+    }
+
+    // Read one input box, opening whatever encrypted form it holds and
+    // re-sealing the box (at rest). Returns the plaintext string ('' = empty).
+    // `slot` is 'raw' | 'police' — the resolved plaintext is kept in attPlain
+    // so 💾 / the ZK gate can read it without touching the ciphertext box.
+    async function readBox(id, slot) {
+        const el = document.getElementById(id);
+        const v = el && el.value ? String(el.value) : '';
+        if (!v.trim()) { attPlain[slot] = ''; return ''; }
+        const o = parseJsonQuiet(v);
+        let text = v;
+        if (isLocalSealObj(o)) text = await localOpen(o);
+        else if (isE2eeBlobObj(o)) text = JSON.stringify(await decryptPastedBlob(o), null, 2);
+        attPlain[slot] = text;
+        return text;
+    }
+
+    // Put plaintext into a box in its AT-REST form (sealed when a local key
+    // exists) and remember the plaintext for the download / ZK paths.
+    async function writeBox(id, slot, plainText, storageKey) {
+        const sealed = await localSeal(plainText);
+        const held = sealed || plainText;
+        attPlain[slot] = plainText;
+        const el = document.getElementById(id);
+        if (el) el.value = held;
+        try { if (storageKey) sessionStorage.setItem(storageKey, held); } catch (e) { /* no storage */ }
+        return held;
+    }
+
     // On load: restore a decrypted E2EE report handed over by /callback
     // (same origin) and auto-start the secure login from the homepage links.
     // v164 — the /callback handoff: the enclave's success page performs NO
@@ -1313,10 +1926,9 @@ Wmw2oAio9A==
                     say('⏳ Decrypting your attestation report…');
                     const env = await localDecryptAndVerify(JSON.parse(raw), jwk, nonceHex, pinned);
                     try { const b = JSON.parse(raw); if (b && b.flow) sessionStorage.setItem('pav_e2ee_flow', String(b.flow)); } catch (e) { /* keep default tag */ }
-                    const pretty = JSON.stringify(env, null, 2);
-                    sessionStorage.setItem('pav_e2ee_report', pretty);
-                    const el = document.getElementById('attestationInput');
-                    if (el) el.value = pretty;
+                    // v200: held AT REST in its sealed form (the box and the
+                    // hand-off copy carry ciphertext; runAudit opens it).
+                    await writeBox('attestationInput', 'raw', JSON.stringify(env, null, 2), 'pav_e2ee_report');
                     if (await runAudit()) {
                         if (location.search.indexOf('afterlogin=1') !== -1 && downloadReportFile()) {
                             say('✅ Report decrypted, audited, and saved as a JSON file. You can audit it offline in ANY copy of the auditor (GitHub Pages copy or your own saved verify.html) — this site is only a convenience.');
@@ -1776,8 +2388,12 @@ Wmw2oAio9A==
     document.addEventListener('DOMContentLoaded', () => {
         const reportInput = document.getElementById('reportFile');
         const certInput = document.getElementById('certFile');
+        const pgpPrivInput = document.getElementById('pgpPrivFile');
         if (reportInput) reportInput.addEventListener('change', (e) => loadFile(e.target, 'attestationInput'));
+        const sealInput = document.getElementById('sealFile');
+        if (sealInput) sealInput.addEventListener('change', (e) => loadFile(e.target, 'sealInput'));
         if (certInput) certInput.addEventListener('change', (e) => loadFile(e.target, 'certInput'));
+        if (pgpPrivInput) pgpPrivInput.addEventListener('change', (e) => loadFile(e.target, 'pgpPrivInput'));
     });
 
     // SECURITY (audit 2026-10-19, VULN follow-up): the report under audit is
@@ -1950,38 +2566,111 @@ Wmw2oAio9A==
         }
     }
 
-    async function runAudit() {
-        try {
-            const inputVal = document.getElementById('attestationInput').value;
-            if (!inputVal) throw new Error("Please provide an attestation report.");
-            
-            let rawData = JSON.parse(inputVal);
-            // v181: pasted ENCRYPTED blob → decrypt in this trusted copy
-            // (key material + fail-closed checks in decryptPastedBlob above),
-            // then audit the plaintext envelope like any other report.
-            // v198: the PGP-SEALED second copy pasted here — ciphertext, not
-            // a report, so no other row of the audit can run on it. Verify the
-            // one claim provable without the private key: the ciphertext's
-            // PKESK key-id IS the S_enc-signed escrow target. Returns early on
-            // success; any mismatch throws → the normal fail-closed alert.
-            if (rawData && rawData.type === 'pav-pgp-sealed-attestation/v1') {
-                const esc = await verifySealedEscrow(rawData);
-                try {
-                    const st = document.getElementById('secureLoginStatus');
-                    if (st) st.innerText = '✅ Police-escrow copy ADDRESSED CORRECTLY — the ciphertext’s PKESK key-id is ' + esc.keyId +
-                        ', exactly the last 16 hex of the S_enc-signed escrow target ' + esc.target +
-                        '. Only the holder of that PGP key’s private half can read it (gpg --decrypt); the attestation itself is the plain attestation-report-*.json — put THAT file in this box for the full green verdict.';
-                } catch (e) { /* stub-safe */ }
+    // v200 — input #2 (the PGP-encrypted attestation) has its OWN independent
+    // box (#sealInput), separate from the raw-data box. Its content is
+    // ciphertext, so no other row of the audit can run on it: verify the one
+    // claim provable without the private key (the ciphertext's PKESK key-id IS
+    // the S_enc-signed escrow target), and — with the test private key in this
+    // copy — decrypt it (PKESK key-id, session-key checksum, SEIPD prefix,
+    // SHA-1 MDC) and require its plaintext to equal the attestation audited
+    // here, field for field.
+    async function processPoliceCopy(rawData) {
+        if (rawData && rawData.type === 'pav-pgp-sealed-attestation/v1') {
+                // v199 (user request): with a test private key in this copy the
+                // sealed file is DECRYPTED here (full OpenPGP verification:
+                // PKESK key-id, session-key checksum, SEIPD prefix, SHA-1 MDC)
+                // and its plaintext is required to equal the audited PayPal
+                // attestation. Without a key the v198 addressing proof stays
+                // the only claim that can be made.
+                let addr = null, addrErr = '';
+                try { addr = await verifySealedEscrow(rawData); }
+                catch (e) { addrErr = e.message; }
+                const privEl = document.getElementById('pgpPrivInput');
+                const priv = privEl && privEl.value ? String(privEl.value).trim() : '';
+                if (!priv) {
+                    if (!addr) throw new Error(addrErr);
+                    try {
+                        const st = document.getElementById('secureLoginStatus');
+                        if (st) st.innerText = '✅ Police-escrow copy ADDRESSED CORRECTLY — the ciphertext’s PKESK key-id is ' + addr.keyId +
+                            ', exactly the last 16 hex of the S_enc-signed escrow target ' + addr.target +
+                            '. Only the holder of that PGP key’s private half can read it (gpg --decrypt); the attestation itself is the plain attestation-report-*.json — put THAT file in this box for the full green verdict.';
+                    } catch (e) { /* stub-safe */ }
+                    try { document.getElementById('resultsArea').style.display = 'block'; } catch (e) { /* stub-safe */ }
+                    setCheckText('policeCheck', 'ℹ️ The sealed copy is addressed to the S_enc-signed escrow key, but no private key was supplied — paste the test PGP private key above to decrypt it and compare it with the attestation.');
+                    return true;
+                }
+                // A copy audited away from the login tab carries no signed
+                // session fingerprint; DECRYPTION itself then proves the
+                // addressing. A real violation (declared target ≠ ciphertext)
+                // is never downgraded.
+                if (!addr && !/UNVERIFIABLE/.test(addrErr)) throw new Error(addrErr);
+                const dec = await pgpDecryptSealed(rawData.ciphertext, priv);
+                let env = null;
+                try { env = JSON.parse(dec.text); } catch (e) {
+                    throw new Error('the Police copy decrypted and passed its MDC, but its plaintext is not JSON');
+                }
+                if (!env || !env.attestation_report) {
+                    throw new Error('the Police copy decrypted but does not contain an attestation envelope');
+                }
+                policeDecoded = { envelope: env, sealed: rawData, keyId: dec.keyId, keyFp: dec.keyFingerprint };
+                try { document.getElementById('resultsArea').style.display = 'block'; } catch (e) { /* stub-safe */ }
+                if (lastAuditedEnvelope) {
+                    const cmp = await comparePoliceCopy(rawData, env, lastAuditedEnvelope.attestation_report || lastAuditedEnvelope, lastAuditedEnvelope);
+                    updateStatus('policeCheck', cmp.ok, cmp.ok
+                        ? '✅ <b>Police-sealed copy DECRYPTED with the test key ' + esc(dec.keyId) + '…</b> — and it is the SAME attestation as the one audited in this tab: every field matches, and both CLEAR hashes match too. The enclave really did seal the PayPal attestation to the key you supplied.'
+                        : '❌ <b>Police-sealed copy MISMATCH:</b> ' + cmp.issues.map(esc).join('; '));
+                    if (!cmp.ok) throw new Error('POLICE-SEALED COPY MISMATCH — ' + cmp.issues.join('; '));
+                    try {
+                        const st = document.getElementById('secureLoginStatus');
+                        if (st) st.innerText = '✅ Police-escrowed copy decrypted with the test key (id ' + dec.keyId + ') and it MATCHES the audited attestation.';
+                    } catch (e) { /* stub-safe */ }
+                } else {
+                    updateStatus('policeCheck', 'warning',
+                        '✅ <b>Police-sealed copy DECRYPTED</b> with the test key ' + esc(dec.keyId) + '… (MDC verified). Nothing to compare it with yet — load this login’s <code>attestation-report-*.json</code> in this box as well and the auditor will require every field to match.');
+                }
                 return true;
             }
-            if (rawData && !rawData.attestation_report && !rawData.report
-                && rawData.ct_b64 && rawData.iv_b64 && rawData.enclave_ecdh_public_key_b64) {
-                rawData = await decryptPastedBlob(rawData);
-                // Persist the plaintext (same convention as the file-picker paste path) so
-                // the 💾 download button and a re-audit use the envelope.
-                const pretty = JSON.stringify(rawData, null, 2);
-                document.getElementById('attestationInput').value = pretty;
-                try { sessionStorage.setItem('pav_e2ee_report', pretty); } catch (e) { /* ignore */ }
+            // Anything else in the independent Police box is not the sealed
+            // copy — say so instead of silently passing.
+            throw new Error('The independent “PGP-encrypted attestation” box must hold pgp-sealed-attestation/v1 (the Police-escrowed copy). What you loaded there is not that file — a plain attestation belongs in the raw-data box above (input #1).');
+    }
+
+    function parseBoxJson(id, text) {
+        let o = null;
+        try { o = JSON.parse(text); } catch (e) { o = null; }
+        if (!o || typeof o !== 'object') {
+            throw new Error('The ' + (id === 'sealInput' ? 'PGP-encrypted attestation' : 'attestation') + ' box does not hold valid JSON.');
+        }
+        return o;
+    }
+
+    async function runAudit() {
+        try {
+            // v200: TWO independent inputs, each accepted as plain JSON or as
+            // ciphertext (the enclave's E2EE blob, or this copy's own at-rest
+            // seal) and held sealed again as soon as it has been read.
+            const rawText = await readBox('attestationInput', 'raw');
+            const policeText = await readBox('sealInput', 'police');
+            if (!rawText) {
+                if (!policeText) throw new Error("Please provide an attestation report.");
+                // Only the Police copy is loaded → the addressing/decrypt
+                // result stands on its own (it may still compare against an
+                // attestation audited earlier in this tab).
+                const onlySealed = parseBoxJson('sealInput', policeText);
+                await writeBox('sealInput', 'police', policeText, 'pav_e2ee_police');
+                return await processPoliceCopy(onlySealed);
+            }
+            const rawData = parseBoxJson('attestationInput', rawText);
+            if (rawData && rawData.type === 'pav-pgp-sealed-attestation/v1') {
+                throw new Error('That is the PGP-encrypted (Police) copy — it has its own independent box below (input #2). Load it there, not in the raw-data box.');
+            }
+            // Both inputs are accepted → park them AT REST (sealed with this
+            // copy's local key) before the audit runs over the plaintext.
+            await writeBox('attestationInput', 'raw', rawText, 'pav_e2ee_report');
+            let policeObj = null;
+            if (policeText) {
+                policeObj = parseBoxJson('sealInput', policeText);
+                await writeBox('sealInput', 'police', policeText, 'pav_e2ee_police');
             }
             const report = rawData.attestation_report || rawData.report || rawData;
             
@@ -2753,6 +3442,24 @@ Wmw2oAio9A==
                     document.getElementById('zkHandoffCard').style.display = 'block';
                 }
             } catch (e) { /* stub-safe */ }
+
+            // v200: this audited attestation becomes the baseline a Police copy
+            // must equal. The independent Police box is processed HERE (after
+            // the raw-data box), so one click audits input #1 and then
+            // compares input #2 against it; a copy decrypted earlier in this
+            // tab is compared against the same baseline.
+            lastAuditedEnvelope = rawData;
+            if (policeObj) {
+                await processPoliceCopy(policeObj);
+            } else if (policeDecoded) {
+                const cmp = await comparePoliceCopy(policeDecoded.sealed, policeDecoded.envelope, report, rawData);
+                updateStatus('policeCheck', cmp.ok, cmp.ok
+                    ? '✅ <b>Police-sealed copy MATCHES.</b> It was decrypted with the test key (id ' + esc(policeDecoded.keyId) + '…) and its plaintext equals this audited attestation field for field.'
+                    : '❌ <b>Police-sealed copy MISMATCH:</b> ' + cmp.issues.map(esc).join('; '));
+                if (!cmp.ok) throw new Error('POLICE-SEALED COPY MISMATCH — ' + cmp.issues.join('; '));
+            } else {
+                setCheckText('policeCheck', 'ℹ️ Optional Police-escrow test not run — load this login’s <code>pgp-sealed-attestation.json</code> in the independent “PGP-encrypted attestation” box below together with the test PGP private key to decrypt it and compare it with this attestation.');
+            }
             return sandboxDeployment ? 'sandbox' : true;
         } catch (e) { 
             console.error(e); 
@@ -2769,38 +3476,68 @@ Wmw2oAio9A==
     // v188: ONE canonical serialization for the saved report file — the
     // download button and the ZK credential's report_sha256 bind the exact
     // same bytes (single source of truth, circom.md §5).
+    // v200: the box may hold AT-REST ciphertext — the plaintext resolved when
+    // it was last read lives in attPlain.raw. A plaintext box still parses
+    // directly (paste-and-download without a local key keeps working), and the
+    // serialization stays the ONE canonical form the ZK credential binds.
     function reportFileText() {
-        let env = null;
-        try {
-            const ta = document.getElementById('attestationInput');
-            env = JSON.parse((ta && ta.value) ? ta.value : 'null');
-        } catch (e) { env = null; }
-        if (!env || !env.attestation_report) return null;
-        return JSON.stringify(env, null, 2);
+        const ta = document.getElementById('attestationInput');
+        const v = ta && ta.value ? String(ta.value) : '';
+        if (!v.trim()) return null;
+        const o = parseJsonQuiet(v);
+        if (isLocalSealObj(o) || isE2eeBlobObj(o)) return attPlain.raw || null;
+        if (!o || !o.attestation_report) return null;
+        return JSON.stringify(o, null, 2);
     }
 
-    function downloadReportFile() {
-        const text = reportFileText();
-        if (!text) {
-            alert('No decrypted report to download yet — complete the login (Step 1/3) or paste a report (Step 4) first.');
-            return false;
+    // v200: the UNENCRYPTED Police copy — its decrypted envelope, once the
+    // test private key opened it in this copy. There is no unencrypted
+    // version before that, so the file is simply not downloaded then.
+    function policeFileText() {
+        if (policeDecoded && policeDecoded.envelope && policeDecoded.envelope.attestation_report) {
+            return JSON.stringify(policeDecoded.envelope, null, 2);
         }
-        const env = JSON.parse(text);
-        let flowTag = 'report';
-        try {
-            flowTag = String(env.flow || sessionStorage.getItem('pav_e2ee_flow') || 'report')
-                .replace(/[^a-z0-9_-]/gi, '').slice(0, 24) || 'report';
-        } catch (e) { /* no sessionStorage (harness) — keep default */ }
+        return null;
+    }
+
+    function saveTextFile(name, text) {
         const blob = new Blob([text], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = 'attestation-report-' + flowTag + '-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+        a.download = name;
         document.body.appendChild(a);
         a.click();
         a.remove();
         setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 5000);
-        return true;
+    }
+
+    // v200 (user request): ONE button downloads the UNENCRYPTED file(s) for
+    // whichever independent input is loaded — the attestation with raw data
+    // and/or the decrypted Police copy (both when both are present).
+    function downloadReportFile() {
+        const text = reportFileText();
+        const police = policeFileText();
+        if (!text && !police) {
+            alert('No decrypted report to download yet — complete the login (Step 1/3) or paste a report (Step 4) first.');
+            return false;
+        }
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        let flowTag = 'report';
+        let n = 0;
+        if (text) {
+            try {
+                flowTag = String((JSON.parse(text).flow) || sessionStorage.getItem('pav_e2ee_flow') || 'report')
+                    .replace(/[^a-z0-9_-]/gi, '').slice(0, 24) || 'report';
+            } catch (e) { /* no sessionStorage (harness) — keep default */ }
+            saveTextFile('attestation-report-' + flowTag + '-' + ts + '.json', text);
+            n++;
+        }
+        if (police) {
+            saveTextFile('attestation-escrow-copy-' + flowTag + '-' + ts + '.json', police);
+            n++;
+        }
+        return n > 0;
     }
 
     // ========================================================================

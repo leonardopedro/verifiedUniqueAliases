@@ -25,7 +25,7 @@ import * as https from 'https';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createRequire } from 'module';
-import { generateKeyPairSync, sign as rsaSign, createHash, createSign } from 'crypto';
+import { generateKeyPairSync, sign as rsaSign, createHash, createSign, publicEncrypt, randomBytes, createCipheriv, createPublicKey, constants } from 'crypto';
 
 const require = createRequire(import.meta.url);
 let forge;
@@ -97,6 +97,18 @@ globalThis.fetch = async () => {
 async function runAuditWith(envelope) {
   lastAlert = null;
   document.getElementById('attestationInput').value = JSON.stringify(envelope);
+  // v200: the Police copy lives in its OWN independent box — clear it so a
+  // leftover input #2 never bleeds into an input #1-only audit.
+  document.getElementById('sealInput').value = '';
+  document.getElementById('certInput').value = '';
+  const ok = await runAudit();
+  return { ok, alert: lastAlert };
+}
+// v200: drive the audit with ONLY the independent PGP-encrypted input (#2).
+async function runAuditSealedWith(sealed) {
+  lastAlert = null;
+  document.getElementById('attestationInput').value = '';
+  document.getElementById('sealInput').value = JSON.stringify(sealed);
   document.getElementById('certInput').value = '';
   const ok = await runAudit();
   return { ok, alert: lastAlert };
@@ -2024,11 +2036,16 @@ console.log('\nTest 33: v181 pasted-ENCRYPTED-blob audit — decrypt with this c
     globalThis.localStorage.setItem('pav_local_session', sessionFor());
     let r = await auditBlob(clone(blobBase));
     check('keyed trusted copy decrypts the pasted blob and audits green', r.ok === true, String(r.alert).slice(0, 200));
-    const persisted = JSON.parse(elements['attestationInput'].value || 'null');
-    check('textarea now holds the decrypted envelope (re-audit + 💾 download work)',
-      persisted && !!persisted.attestation_report, elements['attestationInput'].value.slice(0, 60));
-    check('decrypted envelope persisted for the download button',
-      /"attestation_report"/.test(globalThis.sessionStorage.getItem('pav_e2ee_report') || ''), 'missing pav_e2ee_report');
+  const persisted = JSON.parse(elements['attestationInput'].value || 'null');
+  check('v200: textarea holds the AT-REST sealed form (local key, not plaintext)',
+    persisted && persisted.type === 'pav-local-seal/v1', elements['attestationInput'].value.slice(0, 60));
+  check('reportFileText() resolves the plaintext behind the seal (re-audit + 💾 download work)',
+    /"attestation_report"/.test(reportFileText() || ''), 'reportFileText did not resolve');
+  const storedSeal = JSON.parse(globalThis.sessionStorage.getItem('pav_e2ee_report') || 'null');
+  check('v200: pav_e2ee_report persists CIPHERTEXT at rest',
+    storedSeal && storedSeal.type === 'pav-local-seal/v1', 'missing or plaintext pav_e2ee_report');
+  check('v200: the at-rest seal opens back to the audited envelope',
+    /"attestation_report"/.test(await localOpen(storedSeal) || ''), 'localOpen did not recover the envelope');
 
     // (b) no key in this copy → actionable guidance, never the old parse error.
     globalThis.localStorage.removeItem('pav_local_session');
@@ -3566,7 +3583,7 @@ console.log('\nTest 48: v198 escrow CIPHERTEXT addressing — PKESK key-id vs th
       r.keyId === kid && r.target === target, JSON.stringify(r));
 
     lastAlert = null;
-    const res = await runAuditWith(sample);
+    const res = await runAuditSealedWith(sample);
     check('v198: runAudit on the pasted sealed copy returns true + ADDRESSED CORRECTLY',
       res.ok === true && !res.alert && /ADDRESSED CORRECTLY/.test(elements['secureLoginStatus'].innerText || ''),
       JSON.stringify({ ok: res.ok, alert: res.alert, status: (elements['secureLoginStatus'].innerText || '').slice(0, 140) }));
@@ -3602,6 +3619,241 @@ console.log('\nTest 48: v198 escrow CIPHERTEXT addressing — PKESK key-id vs th
     delete globalThis.localStorage;
     delete globalThis.sessionStorage;
   }
+}
+
+console.log('\nTest 49: v199 test PGP key — DECRYPT the Police-sealed copy and compare it with the audit');
+{
+  // The second download is a real OpenPGP message (PKESK RSA PKCS#1 v1.5 +
+  // SEIPD v1 AES-256-CFB zero IV + SHA-1 MDC). These tests seal a fixture the
+  // exact way src/main.rs `pgp_escrow` does, then drive runAudit() with the
+  // page's own test key and private-key field.
+  const pubJwk = (armor) => {
+    const body = pgpSplitPackets(pgpDearmorBlock(armor,
+      '-----BEGIN PGP PUBLIC KEY BLOCK-----', '-----END PGP PUBLIC KEY BLOCK-----'))
+      .find(p => p.tag === 6).body;
+    const read = (o) => { const bits = (body[o] << 8) | body[o + 1]; const n = Math.ceil(bits / 8); return { v: body.subarray(o + 2, o + 2 + n), next: o + 2 + n }; };
+    const n = read(6); const e = read(n.next);
+    return { kty: 'RSA', n: Buffer.from(n.v).toString('base64url'), e: Buffer.from(e.v).toString('base64url') };
+  };
+  const sealMessage = (pubArmor, keyIdHex, plaintext) => {
+    const sk = randomBytes(32);
+    const sum = sk.reduce((a, b) => (a + b) & 0xffff, 0);
+    const payload = Buffer.concat([Buffer.from([9]), sk, Buffer.from([sum >> 8, sum & 0xff])]);
+    const wrapped = publicEncrypt({ key: createPublicKey({ key: pubJwk(pubArmor), format: 'jwk' }), padding: constants.RSA_PKCS1_PADDING }, payload);
+    const bits = wrapped.length * 8;
+    const pkesk = Buffer.from(pgpPacket(1, Buffer.concat([
+      Buffer.from([3]), Buffer.from(keyIdHex, 'hex'), Buffer.from([1, (bits >> 8) & 0xff, bits & 0xff]), wrapped,
+    ])));
+    const literal = Buffer.from(pgpPacket(11, Buffer.concat([
+      Buffer.from([0x62, 0x00, 0, 0, 0, 0]), Buffer.from(plaintext, 'utf8'),
+    ])));
+    const prefix = randomBytes(18); prefix[16] = prefix[14]; prefix[17] = prefix[15];
+    const head = Buffer.concat([prefix, literal, Buffer.from([0xd3, 0x14])]);
+    const mdc = createHash('sha1').update(head).digest();
+    const cipher = createCipheriv('aes-256-cfb', sk, Buffer.alloc(16));
+    const ct = Buffer.concat([cipher.update(Buffer.concat([head, mdc])), cipher.final()]);
+    return pgpArmorBlock('MESSAGE', Buffer.concat([pkesk, Buffer.from(pgpPacket(18, Buffer.concat([Buffer.from([1]), ct])))]));
+  };
+  const envelopeFixture = () => ({
+    attestation_report: {
+      timestamp_ms: 1793280000000,
+      flow: 'verified',
+      paypal_environment: 'production',
+      paypal_user_info: { user_id: 'U-42', sub: 'S-1', verified_account: 'true', payer_id: 'P-1' },
+      paypal_user_info_raw_hash: 'ab'.repeat(32),
+      hardware_level_attestation: {},
+    },
+    enclave_signature_b64: 'c2ln',
+    enclave_signing_public_key: 'PEM',
+  });
+  const sealedFor = (key, env, over = {}) => ({
+    type: 'pav-pgp-sealed-attestation/v1',
+    recipient_fingerprint: key.fingerprint,
+    recipient_target_fingerprint: key.fingerprint,
+    paypal_user_info_raw_hash: env.attestation_report.paypal_user_info_raw_hash,
+    paypal_id_sha256: createHash('sha256').update(env.attestation_report.paypal_user_info.user_id).digest('hex'),
+    ciphertext: sealMessage(key.publicArmor, key.keyId, JSON.stringify(env)),
+    ...over,
+  });
+
+  // Phase 1 button: generate → Police box + phase-2 private-key field.
+  document.getElementById('policePgpInput').value = '';
+  document.getElementById('pgpPrivInput').value = '';
+  await generateTestPgpKey();
+  const pubArmor = document.getElementById('policePgpInput').value;
+  const privArmor = document.getElementById('pgpPrivInput').value;
+  check('v199: the test-key button fills the Police box and the private-key field',
+    /-----BEGIN PGP PUBLIC KEY BLOCK-----/.test(pubArmor) && /-----BEGIN PGP PRIVATE KEY BLOCK-----/.test(privArmor));
+  const fp = (await pgpPublicFingerprints(pubArmor))[0];
+  const key = { publicArmor: pubArmor, secretArmor: privArmor, fingerprint: fp, keyId: fp.slice(24) };
+  check('v199: the generated key parses with the enclave-compatible v4 fingerprint',
+    /^[0-9A-F]{40}$/.test(fp) && key.keyId === fp.slice(24));
+
+  const env = envelopeFixture();
+  document.getElementById('pgpPrivInput').value = privArmor;
+
+  globalThis.lastAuditedEnvelope = null;
+  globalThis.policeDecoded = null;
+  let res = await runAuditSealedWith(sealedFor(key, env));
+  check('v199: the sealed copy decrypts with the test key and yields the envelope',
+    res.ok === true && globalThis.policeDecoded
+      && globalThis.policeDecoded.envelope.attestation_report.paypal_user_info.user_id === 'U-42', String(res.alert));
+  check('v199: without an audited attestation the row says decrypted-but-not-compared',
+    row('policeCheck').cls.indexOf('warning') >= 0 && /DECRYPTED/.test(row('policeCheck').desc),
+    row('policeCheck').desc.slice(0, 120));
+
+  globalThis.lastAuditedEnvelope = env;
+  globalThis.policeDecoded = null;
+  res = await runAuditSealedWith(sealedFor(key, env));
+  check('v199: a matching sealed copy is verified against the audited attestation',
+    res.ok === true && row('policeCheck').cls.indexOf('verified') >= 0, String(res.alert));
+
+  const other = envelopeFixture();
+  other.attestation_report.paypal_user_info.user_id = 'U-999';
+  globalThis.lastAuditedEnvelope = other;
+  globalThis.policeDecoded = null;
+  res = await runAuditSealedWith(sealedFor(key, env));
+  check('v199: a sealed copy of a DIFFERENT attestation is refused',
+    res.ok === false && /POLICE-SEALED COPY MISMATCH/.test(String(res.alert)), String(res.alert).slice(0, 200));
+
+  globalThis.lastAuditedEnvelope = env;
+  globalThis.policeDecoded = null;
+  res = await runAuditSealedWith(sealedFor(key, env, { paypal_id_sha256: 'ff'.repeat(32) }));
+  check('v199: a rewritten CLEAR hash is refused',
+    res.ok === false && /paypal_id_sha256/.test(String(res.alert)), String(res.alert).slice(0, 200));
+
+  const otherKey = await pgpGenerateTestKey();
+  document.getElementById('pgpPrivInput').value = otherKey.secretArmor;
+  globalThis.lastAuditedEnvelope = env;
+  globalThis.policeDecoded = null;
+  res = await runAuditSealedWith(sealedFor(key, env));
+  check('v199: a different private key cannot open the copy (key-id mismatch)',
+    res.ok === false && /addressed to key id/.test(String(res.alert)), String(res.alert).slice(0, 200));
+
+  document.getElementById('pgpPrivInput').value = privArmor;
+  const tampered = sealedFor(key, env);
+  const bytes = pgpDearmorBlock(tampered.ciphertext, '-----BEGIN PGP MESSAGE-----', '-----END PGP MESSAGE-----');
+  bytes[bytes.length - 3] ^= 0xff;
+  tampered.ciphertext = pgpArmorBlock('MESSAGE', bytes);
+  globalThis.lastAuditedEnvelope = env;
+  globalThis.policeDecoded = null;
+  res = await runAuditSealedWith(tampered);
+  check('v199: a modified ciphertext fails the MDC',
+    res.ok === false && /MDC|CRC/.test(String(res.alert)), String(res.alert).slice(0, 200));
+
+  // ══════════════════════════════════════════════════════════════════
+  // v200 (user request) — TWO INDEPENDENT inputs, both held encrypted at
+  // rest under this copy's local key, and ONE 💾 click that downloads the
+  // unencrypted file of each input that is present.
+  console.log('\nTest 50: v200 — independent inputs + at-rest local seal + per-input downloads');
+  const src200 = readFileSync(join(repoRoot, 'verify.html'), 'utf8');
+  check('v200: the PGP-encrypted copy has its OWN box + file picker',
+    /id="sealInput"/.test(src200) && /id="sealFile"/.test(src200) && /id="attestationInput"/.test(src200),
+    'sealInput/sealFile/attestationInput markers');
+  check('v200: the at-rest local seal type is declared on the page', /pav-local-seal\/v1/.test(src200));
+
+  // (a) input #1 refuses the PGP-encrypted file and points at input #2.
+  let r50 = await runAuditWith(sealedFor(key, env));
+  check('v200: raw-data box refuses the PGP-encrypted file (names input #2)',
+    r50.ok === false && /own independent box/.test(String(r50.alert)), String(r50.alert).slice(0, 170));
+
+  // (b) input #2 refuses anything that is not the sealed copy.
+  r50 = await runAuditSealedWith({ type: 'not-the-sealed-copy' });
+  check('v200: Police box refuses a file that is not pgp-sealed-attestation/v1',
+    r50.ok === false && /must hold pgp-sealed-attestation\/v1/.test(String(r50.alert)), String(r50.alert).slice(0, 170));
+
+  // (c) BOTH boxes at once → ONE run audits input #1 and compares input #2.
+  const store50 = () => { const m = new Map(); return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: k => m.delete(k) }; };
+  globalThis.localStorage = store50();
+  globalThis.sessionStorage = store50();
+  const kp50 = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
+  sessionStorage.setItem('pav_client_jwk', JSON.stringify(await crypto.subtle.exportKey('jwk', kp50.privateKey)));
+  globalThis.preFlightPubKeyPem = null;
+  globalThis.auditorSessionBindingHex = null;
+  globalThis.lastAuditedEnvelope = null;
+  globalThis.policeDecoded = null;
+
+  const shown50 = { user_id: 'U50', sub: 'sub-50', verified_account: 'true', payer_id: null };
+  const both50 = await buildEnvelope({
+    hwBuilder: async (nonce) => {
+      const q = await buildTdxQuote({
+        version: 4, reportData: reportDataFor(nonce),
+        innerChainPems: [goodChain.leaf.pem, goodChain.int.pem],
+        leafKey: goodChain.leaf.key,
+      });
+      return tdxHw({ quoteB64: q.b64 });
+    },
+    // The audited verified-flow app (EXPECTED_APPS) — a login report carrying
+    // paypal_user_info must name an allow-listed app or the audit aborts.
+    reportExtras: {
+      paypal_user_info: shown50,
+      paypal_client_id: 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p',
+    },
+  });
+  document.getElementById('pgpPrivInput').value = privArmor;
+  document.getElementById('certInput').value = '';
+  document.getElementById('attestationInput').value = JSON.stringify(both50.envelope, null, 2);
+  document.getElementById('sealInput').value = JSON.stringify(sealedFor(key, both50.envelope));
+  lastAlert = null;
+  const bothOk = await runAudit();
+  check('v200: ONE audit run accepts BOTH independent inputs', bothOk === true, String(lastAlert).slice(0, 240));
+  check('v200: input #1 (raw data) audited green in that same run',
+    row('enclaveCheck').cls === 'check-item verified', row('enclaveCheck').cls);
+  check('v200: input #2 compared field-for-field against input #1',
+    row('policeCheck').cls.indexOf('verified') >= 0 && /SAME attestation|MATCHES/i.test(row('policeCheck').desc),
+    row('policeCheck').desc.slice(0, 160));
+
+  const boxA50 = JSON.parse(document.getElementById('attestationInput').value);
+  const boxB50 = JSON.parse(document.getElementById('sealInput').value);
+  check('v200: BOTH boxes are held ENCRYPTED at rest after the run',
+    boxA50.type === 'pav-local-seal/v1' && boxB50.type === 'pav-local-seal/v1',
+    JSON.stringify({ a: boxA50.type, b: boxB50.type }));
+  check('v200: BOTH hand-off copies are ciphertext at rest',
+    (JSON.parse(sessionStorage.getItem('pav_e2ee_report') || 'null') || {}).type === 'pav-local-seal/v1'
+    && (JSON.parse(sessionStorage.getItem('pav_e2ee_police') || 'null') || {}).type === 'pav-local-seal/v1',
+    'storage not sealed');
+  check('v200: the sealed boxes still resolve to plaintext for the 💾 button',
+    /"attestation_report"/.test(reportFileText() || '') && /"attestation_report"/.test(policeFileText() || ''),
+    'resolve failed');
+
+  // (d) ONE 💾 click → the UNENCRYPTED file of each present input.
+  const dl50 = [], names50 = [];
+  const realCurl50 = URL.createObjectURL, realCE50 = document.createElement, realBD50 = document.body;
+  document.createElement = () => {
+    const o = { href: '', click() {}, remove() {} };
+    Object.defineProperty(o, 'download', { set: (v) => names50.push(v), get: () => '' });
+    return o;
+  };
+  document.body = { appendChild() {}, removeChild() {} };
+  URL.createObjectURL = (b) => { dl50.push(b); return 'blob:t' + dl50.length; };
+  let dl50ok = false;
+  try { dl50ok = downloadReportFile(); } finally {
+    if (realCurl50 === undefined) delete URL.createObjectURL; else URL.createObjectURL = realCurl50;
+    if (realCE50 === undefined) delete document.createElement; else document.createElement = realCE50;
+    if (realBD50 === undefined) delete document.body; else document.body = realBD50;
+  }
+  check('v200: one 💾 click succeeds with both inputs present', dl50ok === true, String(dl50ok));
+  check('v200: BOTH unencrypted files are downloaded', dl50.length === 2, 'files=' + dl50.length);
+  check('v200: file names distinguish the raw attestation from the Police copy',
+    /^attestation-report-.*\.json$/.test(names50[0] || '') && /^attestation-escrow-copy-.*\.json$/.test(names50[1] || ''),
+    JSON.stringify(names50));
+  const gotA50 = dl50[0] ? JSON.parse(await dl50[0].text()) : null;
+  const gotB50 = dl50[1] ? JSON.parse(await dl50[1].text()) : null;
+  check('v200: file #1 is the UNENCRYPTED attestation with raw data',
+    !!gotA50 && JSON.stringify(gotA50) === JSON.stringify(both50.envelope), 'file #1 mismatch');
+  check('v200: file #2 is the UNENCRYPTED (decrypted) Police copy of the SAME attestation',
+    !!gotB50 && JSON.stringify(gotB50) === JSON.stringify(both50.envelope), 'file #2 mismatch');
+
+  // (e) the encrypted form itself is accepted as input (at-rest ciphertext
+  // pasted straight back into a box) and audits green again.
+  document.getElementById('attestationInput').value = boxA50.type === 'pav-local-seal/v1'
+    ? document.getElementById('attestationInput').value : '';
+  lastAlert = null;
+  check('v200: a local-seal ciphertext pasted into a box is accepted and audits green',
+    (await runAudit()) === true, String(lastAlert).slice(0, 220));
+
+  delete globalThis.localStorage;
+  delete globalThis.sessionStorage;
 }
 
 rmSync(dir, { recursive: true, force: true });;;

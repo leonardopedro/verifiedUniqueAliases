@@ -268,11 +268,19 @@ try {
     throw new Error('paste-decrypt audit did NOT go green (enclave=' + rows.enclave + ' firmware=' + rows.firmware + ') — ' + status.slice(0, 200));
   }
 
-  const rep = await page.evaluate(() => document.getElementById('attestationInput').value);
+  // v200: the box is parked ENCRYPTED after the audit — the plaintext the
+  // page resolved lives behind reportFileText(), which is what the 💾 button
+  // and this capture must read.
+  const rep = await page.evaluate(() => (typeof reportFileText === 'function' ? reportFileText() : null));
   if (rep && rep.trim().startsWith('{')) {
     writeFileSync('/tmp/claimed-report.json', rep);
     log('   decrypted report saved → /tmp/claimed-report.json (' + rep.length + ' bytes)');
   }
+  const atRest = await page.evaluate(() => {
+    const v = (document.getElementById('attestationInput') || {}).value || '';
+    try { return (JSON.parse(v) || {}).type || 'plaintext'; } catch (e) { return 'plaintext'; }
+  });
+  log('   raw-data box at rest:', atRest);
 
   // ── v197 — the SECOND auto-download (Police escrow) ──────────────────
   // The auditor ships the BKA key PREFILLED, so this login must have sealed
@@ -317,7 +325,9 @@ try {
   // target it kept from this login (no private key needed — addressing is the
   // only claim provable without it). Needs this SAME tab's session, which is
   // exactly where the login started.
-  await page.fill('#attestationInput', JSON.stringify(sealed, null, 2));
+  // v200: the PGP-encrypted copy has its OWN independent input — it must NOT
+  // go back into the raw-data box (the auditor refuses it there by design).
+  await page.fill('#sealInput', JSON.stringify(sealed, null, 2));
   await page.click('button:has-text("Perform Cryptographic Audit")');
   await page.waitForTimeout(3000);
   const escrowAudit = (await page.textContent('#secureLoginStatus').catch(() => '')).slice(0, 400);
