@@ -1,0 +1,217 @@
+# =============================================================================
+# oos-watchdog.yaml — FC-free self-healing watchdog for the TDX enclave.
+#
+# Same contract as watchdog/handler.js, executed by Operation Orchestration
+# Service (OOS) instead of Function Compute:
+#
+#   * a tagged instance exists (ANY status) -> do NOT touch it, only make sure
+#     the reserved EIP is attached. A deliberately Stopped box is never
+#     started: that is how the operator runs in-place disk rewrites.
+#   * no tagged instance -> RunInstances with the exact prod spec
+#     (ecs.c9i.large, spot, TDX, cloud_auto 1 GiB, no data disk) and the
+#     enclave user_data, then bind the reserved EIP (101.200.178.251, the
+#     address Cloudflare points at) if the allocation is free.
+#
+# Why not Auto Scaling: ALIYUN::ESS::ScalingConfiguration has no
+# SecurityOptions property at all and floors the system disk at 20 GiB, so an
+# ESS group cannot produce a TDX instance or the 1 GiB shape; ECS documents
+# that confidential-computing instances can only be created through
+# RunInstances. OOS drives RunInstances directly, so it keeps both properties.
+# Why not Function Compute: CreateFunction on this account answers
+# 'code: 403, Current user is in debt overdue' even though there is no overdue
+# invoice and the RAM user holds AdministratorAccess (see ros-template.yaml's
+# ACCOUNT GATE note). OOS answers normally.
+#
+# Deploy with watchdog/deploy-oos-watchdog.sh (creates the template, then a
+# state configuration that runs it every 5 minutes).
+# =============================================================================
+FormatVersion: OOS-2019-06-01
+Description:
+  en: pav watchdog - recreate the TDX enclave when it is released, then rebind the reserved EIP.
+  zh-cn: pav watchdog - 实例释放后重建 TDX 机密计算实例并重新绑定固定 EIP。
+
+Parameters:
+  region:
+    Type: String
+    Default: cn-beijing
+  zoneId:
+    Type: String
+    Default: cn-beijing-i
+  imageId:
+    Type: String
+    Description: Imported enclave image (m-...). Rotates per deploy cycle.
+  instanceType:
+    Type: String
+    Default: ecs.c9i.large
+  vSwitchId:
+    Type: String
+    Default: vsw-2zemsk0m5ky2j6uttlk82
+  securityGroupId:
+    Type: String
+    Default: sg-2zehehuvi1f0v67q11bo
+  eipAllocationId:
+    Type: String
+    Default: eip-2zet05jbat6wr6rp7elrc
+  instanceName:
+    Type: String
+    Default: paypal-auth-vm
+  tagKey:
+    Type: String
+    Default: pav-watchdog
+  tagValue:
+    Type: String
+    Default: prod
+  # NOTE: the enclave config is deliberately NOT a template parameter and NOT
+  # an OOS secret parameter. Two verified reasons (2026-10-30):
+  #   * ListExecutions echoes execution Parameters in cleartext, so anything
+  #     passed there is readable by every OOS reader (a bring-up run leaked it
+  #     and the record had to be deleted);
+  #   * a secret parameter value is capped at 4096 chars while the config is
+  #     ~5.8 KB base64, and `{{ oos-secret:name }}` is not a valid task
+  #     parameter reference at all (InvalidTemplateReference).
+  # deploy-oos-watchdog.sh therefore injects it at deploy time from the
+  # gitignored watchdog/dist/config.json, replacing __USERDATA_B64__ below.
+  # The repo copy never contains the secret.
+
+Tasks:
+  # ---------------------------------------------------------------- is it there?
+  - Name: findTagged
+    Action: ACS::ExecuteAPI
+    Description: Count instances carrying the prod tag.
+    Properties:
+      Service: ECS
+      API: DescribeInstances
+      Parameters:
+        RegionId: '{{ region }}'
+        Tag.1.Key: '{{ tagKey }}'
+        Tag.1.Value: '{{ tagValue }}'
+    Outputs:
+      count:
+        Type: Number
+        ValueSelector: TotalCount
+
+  - Name: decideCreate
+    Action: ACS::Choice
+    Description: Only a released instance is recreated.
+    Properties:
+      DefaultTask: createInstance
+      Choices:
+        - When:
+            Fn::Not:
+              Fn::Equals:
+                - '{{ findTagged.count }}'
+                - 0
+          NextTask: afterCreate
+
+  # ------------------------------------------------------------ recreate the box
+  - Name: createInstance
+    Action: ACS::ExecuteAPI
+    Description: RunInstances with the exact prod spec - TDX, spot, AutoPL 1 GiB, no data disk.
+    Properties:
+      Service: ECS
+      API: RunInstances
+      Parameters:
+        RegionId: '{{ region }}'
+        ZoneId: '{{ zoneId }}'
+        ImageId: '{{ imageId }}'
+        InstanceType: '{{ instanceType }}'
+        VSwitchId: '{{ vSwitchId }}'
+        SecurityGroupId: '{{ securityGroupId }}'
+        InstanceName: '{{ instanceName }}'
+        InstanceChargeType: PostPaid
+        SpotStrategy: SpotAsPriceGo
+        SpotDuration: 0
+        Amount: 1
+        MinAmount: 1
+        # 0 = do NOT allocate a natpublicip. Proven live 2026-10-30: a box
+        # created with a public IP refuses the reserved EIP with
+        # `EIP_CAN_NOT_ASSOCIATE_WITH_PUBLIC_IP` ("instance already bind
+        # natpublicip, cannot bind eip"), so the rebuild came up Running but
+        # unreachable. The reserved EIP is the ONLY public path here (the
+        # Cloudflare DNS-01 token is pinned to its address).
+        InternetMaxBandwidthOut: 0
+        AllocatePublicIp: false
+        'SystemDisk.Category': cloud_auto
+        'SystemDisk.Size': 1
+        'SecurityOptions.ConfidentialComputingMode': TDX
+        'Tag.1.Key': '{{ tagKey }}'
+        'Tag.1.Value': '{{ tagValue }}'
+        # Injected by deploy-oos-watchdog.sh from watchdog/dist/config.json.
+        UserData: '__USERDATA_B64__'
+    Outputs:
+      instanceId:
+        Type: String
+        ValueSelector: InstanceIdSets.InstanceId[0]
+
+  # ------------------------------------------------------- let it register, then re-read
+  - Name: settle
+    Action: ACS::Sleep
+    Description: Give the new instance a moment to appear before binding the EIP.
+    Properties:
+      Duration: PT20S
+
+  # Re-read by tag so the same downstream tasks work whether we created a box
+  # or found an existing one (a previous run may have created it but failed to
+  # bind the EIP).
+  - Name: afterCreate
+    Action: ACS::ExecuteAPI
+    Description: Resolve the tagged instance id.
+    Properties:
+      Service: ECS
+      API: DescribeInstances
+      Parameters:
+        RegionId: '{{ region }}'
+        Tag.1.Key: '{{ tagKey }}'
+        Tag.1.Value: '{{ tagValue }}'
+    Outputs:
+      instanceId:
+        Type: String
+        ValueSelector: Instances.Instance[0].InstanceId
+
+  # ---------------------------------------------------------------- reserved EIP
+  - Name: checkEip
+    Action: ACS::ExecuteAPI
+    Description: Only a free allocation may be bound - never steal a bound EIP.
+    Properties:
+      Service: VPC
+      API: DescribeEipAddresses
+      Parameters:
+        RegionId: '{{ region }}'
+        AllocationId: '{{ eipAllocationId }}'
+    Outputs:
+      status:
+        Type: String
+        ValueSelector: EipAddresses.EipAddress[0].Status
+
+  - Name: decideEip
+    Action: ACS::Choice
+    Description: Bind the reserved EIP only when it is Available.
+    Properties:
+      DefaultTask: associateEip
+      Choices:
+        - When:
+            Fn::Not:
+              Fn::Equals:
+                - '{{ checkEip.status }}'
+                - Available
+          NextTask: ACS::END
+
+  - Name: associateEip
+    Action: ACS::ExecuteAPI
+    Description: Bind 101.200.178.251 (Cloudflare DNS) to the enclave.
+    Properties:
+      Service: VPC
+      API: AssociateEipAddress
+      Parameters:
+        RegionId: '{{ region }}'
+        AllocationId: '{{ eipAllocationId }}'
+        InstanceId: '{{ afterCreate.instanceId }}'
+        InstanceType: EcsInstance
+
+Outputs:
+  instanceId:
+    Type: String
+    Value: '{{ afterCreate.instanceId }}'
+  eipStatus:
+    Type: String
+    Value: '{{ checkEip.status }}'

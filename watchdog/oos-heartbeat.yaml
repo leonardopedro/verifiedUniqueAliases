@@ -1,0 +1,120 @@
+# =============================================================================
+# oos-heartbeat.yaml — the polling cadence for the TDX enclave watchdog
+# (PT1M by default; PAV_OOS_INTERVAL bakes a different one at deploy time).
+#
+# Every native scheduler on this account is closed (verified live 2026-10-30):
+#
+#   * OOS state configuration ("定时运维") rejects ANY user template with
+#     `EntityNotExists.Template`, even though ListTemplates reports it as v5 —
+#     tried with the plain name, the template id (t-...), the full ARN-like
+#     name, plus TemplateVersion and ResourceGroupId. And even if it bound, its
+#     API caps the interval: `ScheduleType: cron` answers "Cron schedule type
+#     is not supported right now." and `rate` documents a 30-minute minimum.
+#   * EventBridge has no OOS event target (documented target types: FC, MNS,
+#     RocketMQ, RabbitMQ, Kafka, SLS, RDS, HTTP(S), API destination, FnF, SAE,
+#     K8s, DingTalk, SMS, mail, DataHub, EventBridge... but not OOS).
+#   * CloudFlow (FnF) answers `AccessDenied: FnF service is not enabled for
+#     current user`, and Function Compute still answers
+#     `code: 403, Current user is in debt overdue` on CreateFunction.
+#
+# What IS available is OOS calling OOS: `ACS::ExecuteAPI` with `Service: OOS`
+# executes normally (proved with a ListTemplates probe). So the cadence is a
+# self-rearming chain of exactly one successor per tick:
+#
+#   wait      -> ACS::Sleep one interval (PT1M by default)
+#   rearm     -> start exactly ONE successor, which then sleeps its own interval
+#   reconcile -> start `pav-watchdog`, the idempotent reconciler
+#
+# ORDERING IS THE WHOLE DESIGN. Rearm must come AFTER the wait: rearming at the
+# top makes every execution spawn a successor the instant it starts, and each of
+# those does the same, so the chain fans out without bound (observed live: 4
+# running heartbeats after 6 minutes and still climbing). With wait-first the
+# steady state is exactly 2 executions: the one reconciling and its successor
+# sleeping out the next interval. Rearm still precedes reconcile, so a failing
+# reconcile can never break the chain.
+#
+# Consequences an operator must know:
+#   * `deploy-oos-watchdog.sh schedule on` cancels running heartbeats before
+#     starting a fresh one, and `schedule status` prints the live chain — if more
+#     than 2 executions are listed, something has doubled the chain.
+#   * if the rearm task itself fails (e.g. an OOS API outage) the chain dies
+#     silently; the chain tip goes dark and is visible in `status` and in the
+#     account's OOS execution history. That is the known weakness of a
+#     scheduler-free cadence; the real fix is an event-driven trigger (see the
+#     README note on the 5-minute spot interruption notice).
+#
+# No secrets: imageId is injected by deploy-oos-watchdog.sh (it rotates per
+# deploy cycle); the enclave's user_data lives only in the watchdog template.
+# =============================================================================
+FormatVersion: OOS-2019-06-01
+Description:
+  en: pav watchdog heartbeat - re-run the enclave reconciler on a fixed interval.
+  zh-cn: pav watchdog 心跳 - 按固定间隔执行机密计算实例自愈。
+
+Parameters:
+  region:
+    Type: String
+    Default: cn-beijing
+  heartbeatTemplate:
+    Type: String
+    Default: pav-watchdog-hb
+  watchdogTemplate:
+    Type: String
+    Default: pav-watchdog
+  # Injected by deploy-oos-watchdog.sh from watchdog/dist/config.json.
+  imageId:
+    Type: String
+    Default: '__IMAGE_ID__'
+  # Baked in at deploy time (PAV_OOS_INTERVAL, default PT1M). The rearm task
+  # deliberately passes NO parameters, so every successor inherits this default
+  # and the cadence can never drift back to an older value.
+  interval:
+    Type: String
+    Default: '__INTERVAL__'
+
+Tasks:
+  # ------------------------------------------------------------------ the interval
+  - Name: wait
+    Action: ACS::Sleep
+    Description: One poll interval. Must run BEFORE rearm - see the header.
+    Properties:
+      Duration: '{{ interval }}'
+
+  # ------------------------------------------------------------------ keep alive
+  - Name: rearm
+    Action: ACS::ExecuteAPI
+    Description: Start exactly one successor, which sleeps its own interval from now.
+    Properties:
+      Service: OOS
+      API: StartExecution
+      Parameters:
+        RegionId: '{{ region }}'
+        TemplateName: '{{ heartbeatTemplate }}'
+    Outputs:
+      nextExecutionId:
+        Type: String
+        ValueSelector: Execution.ExecutionId
+
+  # ------------------------------------------------------------------ the work
+  - Name: reconcile
+    Action: ACS::ExecuteAPI
+    Description: Run the idempotent reconciler (creates the box only when the tag is absent).
+    Properties:
+      Service: OOS
+      API: StartExecution
+      Parameters:
+        RegionId: '{{ region }}'
+        TemplateName: '{{ watchdogTemplate }}'
+        Parameters: '{"imageId":"{{ imageId }}"}'
+    Outputs:
+      watchdogExecutionId:
+        Type: String
+        ValueSelector: Execution.ExecutionId
+
+Outputs:
+  nextExecutionId:
+    Type: String
+    Value: '{{ rearm.nextExecutionId }}'
+  watchdogExecutionId:
+    Type: String
+    Value: '{{ reconcile.watchdogExecutionId }}'
