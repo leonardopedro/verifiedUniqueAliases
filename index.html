@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Enclave Audit | Confidential Attestation Verifier</title>
+    <title>Hardware and PayPal-Attested Unique Aliases</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
     <!-- v169 (independent audit finding): the auditor's only third-party
          dependency is PINNED BY SUBRESOURCE INTEGRITY. forge parses the X.509
@@ -204,10 +204,24 @@
 
 <div class="container">
     <header>
-        <a href="https://leonardopedro.github.io/verifiedUniqueAliases/" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Project Hub (source code, privacy, terms)</a>
-        <h1>Hardware-Attested PayPal Login</h1>
-        <p class="subtitle">Prove the machine handling your PayPal login is genuine confidential-computing hardware — then log in.</p>
+        <a href="https://leonardopedro.github.io/verifiedUniqueAliases/" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 8px;">← Project Hub (source code, privacy, terms)</a>
+        <p style="font-size: 0.82rem; color: var(--text-dim); margin: 0 0 14px;">Legal: <a href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html" style="color: var(--primary);">Privacy Policy</a> · <a href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html" style="color: var(--primary);">User Agreement</a></p>
+        <h1>Hardware and PayPal-Attested Unique Aliases</h1>
+        <p class="subtitle">One PayPal identity, one machine's hardware, bound into one report you control — unique, mostly anonymous, and provably real.</p>
     </header>
+
+    <!-- v203 (user request): WHAT THIS IS FOR, up front and short. The long
+         explanations moved to privacy.html / terms.html / the GitHub Pages
+         hub; this card only states the goal and points at them. -->
+    <div id="whatIsThisCard" style="margin:0 0 24px 0; background:#161b22; border:1px solid #30363d; border-radius:16px; padding:20px 24px;">
+        <label>What you are creating: a verified unique alias</label>
+        <p style="color:var(--text-dim); font-size:0.9rem; margin:0 0 10px;">A login binds your PayPal identity to real confidential-computing hardware (Intel TDX) and the result is one <b>unique alias</b>: nobody can mint a second one that passes as you. It is <b>mostly anonymous</b> — the report carries hashes, not your name — and disclosure is <b>your choice</b>: nobody by default, or one entity you trust (a lawyer, a regulator, the Police escrow key below). Both the <b>owner</b> of this service and the <b>receiver</b> of your attestation verify the same two facts: PayPal vouched for the account, and genuine hardware handled it.</p>
+        <details style="margin-top:2px;">
+            <summary style="cursor:pointer; color:#58a6ff; font-weight:600; font-size:0.95rem;">Derived attestations: reveal less and stay valid (zero-knowledge)</summary>
+            <p style="color:var(--text-dim); font-size:0.88rem; margin:10px 0 0;">A Groth16 zero-knowledge proof (<a href="https://leonardopedro.github.io/verifiedUniqueAliases/zk.html" style="color:#58a6ff;">zk.html</a>) derives a <b>new</b> statement from the same hardware-signed report while the PayPal and hardware signatures stay untouched: you can prove “this report is for a unique, PayPal-verified account that existed before date X” without revealing the email, the name or the account id. The proof is bound to the report's own signed bytes — not to a re-statement of them — so the attestation remains valid, and only what you choose to reveal is revealed.</p>
+        </details>
+        <p style="color:var(--text-dim); font-size:0.85rem; margin:10px 0 0;">Read the details: <a href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html" style="color:#58a6ff;">Privacy Policy</a> · <a href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html" style="color:#58a6ff;">User Agreement</a> · <a href="https://leonardopedro.github.io/verifiedUniqueAliases/" style="color:#58a6ff;">source on GitHub Pages</a></p>
+    </div>
 
     <!-- v202 (user request): LOCAL-COPY RESCUE CARD. Rendered ONLY on a
          non-file:// origin (revealLocalCopyCard checks location.protocol):
@@ -221,10 +235,11 @@
          visitor reach the trusted local copy, which is where the key lives. -->
     <div id="localCopyCard" style="display:none; margin:0 0 24px 0; background:#161b22; border:1px solid #d29922; border-radius:16px; padding:20px 24px;">
         <label style="margin-bottom:6px;">💾 Run this auditor from YOUR machine — save it, then open the local file</label>
-        <p style="color:var(--text-dim); font-size:0.9rem; margin:0 0 14px;">You are viewing a copy served over the network (from <code id="localCopyOrigin">a server</code>). Whoever controls that origin can rewrite this script, and every browser deliberately refuses to follow a <code>file://</code> link clicked inside a web page — so take your own copy from the project's GitHub, then open it as a file. Three steps:</p>
+        <p style="color:var(--text-dim); font-size:0.9rem; margin:0 0 14px;">You are viewing a copy served over the network (from <code id="localCopyOrigin">a server</code>). Whoever controls that origin can rewrite this script, so take your own copy from the project's GitHub, then open it as a file. A browser deliberately refuses to follow a <code>file://</code> link clicked inside a web page — and it never tells a web page the directory it saved into — so tell me where it landed and I will build the link for you:</p>
         <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
             <a id="localCopySave" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html" onclick="return saveLocalCopy(this)" style="display:inline-block; margin:0; padding:13px 18px; background:#238636; color:#fff; border-radius:8px; font-weight:600; text-decoration:none; cursor:pointer;">💾 1. Save verify.html (from the GitHub repo)</a>
-            <a id="localCopyLink" href="file:///Downloads/verify.html" onclick="return copyLocalLink(this)" style="display:inline-block; margin:0; padding:13px 18px; background:#21262d; color:#58a6ff; border:1px solid #30363d; border-radius:8px; font-weight:600; text-decoration:none; cursor:pointer;">2. file:///Downloads/verify.html</a>
+            <input type="text" id="localCopyFolder" placeholder="2. where did it save? e.g. file:///Downloads" oninput="return updateLocalCopyLink()" style="margin:0; padding:12px 12px; background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:8px; font-family:monospace; font-size:0.85rem; min-width:270px; flex:1;">
+            <a id="localCopyLink" href="file:///Downloads/verify.html" onclick="return copyLocalLink(this)" style="display:inline-block; margin:0; padding:13px 18px; background:#21262d; color:#58a6ff; border:1px solid #30363d; border-radius:8px; font-weight:600; text-decoration:none; cursor:pointer;">file:///Downloads/verify.html</a>
             <span id="localCopyStatus" style="font-size:0.82rem; color:var(--text-dim); flex:1; min-width:240px;"></span>
         </div>
         <details style="margin-top:14px;">
@@ -242,8 +257,8 @@
     <div class="grid" style="margin-top: -10px;">
         <div class="input-card" style="grid-column: span 2; border-color: #4caf50;">
             <label>Log in with PayPal — the login IS the pre-flight check</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem;">There is deliberately <b>no separate pre-login hardware check</b>: it would let anyone exhaust the enclave's resources, and a completed PayPal login is itself the attacker filter. Your browser generates a throwaway encryption key that never leaves this page — <b>automatically, the moment this page opens</b> (the green note below records exactly when). Your PayPal identity comes back encrypted to that key — neither the site owner (who holds the PayPal client secret and can issue TLS certificates for this domain) nor the cloud provider (who sees all traffic leaving the machine) can read it. After PayPal verifies you, the enclave mints the hardware proof (an Intel TDX quote) bound to <i>this</i> login and your session, this page audits it, and only a fully green audit decrypts here. <b>This page</b> builds the PayPal link; the enclave never redirects you. The strongest setup is your own copy: take <code>verify.html</code> from the project's GitHub, save it and open it locally (<code>file://</code>, or use the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a>) — keys are then created only on your machine, anything injected on the enclave's origin only ever sees ciphertext, and this enclave-origin copy refuses key generation by design (Web Auditor Tampering defense).</p>
-            <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow (two explicit links):</b> your throwaway encryption key is generated AUTOMATICALLY when this page loads — the green note below says exactly when — so there is nothing to click for that. Then pick ONE of the two links: minimal disclosure (“verified status only”) or the full profile. A click prepares the signed login session and that same link turns into “✅ Continue to PayPal →” (opens in a NEW tab); after PayPal returns, the enclave's callback page <b>downloads your still-ENCRYPTED attestation automatically</b> — no landing page. Bring that file back to THIS tab and load it with the “Attestation JSON report” file picker above: this trusted copy decrypts it with the key it generated on load, runs the full hardware audit, and offers the plain JSON for offline auditing. There is deliberately no “claim” button any more — one auto-generated key, two explicit links, one audit. If any step fails, nothing is saved, so you are safe to close the tab.</p>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">There is no separate pre-login hardware check: a completed PayPal login is the attacker filter. This page makes a throwaway key the moment it opens; your identity comes back encrypted to that key, so neither the site owner nor the cloud provider can read it. PayPal's approval then buys a hardware proof (an Intel TDX quote) bound to <i>this</i> login, which this page audits — only a fully green audit decrypts.</p>
+            <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow:</b> the key is generated automatically when this page loads. Pick ONE of the two links below; it turns into “✅ Continue to PayPal →” in a new tab. After PayPal returns, the enclave's callback page <b>downloads your still-ENCRYPTED attestation automatically</b> — bring that file back here and load it with the “Attestation JSON report” file picker above. <b>Strongest setup:</b> take <code>verify.html</code> from the project's <a href="https://leonardopedro.github.io/verifiedUniqueAliases/" style="color:#58a6ff;">GitHub</a>, save it and open it locally (the yellow card above does this) — the key is then created only on your machine. <a href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html" style="color:#58a6ff;">Privacy Policy</a> · <a href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html" style="color:#58a6ff;">User Agreement</a></p>
             <!-- v188 (user request): the morphing workflow button is SUPPRESSED (removed) — two explicit login links replace it, the throwaway key is auto-generated on render (keyNotice announces it), and the claim step is gone: /callback AUTO-DOWNLOADS the ciphertext and this tab loads it with the file picker (decryptPastedBlob → runAudit). -->
             <div id="keyNotice" style="display:none; margin-top:12px; padding:10px 12px; border-radius:8px; font-size:0.85rem; background:rgba(63,185,80,0.08); border:1px solid #3fb950; color:#3fb950;"></div>
             <!-- v201 (user request): the pre-login option that offered the
@@ -464,6 +479,42 @@ Wmw2oAio9A==
     // ========================================================================
     var LOCAL_COPY_RAW = 'https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html';
     var LOCAL_COPY_FILE = 'file:///Downloads/verify.html';
+    // v203 (user request): the grey file:// link is BUILT from where the copy
+    // actually landed instead of being a hardcoded Downloads guess.
+    //   * browsers never disclose a download directory to a web page, so the
+    //     folder is something the visitor supplies (field #2) — remembered in
+    //     localStorage so it is typed once;
+    //   * when the File System Access API is available (Chrome/Edge) the save
+    //     dialog is used, so we learn the REAL filename — a collision may save
+    //     it as "verify (1).html", and the link must say so;
+    //   * the field also accepts a full file:// URL, in which case it is used
+    //     verbatim.
+    function localCopyGuessFolder() {
+        try {
+            var ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+            if (/Windows/i.test(ua)) return 'file:///C:/Users/<you>/Downloads';
+            if (/Android/i.test(ua)) return 'file:///storage/emulated/0/Download';
+            if (/iPhone|iPad|Mac/i.test(ua)) return 'file:///Users/<you>/Downloads';
+            return 'file:///home/<you>/Downloads';
+        } catch (e) { return 'file:///Downloads'; }
+    }
+    var LOCAL_COPY_NAME = 'verify.html';
+    function updateLocalCopyLink() {
+        try {
+            var inp = document.getElementById('localCopyFolder');
+            var a = document.getElementById('localCopyLink');
+            var val = (inp && typeof inp.value === 'string') ? inp.value.trim() : '';
+            if (val) { try { localStorage.setItem('pav_local_copy_dir', val); } catch (e) {} }
+            else { try { val = localStorage.getItem('pav_local_copy_dir') || ''; } catch (e) { val = ''; } }
+            var href;
+            if (!val) href = 'file:///Downloads/' + LOCAL_COPY_NAME;
+            else if (/\.html?([?#].*)?$/i.test(val)) href = val;          // a full link: keep verbatim
+            else href = val.replace(/\/+$/, '') + '/' + LOCAL_COPY_NAME; // a folder: append the file
+            LOCAL_COPY_FILE = href;
+            if (a) { a.href = href; a.textContent = href; }
+            return href;
+        } catch (e) { return LOCAL_COPY_FILE; }
+    }
     function revealLocalCopyCard() {
         try {
             if (typeof location === 'undefined') return false; // headless harness
@@ -472,6 +523,12 @@ Wmw2oAio9A==
             if (!card) return false;
             var origin = document.getElementById('localCopyOrigin');
             if (origin) origin.textContent = location.protocol + '//' + (location.host || '(server)');
+            var inp = document.getElementById('localCopyFolder');
+            if (inp) {
+                try { inp.value = localStorage.getItem('pav_local_copy_dir') || ''; } catch (e) { inp.value = ''; }
+                if (!inp.value) inp.placeholder = '2. where did it save? e.g. ' + localCopyGuessFolder();
+            }
+            updateLocalCopyLink();
             card.style.display = 'block';
             return true;
         } catch (e) { return false; }
@@ -479,21 +536,46 @@ Wmw2oAio9A==
     async function saveLocalCopy(el) {
         var st = null; try { st = document.getElementById('localCopyStatus'); } catch (e) { st = null; }
         var say = function (m) { if (st) st.innerText = m; };
+        var afterSave = function (name) {
+            LOCAL_COPY_NAME = name || 'verify.html';
+            var inp = null; try { inp = document.getElementById('localCopyFolder'); } catch (e) { inp = null; }
+            if (inp && !inp.value) inp.placeholder = '2. where did it save? e.g. ' + localCopyGuessFolder();
+            updateLocalCopyLink();
+            say('✅ Saved as ' + LOCAL_COPY_NAME + ' — now tell me the folder in field 2 and the grey link becomes yours. To open it: press Ctrl+O (⌘O) and pick the file, or paste the link into the address bar (Ctrl+L / ⌘L).');
+        };
         try {
             var r = await fetch(LOCAL_COPY_RAW, { cache: 'no-store' });
             var text = await r.text();
             if (!r.ok || text.indexOf('<!DOCTYPE') === -1 && text.indexOf('<html') === -1) {
                 throw new Error('unexpected response (HTTP ' + r.status + ')');
             }
+            // Preferred path: the native save dialog. It tells us the filename
+            // the visitor actually chose (a collision may rename it), even
+            // though the directory stays hidden from the page by design.
+            if (typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function') {
+                try {
+                    var handle = await window.showSaveFilePicker({
+                        suggestedName: 'verify.html',
+                        types: [{ description: 'HTML', accept: { 'text/html': ['.html'] } }],
+                    });
+                    var w = await handle.createWritable();
+                    await w.write(text); await w.close();
+                    afterSave(handle.name || 'verify.html');
+                    return false;
+                } catch (pe) {
+                    if (pe && pe.name === 'AbortError') { say('Save cancelled — nothing was written.'); return false; }
+                    // any other failure: fall through to the plain download
+                }
+            }
             var url = URL.createObjectURL(new Blob([text], { type: 'text/html' }));
             var a = document.createElement('a');
-            a.href = url; a.download = 'verify.html';
+            a.href = url; a.download = LOCAL_COPY_NAME;
             document.body.appendChild(a); a.click(); a.remove();
             setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
-            say('✅ Saved as verify.html — now press Ctrl+O (⌘O) and open it, or paste the grey file:// link into the address bar (step 3).');
+            afterSave(LOCAL_COPY_NAME);
         } catch (e) {
             try { window.open(LOCAL_COPY_RAW, '_blank'); } catch (e2) { /* no window */ }
-            say('Opened the GitHub copy in a new tab — save it there with Ctrl+S / ⌘S (File → Save Page As…) under the name verify.html, then open it (step 3).');
+            say('Opened the GitHub copy in a new tab — save it there with Ctrl+S / ⌘S (File → Save Page As…) as verify.html, then tell me the folder in field 2 and open it (Ctrl+O).');
         }
         return false;
     }
@@ -1612,7 +1694,13 @@ Wmw2oAio9A==
         // app. Swapping these back will break the full flow with "invalid scope".
         { flow: 'verified', client_id: 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
         { flow: 'full', client_id: 'ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address%20profile%20email%20https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
-        // Production entries: add here at cutover (www.paypal.com authorize_base).
+        // Production (live cutover 2026-11-02) — same flow pairing as sandbox:
+        // 'welcome' is the REST app with NO PII scopes enabled (verified flow),
+        // 'EncryptedData' is the PII-capable app (full flow). authorize_base is
+        // www.paypal.com — a sandbox client_id can never satisfy this entry and
+        // vice versa, which is exactly what makes the swap fail-closed.
+        { flow: 'verified', client_id: 'BAA6A0dAJkSa5NBAqB7nR18hYg7GbA96lBC_BUa8uttAsYygct8NPtobTxWNQrOAvL7dLCUzAtuqjBN3do', authorize_base: 'https://www.paypal.com/signin/authorize', scope: 'https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
+        { flow: 'full', client_id: 'BAAKIQtHan_IwlC0KJeBICQ86HyaLghkcmyP9W42jfd2TjtugYHpYrfQFKp8SGSGIyA8qGTh0oKNOJQxNU', authorize_base: 'https://www.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address%20profile%20email%20https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
     ];
 
     // ========================================================================

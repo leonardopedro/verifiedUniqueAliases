@@ -96,13 +96,13 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 241,829 bytes | `dc35a23fb8fd3efc9e090ed8d6d7c41f71f909180b1cc26e307458833c2a503c` |
+| `verify.html` | 249,061 bytes | `e6aa0afb134c05e6495ac173fbd7fba2f2c4f914b5a5d4c2b31a80577fe1d7d4` |
 | `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
 | `zk-rsa.html` | 100,001 bytes | `a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40` |
 
 ```bash
 sha256sum verify.html zk.html zk-rsa.html
-# dc35a23fb8fd3efc9e090ed8d6d7c41f71f909180b1cc26e307458833c2a503c  verify.html
+# e6aa0afb134c05e6495ac173fbd7fba2f2c4f914b5a5d4c2b31a80577fe1d7d4  verify.html
 # 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
 # a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40  zk-rsa.html
 ```
@@ -127,6 +127,166 @@ key — it makes zero network requests and never sees a passphrase.)
   is untrusted by design — it refuses every key-generating flow (auditor
   isolation), so a tampered ESP copy cannot steal your keys. It also cannot
   prove anything: check the digest of the file you actually run.
+
+---
+
+## 🔑 Rotating the Credentials (PayPal, ACME, DNS-01, heartbeat key)
+
+### Where the secrets actually live
+
+There is **no secret store**, and this is deliberate. The enclave's config
+*is* the instance `user_data` — one base64 JSON blob the enclave reads at boot
+from `http://100.100.100.200/latest/user-data`. Rotating a credential therefore
+means: read the live config, merge the one change, write it back, reboot.
+
+**Why not bake the secrets into the disk image?** Because then nobody else
+could reproduce the measurement of that disk.
+
+The entire audit rests on a third party recomputing the build from the public
+repo and getting the same hashes (`.build-provenance`). The moment a secret is
+written into the image, two things break at once:
+
+1. **The reproduction stops being possible.** A stranger running the Docker
+   synthesis engine has no access to your PayPal client secret, your ACME
+   account key, or the DNS-01 token. They produce a different disk, therefore
+   a different `disk_manifest`, therefore a different MRTD/RTMR0. The golden
+   pins can no longer be recomputed by anyone but you — which is exactly the
+   "trust me" model the project exists to eliminate.
+2. **The measurement stops being meaningful.** Every credential rotation would
+   change the disk hash, so a measurement match would attest *"this is the
+   image plus whatever secrets were in it"* rather than *"this is the code you
+   can verify"*. The auditor would have to trust that the delta was only a
+   secret rotation.
+
+So the split is: **public, measured, reproducible** (everything in the repo →
+disk → MRTD/RTMR0) and **private, unmeasured, delivered at runtime**
+(`user_data` → read over link-local IMDS before egress lockdown). Keeping the
+second class out of the first is what preserves host-verifiability.
+
+The build path enforces this mechanically rather than by convention: the
+synthesis scripts take no credential inputs, `dist/config.json` is not staged
+into the ESP, and the produced images contain no secret markers.
+
+```bash
+aliyun ecs DescribeInstances --RegionId cn-beijing \
+  | jq -r '.Instances.Instance[] | "\(.InstanceId) \(.InstanceName) \(.Status)"'
+aliyun ecs DescribeUserData --RegionId cn-beijing --InstanceId <ID> \
+  | jq -r '.UserData' | base64 -d | jq .
+```
+
+Find the instance **by name** (`paypal-auth-vm`), never by id — the id changes
+on every spot recreate. The live config carries: the two PayPal client pairs,
+`staging`, `domain`, the ZeroSSL EAB pair, `acme_account_json`,
+`attestation_signing_key`, `dns01_secret`, and the `self_report` heartbeat sink.
+
+> A retired GCP version of `upload-secrets.sh` drove `gcloud secrets` and reset
+> `paypal-auth-vm-v60` in `europe-west4-a`. Nothing about it can take effect on
+> this stack; it was rewritten for Alibaba ECS user_data.
+
+### The procedure
+
+```bash
+# 1. DRY RUN — reads the live config, merges your values, validates, prints a
+#    change plan (secrets never printed). Nothing is pushed.
+PAV_DRY_RUN=1 PAV_NONINTERACTIVE=1 \
+  PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... \
+  PAYPAL_VERIFIED_CLIENT_ID=... PAYPAL_VERIFIED_CLIENT_SECRET=... \
+  bash upload-secrets.sh
+
+# 2. Read the plan. Every field should say `unchanged` except the ones you
+#    meant to rotate. `self_report`, `attestation_signing_key`,
+#    `acme_account_json` and `dns01_secret` MUST read `unchanged` — if one
+#    says `CHANGED` or `absent`, stop.
+
+# 3. Apply. Drops the dry-run flag; prints the same plan, then asks you to
+#    type `yes` before it touches the instance.
+bash upload-secrets.sh
+```
+
+Interactive use is just `bash upload-secrets.sh` — it offers four modes:
+
+| Menu | What it does |
+|---|---|
+| **1 / 2** | Rotate credentials for staging / production |
+| **3** | Flip `staging` only — **prompts for no credentials**, exactly as labelled |
+| **4** | Rotate (or `clear`) the ZeroSSL EAB pair |
+
+`staging: true` = PayPal **sandbox**; `staging: false` = PayPal **production**
+(`main.rs` picks `PAYPAL_SANDBOX_AUTH` vs `PAYPAL_PRODUCTION_AUTH` from that one
+boolean). To go live you must set mode 2 **and** supply the live client pair —
+the boolean alone points production at sandbox credentials and the exchange
+fails.
+
+### Rules the script enforces, and why
+
+1. **Merge, never rebuild.** The new config is `jq`-merged into the live one.
+   Rebuilding from scratch is how `self_report` (the heartbeat RAM key),
+   `attestation_signing_key`, `acme_account_json` and `dns01_secret` get
+   silently dropped — a dropped sink made the boot channel go dark once before
+   (HANDOVER §0.10). Absent keys are reported as loud warnings.
+2. **Fail-closed validation mirrors `require_credentials` in `src/main.rs`.**
+   Empty, `YOUR_*`, `MISSING_*` or truncated values are refused **before** the
+   reboot, so you never find out from a dark `:443` that you pushed a
+   placeholder. Exit 1, nothing pushed.
+3. **EAB is a pair.** Half a ZeroSSL binding is refused; clear both to fall
+   back to Let's Encrypt (no EAB required).
+4. **Push order is Stop → Modify → Start.** `user_data` is **disk-bound**: a
+   push is discarded by any later `ReplaceSystemDisk`, and a push while
+   `Running` may be ignored. So: stop, wait `Stopped`, `ModifyInstanceAttribute
+   --UserData`, start. `upload-secrets.sh` does this; doing it by hand means
+   `Stop → [ReplaceSystemDisk if any] → UserData → Start`.
+5. **No local copy is written.** The pre-rotation config stays in the
+   script's memory and is used for rollback from memory if the new config
+   fails to come up. Nothing containing a credential is written to disk on
+   the operator machine. If you deliberately want a file, set
+   `PAV_BACKUP_DIR=<path>` before running — it defaults to empty, and the
+   script warns and tells you to `shred` it when set. (`~/.paypal-auth-backups`
+   used to be written unconditionally; that was a plaintext credential store
+   in your home directory.) Note the shell-history hazard: running
+   `PAYPAL_CLIENT_SECRET=... bash upload-secrets.sh` records the secret in
+   `~/.bash_history` — prefix the command with a space, or read the value
+   from a descriptor instead of the command line.
+
+### Verifying it actually took effect
+
+`DescribeUserData` can return **0 bytes** right after a perfectly good push —
+a known CLI quirk, not a failure. **The boot is the test.**
+
+```bash
+# serving?
+curl -sI --max-time 20 https://login.airma.de/ | head -2      # HTTP/1.1 200 OK
+
+# measurements and manifest intact?
+curl -s https://login.airma.de/debug/envelope | jq -r \
+  '.attestation_report.enclave_config.boot_measurements.binary_sha256'
+
+# boot heartbeat (needs the endpoint flag; bare `ls` 403s, `-` form unsupported)
+aliyun oss cat oss://paypal-tdx-relay-1792227992/boot/prod/latest.json \
+  --endpoint oss-cn-hongkong.aliyuncs.com
+
+# if it is dark, the serial console says how far it got
+aliyun ecs GetInstanceConsoleOutput --RegionId cn-beijing --InstanceId <ID> \
+  | jq -r '.ConsoleOutput' | base64 -d       # field is ConsoleOutput, not SerialConsoleOutput
+```
+
+Watch for `ACME certificate obtained in RAM successfully` — its absence is the
+usual cause of a dark `:443`, and the retry ladder can hold it for over an hour
+if the ZeroSSL directory is unreachable.
+
+**The environment itself is only proven by a real login.** The signed report
+carries `paypal_environment`; after a production rotation it must read
+`production`, and the auditor refuses `sandbox` outright — a sandbox report is
+a real hardware attestation of a synthetic identity, so anyone could mint
+`verified_account: true` there.
+
+```bash
+CHROMIUM_PATH=$(command -v chromium) node scripts/e2e-login-download.mjs
+```
+
+> **STS trap:** OAuth credentials in `~/.aliyun/config.json` expire (~1 h) and
+> presigned relay URLs embed them. An `InvalidAccessKeyId` or
+> `SecurityTokenExpired` mid-procedure is not a config failure — run any
+> `aliyun` command to re-mint, and regenerate presigns immediately before use.
 
 ---
 
