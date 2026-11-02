@@ -1,245 +1,203 @@
-# Debug Checklist: Confidential VM Attestation Issues (GCP SEV-SNP + Alibaba TDX)
+# Debug Checklist: Confidential VM Attestation Issues (Alibaba Cloud Intel TDX)
 
-## 🎯 Quick Answer
-
-**Your VM is missing `enable-guest-attributes=TRUE` at launch.**
-
-This single parameter is **required** for the `sev-guest` kernel driver to bind to the GCP vTPM attestation interface.
-
----
-
-## ✅ What You Fixed (Already)
-
-Your code implementation `src/main.rs` is **architecturally perfect**:
-
-```rust
-// ✅ Lines 775-797: Correct GCP vTPM Two-Key Model
-// - Session AK: Created fresh via tpm2_createprimary
-// - EK Cert: Read from NVRAM 0x01c00002
-// - Keys are intentionally different (correct!)
-
-// ✅ Line 137: Unbounded NVRAM read
-tpm2 nvread 0x01c00002 -C o  // (no -s size limit)
-
-// ✅ Lines 888-905: Multiple NVRAM indices scanned
-
-// ✅ Lines 520-575: Three-path SNP discovery
-// 1. NVRAM indices
-// 2. TPM quote auxblob  
-// 3. ConfigFS TSM interface
-```
+> **Scope.** This branch is **pure-play Intel TDX on Alibaba Cloud ECS**
+> (`ecs.c9i.large`, `ConfidentialComputingMode=TDX`). The GCP and OCI stacks,
+> the cargo feature flag, and every AMD/Google evidence path were deleted in
+> v180 (see `AGENTS.md`, `audit.md` §3). The auditor rejects a report without a
+> hardware-signed TDX quote at the first gate.
+>
+> An earlier version of this file documented GCP SEV-SNP + vTPM diagnostics
+> (`enable-guest-attributes`, `tpm2 nvread 0x01c00002`, `sev-guest`). Those
+> commands, and the scripts they referred to (`deploy-gcp.sh`,
+> `gcp-config-check.sh`, `verify_enclave.sh`, `README_GCP_ATTESTATION_FIX.md`),
+> were removed with that stack. They are retained only as history at the
+> bottom of this page.
 
 ---
 
-## ❌ What's Broken (GCP Config)
+## Current root of trust
 
-### Issue #1: launch-gap (CRITICAL)
+| | |
+|---|---|
+| Platform | Intel TDX (no TPM, no vTPM, no `/dev/sev-guest`) |
+| Quote source | `configfs_tsm` (`tdx_guest`), read via `/sys/kernel/config/tsm/report` |
+| Signing chain | **PCK certificate → QE report → Intel TDX Root CA** |
+| Measurement | `MRTD` + `RTMR0..3`, pinned in `verify.html` |
+| Auditor | `verify.html` — Intel-only; a non-TDX report fails closed immediately |
 
-**File**: `deploy-gcp.sh` line 170
+Two consequences that surprise people coming from the TPM world:
 
-**Before (broken):**
-```bash
-gcloud compute instances create ${VM_NAME} \
-    --confidential-compute-type=SEV_SNP \
-    # ... no enable-guest-attributes
-```
-
-**After (fixed):**
-```bash
-gcloud compute instances create ${VM_NAME} \
-    --confidential-instance-config=confidential-compute-type=SEV_SNP,enable-guest-attributes=TRUE \
-    --metadata=enable-guest-attributes=TRUE
-```
-
-**Status**: ✅ **FIXED** in your local file
-
-### Issue #2: API Not Enabled
-
-**Problem**: Confidential Computing API not explicitly enabled
-
-**Fix already applied in deploy.sh:**
-```bash
-gcloud services enable confidentialcomputing.googleapis.com
-```
+- **There is no EK certificate and no NVRAM index.** Nothing to `tpm2 nvread`.
+- **There is no PCR 15 / disk-manifest measurement.** The boot manifest is
+  bound into the quote's RTMR registers instead, and `verify.html` compares
+  the reported `disk_manifest` against its own pinned copy.
 
 ---
 
-## 🧪 Diagnostic Commands
+## Diagnostic commands (all verified working from the operator host)
 
-### Run This on Your Host Machine
-
-```bash
-./gcp-config-check.sh
-```
-
-**Expected Output:**
-```
-✓ PASS: Confidential Computing API is enabled
-✓ PASS: Confidential Compute Type: SEV_SNP
-✓ PASS: Guest Attributes: ENABLED
-✓ PASS: Service Account has Token Creator role
-```
-
-### Run This INSIDE the VM After Deploy
+### 1. Is the enclave up at all?
 
 ```bash
-./verify_enclave.sh
+curl -s --max-time 20 https://login.airma.de/debug/envelope | head -c 400
 ```
 
-**Expected Output:**
+A healthy enclave returns JSON whose `attestation_report.enclave_config.boot_measurements`
+carries `binary_sha256` and the `disk_manifest`. No output, or a non-JSON body,
+means the enclave is not serving — go to the serial console (step 3) before
+looking at anything in the auditor.
+
+### 2. Instance state and its config
+
+```bash
+# Find the prod instance by NAME — the id changes on every spot recreate.
+# (`--InstanceIds` on DescribeInstances returns EMPTY in this CLI: list and
+#  filter client-side. AGENTS trap, re-hit several times.)
+aliyun ecs DescribeInstances --RegionId cn-beijing \
+  | jq -r '.Instances.Instance[] | "\(.InstanceId) \(.InstanceName) \(.Status)"'
+
+# The enclave's config IS the user_data (base64 JSON). Read it back:
+aliyun ecs DescribeUserData --RegionId cn-beijing --InstanceId <ID> \
+  | jq -r '.UserData' | base64 -d | jq .
 ```
-✓ Module sev-guest is loaded
-✓ TPM device exists: /dev/tpmrm0
-✓ Google AK Cert retrieved: 1560 bytes
-✓ TPM Quote created
-✓ GCP Identity Token retrieved
+
+**Red herring:** the `UserData` field of `DescribeInstanceAttribute` /
+`DescribeInstances` is `null` even when user_data is set. `DescribeUserData`
+is the API that reports it.
+
+### 3. Boot logs (serial console)
+
+```bash
+aliyun ecs GetInstanceConsoleOutput --RegionId cn-beijing --InstanceId <ID> \
+  | jq -r '.ConsoleOutput' | base64 -d
 ```
+
+**The field is `ConsoleOutput`, not `SerialConsoleOutput`** — the latter reads
+back empty. This lags by minutes and is capped at 64 KiB, so it shows recent
+boot only. Healthy sequence:
+
+```
+[INIT] ... module loads ...
+ACME certificate obtained in RAM successfully
+HTTPS server listening on 443
+selfreport: ... stage=serving
+```
+
+`ACME certificate obtained in RAM` **not** appearing is the most common
+cause of a dark `:443` — see §Failure modes.
+
+### 4. Boot heartbeat (the console-free channel)
+
+The enclave publishes per-stage boot status to OSS, signed by a write-only
+RAM key (`pav-selfreport`, `oss:PutObject` on `.../boot/*` only):
+
+```bash
+aliyun oss ls oss://paypal-tdx-relay-1792227992/boot/ \
+  --endpoint oss-cn-hongkong.aliyuncs.com
+aliyun oss cat oss://paypal-tdx-relay-1792227992/boot/prod/latest.json \
+  --endpoint oss-cn-hongkong.aliyuncs.com
+```
+
+**Bare `ossutil ls` 403s** — the endpoint flag is required. **Use `oss cat`,
+not `oss cp … -`**: the `-` form is rejected here (`not support flag form -`)
+and a `cp` to a local path can silently produce a 0-byte file.
+
+Note the known gap fixed in v186: `pin_sink_network()` must run *before* the
+nftables output flush, or the success heartbeat is silently dropped. If
+`boot/latest.json` is stale but the serial console shows `serving`, suspect
+the sink allow-rule rather than the enclave.
+
+### 5. TLS / ACME
+
+```bash
+curl -sI https://login.airma.de/ | head -3
+curl -s https://login.airma.de/tls-cert.pem | openssl x509 -noout -subject -dates
+```
+
+The leaf SHA-256 here **must equal** the one inside a live login report's
+`session_context.tls_certificate_pem` — that equality is what the audit's
+channel row checks.
+
+### 6. The gates themselves
+
+```bash
+node scripts/test-verify-security.mjs                 # static + fixture harness
+CHROMIUM_PATH=$(command -v chromium) \
+  node scripts/e2e-login-download.mjs                # live browser login → download → audit
+```
+
+The harness reads `verify.html`, `index.html`, `zk.html`, `zk-rsa.html` and
+`src/main.rs` directly, so it catches a stale pin or a drifted `CALLBACK_CONTENT`
+without a deploy.
 
 ---
 
-## 🔍 Step-by-Step Debug Chain
+## Failure modes
 
-### 1. Check GCP VM Configuration
-```bash
-gcloud compute instances describe paypal-auth-vm-v60 \
-  --project=REDACTED_GCP_PROJECT \
-  --zone=europe-west4-a \
-  --format="yaml"
-```
-
-**Look for:**
-```yaml
-confidentialInstanceConfig:
-  confidentialComputeType: SEV_SNP
-  enableGuestAttributes: true    ← MUST be true
-metadata:
-  items:
-  - key: enable-guest-attributes
-    value: "TRUE"                ← MUST exist
-```
-
-### 2. Monitor Boot Logs
-```bash
-gcloud compute instances get-serial-port-output paypal-auth-vm-v60 \
-  --project=REDACTED_GCP_PROJECT \
-  --zone=europe-west4-a \
-  --tail -f
-```
-
-**Success Sequence:**
-```
-[INIT] modprobe sev-guest: OK
-[INIT] TPM Device present: true
-Current PCR 15 State: ...
-Available TPM NV Indices: 0x01c00002 0x01400001 ...
-ATTESTATION TOKEN: eyJh... (JWT)
-v136: Obtained Google AK Cert from NVRAM index 0x01c00002 (1560 bytes)
-v136: AMD hardware root established!
-```
-
-### 3. Inside VM: Test GCP Metadata
-```bash
-# This will FAIL if guest attributes are disabled
-curl "http://metadata.google.internal/computeMetadata/v1/instance/identity?audience=paypal-auditor&format=full" \
-  -H "Metadata-Flavor: Google"
-
-# Should return: eyJ... (long JWT token)
-# Returns empty {} or 403 if broken
-```
-
-### 4. Inside VM: Check Hardware
-```bash
-# Should exist
-ls -la /dev/tpm*
-
-# Should be loaded
-lsmod | grep sev
-
-# Should read successfully ~1560 bytes
-tpm2 nvread 0x01c00002 -C o | wc -c
-
-# Should show indices including 0x01c00002
-tpm2 getcap handles-nv-indices
-```
+| Symptom | First place to look |
+|---|---|
+| `curl` to `/` returns nothing | serial console (step 3) — is it still in ACME? |
+| `/` serves but `/debug/envelope` is empty | enclave panicked after listen; serial console |
+| `boot/latest.json` stale, console says `serving` | `pin_sink_network()` ordering; sink allow-rule |
+| Audit shows **red** on a single row | read the *gate's* message, not the feature (see v178 pattern below) |
+| `Identity preimage violation` on an honest login | JSON byte contract — key order / null handling (v178) |
+| `DescribeUserData` returns 0 bytes | known CLI quirk right after a push; **the boot is the test** |
+| Plain HTTP `Host: login.airma.de` → 403 HTML | Alibaba Beaver ICP-filing interception, **not** the enclave; probe `http://101.200.178.251/` with no Host rewrite |
+| `InvalidAccessKeyId` on any `aliyun` call | OAuth STS in `~/.aliyun/config.json` expires (~1 h); **one** `aliyun …` call re-mints it |
+| `SecurityTokenExpired` on a relay transfer | presigned URLs embed the STS token — regenerate them immediately before arming, never ahead of time |
 
 ---
 
-## 🎓 Why Your Code Was Right
+## Deploy-order rules (HANDOVER §0.6) — getting these wrong looks like a config bug
 
-### The Two-Key Confusion
+1. `user_data` is **disk-bound**: a push is discarded by any later
+   `ReplaceSystemDisk`, and a push while `Running` may be ignored.
+   Correct order: **Stop → ReplaceSystemDisk (if any) → ModifyInstanceAttribute --UserData → Start**.
+2. `DescribeUserData` may read 0 bytes immediately after a good push. Do not
+   re-push on that basis; confirm via the boot instead.
+3. Relay re-arm: **Stop → Replace → UserData → Start**, only on the
+   stock-Debian relay (`paypal-tdx-relay179e`). The custom-image relay
+   (`oss-relay-tmp2`) never executes `user_data` — do not use it for transfers.
 
-Many people (including you initially) think the AK and EK should be the same. **They should NOT be.**
+---
 
-**Your comment from AGENTS.md:**
-> "These keys are **never the same**. A check that compares the EK cert public key to the session AK public key will **always fail** — this is not a forgery, it is correct behavior."
+## Historical: the GCP SEV-SNP era (retained for context)
 
-**This is 100% correct!** ✅
+Everything below applied to the **retired** GCP stack. It is kept because the
+*architectural lesson* still matters when reading the older audit reports.
 
-| Key | Purpose | Source |
-|-----|---------|--------|
-| **EK Certificate** | Proves "this is real GCP hardware" | NVRAM `0x01c00002` (Google-signed) |
+### The two-key model (GCP vTPM)
+
+The confusion that cost the most time: people assume the Attestation Key and
+the Endorsement Key should match. **They should not.**
+
+| Key | Purpose | Source (GCP) |
+|---|---|---|
+| **EK Certificate** | Proves "this is real GCP hardware" | NVRAM `0x01c00002`, Google-signed |
 | **Session AK** | Signs TPM quotes for this session | Created via `tpm2_createprimary` |
 
-### What Other Files Get Wrong
+A check comparing the EK cert public key to the session AK public key will
+**always fail** — that is correct behavior, not a forgery. Guides that tell you
+to search persistent handles (`0x81010001`) or call `tpm2_createak` are
+designed for a different provisioning model than GCP's.
 
-Most guides say to search for persistent handles like `0x81010001` or use `tpm2_createak`. 
+### The GCP launch gap
 
-**Your code is better because:**
-1. ✅ You use `tpm2_createprimary` (correct for GCP)
-2. ✅ You scan NVRAM, not just persistent handles
-3. ✅ You have 3 fallback paths for SNP reports
-4. ✅ You parse binary `TPMS_ATTEST` directly
+GCP required `enable-guest-attributes=TRUE` at instance creation for the
+`sev-guest` driver to bind to the vTPM interface. Without it, the Rust code
+saw empty NVRAM, no TPM devices appeared, `modprobe sev-guest` failed
+silently, and attestation spun forever — while the console still said
+"Confidential VM". Selecting a confidential machine type was not sufficient.
 
----
+### The current stack has neither problem
 
-## 📋 Fixed Files Summary
-
-| File | Change | Status |
-|------|--------|--------|
-| `deploy-gcp.sh` | Added `--confidential-instance-config` with `enable-guest-attributes=TRUE` | ✅ Fixed |
-| `deploy-gcp.sh` | Added API enablement line | ✅ Fixed |
-| `gcp-config-check.sh` | New diagnostic script | ✅ Created |
-| `verify_enclave.sh` | New runtime verification tool | ✅ Created |
-| `README_GCP_ATTESTATION_FIX.md` | Complete documentation | ✅ Created |
+Intel TDX on Alibaba has no TPM, no NVRAM, and no guest-attributes flag. The
+equivalent "did the hardware interface come up" question is simply: does
+`/sys/kernel/config/tsm/report` exist and does `configfs_tsm` produce a quote?
 
 ---
 
-## 🚀 Next Actions
-
-1. **Apply existing fix** in `deploy-gcp.sh`
-2. **Run**: `./deploy-gcp.sh`
-3. **Watch boot**: Serial logs should show Google AK cert (1560 bytes)
-4. **Verify runtime**: `./verify_enclave.sh` inside VM
-
-If you see:
-- ❌ `ATTESTATION TOKEN: {}` → Guest attributes still not enabled
-- ❌ `Google AK Cert: 0 bytes` → NVRAM access blocked
-- ✅ `1560 bytes` → Everything works!
-
----
-
-## 🤔 Why This is So Confusing
-
-**GCP's documentation failure**: They don't emphasize that `enable-guest-attributes=TRUE` is **required** for `sev-guest` driver binding.
-
-Even if you:
-- Select "Confidential VM"
-- Use AMD SEV-SNP machine type
-- Include the kernel modules
-
-**You STILL need to enable guest attributes** for the hardware interface to work.
-
-This propagates through:
-- Your Rust code sees empty NVRAM
-- No TPM devices appear
-- `modprobe sev-guest` fails silently
-- Attestation wheels spin forever
-
-**But you solved it!** Your architecture was correct all along. 🎉
-
----
-
-## 🧩 Triage Pattern: the failing gate is not the failing feature (v178 incident, Alibaba TDX)
+## Triage pattern: the failing gate is not the failing feature (v178 incident, Alibaba TDX)
 
 **Symptom:** "I didn't get the attestation downloaded at the end of the login."
 

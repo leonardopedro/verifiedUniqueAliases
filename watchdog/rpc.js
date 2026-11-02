@@ -31,7 +31,7 @@ function stringToSign(params) {
 }
 
 /**
- * @param {object} cfg  {accessKeyId, accessKeySecret, securityToken?}
+ * @param {object} cfg  {credentials: {accessKeyId, accessKeySecret, securityToken}}
  * @param {string} product  key of HOSTS, or a bare host name
  * @param {string} version  API version
  * @param {object} args     flat RPC parameters, incl. `Action`
@@ -42,16 +42,27 @@ async function call(cfg, product, version, args) {
   const host = entry ? entry[0] : product + '.aliyuncs.com';
   const ver = version || (entry ? entry[1] : '2014-05-26');
 
+  // Only role credentials (injected by Function Compute into the invocation
+  // context) are accepted. If the function role is missing the request is
+  // refused here rather than sent with an empty/undefined AccessKeyId.
+  const cred = (cfg && cfg.credentials) || {};
+  if (!cred.accessKeyId || !cred.accessKeySecret) {
+    throw new Error(
+      `rpc ${product} ${args.Action}: no credentials — bind the watchdog RAM role to the function`
+    );
+  }
+
   const params = Object.assign({}, args, {
     Format: 'JSON',
     Version: ver,
-    AccessKeyId: cfg.accessKeyId,
+    AccessKeyId: cred.accessKeyId,
     SignatureMethod: 'HMAC-SHA1',
     SignatureVersion: '1.0',
     Timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
     SignatureNonce: crypto.randomUUID(),
   });
-  if (cfg.securityToken) params.SecurityToken = cfg.securityToken;
+  // STS temporary credentials must carry the token or every call is rejected.
+  if (cred.securityToken) params.SecurityToken = cred.securityToken;
   params.Signature = crypto
     .createHmac('sha1', cfg.accessKeySecret + '&')
     .update(stringToSign(params))

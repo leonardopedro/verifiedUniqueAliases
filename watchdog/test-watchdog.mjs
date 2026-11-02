@@ -6,6 +6,15 @@ import assert from 'node:assert/strict';
 
 const require = createRequire(import.meta.url);
 const w = require('./handler.js');
+const rpc = require('./rpc.js');
+
+// What Function Compute injects when the function is bound to its role.
+const ROLE_CREDS = {
+  accessKeyId: 'STS.test-ak',
+  accessKeySecret: 'test-sk',
+  securityToken: 'test-token',
+};
+const ROLE_CONTEXT = { credentials: ROLE_CREDS };
 
 let passed = 0;
 const failures = [];
@@ -31,9 +40,9 @@ const baseCfg = (over = {}) => ({
   maxAttempts: 5,
   retryDelayMs: 1,
   clientTokenPrefix: 'pav-watchdog',
-  accessKeyId: 'ak',
-  accessKeySecret: 'sk',
-  securityToken: '',
+  // No AccessKey in config: credentials only arrive per invocation, from the
+  // function role (context.credentials).
+  credentials: null,
   spec: {
     zoneId: 'cn-beijing-i',
     imageId: 'm-2zef5rtftylwooqx1a9b',
@@ -58,7 +67,7 @@ const inst = (id, status = 'Running') => ({
 function fakeCall(script) {
   const log = [];
   const call = async (cfg, product, version, params) => {
-    log.push({ product, action: params.Action, params });
+    log.push({ product, action: params.Action, cfg, params });
     const key = `${product}.${params.Action}`;
     const h = script[key];
     if (!h) throw new Error(`unexpected call ${key}`);
@@ -229,7 +238,12 @@ await test('HTTP event with the token runs ensure()', async () => {
     requestContext: {},
     body: '{}',
   });
-  const res = await w.run(evt, { call, loadConfig: () => baseCfg(), pause: noSleep });
+  const res = await w.run(evt, {
+    call,
+    loadConfig: () => baseCfg(),
+    context: ROLE_CONTEXT,
+    pause: noSleep,
+  });
   assert.equal(res.statusCode, 200);
   assert.match(res.body, /"action":"present"/);
 });
@@ -242,7 +256,12 @@ await test('timer event runs ensure() (poll leg)', async () => {
     },
   });
   const evt = JSON.stringify({ triggerTime: '2026-10-29T00:00:00Z', triggerName: 'poll-5m', payload: '' });
-  const res = await w.run(evt, { call, loadConfig: () => baseCfg(), pause: noSleep });
+  const res = await w.run(evt, {
+    call,
+    loadConfig: () => baseCfg(),
+    context: ROLE_CONTEXT,
+    pause: noSleep,
+  });
   assert.equal(res.statusCode, 200);
   assert.match(res.body, /"trigger":"timer"/);
 });
@@ -255,7 +274,12 @@ await test('event object (direct EventBridge delivery) is understood', async () 
     },
   });
   const evt = { source: 'acs.ecs', type: 'ecs:Instance:StateChange', id: 'x' };
-  const res = await w.run(evt, { call, loadConfig: () => baseCfg(), pause: noSleep });
+  const res = await w.run(evt, {
+    call,
+    loadConfig: () => baseCfg(),
+    context: ROLE_CONTEXT,
+    pause: noSleep,
+  });
   assert.match(res.body, /"trigger":"eventbridge"/);
 });
 
@@ -268,6 +292,76 @@ await test('clientToken is hour-stable and <= 64 chars', () => {
   assert.notEqual(t2, t3, 'next hour => new token');
   assert.ok(t1.length <= 64);
   assert.ok(w.clientToken({ ...cfg, clientTokenPrefix: 'x'.repeat(60) }, Date.now()).length <= 64);
+});
+
+// --- function role credentials ----------------------------------------------
+
+await test('credentialsFromContext reads the Node.js shape and tolerates snake_case', () => {
+  assert.deepEqual(w.credentialsFromContext({ credentials: ROLE_CREDS }), ROLE_CREDS);
+  assert.deepEqual(
+    w.credentialsFromContext({
+      credentials: { access_key_id: 'a', access_key_secret: 'b', security_token: 'c' },
+    }),
+    { accessKeyId: 'a', accessKeySecret: 'b', securityToken: 'c' }
+  );
+  assert.equal(w.credentialsFromContext(undefined), null);
+  assert.equal(w.credentialsFromContext({}), null);
+  assert.equal(
+    w.credentialsFromContext({ credentials: { accessKeyId: 'only-id' } }),
+    null,
+    'a half-populated context is unusable'
+  );
+});
+
+await test('run() refuses to call the API without role credentials (fail closed)', async () => {
+  const { call, log } = fakeCall({});
+  await assert.rejects(
+    () => w.run('{}', { call, loadConfig: () => baseCfg(), pause: noSleep }),
+    /no credentials: the function must be bound/
+  );
+  assert.equal(log.length, 0, 'no signed request may be attempted');
+});
+
+await test('run() passes the context credentials into the RPC config', async () => {
+  const { call, log } = fakeCall({
+    'ecs.DescribeInstances': { Instances: { Instance: [inst('i-aaa')] } },
+    'vpc.DescribeEipAddresses': {
+      EipAddresses: { EipAddress: [{ AllocationId: 'eip-1', InstanceId: 'i-aaa' }] },
+    },
+  });
+  await w.run('{}', { call, loadConfig: () => baseCfg(), context: ROLE_CONTEXT, pause: noSleep });
+  assert.deepEqual(log[0].cfg.credentials, ROLE_CREDS);
+  assert.equal(log[0].cfg.accessKeySecret, undefined, 'the env-var AccessKey path is gone');
+});
+
+await test('rpc signs with the role credentials and carries the STS token', async () => {
+  const seen = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    seen.push({ url, body: opts.body });
+    return { ok: true, status: 200, text: async () => '{"RequestId":"r1"}' };
+  };
+  try {
+    await rpc.call(
+      { credentials: { accessKeyId: 'STS.id', accessKeySecret: 'sec', securityToken: 'tok' } },
+      'ecs',
+      '2014-05-26',
+      { Action: 'DescribeInstances' }
+    );
+  } finally {
+    globalThis.fetch = orig;
+  }
+  const body = seen[0].body;
+  assert.match(body, /AccessKeyId=STS\.id/);
+  assert.match(body, /SecurityToken=tok/, 'temporary credentials need the STS token');
+  assert.match(body, /Signature=/);
+});
+
+await test('rpc refuses to sign without credentials', async () => {
+  await assert.rejects(
+    () => rpc.call({}, 'ecs', '2014-05-26', { Action: 'DescribeInstances' }),
+    /no credentials .*bind the watchdog RAM role/
+  );
 });
 
 // ---------------------------------------------------------------------------

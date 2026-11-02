@@ -51,10 +51,25 @@ function loadConfig() {
     maxAttempts: Number(env.PAV_MAX_ATTEMPTS || file.maxAttempts || 5),
     retryDelayMs: Number(env.PAV_RETRY_DELAY_MS || file.retryDelayMs || 10000),
     clientTokenPrefix: (file.clientTokenPrefix || 'pav-watchdog').slice(0, 40),
-    accessKeyId: env.PAV_AK_ID || '',
-    accessKeySecret: env.PAV_AK_SECRET || '',
-    securityToken: env.PAV_STS_TOKEN || '',
+    // Credentials come from the FC function role at invocation time
+    // (context.credentials), never from the code package or env vars.
+    credentials: null,
   };
+}
+
+// Function Compute assumes the function's RAM role and injects the resulting
+// STS credentials into `context.credentials` (camelCase on Node.js runtimes;
+// the snake_case spellings show up on Python/PHP, tolerate them anyway so a
+// runtime switch cannot silently lock the watchdog out).
+function credentialsFromContext(context) {
+  if (!context) return null;
+  const c = context.credentials || context.Credentials || null;
+  if (!c) return null;
+  const accessKeyId = c.accessKeyId || c.access_key_id || '';
+  const accessKeySecret = c.accessKeySecret || c.access_key_secret || '';
+  const securityToken = c.securityToken || c.security_token || '';
+  if (!accessKeyId || !accessKeySecret) return null;
+  return { accessKeyId, accessKeySecret, securityToken };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -262,6 +277,17 @@ async function run(rawEvent, deps) {
     }
   }
 
+  // Fail closed: without role credentials the signer would produce an
+  // unsigned/undefined request. Refuse loudly instead of guessing.
+  cfg.credentials =
+    deps.credentials || credentialsFromContext(deps.context) || cfg.credentials || null;
+  if (!cfg.credentials) {
+    throw new Error(
+      'no credentials: the function must be bound to the watchdog RAM role ' +
+        '(Function Compute then injects context.credentials)'
+    );
+  }
+
   const res = await ensure(call, cfg, { now, pause });
   const out = Object.assign({ trigger: evt.kind }, res);
   logResult(out);
@@ -269,7 +295,18 @@ async function run(rawEvent, deps) {
 }
 
 async function handler(event, context) {
-  return run(event, null);
+  return run(event, { context });
 }
 
-module.exports = { handler, run, ensure, loadConfig, clientToken, parseEvent, authHttpEvent, listTagged, createInstance };
+module.exports = {
+  handler,
+  run,
+  ensure,
+  loadConfig,
+  credentialsFromContext,
+  clientToken,
+  parseEvent,
+  authHttpEvent,
+  listTagged,
+  createInstance,
+};
