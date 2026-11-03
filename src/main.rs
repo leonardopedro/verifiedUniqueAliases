@@ -2305,9 +2305,9 @@ fn html_with_secure_headers(bytes: Vec<u8>) -> Response {
 //     out is the whole point, and serving it from here defeated that;
 //   * the legal documents live on GitHub Pages, which is linked, not copied;
 //   * what remains at `/` is a small static landing: the title, one paragraph
-//     of what this is, the two legal links, and the machinery that saves
-//     verify.html from the repository and builds the file:// link to wherever
-//     it landed. No auditor code, no keys, no crypto, no user data.
+//     of what this is, the two legal links, a DOWNLOAD link for verify.html
+//     from the repository, and numbered instructions on what to do next. No
+//     text boxes, no key handling, no user data, no auditor code.
 //
 // The protocol endpoints (/attest/login-session, /callback, /tls-cert.pem,
 // /e2ee-blob, /debug/envelope) are untouched: they are the service.
@@ -2319,144 +2319,61 @@ const LANDING_HTML: &str = r#"<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Hardware and PayPal-Attested Unique Aliases</title>
 <style>
-  :root { --bg:#0d1117; --panel:#161b22; --text:#c9d1d9; --dim:#8b949e; --primary:#58a6ff; --ok:#238636; --border:#30363d; }
+  :root { --bg:#0d1117; --panel:#161b22; --text:#c9d1d9; --dim:#8b949e; --primary:#58a6ff; --border:#30363d; }
   * { box-sizing:border-box; }
   body { margin:0; padding:40px 20px; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,'Segoe UI',sans-serif; display:flex; justify-content:center; }
-  .card { max-width:700px; width:100%; background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:30px 32px; }
+  .card { max-width:640px; width:100%; background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:30px 32px; }
   h1 { margin:0 0 10px; font-size:1.45rem; line-height:1.3; color:#fff; }
+  h2 { margin:26px 0 8px; font-size:.95rem; color:#fff; }
   p { line-height:1.55; color:var(--dim); margin:0 0 12px; }
   a { color:var(--primary); }
   code { background:#0d1117; padding:1px 5px; border-radius:4px; font-size:.9em; }
+  ol { margin:0; padding-left:20px; color:var(--dim); line-height:1.6; }
+  ol li { margin-bottom:8px; }
   .legal { font-size:.82rem; margin:0 0 22px; }
-  .step { margin:0 0 0; padding-top:18px; border-top:1px solid var(--border); margin-top:18px; }
-  .label { font-weight:600; color:#3fb950; font-size:.85rem; margin:0 0 6px; }
-  .btn { display:inline-block; padding:12px 16px; border-radius:8px; font-weight:600; font-size:.95rem; cursor:pointer; border:none; }
-  .save { background:var(--ok); color:#fff; text-decoration:none; }
-  .link { background:#21262d; color:var(--primary); border:1px solid var(--border); font-family:monospace; font-size:.82rem; text-decoration:none; word-break:break-all; }
-  input { width:100%; padding:11px 12px; background:#0d1117; color:var(--text); border:1px solid var(--border); border-radius:8px; font-family:monospace; font-size:.85rem; margin:8px 0 12px; }
-  .status { display:block; font-size:.82rem; color:var(--dim); margin-top:10px; }
-  #linkBox { display:none; }
+  .dl { display:inline-block; margin:2px 0 8px; padding:13px 20px; background:#238636; color:#fff; border-radius:8px; font-weight:600; font-size:.95rem; text-decoration:none; }
+  .hint { display:block; font-size:.82rem; color:var(--dim); min-height:1.2em; }
 </style>
 </head>
 <body>
 <div class="card">
   <h1>Hardware and PayPal-Attested Unique Aliases</h1>
-  <p>This service binds a PayPal login to genuine confidential-computing hardware (Intel TDX) and returns a signed attestation: one unique alias, mostly anonymous, that nobody can mint twice. You keep the auditor, so you verify it yourself.</p>
+  <p>One PayPal login, bound to genuine confidential-computing hardware (Intel TDX), yields one verified unique alias &mdash; mostly anonymous, provable by the receiver, and impossible to mint twice.</p>
   <p class="legal">Legal: <a href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html">Privacy Policy</a> &middot; <a href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html">User Agreement</a></p>
 
-  <div class="step">
-    <p class="label">1 &middot; Save the auditor from the GitHub repository</p>
-    <p>Everything that touches your key runs in <code>verify.html</code>, on your machine. Take it from the verified source.</p>
-    <a class="btn save" id="save" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html" onclick="saveCopy(); return false;">&#128190; Save verify.html (opens the OS save window)</a>
-    <span class="status" id="status"></span>
-  </div>
+  <a class="dl" id="dl" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html" download="verify.html">&#128190; Download verify.html</a>
+  <span class="hint" id="hint"></span>
 
-  <div class="step" id="step2" style="display:none">
-    <p class="label">2 &middot; Where did it land?</p>
-    <input id="folder" placeholder="folder it saved into, e.g. file:///home/you/Downloads" oninput="buildLink(true)">
-    <div id="linkBox">
-      <p class="label">3 &middot; Your local copy</p>
-      <a class="btn link" id="localLink" href="file:///Downloads/verify.html" onclick="copyLink(this); return false;">file:///Downloads/verify.html</a>
-      <button class="btn save" id="confirm" onclick="confirmFolder(); return false;">&#10004; That is where I saved it</button>
-      <span class="status" id="registered"></span>
-    </div>
-  </div>
-
-  <div class="step">
-    <p class="label">Then</p>
-    <p>Open the saved file, put <code>https://login.airma.de</code> in its enclave address field, and log in with PayPal. The attestation comes back encrypted to a key that never leaves that file.</p>
-  </div>
+  <h2>What to do next</h2>
+  <ol>
+    <li>Open the downloaded file by double-clicking it (or with <b>Ctrl+O</b> / <b>&#8984;O</b>). The address bar must read <code>file:///&hellip;/verify.html</code> &mdash; the audit only runs from that local copy.</li>
+    <li>In it, keep <code>https://login.airma.de</code> as the enclave address and press <b>Log in with PayPal</b>. Your keypair is created by that file in your browser and never leaves it.</li>
+    <li>After PayPal returns, the encrypted attestation downloads by itself &mdash; load it back into the same file. It is decrypted and audited there; this server never sees the plaintext.</li>
+  </ol>
 </div>
 <script>
-(function () {
-  var RAW = 'https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html';
-  var NAME = 'verify.html', DIR = 'pav_landing_dir', LNK = 'pav_landing_linked';
-  function get(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
-  function set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
-  function guess() {
-    try {
-      var ua = navigator.userAgent || '';
-      if (/Windows/i.test(ua)) return 'file:///C:/Users/<you>/Downloads';
-      if (/Android/i.test(ua)) return 'file:///storage/emulated/0/Download';
-      if (/iPhone|iPad|Mac/i.test(ua)) return 'file:///Users/<you>/Downloads';
-      return 'file:///home/<you>/Downloads';
-    } catch (e) { return 'file:///Downloads'; }
+// The one piece of script left: a cross-origin link cannot carry a filename, and
+// raw.githubusercontent.com serves text/plain (the browser would show source),
+// so fetch the file and hand it to the browser as a download. Without JS the
+// link still works — it just opens the copy on GitHub.
+document.getElementById('dl').addEventListener('click', async function (ev) {
+  var hint = document.getElementById('hint');
+  ev.preventDefault();
+  try {
+    var r = await fetch(this.href, { cache: 'no-store' });
+    var t = await r.text();
+    if (!r.ok || t.indexOf('<html') === -1) throw new Error('HTTP ' + r.status);
+    var u = URL.createObjectURL(new Blob([t], { type: 'text/html;charset=utf-8' }));
+    var a = document.createElement('a');
+    a.href = u; a.download = 'verify.html';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(u); }, 10000);
+    hint.textContent = 'Saved to your downloads folder.';
+  } catch (e) {
+    hint.textContent = 'Could not save it here \u2014 save the page that just opened with Ctrl+S as verify.html.';
+    try { window.open(this.href, '_blank'); } catch (e2) {}
   }
-  function buildLink(manual) {
-    var inp = document.getElementById('folder'), a = document.getElementById('localLink');
-    var box = document.getElementById('linkBox'), reg = document.getElementById('registered');
-    var v = ((inp && inp.value) || '').trim(), remembered = get(DIR);
-    if (manual && v) { set(DIR, v); set(LNK, '1'); }
-    if (!v) v = remembered;
-    var href = '';
-    if (v) href = /\.html?([?#].*)?$/i.test(v) ? v : v.replace(/\/+$/, '') + '/' + NAME;
-    if (!href) { box.style.display = 'none'; reg.textContent = ''; return ''; }
-    a.href = href; a.textContent = href; box.style.display = 'block';
-    reg.textContent = (v === remembered && get(LNK) === '1')
-      ? '\u2705 registered \u2014 this link will be waiting here next time'
-      : '\u2754 guessed from your OS \u2014 confirm it if that is where the file went';
-    return href;
-  }
-  window.buildLink = buildLink;
-  window.confirmFolder = function () {
-    var inp = document.getElementById('folder');
-    if (inp && !inp.value) inp.value = guess();
-    set(DIR, inp.value); set(LNK, '1');
-    var href = buildLink(false);
-    document.getElementById('status').textContent = 'Registered: ' + href + ' \u2014 open it with Ctrl+O, or paste the link into the address bar (Ctrl+L).';
-    return false;
-  };
-  window.copyLink = function (el) {
-    try { navigator.clipboard.writeText(el.href); } catch (e) {}
-    document.getElementById('status').textContent = 'Copied ' + el.href + ' \u2014 paste it into the address bar (Ctrl+L). Clicking a file:// link from a web page is blocked by every browser on purpose.';
-    return false;
-  };
-  function afterSave() {
-    var inp = document.getElementById('folder');
-    document.getElementById('step2').style.display = 'block';
-    if (inp && !inp.value) inp.value = get(DIR) || guess();
-    var href = buildLink(false);
-    document.getElementById('status').textContent = 'Saved as ' + NAME + (href ? ' \u2014 link: ' + href : '') +
-      '. If that is where it went, press "That is where I saved it". Open it with Ctrl+O, or paste the link into the address bar.';
-  }
-  window.saveCopy = async function () {
-    var st = document.getElementById('status');
-    try {
-      var r = await fetch(RAW, { cache: 'no-store' });
-      var t = await r.text();
-      if (!r.ok || (t.indexOf('<html') === -1 && t.indexOf('<!DOCTYPE') === -1)) throw new Error('HTTP ' + r.status);
-      if (typeof window.showSaveFilePicker === 'function') {
-        try {
-          var h = await window.showSaveFilePicker({ suggestedName: NAME, types: [{ description: 'HTML', accept: { 'text/html': ['.html'] } }] });
-          var w = await h.createWritable();
-          await w.write(t); await w.close();
-          NAME = h.name || NAME;
-          afterSave();
-          return false;
-        } catch (pe) {
-          if (pe && pe.name === 'AbortError') { st.textContent = 'Save cancelled \u2014 nothing was written.'; return false; }
-        }
-      }
-      var u = URL.createObjectURL(new Blob([t], { type: 'text/html' }));
-      var a = document.createElement('a');
-      a.href = u; a.download = NAME;
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(function () { URL.revokeObjectURL(u); }, 10000);
-      afterSave();
-    } catch (e) {
-      try { window.open(RAW, '_blank'); } catch (e2) {}
-      st.textContent = 'Could not fetch the file here \u2014 opened the GitHub copy in a new tab: save it with Ctrl+S as verify.html, then fill in the folder below.';
-      document.getElementById('step2').style.display = 'block';
-    }
-    return false;
-  };
-  if (get(DIR)) {
-    var box = document.getElementById('step2'), inp = document.getElementById('folder');
-    box.style.display = 'block';
-    if (inp) inp.value = get(DIR);
-    buildLink(false);
-  }
-})();
+});
 </script>
 </body>
 </html>

@@ -2398,10 +2398,21 @@ console.log('\nTest 51: local-copy rescue card — non-file:// origins get save 
       !rust.includes('serve_privacy_html') && !rust.includes('serve_terms_html')
         && !rust.includes('/boot/efi/verify.html'),
       'a removed route/handler is still present');
-    check('the landing page offers the repo download + the local link builder',
+    // v206 (user directive): the landing is a DOWNLOAD LINK plus instructions.
+    // The folder text box, the file:// builder and the remembered path are
+    // gone — they asked the visitor to type a path the browser already knows.
+    check('the landing offers the repo download link',
       landing.includes('raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html')
-        && landing.includes('showSaveFilePicker') && landing.includes('file:///Downloads/verify.html'),
-      'landing is missing the save/link machinery');
+        && landing.includes('Download verify.html'),
+      'landing is missing the download link');
+    check('the landing carries no path text box and no file:// link builder',
+      !/<input|<textarea/.test(landing)
+        && !landing.includes('localStorage') && !landing.includes('file:///Downloads')
+        && !landing.includes('showSaveFilePicker'),
+      'the old folder/link machinery is still in the landing');
+    check('the landing tells the visitor what to do next',
+      landing.includes('file:///') && landing.includes('Log in with PayPal'),
+      'next-step instructions missing');
     check('the landing carries NO auditor code (no keys, no pins, no crypto)',
       landing.length > 0
         && !/generateKey|subtle\.|EXPECTED_ENCLAVE_SHA256|EXPECTED_RTMR|EXPECTED_MRTD/.test(landing),

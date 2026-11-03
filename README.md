@@ -96,7 +96,7 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 254,709 bytes | `1f0fed7c7b41d16f0afa7d51554cb7a98a9bd27bdfe74307d4d0e68c671e81c3` |
+| `verify.html` | 257,063 bytes | `69bcf10cfbcbb57984e5458de605a18602fab086c1f6f5d220116a77d63c8353` |
 | `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
 | `zk-rsa.html` | 100,001 bytes | `a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40` |
 | `privacy.html` | 4,673 bytes | `e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8` |
@@ -104,17 +104,20 @@ the file it describes:
 
 ```bash
 sha256sum verify.html zk.html zk-rsa.html privacy.html terms.html
-# 1f0fed7c7b41d16f0afa7d51554cb7a98a9bd27bdfe74307d4d0e68c671e81c3  verify.html
+# 69bcf10cfbcbb57984e5458de605a18602fab086c1f6f5d220116a77d63c8353  verify.html
 # 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
 # a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40  zk-rsa.html
 # e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8  privacy.html
 # 9e8daa06da92308c19aa85b1cf33ee44d92be19b0daebe031eecc952002fb61f  terms.html
 ```
 
-**What the service serves (v205):** `https://login.airma.de/` is a minimal
+**What the service serves (v206):** `https://login.airma.de/` is a minimal
 landing only — the title, one paragraph on what this is, the two legal links
-(GitHub Pages), and the machinery that saves `verify.html` from the GitHub
-repository and builds the `file://` link to wherever it landed. The enclave no
+(GitHub Pages), a **Download `verify.html`** link to the repository copy, and
+three short steps on what to do with it (open the saved file, log in there,
+load the encrypted report back). There is no path box and no link builder on
+the service: the browser owns the download location, so the page no longer asks
+the visitor to type it. The enclave no
 longer serves the auditor (`/` and `/verify.html` both render the landing), nor
 `privacy.html`/`terms.html`, nor `zk.html`: the auditor and the ZK prover are
 taken from the repository so the operator cannot rewrite them on the way out,
