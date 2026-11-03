@@ -96,16 +96,30 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 249,061 bytes | `e6aa0afb134c05e6495ac173fbd7fba2f2c4f914b5a5d4c2b31a80577fe1d7d4` |
+| `verify.html` | 254,709 bytes | `1f0fed7c7b41d16f0afa7d51554cb7a98a9bd27bdfe74307d4d0e68c671e81c3` |
 | `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
 | `zk-rsa.html` | 100,001 bytes | `a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40` |
+| `privacy.html` | 4,673 bytes | `e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8` |
+| `terms.html` | 3,663 bytes | `9e8daa06da92308c19aa85b1cf33ee44d92be19b0daebe031eecc952002fb61f` |
 
 ```bash
-sha256sum verify.html zk.html zk-rsa.html
-# e6aa0afb134c05e6495ac173fbd7fba2f2c4f914b5a5d4c2b31a80577fe1d7d4  verify.html
+sha256sum verify.html zk.html zk-rsa.html privacy.html terms.html
+# 1f0fed7c7b41d16f0afa7d51554cb7a98a9bd27bdfe74307d4d0e68c671e81c3  verify.html
 # 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
 # a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40  zk-rsa.html
+# e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8  privacy.html
+# 9e8daa06da92308c19aa85b1cf33ee44d92be19b0daebe031eecc952002fb61f  terms.html
 ```
+
+**What the service serves (v205):** `https://login.airma.de/` is a minimal
+landing only — the title, one paragraph on what this is, the two legal links
+(GitHub Pages), and the machinery that saves `verify.html` from the GitHub
+repository and builds the `file://` link to wherever it landed. The enclave no
+longer serves the auditor (`/` and `/verify.html` both render the landing), nor
+`privacy.html`/`terms.html`, nor `zk.html`: the auditor and the ZK prover are
+taken from the repository so the operator cannot rewrite them on the way out,
+and the legal documents are linked, not copied. `verify.html` carries exactly
+one "Legal:" line, at the top.
 
 (`zk.html` is the standalone zero-knowledge prover — split out of
 `verify.html` in v194 so the ZK layer can be debugged without rebuilding the
@@ -203,13 +217,33 @@ PAV_DRY_RUN=1 PAV_NONINTERACTIVE=1 \
 bash upload-secrets.sh
 ```
 
-Interactive use is just `bash upload-secrets.sh` — it offers four modes:
+Interactive use is just `bash upload-secrets.sh` — it offers five modes:
 
 | Menu | What it does |
 |---|---|
 | **1 / 2** | Rotate credentials for staging / production |
 | **3** | Flip `staging` only — **prompts for no credentials**, exactly as labelled |
 | **4** | Rotate (or `clear`) the ZeroSSL EAB pair |
+| **5** | Rotate the Cloudflare DNS-01 API token (and/or the DNS zone) only |
+
+Mode **5** is the narrow path for an expired/revoked Cloudflare token: it
+prompts for the token in a password field (twice) and an optional zone, touches
+nothing else, and leaves `staging`, both PayPal pairs, the EAB pair and
+`acme_account_json` alone — so the existing ACME account keeps working and only
+the DNS-01 credential changes. `PAV_DNS01_ZONE=derived` drops a zone override
+and goes back to deriving the zone from `domain`. Non-interactively:
+
+```bash
+PAV_NONINTERACTIVE=1 PAV_CHOICE=5 PAV_DNS01_TOKEN=... bash upload-secrets.sh
+```
+
+The token can **not** be verified from the operator host: it is source-IP
+restricted to the reserved EIP, so a request from anywhere else answers
+`9109 Cannot use the access token from location: …` regardless of whether the
+token is good. The reboot that follows the push is the test (ACME runs once at
+boot; a bad token surfaces as `ACME certificate failed: Cloudflare zone not
+found` and a dark `:443`, and the rollback prompt then restores the previous
+config from memory).
 
 `staging: true` = PayPal **sandbox**; `staging: false` = PayPal **production**
 (`main.rs` picks `PAYPAL_SANDBOX_AUTH` vs `PAYPAL_PRODUCTION_AUTH` from that one

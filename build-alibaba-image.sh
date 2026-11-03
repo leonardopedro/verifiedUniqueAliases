@@ -31,6 +31,10 @@ GRUB="./output/grubx64.efi"
 # v167 (plan.md): the auditor lives on the ESP, NOT in the initramfs —
 # RTMR2 covers the initrd, so pins inside the initrd would be circular.
 VERIFY="./verify.html"
+# v205: the service no longer SERVES verify.html (or the legal docs) — the
+# landing page is embedded in the binary and the auditor comes from the GitHub
+# repository. The ESP copy stays for manifest/provenance parity with the
+# deployed disk; nothing routes to it.
 
 for f in "$KERNEL" "$INITRD" "$SHIM" "$GRUB" "$VERIFY"; do
     [ -f "$f" ] || { echo "MISSING: $f"; exit 1; }
@@ -63,7 +67,8 @@ mcopy -i "$ESP_IMAGE" "$SHIM"   ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "$ESP_IMAGE" "$GRUB"   ::/EFI/BOOT/grubx64.efi
 mcopy -i "$ESP_IMAGE" "$KERNEL" ::/EFI/BOOT/vmlinuz
 mcopy -i "$ESP_IMAGE" "$INITRD" ::/EFI/BOOT/initrd.img
-# ESP root: the enclave serves it at /verify.html from /boot/efi/verify.html
+# ESP root. v205: NOT routed any more (the auditor is downloaded from GitHub);
+# kept so the ESP manifest still matches the provenance baseline.
 mcopy -i "$ESP_IMAGE" "$VERIFY" ::/verify.html
 
 # grub.cfg sits NEXT TO grubx64.efi ($cmdpath) so Debian's signed grub finds it

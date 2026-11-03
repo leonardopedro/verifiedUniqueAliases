@@ -1779,8 +1779,8 @@ const CALLBACK_CONTENT: &str = r#"<h1>Authentication Succeeded</h1>
                 <h3>Your encrypted attestation is downloading automatically — save this tab's TLS certificate before you leave it</h3>
                 <p><b>⏳ 1/3 — download in progress:</b> <code>encrypted-attestation-report.json</code> was saved the moment this page loaded. It is CIPHERTEXT, sealed to a throwaway key that only ever existed in the tab where you started the login — useless to anyone else, including this site.</p>
                 <p><b>🔒 2/3 — save the TLS certificate of THIS page:</b> this tab is the response that carried your attestation, so its certificate panel is the only independent record of that connection. <b>Chrome / Edge:</b> padlock → <i>Connection is secure</i> → <i>Certificate is valid</i> → Details → Export → PEM. <b>Firefox:</b> padlock → <i>Connection secure</i> → <i>More information</i> → View Certificate → ⋯ → Save/Export PEM. <b>Safari:</b> ⋯ → Show Certificate → drag it out. Do <b>not</b> use this site's <code>/tls-cert.pem</code> instead: it is served by the same party whose report you are about to check, so it can never disagree with the report. Script cannot read its own connection certificate — that is why this step is manual.</p>
-                <p><b>⬅️ 3/3 — go back to the PREVIOUS (local) tab</b> — your <code>verify.html</code> (file:// or the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color:#64b5f6;">GitHub Pages auditor</a>). Load <code>encrypted-attestation-report.json</code> with the “Attestation JSON report” picker and the certificate you exported with the “Browser TLS certificate” picker, then run the audit. That trusted copy decrypts with the key it generated on load; with a certificate supplied, the channel row proves the endpoint you reached served exactly the chain recorded in the hardware-signed report. This tab holds nothing else — close it with the ✖ button whenever you like.</p>
-                <p style="margin:14px 0 0; font-size:0.85rem; color:#8b949e;">Further reading: <a href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html" style="color:#64b5f6;">Privacy Policy</a> · <a href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html" style="color:#64b5f6;">User Agreement</a> — published on the project's <a href="https://leonardopedro.github.io/verifiedUniqueAliases/" style="color:#64b5f6;">GitHub Pages</a>, independent of this enclave.</p>
+                <p><b>⬅️ 3/3 — go back to the PREVIOUS (local) tab</b> — your saved <code>verify.html</code> (the file you opened from <code>file://</code>). Load <code>encrypted-attestation-report.json</code> with the “Attestation JSON report” picker and the certificate you exported with the “Browser TLS certificate” picker, then run the audit. That trusted copy decrypts with the key it generated on load; with a certificate supplied, the channel row proves the endpoint you reached served exactly the chain recorded in the hardware-signed report. This tab holds nothing else — close it with the ✖ button whenever you like.</p>
+                <p style="margin:14px 0 0; font-size:0.85rem; color:#8b949e;">Further reading: <a href="/privacy.html" style="color:#64b5f6;">Privacy Policy</a> · <a href="/terms.html" style="color:#64b5f6;">User Agreement</a> — served by this service, the party they describe.</p>
                 <p id="cert-reminder" style="margin:12px 0 0; padding:10px 12px; border-radius:6px; background:#0d1117; border:1px solid #d29922; color:#d29922; font-size:0.9rem;">🔒 Export this tab's certificate <b>before</b> closing it — a closed tab's certificate cannot be retrieved. Nothing is held here: the ciphertext above is useless without the key that only ever existed in your other tab.</p>
                 <textarea id="e2ee-blob-view" readonly style="width:100%; height:180px; background:#0d1117; color:#9e9e9e; font-size:12px; border:1px solid #30363d; border-radius:6px; padding:10px; box-sizing:border-box;"></textarea>
                 <p><button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); t.select(); try{document.execCommand('copy');this;}catch(e){} try{navigator.clipboard.writeText(t.value);}catch(e){} this.textContent='✅ Copied — paste it into a trusted auditor';})()" style="margin-top:10px;">📋 Copy encrypted report</button> <button class="btn" onclick="window.close()" style="margin-top:10px;"> ✖ Close this tab</button></p>
@@ -2295,28 +2295,177 @@ fn html_with_secure_headers(bytes: Vec<u8>) -> Response {
     with_secure_headers(resp)
 }
 
-async fn serve_verify_html() -> impl IntoResponse {
-    // Served from the ESP (disk file), NOT embedded via include_str!. This
-    // is deliberate: EXPECTED_ENCLAVE_SHA256 (the code-pin gate) and the
-    // EXPECTED_MRTD/EXPECTED_RTMR* hardware pins live in this file and must
-    // be stable constants that the measured boot chain's hash can be
-    // compared against. v167 (plan.md): the auditor moved from the
-    // initramfs to the ESP because hardware measurements (RTMR2) cover the
-    // initrd — a pin INSIDE the initrd would shift the very register it
-    // pins (self-reference). The ESP copy is not loaded by the boot
-    // chain, so editing pins does not move any RTMR.
-    match std::fs::read("/boot/efi/verify.html") {
-        Ok(bytes) => html_with_secure_headers(bytes),
-        // legacy images kept the auditor in the initramfs root
-        Err(_) => match std::fs::read("/verify.html") {
-            Ok(bytes) => html_with_secure_headers(bytes),
-            Err(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "verify.html not present on ESP or initramfs",
-            )
-                .into_response(),
-        },
+// ============================================================================
+// v205 (user directive): THE SERVICE SERVES ONLY WHAT IS STRICTLY NEEDED.
+//
+// It used to serve the auditor itself (from the ESP) plus privacy.html and
+// terms.html. All three are GONE from this origin:
+//   * the auditor and the ZK prover are taken from the project's GitHub
+//     repository — a copy that the enclave operator cannot rewrite on the way
+//     out is the whole point, and serving it from here defeated that;
+//   * the legal documents live on GitHub Pages, which is linked, not copied;
+//   * what remains at `/` is a small static landing: the title, one paragraph
+//     of what this is, the two legal links, and the machinery that saves
+//     verify.html from the repository and builds the file:// link to wherever
+//     it landed. No auditor code, no keys, no crypto, no user data.
+//
+// The protocol endpoints (/attest/login-session, /callback, /tls-cert.pem,
+// /e2ee-blob, /debug/envelope) are untouched: they are the service.
+// ============================================================================
+const LANDING_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hardware and PayPal-Attested Unique Aliases</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --text:#c9d1d9; --dim:#8b949e; --primary:#58a6ff; --ok:#238636; --border:#30363d; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:40px 20px; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,'Segoe UI',sans-serif; display:flex; justify-content:center; }
+  .card { max-width:700px; width:100%; background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:30px 32px; }
+  h1 { margin:0 0 10px; font-size:1.45rem; line-height:1.3; color:#fff; }
+  p { line-height:1.55; color:var(--dim); margin:0 0 12px; }
+  a { color:var(--primary); }
+  code { background:#0d1117; padding:1px 5px; border-radius:4px; font-size:.9em; }
+  .legal { font-size:.82rem; margin:0 0 22px; }
+  .step { margin:0 0 0; padding-top:18px; border-top:1px solid var(--border); margin-top:18px; }
+  .label { font-weight:600; color:#3fb950; font-size:.85rem; margin:0 0 6px; }
+  .btn { display:inline-block; padding:12px 16px; border-radius:8px; font-weight:600; font-size:.95rem; cursor:pointer; border:none; }
+  .save { background:var(--ok); color:#fff; text-decoration:none; }
+  .link { background:#21262d; color:var(--primary); border:1px solid var(--border); font-family:monospace; font-size:.82rem; text-decoration:none; word-break:break-all; }
+  input { width:100%; padding:11px 12px; background:#0d1117; color:var(--text); border:1px solid var(--border); border-radius:8px; font-family:monospace; font-size:.85rem; margin:8px 0 12px; }
+  .status { display:block; font-size:.82rem; color:var(--dim); margin-top:10px; }
+  #linkBox { display:none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Hardware and PayPal-Attested Unique Aliases</h1>
+  <p>This service binds a PayPal login to genuine confidential-computing hardware (Intel TDX) and returns a signed attestation: one unique alias, mostly anonymous, that nobody can mint twice. You keep the auditor, so you verify it yourself.</p>
+  <p class="legal">Legal: <a href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html">Privacy Policy</a> &middot; <a href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html">User Agreement</a></p>
+
+  <div class="step">
+    <p class="label">1 &middot; Save the auditor from the GitHub repository</p>
+    <p>Everything that touches your key runs in <code>verify.html</code>, on your machine. Take it from the verified source.</p>
+    <a class="btn save" id="save" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html" onclick="saveCopy(); return false;">&#128190; Save verify.html (opens the OS save window)</a>
+    <span class="status" id="status"></span>
+  </div>
+
+  <div class="step" id="step2" style="display:none">
+    <p class="label">2 &middot; Where did it land?</p>
+    <input id="folder" placeholder="folder it saved into, e.g. file:///home/you/Downloads" oninput="buildLink(true)">
+    <div id="linkBox">
+      <p class="label">3 &middot; Your local copy</p>
+      <a class="btn link" id="localLink" href="file:///Downloads/verify.html" onclick="copyLink(this); return false;">file:///Downloads/verify.html</a>
+      <button class="btn save" id="confirm" onclick="confirmFolder(); return false;">&#10004; That is where I saved it</button>
+      <span class="status" id="registered"></span>
+    </div>
+  </div>
+
+  <div class="step">
+    <p class="label">Then</p>
+    <p>Open the saved file, put <code>https://login.airma.de</code> in its enclave address field, and log in with PayPal. The attestation comes back encrypted to a key that never leaves that file.</p>
+  </div>
+</div>
+<script>
+(function () {
+  var RAW = 'https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html';
+  var NAME = 'verify.html', DIR = 'pav_landing_dir', LNK = 'pav_landing_linked';
+  function get(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
+  function set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  function guess() {
+    try {
+      var ua = navigator.userAgent || '';
+      if (/Windows/i.test(ua)) return 'file:///C:/Users/<you>/Downloads';
+      if (/Android/i.test(ua)) return 'file:///storage/emulated/0/Download';
+      if (/iPhone|iPad|Mac/i.test(ua)) return 'file:///Users/<you>/Downloads';
+      return 'file:///home/<you>/Downloads';
+    } catch (e) { return 'file:///Downloads'; }
+  }
+  function buildLink(manual) {
+    var inp = document.getElementById('folder'), a = document.getElementById('localLink');
+    var box = document.getElementById('linkBox'), reg = document.getElementById('registered');
+    var v = ((inp && inp.value) || '').trim(), remembered = get(DIR);
+    if (manual && v) { set(DIR, v); set(LNK, '1'); }
+    if (!v) v = remembered;
+    var href = '';
+    if (v) href = /\.html?([?#].*)?$/i.test(v) ? v : v.replace(/\/+$/, '') + '/' + NAME;
+    if (!href) { box.style.display = 'none'; reg.textContent = ''; return ''; }
+    a.href = href; a.textContent = href; box.style.display = 'block';
+    reg.textContent = (v === remembered && get(LNK) === '1')
+      ? '\u2705 registered \u2014 this link will be waiting here next time'
+      : '\u2754 guessed from your OS \u2014 confirm it if that is where the file went';
+    return href;
+  }
+  window.buildLink = buildLink;
+  window.confirmFolder = function () {
+    var inp = document.getElementById('folder');
+    if (inp && !inp.value) inp.value = guess();
+    set(DIR, inp.value); set(LNK, '1');
+    var href = buildLink(false);
+    document.getElementById('status').textContent = 'Registered: ' + href + ' \u2014 open it with Ctrl+O, or paste the link into the address bar (Ctrl+L).';
+    return false;
+  };
+  window.copyLink = function (el) {
+    try { navigator.clipboard.writeText(el.href); } catch (e) {}
+    document.getElementById('status').textContent = 'Copied ' + el.href + ' \u2014 paste it into the address bar (Ctrl+L). Clicking a file:// link from a web page is blocked by every browser on purpose.';
+    return false;
+  };
+  function afterSave() {
+    var inp = document.getElementById('folder');
+    document.getElementById('step2').style.display = 'block';
+    if (inp && !inp.value) inp.value = get(DIR) || guess();
+    var href = buildLink(false);
+    document.getElementById('status').textContent = 'Saved as ' + NAME + (href ? ' \u2014 link: ' + href : '') +
+      '. If that is where it went, press "That is where I saved it". Open it with Ctrl+O, or paste the link into the address bar.';
+  }
+  window.saveCopy = async function () {
+    var st = document.getElementById('status');
+    try {
+      var r = await fetch(RAW, { cache: 'no-store' });
+      var t = await r.text();
+      if (!r.ok || (t.indexOf('<html') === -1 && t.indexOf('<!DOCTYPE') === -1)) throw new Error('HTTP ' + r.status);
+      if (typeof window.showSaveFilePicker === 'function') {
+        try {
+          var h = await window.showSaveFilePicker({ suggestedName: NAME, types: [{ description: 'HTML', accept: { 'text/html': ['.html'] } }] });
+          var w = await h.createWritable();
+          await w.write(t); await w.close();
+          NAME = h.name || NAME;
+          afterSave();
+          return false;
+        } catch (pe) {
+          if (pe && pe.name === 'AbortError') { st.textContent = 'Save cancelled \u2014 nothing was written.'; return false; }
+        }
+      }
+      var u = URL.createObjectURL(new Blob([t], { type: 'text/html' }));
+      var a = document.createElement('a');
+      a.href = u; a.download = NAME;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function () { URL.revokeObjectURL(u); }, 10000);
+      afterSave();
+    } catch (e) {
+      try { window.open(RAW, '_blank'); } catch (e2) {}
+      st.textContent = 'Could not fetch the file here \u2014 opened the GitHub copy in a new tab: save it with Ctrl+S as verify.html, then fill in the folder below.';
+      document.getElementById('step2').style.display = 'block';
     }
+    return false;
+  };
+  if (get(DIR)) {
+    var box = document.getElementById('step2'), inp = document.getElementById('folder');
+    box.style.display = 'block';
+    if (inp) inp.value = get(DIR);
+    buildLink(false);
+  }
+})();
+</script>
+</body>
+</html>
+"#;
+
+/// The landing page is embedded, not read from the ESP: it carries no pins and
+/// no auditor code, so there is nothing to rotate independently of the binary.
+async fn serve_landing() -> impl IntoResponse {
+    html_with_secure_headers(LANDING_HTML.as_bytes().to_vec())
 }
 
 // ----------------------------------------------------------------------------
@@ -2740,7 +2889,7 @@ async fn callback(
             .into_response();
     }
     if code.trim().is_empty() {
-        return (StatusCode::FORBIDDEN, "Invalid or expired session. Start from /verify.html").into_response();
+        return (StatusCode::FORBIDDEN, "Invalid or expired session. Start from your saved verify.html").into_response();
     }
 
     // v180 (user directive — no pre-login attestation): the client session
@@ -2761,7 +2910,7 @@ async fn callback(
     // PayPal is the attacker filter, so no unauthenticated caller can ever
     // trigger quote minting (the pre-flight's DoS surface, removed).
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
-    let invalid_session = || (StatusCode::FORBIDDEN, "Invalid or expired session. Start from /verify.html").into_response();
+    let invalid_session = || (StatusCode::FORBIDDEN, "Invalid or expired session. Start from your saved verify.html").into_response();
     let state_raw = match B64URL.decode(state_param.trim()) {
         Ok(v) => v,
         Err(_) => return invalid_session(),
@@ -3279,8 +3428,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
 
         let app = Router::new()
-            .route("/", get(serve_verify_html))
-            .route("/verify.html", get(serve_verify_html))
+            // v205: the service serves the landing only. The auditor and the
+            // ZK prover come from the GitHub repository, the legal documents
+            // from GitHub Pages (linked, never copied).
+            .route("/", get(serve_landing))
+            // Kept as an alias so an old bookmark lands on the instructions
+            // instead of a 404 — it serves the same landing, never the auditor.
+            .route("/verify.html", get(serve_landing))
             .route("/attest/login-session", axum::routing::options(login_session_cors).post(attest_login_session))
             .route("/debug/envelope", get(debug_envelope))
             // v189 (user request): the enclave's own TLS chain as a PEM file,

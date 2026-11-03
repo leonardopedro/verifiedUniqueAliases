@@ -204,7 +204,9 @@
 
 <div class="container">
     <header>
-        <a href="https://leonardopedro.github.io/verifiedUniqueAliases/" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 8px;">← Project Hub (source code, privacy, terms)</a>
+        <!-- v205 (user directive): the service serves only the landing page, so
+             the legal documents are LINKED (GitHub Pages), never copied here.
+             This is the only legal line on the page. -->
         <p style="font-size: 0.82rem; color: var(--text-dim); margin: 0 0 14px;">Legal: <a href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html" style="color: var(--primary);">Privacy Policy</a> · <a href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html" style="color: var(--primary);">User Agreement</a></p>
         <h1>Hardware and PayPal-Attested Unique Aliases</h1>
         <p class="subtitle">One PayPal identity, one machine's hardware, bound into one report you control — unique, mostly anonymous, and provably real.</p>
@@ -218,38 +220,54 @@
         <p style="color:var(--text-dim); font-size:0.9rem; margin:0 0 10px;">A login binds your PayPal identity to real confidential-computing hardware (Intel TDX) and the result is one <b>unique alias</b>: nobody can mint a second one that passes as you. It is <b>mostly anonymous</b> — the report carries hashes, not your name — and disclosure is <b>your choice</b>: nobody by default, or one entity you trust (a lawyer, a regulator, the Police escrow key below). Both the <b>owner</b> of this service and the <b>receiver</b> of your attestation verify the same two facts: PayPal vouched for the account, and genuine hardware handled it.</p>
         <details style="margin-top:2px;">
             <summary style="cursor:pointer; color:#58a6ff; font-weight:600; font-size:0.95rem;">Derived attestations: reveal less and stay valid (zero-knowledge)</summary>
-            <p style="color:var(--text-dim); font-size:0.88rem; margin:10px 0 0;">A Groth16 zero-knowledge proof (<a href="https://leonardopedro.github.io/verifiedUniqueAliases/zk.html" style="color:#58a6ff;">zk.html</a>) derives a <b>new</b> statement from the same hardware-signed report while the PayPal and hardware signatures stay untouched: you can prove “this report is for a unique, PayPal-verified account that existed before date X” without revealing the email, the name or the account id. The proof is bound to the report's own signed bytes — not to a re-statement of them — so the attestation remains valid, and only what you choose to reveal is revealed.</p>
+            <p style="color:var(--text-dim); font-size:0.88rem; margin:10px 0 0;">A Groth16 zero-knowledge proof (<a href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/zk.html" style="color:#58a6ff;">zk.html from the GitHub repository</a> — save it and open it locally, like this page) derives a <b>new</b> statement from the same hardware-signed report while the PayPal and hardware signatures stay untouched: you can prove “this report is for a unique, PayPal-verified account that existed before date X” without revealing the email, the name or the account id. The proof is bound to the report's own signed bytes — not to a re-statement of them — so the attestation remains valid, and only what you choose to reveal is revealed.</p>
         </details>
-        <p style="color:var(--text-dim); font-size:0.85rem; margin:10px 0 0;">Read the details: <a href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html" style="color:#58a6ff;">Privacy Policy</a> · <a href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html" style="color:#58a6ff;">User Agreement</a> · <a href="https://leonardopedro.github.io/verifiedUniqueAliases/" style="color:#58a6ff;">source on GitHub Pages</a></p>
     </div>
 
-    <!-- v202 (user request): LOCAL-COPY RESCUE CARD. Rendered ONLY on a
+    <!-- v202/v204 (user request): LOCAL-COPY RESCUE CARD. Rendered ONLY on a
          non-file:// origin (revealLocalCopyCard checks location.protocol):
-           * on the enclave's own origin it is the fix for the UNTRUSTED
-             AUDITOR ORIGIN refusal — the download button takes the page from
-             the project's GitHub (raw),
-           * the grey link is the file:// path where the copy lands, and
+           * step 1 takes the page from the project's GitHub REPOSITORY (raw) —
+             the source whose contents are verified — and deliberately NOT from
+             the GitHub Pages mirror,
+           * step 2 registers where the copy actually landed (a browser never
+             reveals a download folder, so the visitor supplies it once) and
+             step 3 shows the file:// link built from it, remembered in
+             localStorage for the next visit,
            * the open-help explains the browser rules (a web page may NOT
              navigate to file:// — Ctrl+O / paste-in-address-bar always work).
          Nothing here generates keys or talks to the enclave: it only helps the
          visitor reach the trusted local copy, which is where the key lives. -->
     <div id="localCopyCard" style="display:none; margin:0 0 24px 0; background:#161b22; border:1px solid #d29922; border-radius:16px; padding:20px 24px;">
         <label style="margin-bottom:6px;">💾 Run this auditor from YOUR machine — save it, then open the local file</label>
-        <p style="color:var(--text-dim); font-size:0.9rem; margin:0 0 14px;">You are viewing a copy served over the network (from <code id="localCopyOrigin">a server</code>). Whoever controls that origin can rewrite this script, so take your own copy from the project's GitHub, then open it as a file. A browser deliberately refuses to follow a <code>file://</code> link clicked inside a web page — and it never tells a web page the directory it saved into — so tell me where it landed and I will build the link for you:</p>
+        <p style="color:var(--text-dim); font-size:0.9rem; margin:0 0 14px;">You are viewing a copy served over the network (from <code id="localCopyOrigin">a server</code>). Whoever controls that origin can rewrite this script, so take your own copy from the project's <b style="color:#e6edf3;">GitHub repository</b> — the source whose contents are verified — and open it as a file. Do <b style="color:#e6edf3;">not</b> take the GitHub Pages copy for this step: it is a convenience mirror that the site owner can republish, not the source of truth.</p>
+
+        <p style="margin:0 0 6px; font-size:0.85rem; color:#3fb950; font-weight:600;">1 · Save the auditor</p>
         <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
-            <a id="localCopySave" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html" onclick="return saveLocalCopy(this)" style="display:inline-block; margin:0; padding:13px 18px; background:#238636; color:#fff; border-radius:8px; font-weight:600; text-decoration:none; cursor:pointer;">💾 1. Save verify.html (from the GitHub repo)</a>
-            <input type="text" id="localCopyFolder" placeholder="2. where did it save? e.g. file:///Downloads" oninput="return updateLocalCopyLink()" style="margin:0; padding:12px 12px; background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:8px; font-family:monospace; font-size:0.85rem; min-width:270px; flex:1;">
-            <a id="localCopyLink" href="file:///Downloads/verify.html" onclick="return copyLocalLink(this)" style="display:inline-block; margin:0; padding:13px 18px; background:#21262d; color:#58a6ff; border:1px solid #30363d; border-radius:8px; font-weight:600; text-decoration:none; cursor:pointer;">file:///Downloads/verify.html</a>
+            <a id="localCopySave" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html" onclick="saveLocalCopy(this); return false;" style="display:inline-block; margin:0; padding:13px 18px; background:#238636; color:#fff; border-radius:8px; font-weight:600; text-decoration:none; cursor:pointer;">💾 Save verify.html (opens the OS save window)</a>
             <span id="localCopyStatus" style="font-size:0.82rem; color:var(--text-dim); flex:1; min-width:240px;"></span>
         </div>
+
+        <div id="localCopyStep2" style="display:none; margin-top:16px; padding-top:14px; border-top:1px solid #30363d;">
+            <p style="margin:0 0 6px; font-size:0.85rem; color:#3fb950; font-weight:600;">2 · Where did it land?</p>
+            <p style="color:var(--text-dim); font-size:0.85rem; margin:0 0 10px;">A browser never tells a web page which folder it saved into, and it refuses to follow a <code>file://</code> link clicked inside a page — so give me the folder once (usually your <code>Downloads</code>); the link below becomes yours and is remembered for next time.</p>
+            <input type="text" id="localCopyFolder" placeholder="folder it saved into, e.g. file:///home/you/Downloads" oninput="return updateLocalCopyLink(true)" style="margin:0 0 12px 0; width:100%; padding:12px 12px; background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:8px; font-family:monospace; font-size:0.85rem; box-sizing:border-box;">
+            <div id="localCopyLinkBox" style="display:none;">
+                <p style="margin:0 0 6px; font-size:0.85rem; color:#3fb950; font-weight:600;">3 · Your local copy</p>
+                <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+                    <a id="localCopyLink" href="file:///Downloads/verify.html" onclick="return copyLocalLink(this)" style="display:inline-block; margin:0; padding:12px 16px; background:#21262d; color:#58a6ff; border:1px solid #30363d; border-radius:8px; font-weight:600; text-decoration:none; cursor:pointer; font-family:monospace; font-size:0.85rem; word-break:break-all;">file:///Downloads/verify.html</a>
+                    <a id="localCopyConfirm" href="#" onclick="return confirmLocalCopyLocation()" style="display:inline-block; margin:0; padding:12px 16px; background:#238636; color:#fff; border-radius:8px; font-weight:600; text-decoration:none; cursor:pointer;">✔ That is where I saved it</a>
+                    <span id="localCopyRegistered" style="font-size:0.8rem; color:#3fb950; flex:1; min-width:200px;"></span>
+                </div>
+            </div>
+        </div>
         <details style="margin-top:14px;">
-            <summary style="cursor:pointer; color:#58a6ff; font-weight:600; font-size:0.95rem;">3. How to OPEN the local file (a click on a file:// link is blocked — do this instead)</summary>
+            <summary style="cursor:pointer; color:#58a6ff; font-weight:600; font-size:0.95rem;">How to OPEN the local file (a click on a file:// link is blocked — do this instead)</summary>
             <ol style="color:var(--text-dim); font-size:0.88rem; margin:10px 0 0; padding-left:20px;">
-                <li><b style="color:#e6edf3;">Fastest — keyboard:</b> press <b style="color:#e6edf3;">Ctrl+O</b> (<b style="color:#e6edf3;">⌘O</b> on macOS) and pick the <code>verify.html</code> you just saved (usually in <code>Downloads</code>). Chrome, Edge and Firefox all honour it; Safari uses File → Open File….</li>
-                <li><b style="color:#e6edf3;">Or paste the grey link above:</b> copy it, press <b style="color:#e6edf3;">Ctrl+L</b> (<b style="color:#e6edf3;">⌘L</b>) to jump to the address bar, and paste. <i>Clicking</i> it from this page is blocked by every browser on purpose — pasting it (or typing it) always works. If your file is elsewhere, edit the folder: <code>file:///C:/Users/&lt;you&gt;/Downloads/verify.html</code> on Windows, <code>file:///Users/&lt;you&gt;/Downloads/verify.html</code> on macOS.</li>
+                <li><b style="color:#e6edf3;">Fastest — keyboard:</b> press <b style="color:#e6edf3;">Ctrl+O</b> (<b style="color:#e6edf3;">⌘O</b> on macOS) and pick the <code>verify.html</code> you just saved (usually in <code>Downloads</code>). Chrome, Edge and Firefox all honour it; Safari uses File → Open File…. If your browser offers no Open action, paste the step-3 link into the address bar instead — see the next point.</li>
+                <li><b style="color:#e6edf3;">Or paste the step-3 link:</b> copy it, press <b style="color:#e6edf3;">Ctrl+L</b> (<b style="color:#e6edf3;">⌘L</b>) to jump to the address bar, and paste. <i>Clicking</i> it from this page is blocked by every browser on purpose — pasting it (or typing it) always works. If the file is somewhere else, correct step 2: <code>file:///C:/Users/&lt;you&gt;/Downloads</code> on Windows, <code>file:///Users/&lt;you&gt;/Downloads</code> on macOS.</li>
                 <li><b style="color:#e6edf3;">Firefox:</b> if Ctrl+O is greyed out, use File → Open File… in the menu bar. Firefox never follows a file:// link out of a web page — it only accepts the address once it is typed or pasted.</li>
                 <li><b style="color:#e6edf3;">Check it really is local:</b> the address bar must start with <code>file://</code>, and the green note under the login card must say the throwaway key was <b>GENERATED AUTOMATICALLY when this page loaded</b>. Only on that copy are logins enabled — nothing on any server can read your key.</li>
-                <li><b style="color:#e6edf3;">Phone (Android / iPhone):</b> mobile browsers cannot open a saved HTML file as a page — there is no file→page path there. Use the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a> (pinned, trusted by this project) on the phone, and do the local-file step on a computer.</li>
+                <li><b style="color:#e6edf3;">Phone (Android / iPhone):</b> mobile browsers cannot open a saved HTML file as a page — there is no file→page path there, so this local-copy step needs a computer.</li>
             </ol>
         </details>
     </div>
@@ -258,7 +276,7 @@
         <div class="input-card" style="grid-column: span 2; border-color: #4caf50;">
             <label>Log in with PayPal — the login IS the pre-flight check</label>
             <p style="color: var(--text-dim); font-size: 0.9rem;">There is no separate pre-login hardware check: a completed PayPal login is the attacker filter. This page makes a throwaway key the moment it opens; your identity comes back encrypted to that key, so neither the site owner nor the cloud provider can read it. PayPal's approval then buys a hardware proof (an Intel TDX quote) bound to <i>this</i> login, which this page audits — only a fully green audit decrypts.</p>
-            <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow:</b> the key is generated automatically when this page loads. Pick ONE of the two links below; it turns into “✅ Continue to PayPal →” in a new tab. After PayPal returns, the enclave's callback page <b>downloads your still-ENCRYPTED attestation automatically</b> — bring that file back here and load it with the “Attestation JSON report” file picker above. <b>Strongest setup:</b> take <code>verify.html</code> from the project's <a href="https://leonardopedro.github.io/verifiedUniqueAliases/" style="color:#58a6ff;">GitHub</a>, save it and open it locally (the yellow card above does this) — the key is then created only on your machine. <a href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html" style="color:#58a6ff;">Privacy Policy</a> · <a href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html" style="color:#58a6ff;">User Agreement</a></p>
+            <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow:</b> the key is generated automatically when this page loads. Pick ONE of the two links below; it turns into “✅ Continue to PayPal →” in a new tab. After PayPal returns, the enclave's callback page <b>downloads your still-ENCRYPTED attestation automatically</b> — bring that file back here and load it with the “Attestation JSON report” file picker above. <b>Strongest setup:</b> take <code>verify.html</code> from the project's <a href="https://github.com/leonardopedro/verifiedUniqueAliases" style="color:#58a6ff;">GitHub repository</a> (the verified source), save it and open it locally (the yellow card above does this and remembers where it landed) — the key is then created only on your machine.</p>
             <!-- v188 (user request): the morphing workflow button is SUPPRESSED (removed) — two explicit login links replace it, the throwaway key is auto-generated on render (keyNotice announces it), and the claim step is gone: /callback AUTO-DOWNLOADS the ciphertext and this tab loads it with the file picker (decryptPastedBlob → runAudit). -->
             <div id="keyNotice" style="display:none; margin-top:12px; padding:10px 12px; border-radius:8px; font-size:0.85rem; background:rgba(63,185,80,0.08); border:1px solid #3fb950; color:#3fb950;"></div>
             <!-- v201 (user request): the pre-login option that offered the
@@ -337,7 +355,7 @@ Wmw2oAio9A==
         </div>
         <div class="input-card" style="grid-column: span 2;">
             <label>Audit a report you already have</label>
-            <p style="color: var(--text-dim); font-size: 0.9rem;">A saved report JSON (💾 auto-downloaded by the login success page, or the Download button after a passing audit) audits offline in <b>any</b> copy of this auditor, including the <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">GitHub Pages copy</a> or your own saved <code>verify.html</code>. The optional certificate field additionally binds a saved TLS certificate to the report (extra safety). The audit is fail-closed: any red row — including “No valid Silicon Root of Trust” — means the evidence in the report did not verify; a common benign cause is a stale auditor page, so always take the latest <code>verify.html</code> from the project's GitHub. Only trust a report that passes every check.<br><b>🚔 Police copy — its own independent input:</b> <code>pgp-sealed-attestation.json</code> is <b>not</b> pasted into the raw-data box — it has the separate “PGP-encrypted attestation” box below. Load it there together with the test private key and the auditor decrypts it (PKESK key-id, session-key checksum and SHA-1 MDC all verified) and requires its plaintext to equal the attestation audited here, field for field.<br><b>🔒 At rest:</b> both boxes keep their content encrypted with THIS copy's local key (<code>pav-local-seal/v1</code>, derived from the throwaway key this page generated) — plain JSON is accepted on paste/load and re-sealed immediately; the 💾 button downloads the <b>unencrypted</b> file(s) of whichever box is loaded.</p>
+            <p style="color: var(--text-dim); font-size: 0.9rem;">A saved report JSON (💾 auto-downloaded by the login success page, or the Download button after a passing audit) audits offline in <b>any</b> copy of this auditor, including your own saved <code>verify.html</code>. The optional certificate field additionally binds a saved TLS certificate to the report (extra safety). The audit is fail-closed: any red row — including “No valid Silicon Root of Trust” — means the evidence in the report did not verify; a common benign cause is a stale auditor page, so always take the latest <code>verify.html</code> from the project's GitHub. Only trust a report that passes every check.<br><b>🚔 Police copy — its own independent input:</b> <code>pgp-sealed-attestation.json</code> is <b>not</b> pasted into the raw-data box — it has the separate “PGP-encrypted attestation” box below. Load it there together with the test private key and the auditor decrypts it (PKESK key-id, session-key checksum and SHA-1 MDC all verified) and requires its plaintext to equal the attestation audited here, field for field.<br><b>🔒 At rest:</b> both boxes keep their content encrypted with THIS copy's local key (<code>pav-local-seal/v1</code>, derived from the throwaway key this page generated) — plain JSON is accepted on paste/load and re-sealed immediately; the 💾 button downloads the <b>unencrypted</b> file(s) of whichever box is loaded.</p>
             <label style="margin-top: 8px; font-weight: 400; color: var(--text-dim); font-size: 0.9rem;">Attestation JSON report with raw data (report / envelope / encrypted blob)</label>
             <div style="margin-bottom: 15px;">
                 <input type="file" id="reportFile" accept=".json" class="file-input">
@@ -437,7 +455,7 @@ Wmw2oAio9A==
     <div id="zkHandoffCard" class="status-card" style="display:none; margin-top:20px;">
         <label>🔐 ZK escrow credential <span style="font-weight:400; color:var(--text-dim);">(optional — selective disclosure)</span></label>
         <p style="color: var(--text-dim); font-size: 0.85rem;">Proves — <b>without showing your identity</b> — that this audited quote is bound to a <b>verified</b> PayPal identity, and escrows the plaintext to a recipient key you choose. The prover lives on <b>zk.html</b> at the pinned GitHub Pages origin, so the ZK layer can improve without touching the measured enclave image. The button below opens it and hands over <b>only</b> the identity this audit verified — in your browser (postMessage, pinned origin; nothing is uploaded, and the identity bytes never touch any server).</p>
-        <a id="zkOpenBtn" href="https://leonardopedro.github.io/verifiedUniqueAliases/zk.html" target="_blank" onclick="return openZkProver(this.href)" style="display:block; margin-top:12px; padding:14px; text-align:center; background:#8957e5; color:#fff; border-radius:10px; font-weight:600; text-decoration:none; cursor:pointer;">⚡ Open the ZK escrow prover (opens in a new tab) →</a>
+        <a id="zkOpenBtn" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/zk.html" target="_blank" onclick="return openZkProver(this.href)" style="display:block; margin-top:12px; padding:14px; text-align:center; background:#8957e5; color:#fff; border-radius:10px; font-weight:600; text-decoration:none; cursor:pointer;">⚡ Get the ZK escrow prover (zk.html from the GitHub repo — save it, open it locally) →</a>
         <p id="zkHandoffStatus" style="margin:8px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);"></p>
     </div>
     </div>
@@ -475,7 +493,11 @@ Wmw2oAio9A==
     //     web page — it copies the link and says where to paste it;
     //   * the <details> block carries the real keystrokes (Ctrl+O / ⌘O, paste
     //     in the address bar) plus the honest phone answer: no file→page path
-    //     on Android/iOS, use the pinned GitHub Pages copy there.
+    //     on Android/iOS, this step needs a computer.
+    //   * v204: step 1 MUST route through the OS save window. The anchor keeps
+    //     its raw href for no-JS, but an `onclick="return saveLocalCopy(this)"`
+    //     returned a PROMISE (truthy!) so the browser also followed the href
+    //     and rendered the raw file instead of saving it — the reported bug.
     // ========================================================================
     var LOCAL_COPY_RAW = 'https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html';
     var LOCAL_COPY_FILE = 'file:///Downloads/verify.html';
@@ -499,21 +521,81 @@ Wmw2oAio9A==
         } catch (e) { return 'file:///Downloads'; }
     }
     var LOCAL_COPY_NAME = 'verify.html';
-    function updateLocalCopyLink() {
+    var LOCAL_COPY_DIR_KEY = 'pav_local_copy_dir';
+    var LOCAL_COPY_LINKED_KEY = 'pav_local_copy_linked';
+    function localCopyRememberedDir() {
+        try { return localStorage.getItem(LOCAL_COPY_DIR_KEY) || ''; } catch (e) { return ''; }
+    }
+    function showLocalCopyStep2(on) {
+        try {
+            var step = document.getElementById('localCopyStep2');
+            if (step) step.style.display = on ? 'block' : 'none';
+        } catch (e) { /* headless harness */ }
+    }
+    // v204 (user request): the location the visitor saved into is REGISTERED —
+    // a folder is persisted, the file:// link is built from it and shown, and
+    // on the next visit the card opens with that link already waiting. With no
+    // folder yet the link stays hidden instead of guessing a Downloads path.
+    function localCopyIsRegistered() {
+        try { return localStorage.getItem(LOCAL_COPY_LINKED_KEY) === '1'; } catch (e) { return false; }
+    }
+    // manual=true means the visitor typed/confirmed the folder (an act of
+    // registration → persisted). A guess after a save is shown but NOT
+    // persisted until confirmed, so a later visit never presents an invented
+    // path as if it were the one they chose.
+    function updateLocalCopyLink(manual) {
         try {
             var inp = document.getElementById('localCopyFolder');
             var a = document.getElementById('localCopyLink');
+            var box = document.getElementById('localCopyLinkBox');
+            var reg = document.getElementById('localCopyRegistered');
             var val = (inp && typeof inp.value === 'string') ? inp.value.trim() : '';
-            if (val) { try { localStorage.setItem('pav_local_copy_dir', val); } catch (e) {} }
-            else { try { val = localStorage.getItem('pav_local_copy_dir') || ''; } catch (e) { val = ''; } }
-            var href;
-            if (!val) href = 'file:///Downloads/' + LOCAL_COPY_NAME;
-            else if (/\.html?([?#].*)?$/i.test(val)) href = val;          // a full link: keep verbatim
-            else href = val.replace(/\/+$/, '') + '/' + LOCAL_COPY_NAME; // a folder: append the file
+            var remembered = localCopyRememberedDir();
+            if (manual && val) {
+                try {
+                    localStorage.setItem(LOCAL_COPY_DIR_KEY, val);
+                    localStorage.setItem(LOCAL_COPY_LINKED_KEY, '1');
+                } catch (e) { /* no storage */ }
+            }
+            if (!val) val = remembered;
+            var href = '';
+            if (val) {
+                if (/\.html?([?#].*)?$/i.test(val)) href = val;          // a full link: keep verbatim
+                else href = val.replace(/\/+$/, '') + '/' + LOCAL_COPY_NAME; // a folder: append the file
+            }
+            if (!href) {
+                if (box) box.style.display = 'none';
+                if (reg) reg.textContent = '';
+                return '';
+            }
             LOCAL_COPY_FILE = href;
             if (a) { a.href = href; a.textContent = href; }
+            if (box) box.style.display = 'block';
+            if (reg) {
+                reg.textContent = (val === remembered && localCopyIsRegistered())
+                    ? '✅ registered — this link will be waiting here next time'
+                    : '❔ guessed from your OS — confirm it if that is where the file went';
+            }
             return href;
         } catch (e) { return LOCAL_COPY_FILE; }
+    }
+    // One click, no typing: the most common case is the browser's own default
+    // download folder, which is exactly what localCopyGuessFolder() proposes.
+    function confirmLocalCopyLocation() {
+        try {
+            var inp = document.getElementById('localCopyFolder');
+            var v = (inp && typeof inp.value === 'string') ? inp.value.trim() : '';
+            if (!v) v = localCopyGuessFolder();
+            if (inp) inp.value = v;
+            try {
+                localStorage.setItem(LOCAL_COPY_DIR_KEY, v);
+                localStorage.setItem(LOCAL_COPY_LINKED_KEY, '1');
+            } catch (e) { /* no storage */ }
+            var href = updateLocalCopyLink(true);
+            var st = null; try { st = document.getElementById('localCopyStatus'); } catch (e) { st = null; }
+            if (st) st.innerText = '✅ Registered: ' + href + ' — open it with Ctrl+O (⌘O) and pick the file, or copy the link into the address bar (Ctrl+L / ⌘L).';
+            return false;
+        } catch (e) { return false; }
     }
     function revealLocalCopyCard() {
         try {
@@ -524,11 +606,24 @@ Wmw2oAio9A==
             var origin = document.getElementById('localCopyOrigin');
             if (origin) origin.textContent = location.protocol + '//' + (location.host || '(server)');
             var inp = document.getElementById('localCopyFolder');
+            var remembered = localCopyRememberedDir();
             if (inp) {
-                try { inp.value = localStorage.getItem('pav_local_copy_dir') || ''; } catch (e) { inp.value = ''; }
-                if (!inp.value) inp.placeholder = '2. where did it save? e.g. ' + localCopyGuessFolder();
+                inp.value = remembered;
+                if (!remembered) inp.placeholder = 'folder it saved into, e.g. ' + localCopyGuessFolder();
             }
-            updateLocalCopyLink();
+            // A previously REGISTERED location is shown straight away; a first
+            // visit sees only step 1 until a save (it must not suggest a folder
+            // the visitor never chose).
+            if (remembered) {
+                showLocalCopyStep2(true);
+                updateLocalCopyLink(false);
+            } else {
+                showLocalCopyStep2(false);
+                try {
+                    var box0 = document.getElementById('localCopyLinkBox');
+                    if (box0) box0.style.display = 'none';
+                } catch (e0) { /* harness */ }
+            }
             card.style.display = 'block';
             return true;
         } catch (e) { return false; }
@@ -539,9 +634,20 @@ Wmw2oAio9A==
         var afterSave = function (name) {
             LOCAL_COPY_NAME = name || 'verify.html';
             var inp = null; try { inp = document.getElementById('localCopyFolder'); } catch (e) { inp = null; }
-            if (inp && !inp.value) inp.placeholder = '2. where did it save? e.g. ' + localCopyGuessFolder();
-            updateLocalCopyLink();
-            say('✅ Saved as ' + LOCAL_COPY_NAME + ' — now tell me the folder in field 2 and the grey link becomes yours. To open it: press Ctrl+O (⌘O) and pick the file, or paste the link into the address bar (Ctrl+L / ⌘L).');
+            showLocalCopyStep2(true);
+            var known = localCopyRememberedDir();
+            if (inp) {
+                // Build the link AUTOMATICALLY: the registered folder when there
+                // is one, otherwise the OS-typical Downloads path, shown as a
+                // one-click confirmation instead of an empty field to type.
+                inp.value = known || localCopyGuessFolder();
+            }
+            var href = updateLocalCopyLink(false);
+            if (known) {
+                say('✅ Saved as ' + LOCAL_COPY_NAME + ' — your link: ' + href + '. Open it with Ctrl+O (⌘O), or copy the link into the address bar (Ctrl+L / ⌘L).');
+                return;
+            }
+            say('✅ Saved as ' + LOCAL_COPY_NAME + ' — I filled in the usual Downloads folder: ' + href + '. If that is where it went, press “That is where I saved it” (or fix the folder in step 2). Open it with Ctrl+O (⌘O), or copy the link into the address bar (Ctrl+L / ⌘L).');
         };
         try {
             var r = await fetch(LOCAL_COPY_RAW, { cache: 'no-store' });
@@ -1736,7 +1842,7 @@ Wmw2oAio9A==
     // ========================================================================
     var EXPECTED_RTMR0 = '06a32a2f92ea455dd628bc41be9bb5910c2782a2eb93c646c6a5ddebd70291839f197792d289cca528572b6d910294db';
     var EXPECTED_RTMR1 = '6fa0352319182f7ec8cb713223cbc1853506caf719c64d04475a26975ae8ebf72003f592dcf0aafe392cc74de33d3f90';
-    var EXPECTED_RTMR2 = 'e79cce72a685c9459c0a31e740e3ca0fcfd9321087d6dbd90a148903272895d9575b7bd2433c84d253080df5f23293fc';
+    var EXPECTED_RTMR2 = '3ed56c3c63236f7f19f79b39dd061a9711f45ba77021a3746cb1943017303c459f68c5da2af7c41b59c50225e0eeef32';
     var EXPECTED_RTMR3 = '000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000';
 
     // ========================================================================
@@ -1769,7 +1875,7 @@ Wmw2oAio9A==
     // the podman build that produced disk e1bce1d8…, live-confirmed by the
     // post-swap envelope self-reporting 4933005a… (RTMR2 rotated 86784f37… →
     // e79cce72… because the initrd carries the new binary; MRTD/RTMR0/1/3 held).
-    var EXPECTED_ENCLAVE_SHA256 = '4933005adfbebbfcf586dda87640f6d9c83f720c4794869fbe701165ed11900f';
+    var EXPECTED_ENCLAVE_SHA256 = '6dd1c12e6e23c944265a6cd60183f0070b2ac46a58f45c6150b3335c1ec6341e';
 
     // ========================================================================
     // v162 (audit VULN-04): GOLDEN PCR PINS — CI-captured constants for the
@@ -2077,7 +2183,7 @@ Wmw2oAio9A==
                     await writeBox('attestationInput', 'raw', JSON.stringify(env, null, 2), 'pav_e2ee_report');
                     if (await runAudit()) {
                         if (location.search.indexOf('afterlogin=1') !== -1 && downloadReportFile()) {
-                            say('✅ Report decrypted, audited, and saved as a JSON file. You can audit it offline in ANY copy of the auditor (GitHub Pages copy or your own saved verify.html) — this site is only a convenience.');
+                            say('✅ Report decrypted, audited, and saved as a JSON file. You can audit it offline in ANY copy of the auditor (your own saved verify.html) — this site is only a convenience.');
                         } else {
                             say('✅ Report decrypted and fully audited — use the 💾 Download button in the results below to save the JSON.');
                         }

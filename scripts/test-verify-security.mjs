@@ -2352,18 +2352,73 @@ console.log('\nTest 51: local-copy rescue card — non-file:// origins get save 
     /id="localCopyCard"[^>]*style="display:none/.test(html), 'card missing or visible by default');
   check('step 1 saves verify.html from the project GitHub (raw)',
     html.includes('id="localCopySave"')
-      && html.includes('https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html')
-      && html.includes('onclick="return saveLocalCopy(this)"'),
+      && html.includes('https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html'),
     'save button missing');
+  // v204: the handler must NOT return the async function's PROMISE (truthy) —
+  // that let the browser follow the href as well, so the click rendered the raw
+  // file instead of opening the OS save window. Exactly one click = one save.
+  check('step 1 routes through the OS save window, never through the href',
+    html.includes('onclick="saveLocalCopy(this); return false;"'),
+    'onclick still returns a promise');
+  // v205 (user directive): the service serves ONLY the landing, so the legal
+  // documents are links to GitHub Pages and the auditor/prover come from the
+  // repository. Nothing legal is copied onto the service.
+  check('legal links point at the legal documents themselves',
+    html.includes('href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html"')
+      && html.includes('href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html"'),
+    'legal links missing or wrong');
+  // And they are the ONLY legal links: no second copy buried in the login card
+  // or the audit card.
+  {
+    const legal = (html.match(/Privacy Policy/g) || []).length;
+    const terms = (html.match(/User Agreement/g) || []).length;
+    check('exactly one Privacy Policy and one User Agreement link remain',
+      legal === 1 && terms === 1, `privacy=${legal} terms=${terms}`);
+  }
+  // GitHub Pages may serve the LEGAL documents only. The auditor and the ZK
+  // prover are taken from the repository (raw), never from the mirror.
+  {
+    const pagesHrefs = [...html.matchAll(/href="(https:\/\/leonardopedro\.github\.io[^"]*)"/g)].map((m) => m[1]);
+    check('GitHub Pages is linked ONLY for the legal documents',
+      pagesHrefs.every((u) => /\/(privacy|terms)\.html$/.test(u)),
+      JSON.stringify(pagesHrefs.slice(0, 4)));
+    check('the ZK prover link points at the repository, not at Pages',
+      html.includes('href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/zk.html"'),
+      'zk prover still linked to Pages');
+  }
+  // v205 (user directive): the SERVICE serves the landing and nothing else.
+  {
+    const rust = readFileSync(join(repoRoot, 'src', 'main.rs'), 'utf8');
+    const landing = rust.slice(rust.indexOf('const LANDING_HTML'), rust.indexOf('async fn serve_landing'));
+    check('the enclave serves a minimal landing at / and /verify.html',
+      rust.includes('.route("/", get(serve_landing))')
+        && rust.includes('.route("/verify.html", get(serve_landing))'),
+      'landing routes missing');
+    check('the enclave no longer serves the legal docs or the auditor file',
+      !rust.includes('serve_privacy_html') && !rust.includes('serve_terms_html')
+        && !rust.includes('/boot/efi/verify.html'),
+      'a removed route/handler is still present');
+    check('the landing page offers the repo download + the local link builder',
+      landing.includes('raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html')
+        && landing.includes('showSaveFilePicker') && landing.includes('file:///Downloads/verify.html'),
+      'landing is missing the save/link machinery');
+    check('the landing carries NO auditor code (no keys, no pins, no crypto)',
+      landing.length > 0
+        && !/generateKey|subtle\.|EXPECTED_ENCLAVE_SHA256|EXPECTED_RTMR|EXPECTED_MRTD/.test(landing),
+      'the landing embeds auditor logic');
+    check('the ESP carries no legal documents',
+      !readFileSync(join(repoRoot, 'build-alibaba-image.sh'), 'utf8').includes('::/privacy.html'),
+      'build script still copies privacy.html to the ESP');
+  }
   check('step 2 offers the file:// link to the saved copy',
     html.includes('id="localCopyLink"')
       && html.includes('href="file:///Downloads/verify.html"')
       && html.includes('onclick="return copyLocalLink(this)"'),
     'file:// link missing');
-  check('step 3 spells out how to open the local file (Ctrl+O, paste-the-link, phone fallback)',
+  check('step 3 spells out how to open the local file (Ctrl+O, paste-the-link, phone answer)',
     html.includes('Ctrl+O') && html.includes('Ctrl+L')
-      && html.includes('GitHub Pages copy')
-      && /mobile browsers cannot open a saved HTML file/.test(html),
+      && /mobile browsers cannot open a saved HTML file/.test(html)
+      && /this local-copy step needs a computer/.test(html),
     'open-help missing');
 
   // Reveal gating: file:// stays clean, every network origin gets the card.
@@ -2436,6 +2491,71 @@ console.log('\nTest 51: local-copy rescue card — non-file:// origins get save 
     `nav=${nav} copied=${JSON.stringify(copied)} opened=${opened}`);
   check('the copy status says where to paste it',
     /Ctrl\+L/.test(statusAfterCopy), statusAfterCopy.slice(0, 140));
+
+  // v204 (user request): the location the copy landed in is REGISTERED — step 2
+  // opens after a save, the file:// link is BUILT from the folder and SHOWN,
+  // and the next visit lands straight on that link. A first visit must not
+  // invent a Downloads path it was never told about.
+  {
+    // This test runs after an earlier block deleted the storage stub.
+    globalThis.localStorage = (() => {
+      const m = new Map();
+      return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: k => m.delete(k) };
+    })();
+    globalThis.localStorage.removeItem('pav_local_copy_dir');
+    globalThis.localStorage.removeItem('pav_local_copy_linked');
+    setLoc({ protocol: 'https:', host: 'login.airma.de', origin: 'https://login.airma.de' });
+    revealLocalCopyCard();
+    check('first visit hides the link (no invented Downloads guess)',
+      elements['localCopyLinkBox'].style.display === 'none',
+      String(elements['localCopyLinkBox'].style.display));
+    // A guess shown after a save is NOT a registration.
+    elements['localCopyFolder'].value = 'file:///home/leo/Downloads';
+    const guessed = updateLocalCopyLink(false);
+    check('a GUESSED folder shows the link but stays unregistered',
+      guessed === 'file:///home/leo/Downloads/verify.html'
+        && globalThis.localStorage.getItem('pav_local_copy_dir') === null
+        && /guessed/i.test(elements['localCopyRegistered'].textContent),
+      String(elements['localCopyRegistered'].textContent));
+    // One click on “That is where I saved it” registers it without typing.
+    check('one-click confirm registers the guessed location',
+      confirmLocalCopyLocation() === false
+        && globalThis.localStorage.getItem('pav_local_copy_dir') === 'file:///home/leo/Downloads'
+        && globalThis.localStorage.getItem('pav_local_copy_linked') === '1',
+      String(globalThis.localStorage.getItem('pav_local_copy_dir')));
+    elements['localCopyFolder'].value = 'file:///home/leo/Downloads';
+    const built = updateLocalCopyLink(true);
+    check('the folder builds the file:// link to the saved copy',
+      built === 'file:///home/leo/Downloads/verify.html'
+        && elements['localCopyLink'].href === built
+        && elements['localCopyLink'].textContent === built,
+      String(built));
+    check('the link is SHOWN to the user once the location is known',
+      elements['localCopyLinkBox'].style.display === 'block',
+      String(elements['localCopyLinkBox'].style.display));
+    check('the location is REMEMBERED (folder + registered flag)',
+      globalThis.localStorage.getItem('pav_local_copy_dir') === 'file:///home/leo/Downloads'
+        && globalThis.localStorage.getItem('pav_local_copy_linked') === '1',
+      String(globalThis.localStorage.getItem('pav_local_copy_dir')));
+    elements['localCopyFolder'].value = '';
+    elements['localCopyLinkBox'].style.display = 'none';
+    revealLocalCopyCard();
+    check('a later visit re-opens with the registered link already there',
+      elements['localCopyFolder'].value === 'file:///home/leo/Downloads'
+        && elements['localCopyLinkBox'].style.display === 'block'
+        && elements['localCopyLink'].href === 'file:///home/leo/Downloads/verify.html',
+      String(elements['localCopyLink'].href));
+    // A full file:// link pasted instead of a folder is used verbatim (a
+    // browser may have renamed the file, e.g. "verify (1).html").
+    elements['localCopyFolder'].value = 'file:///home/leo/Downloads/verify (1).html';
+    check('a full file:// link (renamed copy) is used verbatim',
+      updateLocalCopyLink(true) === 'file:///home/leo/Downloads/verify (1).html',
+      String(updateLocalCopyLink(true)));
+    globalThis.localStorage.removeItem('pav_local_copy_dir');
+    globalThis.localStorage.removeItem('pav_local_copy_linked');
+    setLoc(null);
+    delete globalThis.localStorage;
+  }
 }
 
 console.log('\nTest 39: ZK escrow credential card — prove/verify wiring (v188, circom.md §5)');
