@@ -232,7 +232,7 @@ The enclave's config IS its `user_data`, and there are **two copies** of it:
 | Copy | Written by | Used by |
 |---|---|---|
 | live instance `user_data` | `upload-secrets.sh` (Stop → `ModifyInstanceAttribute --UserData` → Start) | the running enclave |
-| `pav-watchdog` template `user_data` | `deploy-oos-watchdog.sh` from gitignored `dist/config.json` | **every rebuild** (`RunInstances`) |
+| `pav-watchdog` template `user_data` | `deploy-oos-watchdog.sh`, which prefers the **live instance's** blob and only falls back to gitignored `dist/config.json` | **every rebuild** (`RunInstances`) |
 
 Without a sync step, a rotation updated only the first copy: the next recreate —
 by the heartbeat or by the preemption notice — booted the OLD credentials while
@@ -249,6 +249,11 @@ bash watchdog/sync-enclave-userdata.sh from-instance  # copy the live blob into 
 path and the rollback path, so a rotation can never leave the rebuild path
 stale. Only sizes and sha256 prefixes are printed — never the blob. An
 out-of-band `ModifyInstanceAttribute` still has to be followed by `from-instance`.
+
+`deploy-oos-watchdog.sh deploy` likewise bakes the **live** blob when a tagged
+box exists (it notes when `dist/config.json` disagrees), so a redeploy cannot
+silently revert a synced rotation back to a stale local copy. `dist/config.json`
+is only the bootstrap value, for the first deploy before any box exists.
 
 **When a rotation is possible:** any time a tagged box exists (before or after a
 rebuild — the id changes, the script resolves it by tag/name). It costs one

@@ -84,13 +84,34 @@ EOF
       || die "CreateRole $ROLE failed"
     echo "role created: $ROLE"
   fi
+  # The OOS execution STARTED BY EVENTBRIDGE runs as THIS role, not as the OOS
+  # default role: the first live delivery failed every ECS call with
+  # `Forbidden.RAM` until the ECS/VPC actions were added. The notice template
+  # (Describe*) and the reconcile it starts (RunInstances + EIP bind) both run
+  # under it, so the set below is the union of what they call.
   cat > /tmp/pav-eb-policy.json <<'EOF'
-{"Version":"1","Statement":[{"Effect":"Allow","Action":["oos:StartExecution","oos:GetTemplate","oos:ListTemplates"],"Resource":"*"}]}
+{"Version":"1","Statement":[
+ {"Effect":"Allow","Action":["oos:StartExecution","oos:GetTemplate","oos:ListTemplates"],"Resource":"*"},
+ {"Effect":"Allow","Action":["ecs:DescribeInstances","ecs:RunInstances","ecs:DescribeImages","ecs:DescribeDisks","ecs:DescribeTags","ecs:DescribeAvailableResource","ecs:DescribeUserData"],"Resource":"*"},
+ {"Effect":"Allow","Action":["vpc:DescribeEipAddresses","vpc:AssociateEipAddress"],"Resource":"*"}
+]}
 EOF
   if aliyun ram GetPolicy --PolicyName "$POLICY" --PolicyType Custom 2>/dev/null | grep -q '"PolicyName"'; then
-    aliyun ram CreatePolicyVersion --PolicyName "$POLICY" \
-      --PolicyDocument "$(cat /tmp/pav-eb-policy.json)" --SetAsDefault true >/dev/null 2>&1 \
-      || echo "warn: could not add a policy version (5-version cap?), keeping current"
+    # RAM caps custom policies at 5 versions; prune the oldest non-default one
+    # before adding, or every later deploy silently keeps a stale policy.
+    if ! aliyun ram CreatePolicyVersion --PolicyName "$POLICY" \
+          --PolicyDocument "$(cat /tmp/pav-eb-policy.json)" --SetAsDefault true >/dev/null 2>&1; then
+      local OLD
+      OLD=$(aliyun ram ListPolicyVersions --PolicyName "$POLICY" --PolicyType Custom 2>/dev/null \
+        | jq -r '[.PolicyVersions.PolicyVersion[] | select(.IsDefaultVersion==false)] | sort_by(.CreateDate) | .[0].VersionId // empty')
+      [ -n "$OLD" ] || die "policy version cap hit and no prunable version exists"
+      aliyun ram DeletePolicyVersion --PolicyName "$POLICY" --VersionId "$OLD" >/dev/null 2>&1 \
+        || die "could not prune policy version $OLD"
+      aliyun ram CreatePolicyVersion --PolicyName "$POLICY" \
+        --PolicyDocument "$(cat /tmp/pav-eb-policy.json)" --SetAsDefault true >/dev/null 2>&1 \
+        || die "CreatePolicyVersion $POLICY failed after pruning $OLD"
+      echo "policy version pruned: $OLD"
+    fi
   else
     aliyun ram CreatePolicy --PolicyName "$POLICY" \
       --PolicyDocument "$(cat /tmp/pav-eb-policy.json)" \
@@ -176,43 +197,62 @@ cmd_deploy() {
   upsert_rule
 }
 
-# Two halves, tested separately because the sender half cannot be faked here:
-#
-#   sender   publish a CloudEvent whose source/type match the real notice. The
-#            CLI's eventbridge plugin only talks to eventbridge-console.* (503),
-#            a hand-signed ROA request is refused on the OAuth-STS token, and
-#            OOS's ExecuteAPI whitelist has no PutEvents - so publishing works
-#            only when the plugin's endpoint is healthy. When it is not, the
-#            real notice (or any cloud event on the bus) is the sender test.
-#   receiver run pav-spot-notice directly: proves preflight + early reconcile.
+# Proves BOTH halves, because publishing to the default bus is impossible here:
+#   * the default bus only accepts Aliyun's own sources (a custom source is
+#     refused outright), so a synthetic event cannot be aimed at the live rule;
+#   * PutEvents has no usable path (CLI plugin -> console endpoint 503, a hand
+#     signed ROA request -> SignatureDoesNotMatch on the OAuth STS token, OOS
+#     ExecuteAPI -> no PutEvents in its whitelist).
+# So: a throwaway bus carries an exact copy of the PRODUCTION target (same
+# acs.openapi action, same role, same parameter mapping) and an HTTP event
+# source feeds the event in. Everything downstream of the bus is the real
+# thing. The source is publicly reachable while it exists, hence the immediate
+# teardown below.
 cmd_test() {
+  local BUS="pav-test-$RANDOM" SRC="pav-test-$RANDOM-src" RULE_T="pav-test-$RANDOM-rule"
   local IID; IID=$(aliyun ecs DescribeInstances --RegionId "$REGION" \
     --Tag.1.Key pav-watchdog --Tag.1.Value prod 2>/dev/null | jget 'Instances.Instance.0.InstanceId')
-  IID=${IID:-i-synthetic-notice-test}
+  [ -n "$IID" ] || die "no pav-watchdog=prod instance to build a notice for"
+
+  aliyun eventbridge GetRule --EventBusName default --RuleName "$RULE" 2>/dev/null \
+    | jq '[.Data.Targets[] | select(.Id == "oos-spot-notice")]' > /tmp/pav-test-target.json
+  jq -e 'length == 1' /tmp/pav-test-target.json >/dev/null 2>&1 \
+    || die "production rule $RULE has no oos-spot-notice target (run deploy first)"
+
+  cleanup_test() {
+    aliyun eventbridge delete-event-source --event-bus-name "$BUS" --event-source-name "$SRC" >/dev/null 2>&1
+    aliyun eventbridge DeleteRule --EventBusName "$BUS" --RuleName "$RULE_T" >/dev/null 2>&1
+    aliyun eventbridge DeleteEventBus --EventBusName "$BUS" >/dev/null 2>&1
+    rm -f /tmp/pav-test-target.json /tmp/pav-ce.json
+  }
+  trap cleanup_test RETURN
+
+  aliyun eventbridge CreateEventBus --EventBusName "$BUS" >/dev/null 2>&1 || die "CreateEventBus failed"
+  aliyun eventbridge CreateRule --EventBusName "$BUS" --RuleName "$RULE_T" --FilterPattern '{}' \
+    --EventTargets "$(cat /tmp/pav-test-target.json)" >/dev/null 2>&1 || die "CreateRule failed"
+  aliyun eventbridge CreateEventSource --EventBusName "$BUS" --EventSourceName "$SRC" \
+    --Description "transient synthetic spot notice" \
+    --SourceHttpEventParameters '{"Type":"HTTPS","Method":["POST"],"SecurityConfig":"none"}' >/dev/null 2>&1 \
+    || die "CreateEventSource failed"
+  local URL
+  URL=$(aliyun eventbridge list-user-defined-event-sources --event-bus-name "$BUS" 2>/dev/null \
+    | jq -r '.Data.EventSourceList[0].ExternalSourceConfig.PublicWebHookUrl[0] // empty')
+  [ -n "$URL" ] || die "event source has no webhook url"
+
   local BEFORE; BEFORE=$(notice_exec_ids)
-  echo "[sender] publishing a synthetic spot notice for $IID"
-  local PUB
-  PUB=$(aliyun eventbridge put-events --event-bus-name default \
-    --event-list "[{\"Id\":\"pav-test-$(date +%s)\",\"Source\":\"acs.ecs\",\"Type\":\"ecs:Instance:PreemptibleInstanceInterruption\",\"SpecVersion\":\"1.0\",\"Subject\":\"acs:ecs:$REGION:$IID\",\"DataContentType\":\"application/json\",\"Data\":\"{\\\"instanceId\\\":\\\"$IID\\\"}\"}]" 2>&1 | head -4)
-  printf '%s\n' "$PUB"
+  echo "[sender] posting a synthetic notice for $IID through a transient HTTP event source"
+  node -e 'const iid=process.argv[1];require("fs").writeFileSync("/tmp/pav-ce.json",JSON.stringify({id:"pav-test-"+Date.now(),source:"pav.test",type:"pav.test:PreemptibleInstanceInterruption",specversion:"1.0",subject:"acs:ecs:cn-beijing:"+iid,datacontenttype:"application/json",time:new Date().toISOString(),data:{instanceId:iid}}))' "$IID"
+  curl -sS -X POST -H 'Content-Type: application/cloudevents+json' --data-binary @/tmp/pav-ce.json \
+    "$URL" -o /dev/null -w '[sender] webhook HTTP %{http_code}\n' --max-time 30
+
   local ID="" i
-  if ! printf '%s' "$PUB" | grep -qiE 'error|503|403'; then
-    for i in $(seq 1 20); do
-      sleep 3
-      ID=$(comm -13 <(printf '%s\n' $BEFORE | sort -u) <(notice_exec_ids | tr ' ' '\n' | sort -u) | head -1)
-      [ -n "$ID" ] && break
-    done
-  fi
-  if [ -z "$ID" ]; then
-    echo "[sender] publish unavailable here - exercising the receiver directly instead"
-    ID=$(aliyun oos StartExecution --RegionId "$REGION" --TemplateName "$NOTICE_TEMPLATE" \
-      --Parameters "{\"imageId\":\"$(image_id)\",\"instanceId\":\"$IID\",\"noticeTime\":\"manual-test\"}" 2>/dev/null \
-      | jget 'Execution.ExecutionId')
-    [ -n "$ID" ] || { echo "could not start $NOTICE_TEMPLATE"; return 1; }
-    echo "[receiver] padded run: $ID (sender half unproven - first real notice is the test)"
-  else
-    echo "[sender] delivered - new execution: $ID"
-  fi
+  for i in $(seq 1 15); do
+    sleep 4
+    ID=$(comm -13 <(printf '%s\n' $BEFORE | sort -u) <(notice_exec_ids | tr ' ' '\n' | sort -u) | head -1)
+    [ -n "$ID" ] && break
+  done
+  [ -n "$ID" ] || { echo "[sender] NO execution appeared (check the role policy + target)"; return 1; }
+  echo "[sender] delivered - execution: $ID"
   for i in $(seq 1 20); do
     local ST
     ST=$(aliyun oos ListExecutions --RegionId "$REGION" --ExecutionId "$ID" 2>/dev/null | jget 'Executions.0.Status')
@@ -224,6 +264,8 @@ cmd_test() {
 }
 
 notice_exec_ids() {
+  # MaxResults must be 10..100: a smaller value is rejected, and the rejected
+  # call looks exactly like "no executions" if the error is swallowed.
   aliyun oos ListExecutions --RegionId "$REGION" --TemplateName "$NOTICE_TEMPLATE" --MaxResults 10 2>/dev/null \
     | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let j;try{j=JSON.parse(s)}catch(e){return}console.log((j.Executions||[]).map(e=>e.ExecutionId).join(" "))})'
 }
@@ -233,7 +275,7 @@ cmd_status() {
   aliyun eventbridge GetRule --EventBusName default --RuleName "$RULE" 2>/dev/null \
     | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let j;try{j=JSON.parse(s)}catch(e){return}const d=j.Data||{};console.log("  status:",d.Status);for(const t of (d.Targets||[]))console.log("  target:",t.Id,t.Type)})'
   echo "last notice executions:"
-  aliyun oos ListExecutions --RegionId "$REGION" --TemplateName "$NOTICE_TEMPLATE" --MaxResults 5 2>/dev/null \
+  aliyun oos ListExecutions --RegionId "$REGION" --TemplateName "$NOTICE_TEMPLATE" --MaxResults 10 2>/dev/null \
     | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let j;try{j=JSON.parse(s)}catch(e){return}for(const e of (j.Executions||[]).slice(0,5))console.log("  ",e.ExecutionId,e.Status,e.StartDate||"",e.Outputs||"")})'
 }
 

@@ -145,6 +145,41 @@ without a deploy.
 | Plain HTTP `Host: login.airma.de` → 403 HTML | Alibaba Beaver ICP-filing interception, **not** the enclave; probe `http://101.200.178.251/` with no Host rewrite |
 | `InvalidAccessKeyId` on any `aliyun` call | OAuth STS in `~/.aliyun/config.json` expires (~1 h); **one** `aliyun …` call re-mints it |
 | `SecurityTokenExpired` on a relay transfer | presigned URLs embed the STS token — regenerate them immediately before arming, never ahead of time |
+| PayPal: *“this action is not supported … (invalid client_id or redirect_uri)”* | the **Live app's** Log in with PayPal feature, not the uploaded credentials — see below |
+
+---
+
+## PayPal rejects the authorize URL (`invalid client_id or redirect_uri`)
+
+First, rule the credentials out — they are separable from the authorize page:
+
+```bash
+# 200 = the client_id/secret pair really is a LIVE REST app on this account.
+# 401 invalid_client = it is a sandbox app, or the secret is the sandbox one.
+curl -s -o /dev/null -w '%{http_code}\n' -u "$CID:$SEC" \
+  -d grant_type=client_credentials https://api-m.paypal.com/v1/oauth2/token
+```
+
+A valid pair still gets that page, because `signin/authorize` only accepts a
+client_id whose **Log in with PayPal** feature is enabled and approved with a
+matching Return URL. The enclave sends `redirect_uri = https://<domain>/callback`
+(`src/main.rs`, from `config.domain`) — so for EACH app in `EXPECTED_APPS`
+(`verify.html`), in the **Live** tab of developer.paypal.com:
+
+1. App → *Features* → enable **Log in with PayPal** → *Advanced Settings* →
+   **Return URL** exactly `https://<domain>/callback` (no trailing slash).
+2. **Approval Status** must read *Approved* — PayPal reviews it, up to 7 business days;
+   while pending the authorize page fails with this exact error.
+3. *Information requested from customers*: tick the fields the flow's scope asks for
+   (`full` asks `openid profile email address`; `verified` asks only
+   `…/services/paypalattributes`). An unpermitted scope fails here too.
+4. Fill *Privacy policy URL* and *User agreement URL* (required to save the feature).
+5. A sandbox Return URL does **not** carry over to Live; it is entered per environment.
+
+Discriminator: click **verified only** first. It requests the smallest scope, so if
+it renders the PayPal login form while **full profile** does not, the problem is
+step 3 on the PII app rather than the Return URL. Note also that PayPal forbids
+logging in with the account that OWNS the app — test with a different buyer account.
 
 ---
 

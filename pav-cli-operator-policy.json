@@ -1,0 +1,129 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Sid": "EcsEnclaveLifecycle",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeInstances",
+        "ecs:DescribeImages",
+        "ecs:DescribeDisks",
+        "ecs:DescribeTasks",
+        "ecs:DescribeSecurityGroups",
+        "ecs:DescribeVpcs",
+        "ecs:DescribeVSwitches",
+        "ecs:DescribeSpotPriceHistory",
+        "ecs:DescribeUserData",
+        "ecs:GetInstanceConsoleOutput",
+        "ecs:ImportImage",
+        "ecs:ModifyInstanceAttribute",
+        "ecs:RunInstances",
+        "ecs:StartInstance",
+        "ecs:StopInstance",
+        "ecs:DeleteInstance",
+        "ecs:CreateSecurityGroup",
+        "ecs:CreateVpc",
+        "ecs:CreateVSwitch",
+        "ecs:AuthorizeSecurityGroup",
+        "ecs:ReplaceSystemDisk",
+        "ecs:ModifyImageAttribute"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "VpcTopology",
+      "Effect": "Allow",
+      "Action": [
+        "vpc:DescribeVpcs",
+        "vpc:DescribeVSwitches",
+        "vpc:CreateVpc",
+        "vpc:CreateVSwitch",
+        "vpc:DescribeSecurityGroups"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReservedEipBinding",
+      "Effect": "Allow",
+      "Action": [
+        "vpc:DescribeEipAddresses",
+        "vpc:AssociateEipAddress",
+        "vpc:DisassociateEipAddress"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "OosWatchdog",
+      "Effect": "Allow",
+      "Action": [
+        "oos:CreateTemplate",
+        "oos:UpdateTemplate",
+        "oos:DeleteTemplate",
+        "oos:ListTemplates",
+        "oos:GetTemplate",
+        "oos:StartExecution",
+        "oos:ListExecutions",
+        "oos:GetExecution",
+        "oos:CancelExecution",
+        "oos:DeleteExecutions"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SpotNoticeCapture",
+      "Effect": "Allow",
+      "Action": [
+        "eventbridge:ListRules",
+        "eventbridge:DescribeRule",
+        "eventbridge:CreateRule",
+        "eventbridge:UpdateRule",
+        "eventbridge:DeleteRule",
+        "eventbridge:PutTargets",
+        "eventbridge:DeleteTargets"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ImageStagingBuckets",
+      "Effect": "Allow",
+      "Action": [
+        "oss:GetObject",
+        "oss:PutObject",
+        "oss:DeleteObject",
+        "oss:HeadObject",
+        "oss:ListObjects",
+        "oss:GetObjectAttributes",
+        "oss:AbortMultipartUpload",
+        "oss:ListMultipartUploads",
+        "oss:ListMultipartUploadParts"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "RamReadOnlyDiagnostics",
+      "Effect": "Allow",
+      "Action": [
+        "ram:GetUser",
+        "ram:ListUsers",
+        "ram:GetPolicy",
+        "ram:ListPoliciesForUser",
+        "ram:ListAccessKeys",
+        "ram:GetRole",
+        "ram:ListPoliciesForRole",
+        "ram:GetPolicyVersion",
+        "ram:ListPolicyVersions"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "OssAccountReads",
+      "Effect": "Allow",
+      "Action": [
+        "oss:ListBuckets",
+        "oss:GetBucketInfo",
+        "oss:GetBucketLocation"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

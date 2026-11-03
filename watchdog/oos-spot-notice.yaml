@@ -64,23 +64,44 @@ Parameters:
   watchdogTemplate:
     Type: String
     Default: pav-watchdog
-  # From the EventBridge event payload ($.data.instanceId / $.time). The
-  # default cannot be an empty string ("should not be empty" at CreateTemplate),
-  # so 'unknown' is the sentinel for a notice that carried no payload.
-  instanceId:
+  # NOTE: the warning's own payload (instance id, notice time) is NOT mapped
+  # into the record. EventBridge rejects the TEMPLATE form for this target
+  # (`EventRuleTargetInvalid`), so `Parameters` has to be a CONSTANT JSON
+  # string, and OOS parameters are echoed in cleartext by ListExecutions
+  # anyway. The instance is therefore resolved from our own tag below, which
+  # is also the instance the reconciler cares about.
+  tagKey:
     Type: String
-    Default: unknown
-    Description: Instance the notice is about.
+    Default: pav-watchdog
+  tagValue:
+    Type: String
+    Default: prod
   noticeTime:
     Type: String
     Default: unknown
-    Description: CloudEvents `time` of the notice; the 5-minute window starts here.
+    Description: CloudEvents `time` of the notice; the 5-minute window starts here (from the event, when mapped).
   # Injected by deploy-spot-notice.sh from watchdog/dist/config.json.
   imageId:
     Type: String
     Default: '__IMAGE_ID__'
 
 Tasks:
+  # ------------------------------------------------------- which box is it about?
+  - Name: findInstance
+    Action: ACS::ExecuteAPI
+    Description: The tagged enclave the notice refers to.
+    Properties:
+      Service: ECS
+      API: DescribeInstances
+      Parameters:
+        RegionId: '{{ region }}'
+        Tag.1.Key: '{{ tagKey }}'
+        Tag.1.Value: '{{ tagValue }}'
+    Outputs:
+      instanceId:
+        Type: String
+        ValueSelector: Instances.Instance[0].InstanceId
+
   # ------------------------------------------------------- is the image still there?
   - Name: checkImage
     Action: ACS::ExecuteAPI
@@ -149,8 +170,8 @@ Tasks:
 Outputs:
   instanceId:
     Type: String
-    Description: Preempted instance from the event payload.
-    Value: '{{ instanceId }}'
+    Description: The tagged enclave the notice is about.
+    Value: '{{ findInstance.instanceId }}'
   noticeTime:
     Type: String
     Description: When the 5-minute window started.

@@ -34,6 +34,8 @@
 #                         PAYPAL_VERIFIED_CLIENT_ID=... \
 #                         PAYPAL_VERIFIED_CLIENT_SECRET=... \
 #                         bash upload-secrets.sh
+#   Cloudflare only:    PAV_CHOICE=5 PAV_DNS01_TOKEN=... [PAV_DNS01_ZONE=...] \
+#                         bash upload-secrets.sh
 #
 # NO LOCAL COPY IS WRITTEN (v2). The pre-rotation config stays in this
 # process's memory ($CURRENT) and is used for rollback from memory. Nothing
@@ -347,7 +349,8 @@ else
     echo "  2) Configure Production"
     echo "  3) Switch Active Mode only (keep all credentials)"
     echo "  4) Rotate ACME EAB keys (ZeroSSL) — or clear them to fall back to Let's Encrypt"
-    ask CHOICE "Choice (1-4): "
+    echo "  5) Rotate the Cloudflare DNS-01 API token (and DNS zone) only"
+    ask CHOICE "Choice (1-5): "
 fi
 
 NEW_STAGING=$(echo "$CURRENT" | jq '.staging')
@@ -389,7 +392,49 @@ case "$CHOICE" in
        NEW_CONFIG=$(echo "$CURRENT" | jq --arg i "$FINAL_EAB_ID" --arg h "$FINAL_EAB_HMAC" \
            '.eab_key_id=$i | .eab_hmac_key=$h')
        ;;
-    *) die "invalid choice '$CHOICE'" ;;
+    5) NEW_STAGING=$(echo "$CURRENT" | jq '.staging')
+       echo "--- Cloudflare DNS-01 API token ---"
+       echo "Only the ACME DNS-01 credential changes: the enclave spends it on"
+       echo "GET /zones, POST a TXT _acme-challenge record and DELETE it again."
+       echo "It must stay source-IP-restricted to the reserved EIP, and it cannot be"
+       echo "tested from this machine for that very reason - the next BOOT is the test."
+       cur_tok_len=$(echo "$CURRENT" | jq -r '(.dns01_secret // "") | length')
+       cur_zone=$(echo "$CURRENT" | jq -r '.dns_zone // .dns01 // ""')
+       echo "Current token : ${cur_tok_len:-0} chars"
+       echo "Current zone  : ${cur_zone:-(derived from domain)}"
+       if [[ "$PAV_NONINTERACTIVE" == "1" ]]; then
+           DNS_TOK="${PAV_DNS01_TOKEN-}"
+           DNS_ZONE="${PAV_DNS01_ZONE-}"
+       else
+           # A credential: password field, entered twice (a hidden typo here
+           # surfaces only as a dark :443 after the reboot).
+           ask_secret2 DNS_TOK "New Cloudflare API token (Enter = keep current): "
+           ask DNS_ZONE "DNS zone (Enter = keep '${cur_zone:-derived}', 'derived' = drop the override): "
+       fi
+       DNS_TOK=$(printf '%s' "${DNS_TOK:-}" | tr -d '[:space:]')
+       DNS_ZONE=$(printf '%s' "${DNS_ZONE:-}" | tr -d '[:space:]')
+       if [[ -n "$DNS_TOK" ]]; then
+           [[ ${#DNS_TOK} -ge 20 ]] \
+               || die "the Cloudflare token is only ${#DNS_TOK} chars — that is a truncated paste; nothing was pushed"
+           [[ "$DNS_TOK" =~ ^(cfut_[A-Za-z0-9_-]+|[A-Za-z0-9_-]{40})$ ]] \
+               || warn "token does not look like a Cloudflare API token (expected cfut_… or 40 chars) — continuing"
+           case "$DNS_TOK" in
+               *[[:space:]]*) die "the token still contains whitespace — nothing was pushed" ;;
+           esac
+       fi
+       if [[ -n "$DNS_ZONE" && ! "$DNS_ZONE" =~ ^[A-Za-z0-9.-]+$ && "$DNS_ZONE" != "derived" ]]; then
+           die "'$DNS_ZONE' is not a DNS zone name (letters, digits, dots and dashes only)"
+       fi
+       if [[ -z "$DNS_TOK" && -z "$DNS_ZONE" ]]; then
+           info "nothing entered — the DNS-01 settings stay as they are"
+       fi
+       NEW_CONFIG=$(echo "$CURRENT" | jq --arg t "$DNS_TOK" --arg z "$DNS_ZONE" '
+           (if $t != "" then .dns01_secret = $t else . end)
+           | (if $z == "derived" then del(.dns_zone, .dns01)
+              elif $z != "" then .dns_zone = $z | del(.dns01)
+              else . end)')
+       ;;
+    *) die "invalid choice '$CHOICE' (expected 1-5)" ;;
 esac
 
 # --- Build the merged config (merge, never rebuild) --------------------------
@@ -398,7 +443,7 @@ esac
 # config in the case block above. Only 1 and 2 collect credentials.
 if [[ "$CHOICE" == "3" ]]; then
     NEW_CONFIG=$(echo "$CURRENT" | jq --argjson st "$NEW_STAGING" '.staging=$st')
-elif [[ "$CHOICE" != "4" ]]; then
+elif [[ "$CHOICE" != "4" && "$CHOICE" != "5" ]]; then
     # A blank answer means "keep the live value" — that is the whole point of
     # reading the baseline first. Defaults come from the live config, so a
     # partial run (rotate only the secret you are holding) cannot blank out the

@@ -55,20 +55,54 @@ die() { echo "error: $*" >&2; exit 1; }
 need_config() { [ -f "$CONFIG" ] || die "$CONFIG missing (run: node watchdog/make-zip.mjs)"; }
 image_id() { node -p 'require("./'"$CONFIG"'").spec.imageId'; }
 
+# The rebuild must boot the credentials the LIVE box is actually running, not
+# whatever watchdog/dist/config.json happens to hold. `upload-secrets.sh`
+# syncs the deployed template straight from the blob it just pushed; a
+# `deploy` that re-baked the stale local copy would silently undo that — and
+# the next preemption recreate (or any 5-minute heartbeat) would boot old
+# credentials while the operator sees a healthy instance.
+#
+# Returns "" when there is no live instance or the CLI quirk returns no bytes
+# (DescribeUserData can read 0 right after a good push); callers then fall back
+# to config.json.
+live_userdata_b64() {
+  local ID
+  ID=$(aliyun ecs DescribeInstances --RegionId "$REGION" --Tag.1.Key pav-watchdog --Tag.1.Value prod 2>/dev/null \
+    | jget 'Instances.Instance.0.InstanceId')
+  [ -n "$ID" ] || { echo ""; return 0; }
+  aliyun ecs DescribeUserData --RegionId "$REGION" --InstanceId "$ID" 2>/dev/null \
+    | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let j;try{j=JSON.parse(s)}catch(e){return}const v=typeof j.UserData==="string"?j.UserData:((j.UserData&&j.UserData.Value)||"");process.stdout.write(v)})'
+}
+
 # Build the deployable templates: substitute the enclave user_data blob and the
 # rotating image id. Placeholders are the only secret-bearing hook, and they
 # live in the repo copies.
 build_watchdog_template() {
   need_config
-  node -e '
+  local LIVE CFG_UD CfgSha LiveSha B64 FROM
+  LIVE=$(live_userdata_b64)
+  CFG_UD=$(node -p 'require("./'"$CONFIG"'").userDataB64||""')
+  if [ -n "$LIVE" ]; then
+    CfgSha=$(printf '%s' "$CFG_UD" | sha256sum | cut -c1-16)
+    LiveSha=$(printf '%s' "$LIVE" | sha256sum | cut -c1-16)
+    if [ -n "$CFG_UD" ] && [ "$CfgSha" != "$LiveSha" ]; then
+      echo "note: $CONFIG ($CfgSha) differs from the live box ($LiveSha) — baking the LIVE blob"
+    fi
+    B64="$LIVE"; FROM="live instance"
+  else
+    B64="$CFG_UD"; FROM="$CONFIG"
+    [ -n "$B64" ] || die "config.json has no userDataB64 and no live instance was found"
+  fi
+  printf '%s' "$B64" | wc -c | grep -qx '0' && die "empty user_data — refusing to bake an empty config into the rebuild path"
+  B64="$B64" SRCJS="$SRC" OUTJS="$BUILT" node -e '
     const fs = require("fs");
-    const cfg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    if (!cfg.userDataB64) { console.error("config.json has no userDataB64"); process.exit(1); }
-    const src = fs.readFileSync(process.argv[2], "utf8");
+    const blob = process.env.B64 || "";
+    if (!blob) { console.error("empty user_data"); process.exit(1); }
+    const src = fs.readFileSync(process.env.SRCJS, "utf8");
     if (!src.includes("__USERDATA_B64__")) { console.error("placeholder missing in template"); process.exit(1); }
-    fs.writeFileSync(process.argv[3], src.replaceAll("__USERDATA_B64__", cfg.userDataB64));
-    console.log("built watchdog template (user_data " + cfg.userDataB64.length + " b64 chars)");
-  ' "$CONFIG" "$SRC" "$BUILT" || die "template build failed"
+    fs.writeFileSync(process.env.OUTJS, src.replaceAll("__USERDATA_B64__", blob));
+  ' || die "template build failed"
+  echo "built watchdog template (user_data from $FROM, ${#B64} b64 chars)"
 }
 
 build_heartbeat_template() {
