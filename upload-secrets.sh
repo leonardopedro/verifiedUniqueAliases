@@ -270,6 +270,26 @@ push_config() {
     wait_for_status Running 300
 }
 
+# The rebuild path is a DIFFERENT copy of the same secret: `pav-watchdog` runs
+# RunInstances with the `user_data` baked into the OOS template at deploy time.
+# Pushing to the instance alone therefore leaves it booting the PRE-rotation
+# credentials after any recreate (heartbeat or the 5-minute preemption notice).
+# Feed the blob we just pushed straight into the template.
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+sync_rebuild_template() {
+    local cfg="$1" out
+    info "syncing the rebuild template with the pushed user_data ..."
+    out=$(printf '%s' "$cfg" | base64 -w0 \
+        | bash "$ROOT_DIR/watchdog/sync-enclave-userdata.sh" from-stdin 2>&1)
+    if [[ $? -eq 0 ]]; then
+        while IFS= read -r line; do info "  $line"; done <<< "$out"
+    else
+        warn "rebuild template NOT synced — a recreate would boot the OLD credentials:"
+        while IFS= read -r line; do warn "  $line"; done <<< "$out"
+        warn "fix later with: bash watchdog/sync-enclave-userdata.sh from-instance"
+    fi
+}
+
 # --- Verify the boot, not the CLI readback -----------------------------------
 verify_boot() {
     info "waiting for TLS on https://${DOMAIN} (ACME can take minutes) ..."
@@ -439,6 +459,7 @@ fi
 DOMAIN=$(echo "$NEW_CONFIG" | jq -r '.domain')
 backup_config "$CURRENT"
 push_config "$NEW_CONFIG"
+sync_rebuild_template "$NEW_CONFIG"
 
 info "user_data pushed. DescribeUserData may read 0 right after a good push (known quirk) — verifying via the boot instead."
 if verify_boot; then
@@ -459,6 +480,7 @@ else
         if [[ "$RB" == "yes" ]]; then
             info "restoring pre-rotation config from memory ..."
             push_config "$CURRENT"
+            sync_rebuild_template "$CURRENT"
             if verify_boot; then
                 info "✅ rollback succeeded — the enclave is serving the pre-rotation config again"
             else

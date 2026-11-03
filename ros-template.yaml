@@ -1,0 +1,98 @@
+# =============================================================================
+# ros-template.yaml — activate the confidential-VM reconciler IMMEDIATELY
+# instead of waiting up to 1 minute for the next heartbeat tick.
+#
+# What this stack does (deliberately little):
+#
+#   * ONE resource: an OOS execution of the already-deployed `pav-watchdog`
+#     template, fired the moment the stack is created. The reconciler is
+#     idempotent: if the tagged box exists it only verifies the reserved EIP;
+#     if the box is gone (spot preemption, operator release) it recreates it
+#     with the exact prod spec — TDX, cloud_auto 1 GiB, no data disk — via
+#     RunInstances. RunInstances stays the ONLY creator of the enclave (user
+#     directive: no ALIYUN::ECS::Instance resource here, so 1 GiB stays
+#     uniform and the measurement cannot drift to a 20 GiB default).
+#   * The ongoing 1-minute cadence stays with the self-rearming heartbeat
+#     chain started by watchdog/deploy-oos-watchdog.sh. This stack must NOT
+#     start a second heartbeat: two roots double the chain (steady state 4
+#     executions, 2 reconciles/min) and trip `schedule status`'s ">2 = something
+#     doubled the chain" alarm. Ownership split: deploy script = cadence,
+#     this stack = activate-now.
+#   * No secrets: imageId is a parameter; the enclave user_data lives only in
+#     the deployed OOS template (injected by deploy-oos-watchdog.sh from the
+#     gitignored watchdog/dist/config.json). This file is committed to git, so
+#     it must never carry the config — same rule as watchdog/oos-watchdog.yaml.
+#
+# ACCOUNT GATE note (why the watchdog is OOS and not the fancier options):
+#   * Function Compute: `CreateFunction` answers `code: 403, Current user is
+#     in debt overdue` even with no overdue invoice and a RAM user holding
+#     AdministratorAccess → no FC watchdog, no FC trigger.
+#   * Auto Scaling (ESS): `ALIYUN::ESS::ScalingConfiguration` has no
+#     SecurityOptions property at all (verified against the live ROS resource
+#     schema 2026-11-03) and `SystemDiskSize` carries `Range.Min = 20`, so an
+#     ESS group can express neither TDX nor the 1 GiB AutoPL disk. ECS
+#     documents confidential-computing instances as RunInstances-only.
+#   * OOS state configuration (定时运维): rejects user templates with
+#     `EntityNotExists.Template`, its `rate` schedule has a 30-minute floor,
+#     and `cron` answers "not supported right now" — it cannot hold the
+#     1-minute cadence (see watchdog/oos-heartbeat.yaml header).
+#   * EventBridge: CAN reach OOS through the generic `acs.openapi` target
+#     (Product=oos, Action=StartExecution, RoleName) — that is the 5-minute
+#     preemption signal, wired by watchdog/deploy-spot-notice.sh and received
+#     by watchdog/oos-spot-notice.yaml. (The `acs.openapi.oos` type the OOS
+#     docs name does not exist: EventTargetNotExist.)
+#   => The only working activators are OOS calling OOS (ACS::ExecuteAPI, used
+#      by the heartbeat chain) and, for "right now, not in a minute", this
+#      stack: ROS creating an OOS execution directly.
+#
+# Usage:
+#   IMAGE_ID=$(node -p 'require("./watchdog/dist/config.json").spec.imageId')
+#   aliyun ros CreateStack --StackName pav-activate --RegionId cn-beijing \
+#     --TemplateBody "$(cat ros-template.yaml)" \
+#     --Parameters '[{"ParameterKey":"imageId","ParameterValue":"'"$IMAGE_ID"'"}]'
+# Re-activating later (e.g. after rotating the image) = update the stack with
+# the new imageId: the execution resource is immutable, so ROS replaces it and
+# a fresh reconcile fires with the new image.
+# =============================================================================
+ROSTemplateFormatVersion: '2015-09-01'
+Description: >-
+  Activate the pav-watchdog reconciler immediately (do not wait for the next
+  1-minute heartbeat tick). Idempotent: creates the TDX 1 GiB enclave only
+  when the tagged box is absent, then ensures the reserved EIP.
+
+Parameters:
+  imageId:
+    Type: String
+    Description: >-
+      Enclave image (m-...) used if the box must be recreated. Rotates per
+      deploy cycle - read the current value from watchdog/dist/config.json
+      (spec.imageId) at create/update time.
+  watchdogTemplate:
+    Type: String
+    Default: pav-watchdog
+    Description: Deployed OOS reconciler template; its latest version is used.
+
+Resources:
+  ImmediateReconcile:
+    Type: ALIYUN::OOS::Execution
+    Properties:
+      TemplateName:
+        Ref: watchdogTemplate
+      # Unattended by design: the same automation already runs every minute
+      # from the heartbeat chain without a human confirming anything.
+      Mode: Automatic
+      SafetyCheck: Skip
+      Description: ros-template immediate reconcile (activate now, do not wait for the heartbeat tick)
+      Parameters:
+        imageId:
+          Ref: imageId
+
+Outputs:
+  executionId:
+    Description: OOS execution started by this stack.
+    Value:
+      Fn::GetAtt: [ImmediateReconcile, ExecutionId]
+  status:
+    Description: Status of that execution right after stack create.
+    Value:
+      Fn::GetAtt: [ImmediateReconcile, Status]

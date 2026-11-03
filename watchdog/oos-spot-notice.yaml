@@ -1,0 +1,173 @@
+# =============================================================================
+# oos-spot-notice.yaml — the 5-MINUTE PREEMPTION SIGNAL, received by OOS.
+#
+# Until now the spot interruption notice only landed in SLS
+# (`pav-events/spot-notices` via the EventBridge rule `pav-spot-interruption`):
+# an audit trail no automation could act on, because OOS cannot read SLS
+# (`ACS::ExecuteAPI` form-encodes the body, SLS `GetLogs` needs a JSON body →
+# `PostBodyInvalid`) and no native scheduler can hold a 1-minute cadence.
+#
+# The missing piece was the EventBridge target type `acs.openapi`, which calls
+# any Alibaba Cloud OpenAPI with a RAM role. Verified live 2026-11-03:
+#
+#   Type: acs.openapi  ParamList:
+#     TargetRegion = cn-beijing          (the API endpoint region)
+#     Product      = oos                 ('Product not exist!' until correct)
+#     Version      = 2019-06-01          ('Version not exist!' until correct)
+#     Action       = StartExecution      ('Action not exist!' when sent as 'Api')
+#     RoleName     = pav-eventbridge-oos (assumed by EventBridge)
+#     Parameters   = {"TemplateName":"pav-spot-notice",...}
+#
+# So the notice is now PUSHED into OOS ~5 minutes before the box is taken,
+# while it is still running. That is what this template does with the signal:
+#
+#   1. record      — the execution itself is the record; the instance id and
+#                    notice time arrive from the event payload, and the raw
+#                    event stays in SLS for audit.
+#   2. preflight   — the three ways a rebuild can silently fail are checked
+#                    WHILE THERE IS STILL TIME TO REACT:
+#                      * image     — the enclave image still exists/Available
+#                      * eip       — the reserved allocation is InUse by us (it
+#                                    must be released by the cloud before the
+#                                    replacement can bind it)
+#                      * stock     — ecs.c9i.large spot capacity in our zone
+#   3. reconcile   — the idempotent reconciler runs now, so a notice that is
+#                    shorter than advertised (or a box already gone) starts the
+#                    rebuild immediately instead of at the next heartbeat tick.
+#
+# It deliberately does NOT delete the doomed box: it is still serving traffic,
+# and the EIP cannot move until the cloud releases it. Deleting early would
+# convert a 5-minute warning into 5 minutes of avoidable downtime.
+#
+# No secrets: the enclave config lives only in the deployed `pav-watchdog`
+# template. imageId is injected at deploy time (like the heartbeat template) so
+# the EventBridge target needs no payload for it.
+# =============================================================================
+FormatVersion: OOS-2019-06-01
+Description:
+  en: pav spot-notice - act on the 5-minute preemption warning (record, preflight, reconcile early).
+  zh-cn: pav 抢占通知 - 在实例被回收前 5 分钟记录并预检，提前触发重建。
+
+Parameters:
+  region:
+    Type: String
+    Default: cn-beijing
+  zoneId:
+    Type: String
+    Default: cn-beijing-i
+  eipAllocationId:
+    Type: String
+    Default: eip-2zet05jbat6wr6rp7elrc
+  instanceType:
+    Type: String
+    Default: ecs.c9i.large
+  watchdogTemplate:
+    Type: String
+    Default: pav-watchdog
+  # From the EventBridge event payload ($.data.instanceId / $.time). The
+  # default cannot be an empty string ("should not be empty" at CreateTemplate),
+  # so 'unknown' is the sentinel for a notice that carried no payload.
+  instanceId:
+    Type: String
+    Default: unknown
+    Description: Instance the notice is about.
+  noticeTime:
+    Type: String
+    Default: unknown
+    Description: CloudEvents `time` of the notice; the 5-minute window starts here.
+  # Injected by deploy-spot-notice.sh from watchdog/dist/config.json.
+  imageId:
+    Type: String
+    Default: '__IMAGE_ID__'
+
+Tasks:
+  # ------------------------------------------------------- is the image still there?
+  - Name: checkImage
+    Action: ACS::ExecuteAPI
+    Description: The rebuild is impossible if the enclave image has been deleted.
+    Properties:
+      Service: ECS
+      API: DescribeImages
+      Parameters:
+        RegionId: '{{ region }}'
+        ImageId: '{{ imageId }}'
+    Outputs:
+      status:
+        Type: String
+        ValueSelector: Images.Image[0].Status
+
+  # ------------------------------------------------------- is the EIP where we expect?
+  - Name: checkEip
+    Action: ACS::ExecuteAPI
+    Description: InUse while the box lives; Available once the cloud releases it.
+    Properties:
+      Service: VPC
+      API: DescribeEipAddresses
+      Parameters:
+        RegionId: '{{ region }}'
+        AllocationId: '{{ eipAllocationId }}'
+    Outputs:
+      status:
+        Type: String
+        ValueSelector: EipAddresses.EipAddress[0].Status
+
+  # ------------------------------------------------------- can we even get capacity?
+  - Name: checkStock
+    Action: ACS::ExecuteAPI
+    Description: Spot capacity in our zone - the failure mode nobody notices until preemption.
+    Properties:
+      Service: ECS
+      API: DescribeAvailableResource
+      Parameters:
+        RegionId: '{{ region }}'
+        DestinationResource: InstanceType
+        InstanceType: '{{ instanceType }}'
+        ZoneId: '{{ zoneId }}'
+        InstanceChargeType: PostPaid
+        SpotStrategy: SpotAsPriceGo
+    Outputs:
+      status:
+        Type: String
+        ValueSelector: AvailableZones.AvailableZone[0].StatusCategory
+
+  # ------------------------------------------------------- start the rebuild clock now
+  - Name: reconcile
+    Action: ACS::ExecuteAPI
+    Description: Idempotent reconciler - creates the box only if the tag is already gone.
+    Properties:
+      Service: OOS
+      API: StartExecution
+      Parameters:
+        RegionId: '{{ region }}'
+        TemplateName: '{{ watchdogTemplate }}'
+        Parameters: '{"imageId":"{{ imageId }}"}'
+    Outputs:
+      executionId:
+        Type: String
+        ValueSelector: Execution.ExecutionId
+
+Outputs:
+  instanceId:
+    Type: String
+    Description: Preempted instance from the event payload.
+    Value: '{{ instanceId }}'
+  noticeTime:
+    Type: String
+    Description: When the 5-minute window started.
+    Value: '{{ noticeTime }}'
+  imageStatus:
+    Type: String
+    Description: Available means the rebuild will find its image.
+    Value: '{{ checkImage.status }}'
+  eipStatus:
+    Type: String
+    Description: InUse = still ours to lose; Available = free to rebind.
+    Value: '{{ checkEip.status }}'
+  spotStock:
+    Type: String
+    Description: WithStock means spot capacity exists for the replacement.
+    Value: '{{ checkStock.status }}'
+  reconcileExecutionId:
+    Type: String
+    Description: Early reconcile fired by the notice.
+    Value: '{{ reconcile.executionId }}'

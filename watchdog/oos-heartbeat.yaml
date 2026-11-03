@@ -10,9 +10,11 @@
 #     name, plus TemplateVersion and ResourceGroupId. And even if it bound, its
 #     API caps the interval: `ScheduleType: cron` answers "Cron schedule type
 #     is not supported right now." and `rate` documents a 30-minute minimum.
-#   * EventBridge has no OOS event target (documented target types: FC, MNS,
-#     RocketMQ, RabbitMQ, Kafka, SLS, RDS, HTTP(S), API destination, FnF, SAE,
-#     K8s, DingTalk, SMS, mail, DataHub, EventBridge... but not OOS).
+#   * EventBridge DOES reach OOS through the generic `acs.openapi` target
+#     (Product/Version/Action/RoleName/Parameters) - that is how the spot
+#     notice is pushed into OOS (watchdog/oos-spot-notice.yaml). What
+#     EventBridge still cannot do is hold a 1-minute *cadence*, which is why
+#     this chain exists.
 #   * CloudFlow (FnF) answers `AccessDenied: FnF service is not enabled for
 #     current user`, and Function Compute still answers
 #     `code: 403, Current user is in debt overdue` on CreateFunction.

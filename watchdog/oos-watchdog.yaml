@@ -129,8 +129,14 @@ Tasks:
         # natpublicip, cannot bind eip"), so the rebuild came up Running but
         # unreachable. The reserved EIP is the ONLY public path here (the
         # Cloudflare DNS-01 token is pinned to its address).
+        #
+        # Do NOT add `AllocatePublicIp` here: RunInstances has no such
+        # parameter (it belongs to CreateInstance) and the API fails the whole
+        # call with "The parameter (AllocatePublicIp) in (Parameters) is not
+        # supported". Found live 2026-11-03 — the rebuild silently returned
+        # CREATE_ROLLBACK_COMPLETE and the enclave stayed dark until the line
+        # was removed. Bandwidth 0 is what keeps the natpublicip away.
         InternetMaxBandwidthOut: 0
-        AllocatePublicIp: false
         'SystemDisk.Category': cloud_auto
         'SystemDisk.Size': 1
         'SecurityOptions.ConfidentialComputingMode': TDX
