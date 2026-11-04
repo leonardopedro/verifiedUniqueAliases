@@ -1749,8 +1749,11 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
       lastLoginBody = opts.body;
       const pubDer = Buffer.from(body.client_ecdh_pub_b64, 'base64');
       const binding = await clientSessionBindingHex(pubDer, body.client_nonce_hex);
+      // v207: the flow-substitution probe now swaps the OTHER way round —
+      // this block drives the full flow, so a substituted response carries the
+      // verified app id and the auditor must still refuse it.
       const app = globalThis.EXPECTED_APPS.find(a => a.flow ===
-        (substituteFlow ? 'full' : (body.flow || 'verified')));
+        (substituteFlow ? 'verified' : (body.flow || 'verified')));
       // v198: mirror main.rs — the enclave signs the ENCRYPTION TARGET (the
       // key the ciphertext's PKESK key-id names), not the primary.
       let escrowFp = null;
@@ -1785,18 +1788,27 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
     document.getElementById('localEnclaveHost').value = 'https://login.airma.de';
     document.getElementById('customInfoInput').value = '';
     elements['attestationInput'].value = '';
-    await executePreflightAndLogin('verified');
+    await executePreflightAndLogin('full');
     check('exactly one network call, to /attest/login-session',
       requests.length === 1 && requests[0].endsWith('/attest/login-session'), JSON.stringify(requests));
     check('no pre-login audit ran (report textarea untouched)',
       elements['attestationInput'].value === '', elements['attestationInput'].value.slice(0, 60));
     check('no escrow key in the box → pgp_recipient travels empty (v197)',
       JSON.parse(lastLoginBody).pgp_recipient === '', lastLoginBody.slice(-140));
-    const href = elements['loginVerifiedLink'].href || '';
+    check('v207: the session asks for the full flow (verified login is disabled)',
+      JSON.parse(lastLoginBody).flow === 'full', String(JSON.parse(lastLoginBody).flow));
+    const href = elements['loginFullLink'].href || '';
     check('flow link becomes the authorize handoff (v188 two explicit links)',
       typeof href === 'string' && href.startsWith('https://www.sandbox.paypal.com'),
       String(href).slice(0, 140));
     check('authorize URL carries the state token', href.includes('&state=teststate-abc'), href.slice(0, 220));
+    // v207 (user directive): no login may ask PayPal for paypalattributes —
+    // that scope is the one that hands over the PayPal user id, and PayPal
+    // now answers it with "invalid scope".
+    check('v207: authorize URL requests only openid/profile/email/address',
+      href.includes('&scope=openid%20profile%20email%20address')
+        && !href.includes('paypalattributes'),
+      (href.match(/[&?]scope=[^&]*/) || [''])[0]);
     check('authorize URL carries the required PKCE challenge + S256 method (R3-1)',
       href.includes('&code_challenge=' + PKCE_CHALLENGE) && href.includes('&code_challenge_method=S256'),
       href.slice(0, 260));
@@ -1817,8 +1829,8 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
       const reqsBefore = requests.length;
       const nonceBefore = globalThis.sessionStorage.getItem('pav_client_nonce');
       const sessBefore = globalThis.localStorage.getItem('pav_local_session');
-      const hrefBefore = elements['loginVerifiedLink'].href;
-      await executePreflightAndLogin('verified');
+      const hrefBefore = elements['loginFullLink'].href;
+      await executePreflightAndLogin('full');
       check('F6: repeat click on a prepared handoff makes NO new session call',
         requests.length === reqsBefore,
         `requests ${reqsBefore} -> ${requests.length}`);
@@ -1828,17 +1840,17 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
       check('F6: repeat click does NOT rewrite pav_local_session (state #1 stays live)',
         globalThis.localStorage.getItem('pav_local_session') === sessBefore);
       check('F6: the authorize href is untouched by the repeat click',
-        elements['loginVerifiedLink'].href === hrefBefore
-        && String(elements['loginVerifiedLink'].href).includes('authorize'));
+        elements['loginFullLink'].href === hrefBefore
+        && String(elements['loginFullLink'].href).includes('authorize'));
     }
 
     // R3-1 downgrade defense: S_enc-signed login fields WITHOUT a PKCE
     // challenge (stale enclave, or a relay stripping fields before signing)
     // must be refused BEFORE the user is sent to PayPal. Start from an
     // UNPREPARED link (F6 keeps a prepared link from re-entering prepare).
-    elements['loginVerifiedLink'].href = '';
+    elements['loginFullLink'].href = '';
     omitPkce = true;
-    await executePreflightAndLogin('verified');
+    await executePreflightAndLogin('full');
     omitPkce = false;
     check('PKCE-less signed login fields are refused (downgrade defense)',
       /PKCE MISSING OR WEAK/.test(elements['secureLoginStatus'].innerText || ''),
@@ -1851,23 +1863,23 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
     // fully-valid signed response for the WRONG app — app pin and PKCE both
     // pass — so the auditor must compare the signed flow against the one THIS
     // tab requested, before any authorize link exists.
-    elements['loginVerifiedLink'].href = ''; // clear the happy-path href
+    elements['loginFullLink'].href = ''; // clear the happy-path href
     substituteFlow = true;
-    await executePreflightAndLogin('verified');
+    await executePreflightAndLogin('full');
     substituteFlow = false;
     check('flow-substituted session is refused before PayPal (v186)',
       /FLOW SUBSTITUTION/.test(elements['secureLoginStatus'].innerText || ''),
       (elements['secureLoginStatus'].innerText || '').slice(0, 200));
     check('flow substitution built no authorize link',
-      requests.length === 3 && !elements['loginVerifiedLink'].href,
-      JSON.stringify({ requests: requests.length, href: elements['loginVerifiedLink'].href }));
+      requests.length === 3 && !elements['loginFullLink'].href,
+      JSON.stringify({ requests: requests.length, href: elements['loginFullLink'].href }));
 
     // v186: the client-side custom_info cap counts BYTES (TextEncoder),
     // matching the enclave's new server-side 512-byte rejection. 257 two-byte
     // chars = 257 UTF-16 units (the old char-count check passed them) but
     // 514 bytes — must be refused BEFORE any network call.
     document.getElementById('customInfoInput').value = 'é'.repeat(257);
-    await executePreflightAndLogin('verified');
+    await executePreflightAndLogin('full');
     document.getElementById('customInfoInput').value = '';
     check('oversized custom_info refused client-side by BYTES (v186)',
       /exceeds 512 bytes/.test(elements['secureLoginStatus'].innerText || ''),
@@ -1889,9 +1901,9 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
         && prefilledPgp.length > 3000,
       prefilledPgp.slice(0, 60) + ' … ' + prefilledPgp.length + ' B');
 
-    elements['loginVerifiedLink'].href = '';       // F6: force a fresh prepare
+    elements['loginFullLink'].href = '';       // F6: force a fresh prepare
     elements['policePgpInput'].value = prefilledPgp;
-    await executePreflightAndLogin('verified');
+    await executePreflightAndLogin('full');
     const sentBody = JSON.parse(lastLoginBody);
     check('v197: default prefilled Police key travels as pgp_recipient',
       typeof sentBody.pgp_recipient === 'string'
@@ -1903,32 +1915,32 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
 
     // Hostile substitution: the enclave signs a fingerprint for a DIFFERENT
     // key than this tab pasted → abort BEFORE PayPal, link reset.
-    elements['loginVerifiedLink'].href = '';
+    elements['loginFullLink'].href = '';
     escrowMode = 'wrong';
-    await executePreflightAndLogin('verified');
+    await executePreflightAndLogin('full');
     escrowMode = 'echo';
     check('v197: substituted escrow fingerprint fails closed before PayPal',
       /ESCROW KEY SUBSTITUTION/.test(elements['secureLoginStatus'].innerText || ''),
       (elements['secureLoginStatus'].innerText || '').slice(0, 240));
     check('v197: substitution refusal left no authorize link',
-      !elements['loginVerifiedLink'].href, String(elements['loginVerifiedLink'].href).slice(0, 120));
+      !elements['loginFullLink'].href, String(elements['loginFullLink'].href).slice(0, 120));
 
     // Legacy (pre-v197) enclave: no fingerprint signed back → warn, proceed
     // (deploy-window safety: an old enclave ignores the field entirely).
-    elements['loginVerifiedLink'].href = '';
+    elements['loginFullLink'].href = '';
     escrowMode = 'omit';
-    await executePreflightAndLogin('verified');
+    await executePreflightAndLogin('full');
     escrowMode = 'echo';
     check('v197: legacy enclave (no signed fingerprint) warns but proceeds',
       /pre-v197 enclave/.test(elements['secureLoginStatus'].innerText || '')
-        && String(elements['loginVerifiedLink'].href || '').includes('authorize'),
+        && String(elements['loginFullLink'].href || '').includes('authorize'),
       (elements['secureLoginStatus'].innerText || '').slice(0, 240));
 
     // Garbage in the escrow box must fail closed client-side, with NO request.
-    elements['loginVerifiedLink'].href = '';
+    elements['loginFullLink'].href = '';
     elements['policePgpInput'].value = 'not a PGP key';
     const reqsBeforeBad = requests.length;
-    await executePreflightAndLogin('verified');
+    await executePreflightAndLogin('full');
     elements['policePgpInput'].value = '';
     check('v197: non-PGP content in the escrow box fails before any request',
       /does not contain a PGP PUBLIC KEY BLOCK/.test(elements['secureLoginStatus'].innerText || '')
@@ -1937,6 +1949,12 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
   } finally {
     globalThis.fetch = origFetch;
     setLoc(null);
+    // v207: this block now drives the FULL flow, so the tab remembers
+    // "full" (both the variable and sessionStorage). Put the tab back to the
+    // flow the later fixtures were minted with, or every audit below trips
+    // FLOW ESCALATION.
+    try { globalThis.sessionStorage.removeItem('pav_selected_flow'); } catch (e) { /* no storage */ }
+    rememberSelectedFlow('verified');
     delete globalThis.localStorage;
     delete globalThis.sessionStorage;
   }
@@ -2192,6 +2210,29 @@ console.log('\nTest 36: two explicit login links + key auto-generated on render 
       && verifySrc2.includes("onclick=\"executePreflightAndLogin('verified')\"")
       && verifySrc2.includes("onclick=\"executePreflightAndLogin('full')\""),
     'explicit login links missing');
+  // v207 (user directive): PayPal rejects the verified flow's scope, so that
+  // login is hidden behind ONE flag — the markup and the app pin stay, and any
+  // stale entry point falls through to the full-profile flow.
+  check('v207: the verified login sits in a block hidden by default',
+    /<div id="verifiedFlowBlock" style="display:none;"/.test(verifySrc2),
+    'verifiedFlowBlock wrapper missing or visible');
+  check('v207: one flag disables the verified flow (and defaults to disabled)',
+    verifySrc2.includes('var VERIFIED_FLOW_ENABLED = false;')
+      && verifySrc2.includes("if (flow === 'verified' && !VERIFIED_FLOW_ENABLED) flow = 'full';"),
+    'VERIFIED_FLOW_ENABLED flag or its fallback missing');
+  check('v207: every PayPal button carries the standard label only',
+    (verifySrc2.match(/<span class="pp-label">([^<]*)<\/span>/g) || [])
+      .every((s) => s.includes('>Log in with PayPal<')),
+    (verifySrc2.match(/<span class="pp-label">([^<]*)<\/span>/g) || []).join(' | '));
+  check('v207: progress and handoff notes render OUTSIDE the button',
+    verifySrc2.includes('id="loginProgress"')
+      && !verifySrc2.includes("labelEl.textContent = 'Preparing")
+      && !verifySrc2.includes("labelEl.textContent = 'Continue to PayPal"),
+    'button label is being rewritten');
+  check('v207: the button uses PayPal\u2019s accessible blue + white monogram',
+    /\.pp-btn \{[^}]*background: #0070BA/.test(verifySrc2)
+      && verifySrc2.includes('paypal-mark-monotone.svg'),
+    'button colour/mark not per the designer guide');
   check('initial workflow button is suppressed (removed entirely)',
     !verifySrc2.includes('id="workflowBtn"') && !verifySrc2.includes('workflowClick'),
     'workflow button still present');
