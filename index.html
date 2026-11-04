@@ -1878,7 +1878,7 @@ Wmw2oAio9A==
     // ========================================================================
     var EXPECTED_RTMR0 = '06a32a2f92ea455dd628bc41be9bb5910c2782a2eb93c646c6a5ddebd70291839f197792d289cca528572b6d910294db';
     var EXPECTED_RTMR1 = '6fa0352319182f7ec8cb713223cbc1853506caf719c64d04475a26975ae8ebf72003f592dcf0aafe392cc74de33d3f90';
-    var EXPECTED_RTMR2 = '3ed56c3c63236f7f19f79b39dd061a9711f45ba77021a3746cb1943017303c459f68c5da2af7c41b59c50225e0eeef32';
+    var EXPECTED_RTMR2 = '34ad4cc5ac0b0662a75308f3f5a962a1cc50955e57948f019752e13bf2cbf75eb101b6cf9ea1c16c0ad4b7ad06a12bec';
     var EXPECTED_RTMR3 = '000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000';
 
     // ========================================================================
@@ -1911,7 +1911,13 @@ Wmw2oAio9A==
     // the podman build that produced disk e1bce1d8…, live-confirmed by the
     // post-swap envelope self-reporting 4933005a… (RTMR2 rotated 86784f37… →
     // e79cce72… because the initrd carries the new binary; MRTD/RTMR0/1/3 held).
-    var EXPECTED_ENCLAVE_SHA256 = '6dd1c12e6e23c944265a6cd60183f0070b2ac46a58f45c6150b3335c1ec6341e';
+    // v206 rotation (2026-11-04): the v206 binary (PayPal-conformant login
+    // buttons on the landing page; the landing is compiled in, so the binary
+    // digest rotates) — digest of the podman build that produced disk
+    // fc790cbf…, live-confirmed by the post-swap envelope self-reporting
+    // 513482d8… (RTMR2 rotated 3ed56c3c… → 34ad4cc5… because the initrd
+    // carries the new binary; MRTD/RTMR0/1/3 held).
+    var EXPECTED_ENCLAVE_SHA256 = '513482d83ec51d045d182b2334efc92058f3c990b1e85e7247e9cbe727b9ce9a';
 
     // ========================================================================
     // v162 (audit VULN-04): GOLDEN PCR PINS — CI-captured constants for the
