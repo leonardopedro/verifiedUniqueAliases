@@ -1902,7 +1902,17 @@ impl AppState {
     /// account change. Re-adding the scope means re-adding it here AND in the
     /// EXPECTED_APPS pin in verify.html (the pin is an equality check).
     fn get_flow_config(&self, flow_name: &str) -> (String, String, String, String) {
-        const MINIMAL_SCOPE: &str = "openid%20profile%20email%20address";
+        // v208 (user directive, 2026-11-04): NOTHING is requested from PayPal
+        // any more — not the user id, not the name, not the e-mail, not the
+        // address. `openid` is the single scope PayPal's Log in with PayPal
+        // needs to run at all (it is the OAuth handshake itself); the enclave
+        // stops asking for any attribute and records that it asked for none.
+        // CONSEQUENCE (accepted, temporary): the report's `paypal_user_info` is
+        // empty, so the identity hash is the hash of an empty record — every
+        // login of every account hashes alike and the "unique alias" claim is
+        // suspended until an attribute scope is approved again. Re-adding one
+        // means editing MINIMAL_SCOPE here AND the EXPECTED_APPS pin.
+        const MINIMAL_SCOPE: &str = "openid";
         if flow_name == "verified" {
             (
                 self.paypal_verified_client_id.clone(),
@@ -2966,7 +2976,14 @@ async fn callback(
     // Zeroize sensitive token memory immediately
     zeroize_str(&mut token_obj.access_token);
     if let Some(ref mut idt) = token_obj.id_token { zeroize_str(idt); }        let minimized = userinfo.verified_only();
-    if minimized.verified_account.as_deref() != Some("true") {
+    // v208 (user directive): the verified-account gate is SUSPENDED while the
+    // login asks PayPal for no attributes at all — `verified_account` arrives
+    // only with the paypalattributes scope, so requiring it here would 403
+    // every login. Flip this back to `true` in the same commit that restores
+    // an attribute scope; the auditor has the matching switch
+    // (REQUIRE_VERIFIED_ACCOUNT in verify.html), and both must move together.
+    const REQUIRE_VERIFIED_ACCOUNT: bool = false;
+    if REQUIRE_VERIFIED_ACCOUNT && minimized.verified_account.as_deref() != Some("true") {
         return (StatusCode::FORBIDDEN, "PayPal account must be verified").into_response();
     }
 

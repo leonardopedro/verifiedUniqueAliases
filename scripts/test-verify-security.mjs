@@ -1215,9 +1215,21 @@ console.log('\nTest 27: environment binding — two-verdict model: sandbox = gre
       paypal_environment: 'production',
     },
   });
+  // v208 (user directive): the gate is switchable, because the login asks
+  // PayPal for no attributes at all and `verified_account` therefore never
+  // arrives. With the switch OFF the report audits (as a login, not a verified
+  // account); with it ON — the shipped configuration as soon as an attribute
+  // scope is restored — the old refusal must still fire, so the switch must not
+  // become a silent bypass.
+  const uOff = await runAuditWith(unverified.envelope);
+  check('v208: with REQUIRE_VERIFIED_ACCOUNT off, an attribute-less report audits',
+    uOff.ok === true, `ok=${uOff.ok}`);
+  const savedGate = globalThis.REQUIRE_VERIFIED_ACCOUNT;
+  globalThis.REQUIRE_VERIFIED_ACCOUNT = true;
   const u = await runAuditWith(unverified.envelope);
-  check('unverified account fails closed', u.ok === false, `ok=${u.ok}`);
-  check('failure names the unverified-account refusal',
+  globalThis.REQUIRE_VERIFIED_ACCOUNT = savedGate;
+  check('v208: with the gate on, unverified account fails closed', u.ok === false, `ok=${u.ok}`);
+  check('v208: the refusal still names UNVERIFIED ACCOUNT',
     /UNVERIFIED ACCOUNT REFUSED/.test(u.alert || ''), (u.alert || '').slice(0, 200));
 
   // (d) an older report that does not declare the environment is refused too
@@ -1802,11 +1814,11 @@ console.log('\nTest 32: v180 no pre-login attestation — login-session flow, no
       typeof href === 'string' && href.startsWith('https://www.sandbox.paypal.com'),
       String(href).slice(0, 140));
     check('authorize URL carries the state token', href.includes('&state=teststate-abc'), href.slice(0, 220));
-    // v207 (user directive): no login may ask PayPal for paypalattributes —
-    // that scope is the one that hands over the PayPal user id, and PayPal
-    // now answers it with "invalid scope".
-    check('v207: authorize URL requests only openid/profile/email/address',
-      href.includes('&scope=openid%20profile%20email%20address')
+    // v208 (user directive): the login asks PayPal for NOTHING but the
+    // handshake itself — no user id, no profile, no e-mail, no address.
+    check('v208: authorize URL requests the openid scope and no attribute',
+      /[&?]scope=openid(&|$)/.test(href)
+        && !href.includes('profile') && !href.includes('email')
         && !href.includes('paypalattributes'),
       (href.match(/[&?]scope=[^&]*/) || [''])[0]);
     check('authorize URL carries the required PKCE challenge + S256 method (R3-1)',

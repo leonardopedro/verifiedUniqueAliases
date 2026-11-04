@@ -925,6 +925,12 @@ Wmw2oAio9A==
     // get_flow_config("verified") path and every flow test stay, so flipping
     // this to true (plus the block's display) brings the button back unchanged.
     var VERIFIED_FLOW_ENABLED = false;
+    // v208 (user directive, TEMPORARY): the login asks PayPal for the openid
+    // handshake and NOTHING else — no user id, no name, no e-mail, no address —
+    // so `verified_account` never arrives. This switch disables the
+    // verified-account gate and mirrors REQUIRE_VERIFIED_ACCOUNT in src/main.rs;
+    // turn both on together with the attribute scope that justifies them.
+    var REQUIRE_VERIFIED_ACCOUNT = false;
     var LOGIN_LINK_ID = { verified: 'loginVerifiedLink', full: 'loginFullLink' };
     var LOGIN_LINK_LABEL = {
         verified: 'Log in with PayPal',
@@ -1870,15 +1876,15 @@ Wmw2oAio9A==
         // app level), so minimal disclosure is structurally enforced by PayPal,
         // not just by the requested scope. The full flow uses the PII-capable
         // app. Swapping these back will break the full flow with "invalid scope".
-        { flow: 'verified', client_id: 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address' },
-        { flow: 'full', client_id: 'ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address' },
+        { flow: 'verified', client_id: 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'openid' },
+        { flow: 'full', client_id: 'ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'openid' },
         // Production (live cutover 2026-11-02) — same flow pairing as sandbox:
         // 'welcome' is the REST app with NO PII scopes enabled (verified flow),
         // 'EncryptedData' is the PII-capable app (full flow). authorize_base is
         // www.paypal.com — a sandbox client_id can never satisfy this entry and
         // vice versa, which is exactly what makes the swap fail-closed.
-        { flow: 'verified', client_id: 'BAA6A0dAJkSa5NBAqB7nR18hYg7GbA96lBC_BUa8uttAsYygct8NPtobTxWNQrOAvL7dLCUzAtuqjBN3do', authorize_base: 'https://www.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address' },
-        { flow: 'full', client_id: 'BAAKIQtHan_IwlC0KJeBICQ86HyaLghkcmyP9W42jfd2TjtugYHpYrfQFKp8SGSGIyA8qGTh0oKNOJQxNU', authorize_base: 'https://www.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address' },
+        { flow: 'verified', client_id: 'BAA6A0dAJkSa5NBAqB7nR18hYg7GbA96lBC_BUa8uttAsYygct8NPtobTxWNQrOAvL7dLCUzAtuqjBN3do', authorize_base: 'https://www.paypal.com/signin/authorize', scope: 'openid' },
+        { flow: 'full', client_id: 'BAAKIQtHan_IwlC0KJeBICQ86HyaLghkcmyP9W42jfd2TjtugYHpYrfQFKp8SGSGIyA8qGTh0oKNOJQxNU', authorize_base: 'https://www.paypal.com/signin/authorize', scope: 'openid' },
     ];
 
     // ========================================================================
@@ -3016,6 +3022,8 @@ Wmw2oAio9A==
             // deployment keeps the integrity verdict green but downgrades the
             // IDENTITY verdict (see the environment gate below).
             let sandboxDeployment = false;
+            // v208: the enclave requested no PayPal attributes (scope=openid).
+            let noIdentityAttributes = false;
             
             document.getElementById('resultsArea').style.display = 'block';
             document.getElementById('signTime').innerText = new Date(report.timestamp_ms).toLocaleString();
@@ -3217,11 +3225,21 @@ Wmw2oAio9A==
                 // the auditor must not take the displayed status on faith from
                 // the same party that benefits from asserting it — check the
                 // signed field itself.
-                if (String(report.paypal_user_info.verified_account || '') !== 'true') {
+                // v208 (user directive, TEMPORARY): the enclave asks PayPal for
+                // no attributes, so `verified_account` is absent BY DESIGN and
+                // this gate is switched off — it must come back in the same
+                // commit that restores an attribute scope (src/main.rs carries
+                // the matching REQUIRE_VERIFIED_ACCOUNT). While it is off the
+                // audit states plainly that no PayPal attribute was requested.
+                if (REQUIRE_VERIFIED_ACCOUNT && String(report.paypal_user_info.verified_account || '') !== 'true') {
                     throw new Error('UNVERIFIED ACCOUNT REFUSED: this report carries a PayPal identity whose ' +
                         'verified_account flag is "' + String(report.paypal_user_info.verified_account) + '", not "true". ' +
                         'The enclave promises verified-only identities; a green report on an unverified account would be a lie. Failing closed.');
                 }
+                // v208: while the gate is off the identity row must not read as
+                // a verified PayPal identity — the report proves a PayPal LOGIN,
+                // not a verified account (no attribute scope was requested).
+                if (!REQUIRE_VERIFIED_ACCOUNT) noIdentityAttributes = true;
                 const env = String(report.paypal_environment || '').toLowerCase();
                 if (!env) {
                     throw new Error('PAYPAL ENVIRONMENT UNDECLARED: this report does not state which PayPal ' +
@@ -3753,6 +3771,13 @@ Wmw2oAio9A==
             // render as a verified PRODUCTION identity. The identity row is
             // downgraded to a loud warning and runAudit returns 'sandbox'
             // (truthy — the flow works) instead of true.
+            if (noIdentityAttributes && !sandboxDeployment) {
+                updateStatus('identityCheck', 'warning',
+                    'ℹ️ <b>No PayPal identity was requested.</b> This login asked PayPal for <code>openid</code> only — ' +
+                    'no user id, name, e-mail or address — so the report binds a PayPal <i>login</i>, not a verified ' +
+                    'account: the identity fields are empty by design and two different account holders produce the ' +
+                    'same identity hash. The hardware attestation and every binding above are unaffected.');
+            }
             if (sandboxDeployment) {
                 updateStatus('identityCheck', 'warning',
                     '⚠️ <b>SANDBOX IDENTITY — NOT a production PayPal user.</b> Every integrity check above is ' +
