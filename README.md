@@ -96,7 +96,7 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 259,903 bytes | `a7ee4f0ecc8b3f06be4b06925522ac256d7a5a89d51591b2a81cd55494124121` |
+| `verify.html` | 260,301 bytes | `2c282579402d83a2109f932240b810db76de30f9db44da5c8543f63821cb12d0` |
 | `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
 | `zk-rsa.html` | 100,001 bytes | `a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40` |
 | `privacy.html` | 4,673 bytes | `e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8` |
