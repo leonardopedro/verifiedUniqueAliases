@@ -296,7 +296,7 @@
         <div class="input-card" style="grid-column: span 2; border-color: #4caf50;">
             <label>Log in with PayPal — the login IS the pre-flight check</label>
             <p style="color: var(--text-dim); font-size: 0.9rem;">There is no separate pre-login hardware check: a completed PayPal login is the attacker filter. This page makes a throwaway key the moment it opens; your identity comes back encrypted to that key, so neither the site owner nor the cloud provider can read it. PayPal's approval then buys a hardware proof (an Intel TDX quote) bound to <i>this</i> login, which this page audits — only a fully green audit decrypts.</p>
-            <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow:</b> the key is generated automatically when this page loads. Pick ONE of the two links below; it turns into “✅ Continue to PayPal →” in a new tab. After PayPal returns, the enclave's callback page <b>downloads your still-ENCRYPTED attestation automatically</b> — bring that file back here and load it with the “Attestation JSON report” file picker above. <b>Strongest setup:</b> take <code>verify.html</code> from the project's <a href="https://github.com/leonardopedro/verifiedUniqueAliases" style="color:#58a6ff;">GitHub repository</a> (the verified source), save it and open it locally (the yellow card above does this and remembers where it landed) — the key is then created only on your machine.</p>
+            <p style="color: var(--text-dim); font-size: 0.9rem; margin-top: -6px;"><b style="color:#e0e0e0;">Flow:</b> the key is generated automatically when this page loads. Press the login button below; when the note under it says the session is ready, press the same button again to open PayPal in a new tab. After PayPal returns, the enclave's callback page <b>downloads your still-ENCRYPTED attestation automatically</b> — bring that file back here and load it with the “Attestation JSON report” file picker above. <b>Strongest setup:</b> take <code>verify.html</code> from the project's <a href="https://github.com/leonardopedro/verifiedUniqueAliases" style="color:#58a6ff;">GitHub repository</a> (the verified source), save it and open it locally (the yellow card above does this and remembers where it landed) — the key is then created only on your machine.</p>
             <!-- v188 (user request): the morphing workflow button is SUPPRESSED (removed) — two explicit login links replace it, the throwaway key is auto-generated on render (keyNotice announces it), and the claim step is gone: /callback AUTO-DOWNLOADS the ciphertext and this tab loads it with the file picker (decryptPastedBlob → runAudit). -->
             <div id="keyNotice" style="display:none; margin-top:12px; padding:10px 12px; border-radius:8px; font-size:0.85rem; background:rgba(63,185,80,0.08); border:1px solid #3fb950; color:#3fb950;"></div>
             <!-- v201 (user request): the pre-login option that offered the
@@ -307,10 +307,24 @@
                  logins are PayPal-branded buttons — official label, official
                  mark, recommended colours and pill shape — and the difference
                  between them lives in the caption, not in a recoloured button. -->
-            <p class="pp-cap"><b style="color:#e6edf3;">Verified status only</b> — PayPal confirms the account exists; no name, e-mail or address is shared.</p>
-            <a id="loginVerifiedLink" class="pp-btn" onclick="executePreflightAndLogin('verified')"><img src="https://www.paypalobjects.com/paypal-ui/logos/svg/paypal-mark-color.svg" alt="PayPal" width="22" height="22"><span class="pp-label">Log in with PayPal</span></a>
+            <!-- v207 (2026-11-04, TEMPORARY — user directive): the "verified
+                 status only" login asked PayPal for the paypalattributes scope
+                 alone, which is exactly the scope that returns the PayPal USER
+                 ID; PayPal now answers it with "invalid scope", so every click
+                 dead-ended. The block is hidden (not deleted) and the flow is
+                 forced to the full-profile app below; get_flow_config, the app
+                 pins and the enclave path are untouched, so re-enabling is the
+                 one flag VERIFIED_FLOW_ENABLED in the script. -->
+            <div id="verifiedFlowBlock" style="display:none;">
+                <p class="pp-cap"><b style="color:#e6edf3;">Verified status only</b> — PayPal confirms the account exists; no name, e-mail or address is shared.</p>
+                <a id="loginVerifiedLink" class="pp-btn" onclick="executePreflightAndLogin('verified')"><img src="https://www.paypalobjects.com/paypal-ui/logos/svg/paypal-mark-color.svg" alt="PayPal" width="22" height="22"><span class="pp-label">Log in with PayPal</span></a>
+            </div>
             <p class="pp-cap"><b style="color:#e6edf3;">Name, e-mail and address</b> — only needed when the alias must carry your real identity (escrow).</p>
             <a id="loginFullLink" class="pp-btn" onclick="executePreflightAndLogin('full')"><img src="https://www.paypalobjects.com/paypal-ui/logos/svg/paypal-mark-color.svg" alt="PayPal" width="22" height="22"><span class="pp-label">Log in with PayPal</span></a>
+            <!-- v207 (user directive): the button keeps PayPal's standard label
+                 at all times — progress and the "it is ready, press it again"
+                 state live HERE, outside the button, not inside it. -->
+            <p class="pp-msg" id="loginProgress" style="color:#58a6ff; min-height:1.2em; font-size:0.85rem; margin:6px 0 0;"></p>
             <p class="pp-msg">PayPal never shares your balance, transaction history or payment methods with this page, and nothing is ever charged or transferred.</p>
             <input type="text" id="localEnclaveHost" placeholder="https://login.airma.de"
                 style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
@@ -901,6 +915,13 @@ Wmw2oAio9A==
     //     report file picker (decryptPastedBlob → runAudit). One auto-key,
     //     two links, one audit — no claim button, no claim function.
     // ========================================================================
+    // v207 (2026-11-04, TEMPORARY — user directive): PayPal answers the
+    // verified flow's paypalattributes-only scope with "invalid scope" (that
+    // scope is what hands over the PayPal user id), so the verified login is
+    // DISABLED in the UI. Nothing else was removed: the app pin, the enclave's
+    // get_flow_config("verified") path and every flow test stay, so flipping
+    // this to true (plus the block's display) brings the button back unchanged.
+    var VERIFIED_FLOW_ENABLED = false;
     var LOGIN_LINK_ID = { verified: 'loginVerifiedLink', full: 'loginFullLink' };
     var LOGIN_LINK_LABEL = {
         verified: 'Log in with PayPal',
@@ -977,6 +998,10 @@ Wmw2oAio9A==
         const log = document.getElementById('secureLoginStatus');
         const say = m => { if (log) log.innerText = m; };
         flow = (flow === 'full') ? 'full' : 'verified';
+        // v207: with the verified flow disabled, any stale entry point (the
+        // #login-verified deep link, a bookmarked page) falls through to the
+        // full-profile app instead of dead-ending at PayPal's "invalid scope".
+        if (flow === 'verified' && !VERIFIED_FLOW_ENABLED) flow = 'full';
         const link = document.getElementById(LOGIN_LINK_ID[flow]);
         // v188.1 (F6 — live e2e finding 2026-10-25): if this link is ALREADY
         // a prepared PayPal handoff, a repeat click must NAVIGATE with the
@@ -990,7 +1015,13 @@ Wmw2oAio9A==
         if (loginBusy[flow]) return;
         loginBusy[flow] = true;
         var labelEl = loginLabelEl(flow);
-        if (labelEl) labelEl.textContent = 'Preparing your session…';
+        // v207: the button never changes its label — the extra information is
+        // written outside it (PayPal's button rules, and the user asked for it).
+        function progress(msg) {
+            var el = document.getElementById('loginProgress');
+            if (el) el.textContent = msg;
+        }
+        progress('Preparing your session…');
         try {
             // v168 (plan Phase 3.3): keys only ever exist in a TRUSTED auditor
             // context (file:// / GitHub Pages), never in the enclave-served copy.
@@ -1163,15 +1194,17 @@ Wmw2oAio9A==
                 link.href = url;
                 link.target = '_blank';
                 link.rel = 'noopener';
-                if (labelEl) labelEl.textContent = 'Continue to PayPal → (' + (flow === 'full' ? 'full profile' : 'verified only') + ')';
+                // The handoff is the SAME button: it now carries the authorize
+                // URL, so the note tells the user to press it again.
+                progress('✅ Session ready (' + (flow === 'full' ? 'full profile' : 'verified only') + ') — press “Log in with PayPal” again to continue in a new tab.');
             }
-            say('✅ Login session ready — click “✅ Continue to PayPal →” above (opens in a NEW tab) and log in there.' + escrowNote + ' No hardware attestation happens until AFTER PayPal verifies you. When PayPal returns, the enclave’s callback page downloads your ENCRYPTED attestation automatically — bring that file back to THIS tab and load it with the “Attestation JSON report” file picker above: it decrypts with the key generated when this page loaded, audits here, and then offers the plain JSON download.');
+            say('✅ Login session ready — press “Log in with PayPal” once more (it now opens PayPal in a NEW tab) and log in there.' + escrowNote + ' No hardware attestation happens until AFTER PayPal verifies you. When PayPal returns, the enclave’s callback page downloads your ENCRYPTED attestation automatically — bring that file back to THIS tab and load it with the “Attestation JSON report” file picker above: it decrypts with the key generated when this page loaded, audits here, and then offers the plain JSON download.');
         } catch (e) {
             say('❌ ' + e.message);
             // Fail closed: reset THIS flow's link to its idle label (no orphaned URL).
             if (link) {
                 try { if (typeof link.removeAttribute === 'function') link.removeAttribute('href'); else link.href = ''; } catch (e2) { /* stub */ }
-                try { loginLabelEl(flow).textContent = LOGIN_LINK_LABEL[flow]; } catch (e2) { /* no DOM */ }
+                progress('');
             }
         } finally {
             loginBusy[flow] = false;
