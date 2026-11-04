@@ -322,7 +322,13 @@
                 <p class="pp-cap"><b style="color:#e6edf3;">Verified status only</b> — PayPal confirms the account exists; no name, e-mail or address is shared.</p>
                 <a id="loginVerifiedLink" class="pp-btn" onclick="executePreflightAndLogin('verified')"><img src="https://www.paypalobjects.com/paypal-ui/logos/svg/paypal-mark-monotone.svg" alt="PayPal" width="22" height="22"><span class="pp-label">Log in with PayPal</span></a>
             </div>
-            <p class="pp-cap"><b style="color:#e6edf3;">Name, e-mail and address</b> — only needed when the alias must carry your real identity (escrow).</p>
+            <!-- v209 (2026-11-04, TEMPORARY — user directive): the login asks
+                 PayPal for NOTHING but the sign-in. The old caption promised
+                 name / e-mail / address; with scope=openid those never arrive,
+                 so the caption now states the opposite and the page asks for no
+                 user info at all. Re-enabling an attribute scope means editing
+                 this caption in the same commit as MINIMAL_SCOPE. -->
+            <p class="pp-cap"><b style="color:#e6edf3;">Nothing is shared.</b> PayPal only confirms that you signed in — no name, no e-mail, no address and no PayPal user id is requested.</p>
             <a id="loginFullLink" class="pp-btn" onclick="executePreflightAndLogin('full')"><img src="https://www.paypalobjects.com/paypal-ui/logos/svg/paypal-mark-monotone.svg" alt="PayPal" width="22" height="22"><span class="pp-label">Log in with PayPal</span></a>
             <!-- v207 (user directive): the button keeps PayPal's standard label
                  at all times — progress and the "it is ready, press it again"
@@ -1205,7 +1211,7 @@ Wmw2oAio9A==
                 link.rel = 'noopener';
                 // The handoff is the SAME button: it now carries the authorize
                 // URL, so the note tells the user to press it again.
-                progress('✅ Session ready (' + (flow === 'full' ? 'full profile' : 'verified only') + ') — press “Log in with PayPal” again to continue in a new tab.');
+                progress('✅ Session ready (' + (flow === 'full' ? 'no PayPal attributes requested' : 'verified only') + ') — press “Log in with PayPal” again to continue in a new tab.');
             }
             say('✅ Login session ready — press “Log in with PayPal” once more (it now opens PayPal in a NEW tab) and log in there.' + escrowNote + ' No hardware attestation happens until AFTER PayPal verifies you. When PayPal returns, the enclave’s callback page downloads your ENCRYPTED attestation automatically — bring that file back to THIS tab and load it with the “Attestation JSON report” file picker above: it decrypts with the key generated when this page loaded, audits here, and then offers the plain JSON download.');
         } catch (e) {
