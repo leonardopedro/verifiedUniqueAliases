@@ -1888,19 +1888,33 @@ struct AppState {
 }
 
 impl AppState {
+    /// v207 (user directive, 2026-11-04): NO flow asks PayPal for the
+    /// `paypalattributes` scope any more. That scope is what returns the PayPal
+    /// user id (and `payer_id` / `verified_account`), and PayPal answers a
+    /// request for it with `invalid scope`, so every login dead-ended at the
+    /// consent screen. Both flows now request openid + profile + email + address
+    /// only — the userinfo endpoint still needs `openid`, so it stays. The
+    /// duplicated `profile email` in the old string was harmless but is gone.
+    /// CONSEQUENCE (accepted): `user_id`, `payer_id` and `verified_account` come
+    /// back EMPTY, so the report carries no PayPal account id and the "verified
+    /// account" statement can no longer be made. All fields are serde(default),
+    /// so the callback keeps working; only the assertions about a verified
+    /// account change. Re-adding the scope means re-adding it here AND in the
+    /// EXPECTED_APPS pin in verify.html (the pin is an equality check).
     fn get_flow_config(&self, flow_name: &str) -> (String, String, String, String) {
+        const MINIMAL_SCOPE: &str = "openid%20profile%20email%20address";
         if flow_name == "verified" {
             (
                 self.paypal_verified_client_id.clone(),
                 self.paypal_verified_client_secret.clone(),
-                "https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes".to_string(),
+                MINIMAL_SCOPE.to_string(),
                 "verified".to_string(),
             )
         } else {
             (
                 self.paypal_client_id.clone(),
                 self.paypal_client_secret.clone(),
-                "openid%20profile%20email%20address%20profile%20email%20https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes".to_string(),
+                MINIMAL_SCOPE.to_string(),
                 "full".to_string(),
             )
         }

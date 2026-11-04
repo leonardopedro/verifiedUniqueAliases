@@ -92,12 +92,15 @@
             display: flex; align-items: center; justify-content: center; gap: 10px;
             width: 100%; box-sizing: border-box;
             margin: 8px 0 0; padding: 13px 22px;
-            background: #EEEEEE; color: #001435 !important;
-            border: 1px solid #cfcfcf; border-radius: 999px;
+            /* PayPal's accessible blue, one of the two backgrounds the design
+               guide recommends; white label + the WHITE monogram it prescribes
+               for a coloured button. Never recoloured, never re-lettered. */
+            background: #0070BA; color: #fff !important;
+            border: 1px solid #0070BA; border-radius: 999px;
             font: 600 17px/1.15 system-ui, -apple-system, 'Segoe UI', sans-serif;
             text-decoration: none; cursor: pointer;
         }
-        .pp-btn:hover { background: #e3e3e3; }
+        .pp-btn:hover { background: #005ea6; border-color: #005ea6; }
         .pp-btn img { width: 22px; height: 22px; flex: 0 0 22px; display: block; }
         .pp-cap { margin: 14px 0 0; font-size: 0.86rem; color: var(--text-dim); }
         .pp-msg { margin: 6px 0 0; font-size: 0.8rem; color: var(--text-dim); }
@@ -317,10 +320,10 @@
                  one flag VERIFIED_FLOW_ENABLED in the script. -->
             <div id="verifiedFlowBlock" style="display:none;">
                 <p class="pp-cap"><b style="color:#e6edf3;">Verified status only</b> — PayPal confirms the account exists; no name, e-mail or address is shared.</p>
-                <a id="loginVerifiedLink" class="pp-btn" onclick="executePreflightAndLogin('verified')"><img src="https://www.paypalobjects.com/paypal-ui/logos/svg/paypal-mark-color.svg" alt="PayPal" width="22" height="22"><span class="pp-label">Log in with PayPal</span></a>
+                <a id="loginVerifiedLink" class="pp-btn" onclick="executePreflightAndLogin('verified')"><img src="https://www.paypalobjects.com/paypal-ui/logos/svg/paypal-mark-monotone.svg" alt="PayPal" width="22" height="22"><span class="pp-label">Log in with PayPal</span></a>
             </div>
             <p class="pp-cap"><b style="color:#e6edf3;">Name, e-mail and address</b> — only needed when the alias must carry your real identity (escrow).</p>
-            <a id="loginFullLink" class="pp-btn" onclick="executePreflightAndLogin('full')"><img src="https://www.paypalobjects.com/paypal-ui/logos/svg/paypal-mark-color.svg" alt="PayPal" width="22" height="22"><span class="pp-label">Log in with PayPal</span></a>
+            <a id="loginFullLink" class="pp-btn" onclick="executePreflightAndLogin('full')"><img src="https://www.paypalobjects.com/paypal-ui/logos/svg/paypal-mark-monotone.svg" alt="PayPal" width="22" height="22"><span class="pp-label">Log in with PayPal</span></a>
             <!-- v207 (user directive): the button keeps PayPal's standard label
                  at all times — progress and the "it is ready, press it again"
                  state live HERE, outside the button, not inside it. -->
@@ -1867,15 +1870,15 @@ Wmw2oAio9A==
         // app level), so minimal disclosure is structurally enforced by PayPal,
         // not just by the requested scope. The full flow uses the PII-capable
         // app. Swapping these back will break the full flow with "invalid scope".
-        { flow: 'verified', client_id: 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
-        { flow: 'full', client_id: 'ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address%20profile%20email%20https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
+        { flow: 'verified', client_id: 'AZXkzMWMioIQ-lYG1lrKrgiDAwtx2rWtigoGqdJssecNIdcp2q5FxHmvxyDaUJcvz1zAwVeSgIzOuI6p', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address' },
+        { flow: 'full', client_id: 'ARDDrFepkPcuh-bWdtKPLeMNptSHp2BvhahGiPNt3n317a-Uu68Xu4c9F_4N0hPI5YK60R3xRMNYr-B0', authorize_base: 'https://www.sandbox.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address' },
         // Production (live cutover 2026-11-02) — same flow pairing as sandbox:
         // 'welcome' is the REST app with NO PII scopes enabled (verified flow),
         // 'EncryptedData' is the PII-capable app (full flow). authorize_base is
         // www.paypal.com — a sandbox client_id can never satisfy this entry and
         // vice versa, which is exactly what makes the swap fail-closed.
-        { flow: 'verified', client_id: 'BAA6A0dAJkSa5NBAqB7nR18hYg7GbA96lBC_BUa8uttAsYygct8NPtobTxWNQrOAvL7dLCUzAtuqjBN3do', authorize_base: 'https://www.paypal.com/signin/authorize', scope: 'https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
-        { flow: 'full', client_id: 'BAAKIQtHan_IwlC0KJeBICQ86HyaLghkcmyP9W42jfd2TjtugYHpYrfQFKp8SGSGIyA8qGTh0oKNOJQxNU', authorize_base: 'https://www.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address%20profile%20email%20https%3A%2F%2Furi.paypal.com%2Fservices%2Fpaypalattributes' },
+        { flow: 'verified', client_id: 'BAA6A0dAJkSa5NBAqB7nR18hYg7GbA96lBC_BUa8uttAsYygct8NPtobTxWNQrOAvL7dLCUzAtuqjBN3do', authorize_base: 'https://www.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address' },
+        { flow: 'full', client_id: 'BAAKIQtHan_IwlC0KJeBICQ86HyaLghkcmyP9W42jfd2TjtugYHpYrfQFKp8SGSGIyA8qGTh0oKNOJQxNU', authorize_base: 'https://www.paypal.com/signin/authorize', scope: 'openid%20profile%20email%20address' },
     ];
 
     // ========================================================================
