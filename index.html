@@ -924,7 +924,7 @@ Wmw2oAio9A==
     // DISABLED in the UI. Nothing else was removed: the app pin, the enclave's
     // get_flow_config("verified") path and every flow test stay, so flipping
     // this to true (plus the block's display) brings the button back unchanged.
-    var VERIFIED_FLOW_ENABLED = false;
+    var VERIFIED_FLOW_ENABLED = true;
     // v208 (user directive, TEMPORARY): the login asks PayPal for the openid
     // handshake and NOTHING else — no user id, no name, no e-mail, no address —
     // so `verified_account` never arrives. This switch disables the
@@ -1205,7 +1205,7 @@ Wmw2oAio9A==
                 link.rel = 'noopener';
                 // The handoff is the SAME button: it now carries the authorize
                 // URL, so the note tells the user to press it again.
-                progress('✅ Session ready (' + (flow === 'full' ? 'no PayPal attributes requested' : 'verified only') + ') — press “Log in with PayPal” again to continue in a new tab.');
+                progress('✅ Session ready (no PayPal attributes requested — ' + (flow === 'full' ? 'app “EncryptedData”' : 'app “welcome”') + ') — press “Log in with PayPal” again to continue in a new tab.');
             }
             say('✅ Login session ready — press “Log in with PayPal” once more (it now opens PayPal in a NEW tab) and log in there.' + escrowNote + ' No hardware attestation happens until AFTER PayPal verifies you. When PayPal returns, the enclave’s callback page downloads your ENCRYPTED attestation automatically — bring that file back to THIS tab and load it with the “Attestation JSON report” file picker above: it decrypts with the key generated when this page loaded, audits here, and then offers the plain JSON download.');
         } catch (e) {

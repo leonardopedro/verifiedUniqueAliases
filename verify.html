@@ -310,25 +310,23 @@
                  logins are PayPal-branded buttons — official label, official
                  mark, recommended colours and pill shape — and the difference
                  between them lives in the caption, not in a recoloured button. -->
-            <!-- v207 (2026-11-04, TEMPORARY — user directive): the "verified
-                 status only" login asked PayPal for the paypalattributes scope
-                 alone, which is exactly the scope that returns the PayPal USER
-                 ID; PayPal now answers it with "invalid scope", so every click
-                 dead-ended. The block is hidden (not deleted) and the flow is
-                 forced to the full-profile app below; get_flow_config, the app
-                 pins and the enclave path are untouched, so re-enabling is the
-                 one flag VERIFIED_FLOW_ENABLED in the script. -->
-            <div id="verifiedFlowBlock" style="display:none;">
-                <p class="pp-cap"><b style="color:#e6edf3;">Verified status only</b> — PayPal confirms the account exists; no name, e-mail or address is shared.</p>
+            <!-- v210 (2026-11-04, TEMPORARY — user directive): BOTH PayPal apps
+                 are live again, and BOTH ask for nothing but the sign-in. The
+                 verified-flow button was hidden in v207 because the
+                 paypalattributes scope it needed is what PayPal now rejects
+                 with "invalid scope"; with the enclave requesting scope=openid
+                 in both flows that blocker is gone, so the block is visible and
+                 VERIFIED_FLOW_ENABLED is true. The apps still differ (welcome vs
+                 EncryptedData) and the auditor still pins the pair — the
+                 captions name the app, they no longer promise data that the
+                 scope does not request. Restoring attributes means editing
+                 MINIMAL_SCOPE, these captions and the EXPECTED_APPS pins in the
+                 same commit. -->
+            <div id="verifiedFlowBlock">
+                <p class="pp-cap"><b style="color:#e6edf3;">App “welcome” — sign-in only.</b> Nothing is shared: no name, no e-mail, no address, no PayPal user id.</p>
                 <a id="loginVerifiedLink" class="pp-btn" onclick="executePreflightAndLogin('verified')"><img src="https://www.paypalobjects.com/paypal-ui/logos/svg/paypal-mark-monotone.svg" alt="PayPal" width="22" height="22"><span class="pp-label">Log in with PayPal</span></a>
             </div>
-            <!-- v209 (2026-11-04, TEMPORARY — user directive): the login asks
-                 PayPal for NOTHING but the sign-in. The old caption promised
-                 name / e-mail / address; with scope=openid those never arrive,
-                 so the caption now states the opposite and the page asks for no
-                 user info at all. Re-enabling an attribute scope means editing
-                 this caption in the same commit as MINIMAL_SCOPE. -->
-            <p class="pp-cap"><b style="color:#e6edf3;">Nothing is shared.</b> PayPal only confirms that you signed in — no name, no e-mail, no address and no PayPal user id is requested.</p>
+            <p class="pp-cap"><b style="color:#e6edf3;">App “EncryptedData” — sign-in only.</b> Nothing is shared: no name, no e-mail, no address, no PayPal user id.</p>
             <a id="loginFullLink" class="pp-btn" onclick="executePreflightAndLogin('full')"><img src="https://www.paypalobjects.com/paypal-ui/logos/svg/paypal-mark-monotone.svg" alt="PayPal" width="22" height="22"><span class="pp-label">Log in with PayPal</span></a>
             <!-- v207 (user directive): the button keeps PayPal's standard label
                  at all times — progress and the "it is ready, press it again"
@@ -930,7 +928,7 @@ Wmw2oAio9A==
     // DISABLED in the UI. Nothing else was removed: the app pin, the enclave's
     // get_flow_config("verified") path and every flow test stay, so flipping
     // this to true (plus the block's display) brings the button back unchanged.
-    var VERIFIED_FLOW_ENABLED = false;
+    var VERIFIED_FLOW_ENABLED = true;
     // v208 (user directive, TEMPORARY): the login asks PayPal for the openid
     // handshake and NOTHING else — no user id, no name, no e-mail, no address —
     // so `verified_account` never arrives. This switch disables the
@@ -1211,7 +1209,7 @@ Wmw2oAio9A==
                 link.rel = 'noopener';
                 // The handoff is the SAME button: it now carries the authorize
                 // URL, so the note tells the user to press it again.
-                progress('✅ Session ready (' + (flow === 'full' ? 'no PayPal attributes requested' : 'verified only') + ') — press “Log in with PayPal” again to continue in a new tab.');
+                progress('✅ Session ready (no PayPal attributes requested — ' + (flow === 'full' ? 'app “EncryptedData”' : 'app “welcome”') + ') — press “Log in with PayPal” again to continue in a new tab.');
             }
             say('✅ Login session ready — press “Log in with PayPal” once more (it now opens PayPal in a NEW tab) and log in there.' + escrowNote + ' No hardware attestation happens until AFTER PayPal verifies you. When PayPal returns, the enclave’s callback page downloads your ENCRYPTED attestation automatically — bring that file back to THIS tab and load it with the “Attestation JSON report” file picker above: it decrypts with the key generated when this page loaded, audits here, and then offers the plain JSON download.');
         } catch (e) {

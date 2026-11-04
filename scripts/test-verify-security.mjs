@@ -2225,13 +2225,24 @@ console.log('\nTest 36: two explicit login links + key auto-generated on render 
   // v207 (user directive): PayPal rejects the verified flow's scope, so that
   // login is hidden behind ONE flag — the markup and the app pin stay, and any
   // stale entry point falls through to the full-profile flow.
-  check('v207: the verified login sits in a block hidden by default',
-    /<div id="verifiedFlowBlock" style="display:none;"/.test(verifySrc2),
-    'verifiedFlowBlock wrapper missing or visible');
-  check('v207: one flag disables the verified flow (and defaults to disabled)',
-    verifySrc2.includes('var VERIFIED_FLOW_ENABLED = false;')
+  // v210 (user directive): BOTH PayPal apps are live again, and both ask for
+  // nothing but the sign-in — the v207 "hide the verified button" workaround
+  // existed only because that flow needed the paypalattributes scope PayPal now
+  // rejects. The gate below therefore flips: the block must be VISIBLE (no
+  // display:none), the flag must be ON, and the disable-path must still exist so
+  // a future scope regression can be shut off again in one line.
+  check('v210: both PayPal apps are live (verified block visible, flag on)',
+    !/<div id="verifiedFlowBlock"[^>]*style="display:none;?"/.test(verifySrc2)
+      && /<div id="verifiedFlowBlock"/.test(verifySrc2)
+      && verifySrc2.includes('var VERIFIED_FLOW_ENABLED = true;')
       && verifySrc2.includes("if (flow === 'verified' && !VERIFIED_FLOW_ENABLED) flow = 'full';"),
-    'VERIFIED_FLOW_ENABLED flag or its fallback missing');
+    'verifiedFlowBlock still hidden, or VERIFIED_FLOW_ENABLED/fallback missing');
+  // Both flows must still be pinned to the data-less scope: an enabled button
+  // pointing at an attribute scope would be the exact regression v207 guarded.
+  check('v210: every ENABLED flow pins scope openid (no attributes requested)',
+    (verifySrc2.match(/\{ flow: '[a-z]+', client_id: '[^']+', authorize_base: '[^']+', scope: '([^']+)' \}/g) || [])
+      .every((e) => /scope: 'openid' \}$/.test(e)),
+    (verifySrc2.match(/\{ flow: '[a-z]+'.*?scope: '[^']+' \}/g) || []).join(' | '));
   check('v207: every PayPal button carries the standard label only',
     (verifySrc2.match(/<span class="pp-label">([^<]*)<\/span>/g) || [])
       .every((s) => s.includes('>Log in with PayPal<')),
