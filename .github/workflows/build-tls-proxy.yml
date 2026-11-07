@@ -57,6 +57,24 @@ jobs:
           # PayPal-only image, so make that impossible to overlook in the log.
           echo "::notice::dual-service image — rotate RTMR2/self-measure pins before auditing"
 
+      # The dual-service initramfs is NOT the PayPal-only one (it carries
+      # /tls-proxy next to /init), so build-attest.yml's attestation does not
+      # cover it. Without these steps the auditor's GitHub-provenance row looks
+      # the measured EFI/BOOT/initrd.img hash up, gets a 404 from the
+      # attestations API and reports "NO GitHub attestation exists" — for a
+      # component this very workflow builds, measures into RTMR2 and ships.
+      - name: Attest the dual-service initramfs
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: Initramfs (dual-service: PayPal + TLSNotary proxy)
+          subject-path: output-tls-proxy/initramfs-dual.img
+
+      - name: Attest the TLSNotary proxy binary
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: TLSNotary proxy binary (dual-service)
+          subject-path: output-tls-proxy/tls-proxy-bin
+
       - uses: actions/upload-artifact@v4
         with:
           name: disk-tls-proxy

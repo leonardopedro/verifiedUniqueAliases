@@ -147,6 +147,47 @@ key — it makes zero network requests and never sees a passphrase.)
 
 ---
 
+## 🧾 Attesting a sandbox PayPal page (prover walkthrough)
+
+The TLSNotary proxy attested `api-m.sandbox.paypal.com` — the OAuth *API*. To
+attest a page a person actually sees, commit to the sandbox **site** host:
+`www.sandbox.paypal.com`. That name is in the default `relay_targets`, so no
+config change is needed; enabling the service is (`"services": {"tls_proxy":
+{"enabled": true}}`, see `docs/tls-proxy.md`).
+
+Two details decide whether you get a page or a redirect:
+
+- `sandbox.paypal.com` answers `301` to `www.sandbox.paypal.com`. One session
+  attests one TLS connection and does not follow redirects, so commit to the
+  `www` host to reach the page itself.
+- The notary authorises a **host**, not a URL. The path is yours: point the
+  prover at `/checkoutnow` and the transcript is that request and its response.
+
+```bash
+# one session against the sandbox site, path of your choosing
+LIVE_NOTARY=101.200.178.251:8443 \
+LIVE_SERVER=www.sandbox.paypal.com \
+LIVE_PATH=/checkoutnow \
+  cargo test --manifest-path tls-proxy/Cargo.toml --test live -- --ignored --nocapture
+```
+
+Observed against this deployment: `commit accepted — the notary is relaying TLS
+to www.sandbox.paypal.com`, then `relayed response status: 302 Found`, transcript
+`sent 108 B, received 3931 B`, and `presentation complete` in ~11 s. `302` is
+correct for a checkout page without a real token — the attestation is about the
+bytes that crossed the connection, not about the page being useful.
+
+The notary stores what it relayed (`GET :8081/attestations` and
+`/attestations/{id}` on loopback, i.e. from inside the VM). The signed body names
+`server_name` and pins `sent_sha256`/`received_sha256` over the transcript; the
+signing key is only trustworthy because the hardware quote covers the measured
+initramfs that contains the proxy binary. Sandbox identity is synthetic: this
+proves *transport and bytes*, never that a real account was involved — that is
+what the production login report is for, and why the auditor marks sandbox
+reports `sandbox` rather than green.
+
+---
+
 ## 🔑 Rotating the Credentials (PayPal, ACME, DNS-01, heartbeat key)
 
 ### Where the secrets actually live
@@ -312,9 +353,12 @@ if the ZeroSSL directory is unreachable.
 
 **The environment itself is only proven by a real login.** The signed report
 carries `paypal_environment`; after a production rotation it must read
-`production`, and the auditor refuses `sandbox` outright — a sandbox report is
-a real hardware attestation of a synthetic identity, so anyone could mint
-`verified_account: true` there.
+`production`. A sandbox report is a real hardware attestation of a synthetic
+identity — anyone can mint `verified_account: true` there — so the auditor keeps
+it non-green: it returns the verdict `sandbox` and says so, instead of refusing
+the file outright (a hard refusal made every honest sandbox deployment
+unauditable, and no refusal at all would let a sandbox report pass as
+production).
 
 ```bash
 CHROMIUM_PATH=$(command -v chromium) node scripts/e2e-login-download.mjs

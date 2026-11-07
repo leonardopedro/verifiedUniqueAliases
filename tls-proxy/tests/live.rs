@@ -7,6 +7,11 @@
 //!   LIVE_NOTARY=101.200.178.251:8443 LIVE_SERVER=api-m.paypal.com \
 //!     cargo test --test live -- --ignored --nocapture
 //!
+//! `LIVE_PATH` (default `/`) picks the request path. The notary authorises a
+//! *host*, so the page is the prover's choice: point it at
+//! `www.sandbox.paypal.com` with `LIVE_PATH=/checkoutnow` to attest that page
+//! rather than the sandbox's bare origin.
+//!
 //! The prover is the same shape as `tests/session.rs`, minus the fixture: the
 //! root store comes from the host bundle, so the relayed certificate has to
 //! chain to a real public CA exactly as a browser's would.
@@ -58,6 +63,9 @@ async fn live_relay_of_a_real_website() -> Result<(), Box<dyn std::error::Error>
     let server = std::env::var("LIVE_SERVER").unwrap_or_else(|_| "api-m.paypal.com".into());
     let ca_bundle = std::env::var("LIVE_CA_BUNDLE")
         .unwrap_or_else(|_| "/etc/ssl/certs/ca-certificates.crt".into());
+    // A host is what the notary authorises; the page is the prover's choice.
+    let path = std::env::var("LIVE_PATH").unwrap_or_else(|_| "/".into());
+    let path = if path.starts_with('/') { path } else { format!("/{path}") };
 
     let roots = roots_from_bundle(&ca_bundle)?;
     assert!(!roots.is_empty(), "{ca_bundle} had no certificates");
@@ -96,7 +104,7 @@ async fn live_relay_of_a_real_website() -> Result<(), Box<dyn std::error::Error>
     tokio::spawn(connection);
 
     let request = Request::builder()
-        .uri(format!("https://{server}/"))
+        .uri(format!("https://{server}{path}"))
         .header("Host", server.as_str())
         .header("Connection", "close")
         .method("GET")
