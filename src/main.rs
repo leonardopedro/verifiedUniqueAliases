@@ -570,13 +570,11 @@ mod enclave_init {
             }
         }
 
-        // A relay session resolves the name the prover committed to when it
-        // starts, but the post-boot lockdown drops DNS and leaves only the
-        // PayPal endpoint IPs reachable on 443. Without a mapping in
-        // /etc/hosts, getaddrinfo cannot answer after that and every session
-        // dies at connect. Pin the names now, while DNS is still open (the
-        // firewall's IP allowlist, not this file, is the boundary).
-        pin_relay_targets(&["api-m.paypal.com", "api-m.sandbox.paypal.com"]);
+        // Relay targets are pinned once the config says which they are — see
+        // main() after fetch_config(). They cannot be pinned here: at this
+        // point the config has not been read yet, and the list is configurable.
+        // DNS is still open then (egress_lockdown is later), which is all the
+        // pinning needs.
         Ok(())
     }
 
@@ -585,18 +583,29 @@ mod enclave_init {
     /// DNS answered nothing, in which case no extra rule is added.
     static RELAY_TARGET_IPS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
-    /// Write the IPv4 addresses an allowed relay target had at boot into
-    /// /etc/hosts, so the proxy can still resolve it after DNS is locked down,
+    /// Write the IPv4 addresses the configured relay targets had at boot into
+    /// /etc/hosts, so the proxy can still resolve them after DNS is locked down,
     /// and remember them for the firewall allowlist.
-    fn pin_relay_targets(names: &[&str]) {
+    ///
+    /// Names come from `services.tls_proxy.relay_targets` and are already
+    /// validated (see `validate_relay_targets`); this lower-cases and
+    /// de-duplicates them anyway, because a hosts file matches case-sensitively
+    /// while DNS does not.
+    pub fn pin_relay_targets(names: &[String]) {
         use std::net::ToSocketAddrs;
         let mut granted: Vec<String> = Vec::new();
         let mut lines = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
         if !lines.is_empty() && !lines.ends_with('\n') {
             lines.push('\n');
         }
-        for name in names {
-            match (*name, 443u16).to_socket_addrs() {
+        let mut already: Vec<String> = Vec::new();
+        for raw in names {
+            let name = raw.trim().to_ascii_lowercase();
+            if name.is_empty() || already.contains(&name) {
+                continue;
+            }
+            already.push(name.clone());
+            match (name.as_str(), 443u16).to_socket_addrs() {
                 Ok(addrs) => {
                     let ips: Vec<String> = addrs
                         .filter(|a| a.is_ipv4())
@@ -1996,6 +2005,24 @@ struct TlsProxyConfig {
     /// attestation key).
     #[serde(default)]
     signing_key_pem: Option<String>,
+    /// Hosts a prover may commit to. These are the only names pinned into
+    /// /etc/hosts and the only addresses the post-boot firewall leaves
+    /// reachable on 443, so listing one here is what makes the proxy useful for
+    /// anything beyond PayPal. Absent = the PayPal API names, which keeps an
+    /// unconfigured deployment behaving exactly as it always has.
+    #[serde(default = "proxy_default_relay_targets")]
+    relay_targets: Vec<String>,
+}
+
+/// Longest list accepted. Every target costs a /etc/hosts line and an address
+/// in a firewall rule, and a proxy needs a handful, not a catalogue.
+const MAX_RELAY_TARGETS: usize = 32;
+
+fn proxy_default_relay_targets() -> Vec<String> {
+    vec![
+        "api-m.paypal.com".to_string(),
+        "api-m.sandbox.paypal.com".to_string(),
+    ]
 }
 
 fn proxy_default_session_port() -> u16 {
@@ -2203,7 +2230,85 @@ fn services_from_env() -> Option<Services> {
         .and_then(|s| serde_json::from_str::<Services>(&s).ok())
 }
 
+/// One relay target: a DNS name or an IPv4 literal, and nothing else.
+///
+/// The list is an egress boundary rather than a preference — each entry becomes
+/// a /etc/hosts pin and a `tcp dport 443 accept` rule — so a scheme, a port, a
+/// path or a wildcard must be refused here rather than silently widening the
+/// firewall or producing a hosts line nobody can match.
+fn validate_relay_target(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("empty target".into());
+    }
+    if name.trim() != name {
+        return Err(format!("{name:?} has surrounding whitespace"));
+    }
+    if name.len() > 253 {
+        return Err(format!("{name}: longer than 253 characters"));
+    }
+    if name.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Ok(());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        return Err(format!(
+            "{name}: only letters, digits, '-' and '.' — no scheme, port, path or wildcard"
+        ));
+    }
+    let labels: Vec<&str> = name.split('.').collect();
+    if labels.len() < 2 {
+        return Err(format!("{name}: not a fully-qualified name"));
+    }
+    for label in &labels {
+        if label.is_empty() {
+            return Err(format!("{name}: empty label"));
+        }
+        if label.len() > 63 {
+            return Err(format!("{name}: a label is longer than 63 characters"));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(format!("{name}: a label starts or ends with '-'"));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the whole list: non-empty, bounded, every entry well-formed, no
+/// duplicates (case-insensitively — DNS names are case-insensitive, so
+/// `Example.com` and `example.com` would collide in /etc/hosts).
+fn validate_relay_targets(targets: &[String]) -> Result<(), String> {
+    if targets.is_empty() {
+        return Err("the list is empty — proxy sessions would have no target the firewall allows".into());
+    }
+    if targets.len() > MAX_RELAY_TARGETS {
+        return Err(format!(
+            "{} targets listed, more than the {MAX_RELAY_TARGETS} this build accepts",
+            targets.len()
+        ));
+    }
+    let mut seen: Vec<String> = Vec::with_capacity(targets.len());
+    for target in targets {
+        validate_relay_target(target)?;
+        let key = target.to_ascii_lowercase();
+        if seen.contains(&key) {
+            return Err(format!("{target}: listed twice"));
+        }
+        seen.push(key);
+    }
+    Ok(())
+}
+
 fn require_credentials(config: Config) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
+    // Relay targets are checked before either branch below returns: a
+    // proxy-only deployment has no PayPal credentials to check, but it still
+    // must not boot with a list that would widen the firewall or pin a hosts
+    // line the proxy cannot dial.
+    if let Some(proxy) = config.services.as_ref().and_then(|s| s.proxy()) {
+        validate_relay_targets(&proxy.relay_targets)
+            .map_err(|e| format!("FAIL-CLOSED: services.tls_proxy.relay_targets: {e}"))?;
+    }
     // Proxy-only deployment: there is no PayPal app to configure, and requiring
     // its credentials would make `services.paypal = false` unbootable — the one
     // configuration this check must not break. What it still refuses is a VM
@@ -3714,6 +3819,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         selfreport::init(config.self_report.clone());
         selfreport::progress();
 
+        // Relay targets are config now, so they are pinned here — after the
+        // config is known, but still before egress_lockdown() closes DNS. The
+        // proxy resolves the name a prover committed to when that session
+        // starts, which is long after DNS is gone; the addresses resolved here
+        // are also what the lockdown rule allows on 443.
+        if let Some(proxy) = config.services.as_ref().and_then(|s| s.proxy()) {
+            enclave_init::pin_relay_targets(&proxy.relay_targets);
+        }
+
         // --- service selection -------------------------------------------------
         // Both webservices can run in this VM; each can run alone. `services`
         // absent means PayPal only, and then nothing below changes the boot:
@@ -4060,6 +4174,83 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 mod security_tests {
     use super::*;
 
+    fn proxy_config(services: &str) -> Config {
+        serde_json::from_str(&format!(
+            r#"{{"paypal_client_id":"id","paypal_client_secret":"sec",
+                 "paypal_verified_client_id":"vid","paypal_verified_client_secret":"vsec",
+                 "domain":"notary.example","services":{services}}}"#
+        ))
+        .expect("config parses")
+    }
+
+    /// Relay targets are the proxy's egress boundary, and they are optional:
+    /// absent must reproduce the PayPal-only-API behaviour exactly, so an
+    /// existing config keeps working byte-for-byte.
+    #[test]
+    fn relay_targets_default_to_the_paypal_api_names() {
+        let config = proxy_config(r#"{"tls_proxy":{"enabled":true}}"#);
+        let proxy = config.services.as_ref().and_then(|s| s.proxy()).expect("proxy on");
+        assert_eq!(
+            proxy.relay_targets,
+            vec!["api-m.paypal.com".to_string(), "api-m.sandbox.paypal.com".to_string()]
+        );
+
+        // An explicit list is taken as given — this is the feature: a notary
+        // for something other than PayPal.
+        let config = proxy_config(
+            r#"{"tls_proxy":{"enabled":true,"relay_targets":["example.com","news.ycombinator.com"]}}"#,
+        );
+        let proxy = config.services.as_ref().and_then(|s| s.proxy()).expect("proxy on");
+        assert_eq!(
+            proxy.relay_targets,
+            vec!["example.com".to_string(), "news.ycombinator.com".to_string()]
+        );
+    }
+
+    /// Everything that is not a bare hostname is refused, because each entry
+    /// becomes a /etc/hosts pin and a firewall rule: a scheme or a wildcard
+    /// would either never match or quietly widen what the proxy can reach.
+    #[test]
+    fn relay_targets_refuse_anything_but_a_hostname_and_fail_the_boot() {
+        for bad in [
+            "",
+            " example.com",
+            "*",
+            "*.example.com",
+            "https://example.com",
+            "example.com:443",
+            "example.com/path",
+            "localhost",
+            "a..b",
+            "-bad.example.com",
+        ] {
+            assert!(validate_relay_target(bad).is_err(), "{bad:?} must be rejected");
+        }
+        for good in ["api-m.paypal.com", "example.co.uk", "a-b.example", "127.0.0.1"] {
+            assert!(validate_relay_target(good).is_ok(), "{good:?} must be accepted");
+        }
+
+        assert!(validate_relay_targets(&[]).is_err(), "an empty list serves nothing");
+        assert!(
+            validate_relay_targets(&["example.com".into(), "EXAMPLE.com".into()]).is_err(),
+            "DNS is case-insensitive, so these collide in /etc/hosts"
+        );
+        let too_many: Vec<String> = (0..MAX_RELAY_TARGETS + 1)
+            .map(|i| format!("h{i}.example.com"))
+            .collect();
+        assert!(validate_relay_targets(&too_many).is_err());
+
+        // And the hook is real: a bad list must stop the boot, not warn.
+        let config = proxy_config(r#"{"tls_proxy":{"enabled":true,"relay_targets":["https://example.com"]}}"#);
+        let err = require_credentials(config).expect_err("a URL target must fail closed");
+        assert!(err.to_string().contains("relay_targets"), "{err}");
+
+        // A disabled proxy is not validated away: nothing is pinned, so a list
+        // that would never be used must not block a PayPal-only boot.
+        let config = proxy_config(r#"{"tls_proxy":{"enabled":false,"relay_targets":[]}}"#);
+        assert!(require_credentials(config).is_ok());
+    }
+
     /// `/proxy/refusals` is the only path by which a refusal reason reaches the
     /// internet, so its redaction is pinned here: committed hosts get a stable
     /// fingerprint (repeated attempts still correlate), dotted numbers and
@@ -4235,6 +4426,7 @@ mod security_tests {
                     api_port: 8081,
                     session_timeout_secs: 120,
                     signing_key_pem: None,
+                    relay_targets: proxy_default_relay_targets(),
                 }),
             }),
         };

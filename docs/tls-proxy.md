@@ -27,8 +27,9 @@ config.proxy.example.json   a config with both services enabled
 
 `src/main.rs` (the enclave) gains one config block and one supervision task:
 when `services.tls_proxy.enabled` is true it opens exactly one inbound port on the
-nftables firewall, spawns `/tls-proxy` as a child of PID 1, and restarts it with a
-2 s → 60 s backoff. Nothing else about the PayPal path changes.
+nftables firewall, pins `relay_targets` while DNS is still open, spawns
+`/tls-proxy` as a child of PID 1, and restarts it with a 2 s → 60 s backoff.
+Nothing else about the PayPal path changes.
 
 ## Service selection
 
@@ -43,10 +44,37 @@ existed before this feature.
     "session_port": 8443,        // inbound TLSNotary sessions
     "api_port": 8081,            // loopback-only attestation API
     "session_timeout_secs": 120,
-    "signing_key_pem": null      // null/absent = fresh per-boot RSA-2048 key
+    "signing_key_pem": null,     // null/absent = fresh per-boot RSA-2048 key
+    "relay_targets": [           // hosts a prover may commit to
+      "api-m.paypal.com",
+      "api-m.sandbox.paypal.com"
+    ]
   }
 }
 ```
+
+### Relay targets
+
+`relay_targets` is the list of hosts a prover may commit to, and it is the whole
+point of a *general* notary: everything the proxy can reach is decided here.
+Absent, it defaults to the two PayPal API names, so an unconfigured deployment
+behaves exactly as it did before the field existed.
+
+Each name is resolved **once, at boot, while DNS is still open**, written into
+`/etc/hosts`, and its addresses become the only destination on 443 the post-boot
+firewall allows beyond the PayPal endpoint and the self-report sink. After that
+the resolver is gone by design, which is why the list is fixed at boot rather
+than looked up per session: a proxy that could resolve at will would be exactly
+the exfil channel the lockdown exists to close.
+
+Entries are validated at boot, and a bad list is a fail-closed error rather than
+a warning: a `scheme://`, a `:port`, a path, a `*.wildcard`, a bare hostname with
+no dot, a duplicate (case-insensitive) or an empty list all stop the boot with
+the offending entry named. At most 32 entries are accepted — every one costs a
+hosts line and an address in a firewall rule.
+
+Consequence worth stating plainly: adding a target lets **any** prover commit to
+it, not just the operator. Widen the list deliberately.
 
 | Configuration | What runs |
 |---|---|

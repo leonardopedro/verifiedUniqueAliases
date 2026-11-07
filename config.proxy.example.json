@@ -25,6 +25,10 @@
             "session_port": 8443,
             "api_port": 8081,
             "session_timeout_secs": 120,
+            "relay_targets": [
+                "api-m.paypal.com",
+                "api-m.sandbox.paypal.com"
+            ],
             "signing_key_pem": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC...\n-----END PRIVATE KEY-----\n"
         }
     }
