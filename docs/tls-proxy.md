@@ -47,7 +47,9 @@ existed before this feature.
     "signing_key_pem": null,     // null/absent = fresh per-boot RSA-2048 key
     "relay_targets": [           // hosts a prover may commit to
       "api-m.paypal.com",
-      "api-m.sandbox.paypal.com"
+      "api-m.sandbox.paypal.com",
+      "sandbox.paypal.com",      // the site a person logs into …
+      "www.sandbox.paypal.com"   // … and where it redirects to
     ]
   }
 }
@@ -57,8 +59,15 @@ existed before this feature.
 
 `relay_targets` is the list of hosts a prover may commit to, and it is the whole
 point of a *general* notary: everything the proxy can reach is decided here.
-Absent, it defaults to the two PayPal API names, so an unconfigured deployment
-behaves exactly as it did before the field existed.
+Absent, it defaults to the two PayPal API hosts and the sandbox website
+(`sandbox.paypal.com`, `www.sandbox.paypal.com`).
+
+Both sandbox names are listed because a session attests exactly one TLS
+connection and does not follow redirects: `sandbox.paypal.com` answers `301` to
+`www.sandbox.paypal.com`, so a prover who commits to the bare name gets a
+redirect in the transcript, and a prover who wants the actual page has to commit
+to the `www` host. Production `paypal.com`/`www.paypal.com` are deliberately not
+in the default set — add them here if you want live-site sessions.
 
 Each name is resolved **once, at boot, while DNS is still open**, written into
 `/etc/hosts`, and its addresses become the only destination on 443 the post-boot
@@ -75,6 +84,36 @@ hosts line and an address in a firewall rule.
 
 Consequence worth stating plainly: adding a target lets **any** prover commit to
 it, not just the operator. Widen the list deliberately.
+
+#### Hosts whose addresses rotate, and IP literals
+
+Because the addresses are resolved once per boot, a target whose CDN answers
+move (Cloudflare rotates `api-m.sandbox.paypal.com` regularly) keeps working
+only until the next boot re-resolves it — a reboot is the refresh mechanism, by
+design. If a session fails at connect right after an address change, restart the
+instance; there is no per-session lookup to fall back on, and adding one would
+reopen the DNS channel the lockdown closes.
+
+When the boot resolver is wrong, or the address you want is a specific one, write
+the mapping yourself with `host@address`:
+
+```json
+"relay_targets": ["www.sandbox.paypal.com@151.101.195.1"]
+```
+
+That entry is **not** resolved: the address is written into `/etc/hosts` as
+`151.101.195.1 www.sandbox.paypal.com` and admitted on 443, so the proxy dials
+exactly that address for that name. It is the supported way to keep a host with a
+rotating or boot-unavailable address reachable without widening the list. The
+left side must be a hostname and the right side an IPv4 address (IPv6 is refused —
+the egress rule matches `ip daddr` only); a duplicate name with two addresses is
+fine, two entries for the same name are not.
+
+A bare IPv4 literal is accepted too, but understand what it buys: it opens 443 to
+that address with no DNS and no hosts entry, yet **nothing can be relayed to it**,
+because a prover commits a *server name* and tlsn rejects an address as one
+(`InvalidDnsNameError`, observed against this build). Literals are for keeping an
+address reachable; use `host@address` when you actually want a session.
 
 | Configuration | What runs |
 |---|---|

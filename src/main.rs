@@ -583,6 +583,13 @@ mod enclave_init {
     /// DNS answered nothing, in which case no extra rule is added.
     static RELAY_TARGET_IPS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
+    /// A relay target that is already an address, so nothing has to resolve it.
+    /// IPv4 only: the egress rule is `ip daddr`, and TLS verifies against the
+    /// committed name, so an IPv6 literal would be allowed by neither.
+    pub(crate) fn relay_target_is_literal(name: &str) -> bool {
+        name.parse::<std::net::Ipv4Addr>().is_ok()
+    }
+
     /// Write the IPv4 addresses the configured relay targets had at boot into
     /// /etc/hosts, so the proxy can still resolve them after DNS is locked down,
     /// and remember them for the firewall allowlist.
@@ -600,11 +607,38 @@ mod enclave_init {
         }
         let mut already: Vec<String> = Vec::new();
         for raw in names {
-            let name = raw.trim().to_ascii_lowercase();
-            if name.is_empty() || already.contains(&name) {
+            let entry = raw.trim().to_ascii_lowercase();
+            if entry.is_empty() || already.contains(&entry) {
                 continue;
             }
-            already.push(name.clone());
+            already.push(entry.clone());
+            // `host@address`: the operator already knows the address, so it is
+            // pinned as given rather than resolved — this is how a host whose
+            // DNS rotates (or does not answer at boot) stays reachable.
+            if let Some((host, address)) = entry.split_once('@') {
+                lines.push_str(&format!("{address} {host}\n"));
+                if !granted.contains(&address.to_string()) {
+                    granted.push(address.to_string());
+                }
+                kmsg(&format!(
+                    "relay target {host} pinned in /etc/hosts to {address} (configured address, not resolved)"
+                ));
+                continue;
+            }
+            // A bare literal needs no resolution and no hosts entry:
+            // getaddrinfo answers it without DNS, so it survives the lockdown
+            // on its own. It opens 443 only: the prover cannot commit an
+            // address, so nothing can actually be relayed to it.
+            if relay_target_is_literal(&entry) {
+                if !granted.contains(&entry) {
+                    granted.push(entry.clone());
+                }
+                kmsg(&format!(
+                    "relay target {entry} is a literal address: allowed on 443, but a prover cannot commit to it (use host@address)"
+                ));
+                continue;
+            }
+            let name = entry;
             match (name.as_str(), 443u16).to_socket_addrs() {
                 Ok(addrs) => {
                     let ips: Vec<String> = addrs
@@ -2018,10 +2052,17 @@ struct TlsProxyConfig {
 /// in a firewall rule, and a proxy needs a handful, not a catalogue.
 const MAX_RELAY_TARGETS: usize = 32;
 
+/// Defaults: the two API hosts a prover attests PayPal *responses* from, plus
+/// the sandbox *website* a person actually logs into. `sandbox.paypal.com` only
+/// answers 301 to `www.sandbox.paypal.com`, and a TLSNotary session attests the
+/// one TLS connection it opened — it does not follow redirects — so both names
+/// have to be here for a user-facing session to be worth making.
 fn proxy_default_relay_targets() -> Vec<String> {
     vec![
         "api-m.paypal.com".to_string(),
         "api-m.sandbox.paypal.com".to_string(),
+        "sandbox.paypal.com".to_string(),
+        "www.sandbox.paypal.com".to_string(),
     ]
 }
 
@@ -2236,13 +2277,38 @@ fn services_from_env() -> Option<Services> {
 /// a /etc/hosts pin and a `tcp dport 443 accept` rule — so a scheme, a port, a
 /// path or a wildcard must be refused here rather than silently widening the
 /// firewall or producing a hosts line nobody can match.
-fn validate_relay_target(name: &str) -> Result<(), String> {
-    if name.trim().is_empty() {
+fn validate_relay_target(target: &str) -> Result<(), String> {
+    if target.trim().is_empty() {
         return Err("empty target".into());
     }
-    if name.trim() != name {
-        return Err(format!("{name:?} has surrounding whitespace"));
+    if target.trim() != target {
+        return Err(format!("{target:?} has surrounding whitespace"));
     }
+    // `host@address` pins a known address for a name instead of resolving it at
+    // boot — the answer for a host whose DNS rotates or is unusable at boot.
+    // The left side must be a real hostname: the prover commits a name, and
+    // tlsn rejects an IP as a server name (`InvalidDnsNameError`), so a literal
+    // on the left would be a target nobody can use.
+    match target.split_once('@') {
+        Some((host, address)) => {
+            if address.contains('@') {
+                return Err(format!("{target}: at most one '@'"));
+            }
+            validate_relay_hostname(host)?;
+            if host.parse::<std::net::Ipv4Addr>().is_ok() {
+                return Err(format!(
+                    "{target}: the part before '@' must be a hostname — a prover cannot commit an address"
+                ));
+            }
+            address.parse::<std::net::Ipv4Addr>().map(|_| ()).map_err(|_| {
+                format!("{target}: '{address}' after '@' is not an IPv4 address")
+            })
+        }
+        None => validate_relay_hostname(target),
+    }
+}
+
+fn validate_relay_hostname(name: &str) -> Result<(), String> {
     if name.len() > 253 {
         return Err(format!("{name}: longer than 253 characters"));
     }
@@ -4187,12 +4253,21 @@ mod security_tests {
     /// absent must reproduce the PayPal-only-API behaviour exactly, so an
     /// existing config keeps working byte-for-byte.
     #[test]
-    fn relay_targets_default_to_the_paypal_api_names() {
+    fn relay_targets_default_to_the_paypal_api_and_the_sandbox_site() {
         let config = proxy_config(r#"{"tls_proxy":{"enabled":true}}"#);
         let proxy = config.services.as_ref().and_then(|s| s.proxy()).expect("proxy on");
         assert_eq!(
             proxy.relay_targets,
-            vec!["api-m.paypal.com".to_string(), "api-m.sandbox.paypal.com".to_string()]
+            vec![
+                "api-m.paypal.com".to_string(),
+                "api-m.sandbox.paypal.com".to_string(),
+                // The user-facing sandbox site, not just its API: a session
+                // attests one TLS connection and does not follow the 301 from
+                // sandbox.paypal.com to www.sandbox.paypal.com, so both names
+                // have to be present for a person to attest a page there.
+                "sandbox.paypal.com".to_string(),
+                "www.sandbox.paypal.com".to_string(),
+            ]
         );
 
         // An explicit list is taken as given — this is the feature: a notary
@@ -4228,6 +4303,32 @@ mod security_tests {
         }
         for good in ["api-m.paypal.com", "example.co.uk", "a-b.example", "127.0.0.1"] {
             assert!(validate_relay_target(good).is_ok(), "{good:?} must be accepted");
+        }
+
+        // A literal is allowed (it opens 443 without needing DNS) but it is not
+        // committable: tlsn rejects an IP as a server name, so the useful form
+        // for a fixed address is host@address.
+        assert!(enclave_init::relay_target_is_literal("151.101.195.1"));
+        assert!(!enclave_init::relay_target_is_literal("sandbox.paypal.com"));
+        assert!(
+            validate_relay_target("::1").is_err(),
+            "IPv6 is refused: the egress rule matches `ip daddr` only"
+        );
+
+        // host@address: pinned instead of resolved, for a host whose DNS rotates.
+        assert!(validate_relay_target("www.sandbox.paypal.com@151.101.195.1").is_ok());
+        for bad in [
+            "www.sandbox.paypal.com@",
+            "@151.101.195.1",
+            "www.sandbox.paypal.com@not-an-address",
+            "www.sandbox.paypal.com@::1",
+            "151.101.195.1@151.101.195.1",
+            "a@b@c",
+        ] {
+            assert!(
+                validate_relay_target(bad).is_err(),
+                "{bad:?} must be rejected — the left side is a hostname, the right an IPv4 address"
+            );
         }
 
         assert!(validate_relay_targets(&[]).is_err(), "an empty list serves nothing");

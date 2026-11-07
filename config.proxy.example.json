@@ -27,7 +27,9 @@
             "session_timeout_secs": 120,
             "relay_targets": [
                 "api-m.paypal.com",
-                "api-m.sandbox.paypal.com"
+                "api-m.sandbox.paypal.com",
+                "sandbox.paypal.com",
+                "www.sandbox.paypal.com"
             ],
             "signing_key_pem": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC...\n-----END PRIVATE KEY-----\n"
         }

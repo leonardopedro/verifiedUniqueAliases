@@ -26,6 +26,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Relay targets are an egress boundary that the docs promise is validated
+      # at boot; a committed config listing one the docs and example never
+      # describe is drift no compiler catches, and the operator would only find
+      # out by reading a boot log. Runs in under a second.
+      - name: Relay-target documentation parity
+        run: npm run --silent check:relay-targets
+
       # Fail before the expensive build if the proxy crate cannot even be
       # parsed against the pinned tlsn revision — a broken manifest here would
       # otherwise surface 20 minutes into the image build.
