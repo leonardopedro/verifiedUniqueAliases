@@ -3464,6 +3464,176 @@ async fn proxy_health() -> axum::response::Response {
     }
 }
 
+/// `/proxy/refusals` — the proxy's refusal ring, readable on the public origin.
+///
+/// `/proxy/health` only says the child is alive; it cannot answer "why was my
+/// session rejected?", and the loopback API that can needs a shell on the VM.
+/// An operator on a managed importer, or one whose serial console has scrolled
+/// past the refusal, has neither. This route relays the ring so the answer is
+/// reachable over HTTPS.
+///
+/// Reasons quote the host each prover committed to. A notary must not publish
+/// who other provers were looking at, so host-shaped tokens are replaced with a
+/// stable fingerprint (`api-m.paypal.com` → `host:9f2c0a1b`): repeated attempts
+/// still line up, the name itself never leaves the loopback API. The full text
+/// stays at `GET :8081/refusals` and in the boot log.
+async fn proxy_refusals() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let unavailable = |code: axum::http::StatusCode, detail: serde_json::Value| {
+        (
+            code,
+            axum::Json(serde_json::json!({
+                "service": "tls-proxy",
+                "enabled": true,
+                "running": false,
+                "last": detail,
+            })),
+        )
+            .into_response()
+    };
+
+    let Some(sup) = PROXY_SUPERVISOR.get() else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"service": "tls-proxy", "enabled": false})),
+        )
+            .into_response();
+    };
+    if !sup.alive.load(Ordering::Relaxed) {
+        return unavailable(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!(sup.last.read().clone()),
+        );
+    }
+
+    // Loopback only: the child's API binds 127.0.0.1, so this is an in-guest
+    // read, not a second network hop an attacker could redirect.
+    let url = format!("http://127.0.0.1:{}/refusals", sup.api_port);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            error!("proxy refusals: cannot build the loopback client: {e}");
+            return unavailable(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!(format!("cannot build the loopback client: {e}")),
+            );
+        }
+    };
+
+    let body = match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                warn!("proxy refusals: cannot read the loopback answer: {e}");
+                return unavailable(
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    serde_json::json!(format!("cannot read the loopback answer: {e}")),
+                );
+            }
+        },
+        Ok(resp) => {
+            let status = resp.status();
+            warn!("proxy refusals: loopback API answered {status}");
+            return unavailable(
+                axum::http::StatusCode::BAD_GATEWAY,
+                serde_json::json!(format!("loopback API answered {status}")),
+            );
+        }
+        Err(e) => {
+            warn!("proxy refusals: loopback API unreachable: {e}");
+            return unavailable(
+                axum::http::StatusCode::BAD_GATEWAY,
+                serde_json::json!(format!("loopback API unreachable: {e}")),
+            );
+        }
+    };
+
+    let mut parsed: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(e) => {
+            warn!("proxy refusals: loopback answer is not JSON: {e}");
+            return unavailable(
+                axum::http::StatusCode::BAD_GATEWAY,
+                serde_json::json!(format!("loopback answer is not JSON: {e}")),
+            );
+        }
+    };
+    if let Some(records) = parsed.get_mut("refusals").and_then(|v| v.as_array_mut()) {
+        for record in records.iter_mut() {
+            if let Some(reason) = record.get("reason").and_then(|v| v.as_str()) {
+                record["reason"] = serde_json::Value::String(fingerprint_hosts(reason));
+            }
+        }
+    }
+    if let Some(map) = parsed.as_object_mut() {
+        map.insert("service".into(), serde_json::json!("tls-proxy"));
+        map.insert("running".into(), serde_json::json!(true));
+        map.insert(
+            "redaction".into(),
+            serde_json::json!(
+                "host-shaped tokens in `reason` are replaced by host:<sha256 prefix>; \
+                 full text is served by the loopback API (GET :8081/refusals) and the boot log"
+            ),
+        );
+    }
+    axum::Json(parsed).into_response()
+}
+
+/// Replace host-shaped tokens in a refusal reason with a stable fingerprint.
+///
+/// Deliberately lexical rather than clever: it only needs to catch the things a
+/// prover commits to (`api-m.paypal.com`, `example.co.uk`) and must leave
+/// numbers that only look dotted (`1.99.0`, a byte count) alone, so the last
+/// label has to be alphabetic and at least two characters.
+fn fingerprint_hosts(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            token.push(ch);
+        } else {
+            push_fingerprinted(&mut out, &token);
+            token.clear();
+            out.push(ch);
+        }
+    }
+    push_fingerprinted(&mut out, &token);
+    out
+}
+
+fn push_fingerprinted(out: &mut String, token: &str) {
+    // Leading/trailing punctuation stays outside the replacement, so
+    // "(api-x.com)." keeps its brackets and full stop.
+    let start = token.find(|c: char| c.is_ascii_alphanumeric());
+    let end = token.rfind(|c: char| c.is_ascii_alphanumeric());
+    let (Some(start), Some(end)) = (start, end) else {
+        out.push_str(token);
+        return;
+    };
+    let core = &token[start..=end];
+    if is_host_shaped(core) {
+        use sha2::Digest as _;
+        out.push_str(&token[..start]);
+        out.push_str("host:");
+        out.push_str(&hex::encode(sha2::Sha256::digest(core.as_bytes()))[..8]);
+        out.push_str(&token[end + 1..]);
+    } else {
+        out.push_str(token);
+    }
+}
+
+fn is_host_shaped(core: &str) -> bool {
+    let labels: Vec<&str> = core.split('.').collect();
+    if labels.len() < 2 || labels.iter().any(|label| label.is_empty()) {
+        return false;
+    }
+    let tld = labels[labels.len() - 1];
+    tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic())
+}
+
 /// Refuse the PayPal OAuth surface when `services.paypal` is false: a provider
 /// surface with no credentials behind it is an attack surface, not a feature.
 async fn paypal_disabled_gate(
@@ -3754,6 +3924,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // origin, so an operator can see whether the proxy child is alive
             // without reaching the loopback API.
             .route("/proxy/health", get(proxy_health))
+            // The refusal ring, on the same origin: health says the child is
+            // alive, this says why a session was refused when there is no
+            // shell and no serial console to read.
+            .route("/proxy/refusals", get(proxy_refusals))
             // v189 (user request): the enclave's own TLS chain as a PEM file,
             // offered by verify.html BEFORE the PayPal login (see handler).
             .route("/tls-cert.pem", get(serve_tls_cert))
@@ -3885,6 +4059,44 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    /// `/proxy/refusals` is the only path by which a refusal reason reaches the
+    /// internet, so its redaction is pinned here: committed hosts get a stable
+    /// fingerprint (repeated attempts still correlate), dotted numbers and
+    /// versions are left alone, and no hostname survives in the output.
+    #[test]
+    fn public_refusal_view_fingerprints_committed_hosts() {
+        let reason = "revealed server name api-m.paypal.com does not match the committed api-m.sandbox.paypal.com";
+        let redacted = fingerprint_hosts(reason);
+        assert!(!redacted.contains("paypal.com"), "host leaked: {redacted}");
+        assert_eq!(redacted.matches("host:").count(), 2, "{redacted}");
+        assert_eq!(
+            redacted,
+            fingerprint_hosts(reason),
+            "the fingerprint must be stable across reads"
+        );
+        assert_ne!(
+            fingerprint_hosts("api-m.paypal.com"),
+            fingerprint_hosts("api-m.sandbox.paypal.com"),
+            "different hosts must not collapse into one fingerprint"
+        );
+
+        // Things that only look dotted must survive verbatim, or the reason
+        // stops being diagnostic (byte bounds, versions, the service tag).
+        for untouched in [
+            "transcript is 9000 bytes, over the 8388608-byte bound",
+            "no verdict within 120s",
+            "1.99.0",
+            "tls-proxy/1",
+            "prover requested MPC mode; proxy mode only",
+        ] {
+            assert_eq!(fingerprint_hosts(untouched), untouched, "{untouched}");
+        }
+
+        // Punctuation around a host is preserved, the host itself is not.
+        let bracketed = fingerprint_hosts("(example.co.uk).");
+        assert!(bracketed.starts_with("(host:") && bracketed.ends_with(")."), "{bracketed}");
+    }
 
     /// v169 (audit finding: identity preimage binding). verify.html recomputes
     /// SHA-256(JSON.stringify(paypal_user_info)) and requires it to equal the

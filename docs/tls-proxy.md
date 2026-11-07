@@ -67,6 +67,7 @@ nothing, and stops demanding PayPal app credentials only for the proxy-only case
 | `GET :8081/attestations/{id}` | the signed attestation |
 | `GET :8081/refusals` | why the last 32 sessions were refused, newest last |
 | `GET https://<domain>/proxy/health` | same liveness answer on the public origin |
+| `GET https://<domain>/proxy/refusals` | the refusal ring on the public origin, hostnames fingerprinted |
 
 `/refusals` answers the operator's question "why was that session rejected?"
 without a shell: each entry is `{at, kind, reason}`, where `kind` is `rejected`
@@ -75,6 +76,23 @@ mismatched name, a transcript over the bound) or `timeout` (no verdict in
 `session_timeout_secs`). The reason quotes the prover's own commit, so it is
 capped at 400 characters; these records are diagnostics, never evidence, and
 they are not signed.
+
+`/proxy/refusals` exists because a dead session is the one thing an operator
+most needs to explain and the boot log is the one thing they often cannot read:
+no shell on a managed importer, a spot instance whose serial console has already
+scrolled. Health only proves the child is running. The public route relays the
+same ring, so "sessions_failed went up by one" becomes "the commit was refused
+because …" over plain HTTPS.
+
+It is not a verbatim copy. A refusal reason quotes the host the prover committed
+to, and a notary must not publish what other provers were looking at, so
+host-shaped tokens are replaced by a stable fingerprint — `api-m.paypal.com`
+becomes `host:9f2c0a1b`, the same fingerprint for the same name every time, so
+repeated attempts still line up without the name leaving the VM. Numbers that
+merely look dotted (`1.99.0`, a byte count) are left alone, since stripping them
+would cost the diagnosis without hiding anything. The `redaction` field in the
+response says this in-band, and the unredacted text remains at
+`GET :8081/refusals` and in the boot log for whoever does have a shell.
 
 The attestation API binds loopback on purpose: it is read by whoever already has
 a shell on the VM (or a future in-guest collector), not by the internet. Session
