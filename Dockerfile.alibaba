@@ -23,6 +23,21 @@ COPY Cargo.toml Cargo.lock ./
 
 ENV RUSTFLAGS="-C target-cpu=generic -C strip=symbols"
 
+# --- Optional second service: the TLSNotary proxy (dual-service image) --------
+# TLS_PROXY=0 (default) is the PayPal-only image this Dockerfile has always
+# produced: the only trace of the proxy is an EMPTY /tls-proxy-bin, which never
+# reaches the initramfs or the disk, so the assembled disk stays byte-identical.
+# TLS_PROXY=1 compiles tls-proxy/ (a separate crate with its own lockfile, so
+# the parent's dependency set is untouched) and packs the binary into the
+# initramfs — see TLS_PROXY_BIN in build-initramfs-tools.sh. The proxy's first
+# build compiles the tlsn tree (a few minutes); it is not cached in layer 1.
+ARG TLS_PROXY=0
+# The tlsn tree needs rustc >= 1.95 (mpz-fields pins an MSRV above the enclave's
+# toolchain), so the proxy is built with its OWN toolchain — installed only in
+# the TLS_PROXY=1 path. The PayPal binary keeps the pinned RUST_VERSION, which is
+# what keeps the TLS_PROXY=0 disk unaffected by the proxy's requirements.
+ARG TLS_PROXY_RUST_VERSION=1.99.0
+
 # Layer 1: compile dependencies
 RUN bash -c ". /usr/local/cargo/env && \
     set -euo pipefail && \
@@ -39,14 +54,26 @@ RUN bash -c ". /usr/local/cargo/env && \
 # self-measure SHA256(/init) independent of EXPECTED_ENCLAVE_SHA256 (the code
 # pin inside verify.html), so the pin is not self-referential.
 COPY src ./src
+# The proxy crate is copied even in the PayPal-only build: `tls-proxy` is not a
+# workspace member, so nothing under it is compiled unless asked for.
+COPY tls-proxy ./tls-proxy
 RUN bash -c ". /usr/local/cargo/env && \
     set -euo pipefail && \
     cargo build --release --target x86_64-unknown-linux-gnu && \
-    cp target/x86_64-unknown-linux-gnu/release/paypal-auth-vm /paypal-auth-vm-bin"
+    cp target/x86_64-unknown-linux-gnu/release/paypal-auth-vm /paypal-auth-vm-bin && \
+    if [ \"$TLS_PROXY\" = 1 ]; then \
+        rustup toolchain install $TLS_PROXY_RUST_VERSION --profile minimal --no-self-update && \
+        (cd tls-proxy && cargo +$TLS_PROXY_RUST_VERSION build --release --target x86_64-unknown-linux-gnu) && \
+        cp tls-proxy/target/x86_64-unknown-linux-gnu/release/tls-proxy /tls-proxy-bin ; \
+    else \
+        : > /tls-proxy-bin ; \
+    fi"
 
-# Strip binary for determinism
+# Strip binaries for determinism (add-det on an empty placeholder is pointless)
 RUN /usr/bin/add-det /paypal-auth-vm-bin && \
+    { [ -s /tls-proxy-bin ] && /usr/bin/add-det /tls-proxy-bin || true ; } && \
     rm -rf /usr/local/cargo/registry /usr/local/cargo/git
+
 
 
 FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a AS image-builder
@@ -68,6 +95,8 @@ RUN apt-get -o Acquire::Check-Valid-Until=false update && apt-get install -y --n
 
 WORKDIR /build
 COPY --from=rust-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin
+# Empty when TLS_PROXY=0; build-initramfs-tools.sh skips a non-executable file.
+COPY --from=rust-builder /tls-proxy-bin /build/tls-proxy-bin
 COPY --from=rust-builder /usr/bin/add-det /usr/bin/add-det
 
 COPY build-initramfs-tools.sh ./
@@ -77,13 +106,14 @@ COPY src ./src
 RUN chmod +x build-initramfs-tools.sh && \
     dpkg-query -W -f='${Package} ${Version} ${Architecture}\n' | sort > /build/packages.txt && \
     echo "=== Installed Package Manifest ===" && cat /build/packages.txt && \
-    BUILD_FEATURE=alibabacloud ./build-initramfs-tools.sh && \
+    TLS_PROXY_BIN=/build/tls-proxy-bin BUILD_FEATURE=alibabacloud ./build-initramfs-tools.sh && \
     rm -rf /usr/local/cargo/registry /usr/local/cargo/git
 
 # Copy artifacts to root for easy extraction
 RUN cp /build/output/initramfs-paypal-auth.img /initramfs-paypal-auth.img && \
     cp /build/packages.txt /packages.txt && \
     cp /build/paypal-auth-vm-bin /paypal-auth-vm-bin && \
+    cp /build/tls-proxy-bin /tls-proxy-bin && \
     cp /build/output/vmlinuz /vmlinuz && \
     cp /build/output/shimx64.efi /shimx64.efi && \
     cp /build/output/grubx64.efi /grubx64.efi && \
@@ -117,6 +147,7 @@ COPY --from=image-builder /vmlinuz /build/output/vmlinuz
 COPY --from=image-builder /shimx64.efi /build/output/shimx64.efi
 COPY --from=image-builder /grubx64.efi /build/output/grubx64.efi
 COPY --from=image-builder /paypal-auth-vm-bin /build/paypal-auth-vm-bin
+COPY --from=image-builder /tls-proxy-bin /build/tls-proxy-bin
 COPY --from=image-builder /packages.txt /build/packages.txt
 COPY build-alibaba-image.sh ./
 # verify.html ships on the ESP (v167) and build-alibaba-image.sh refuses to
@@ -130,6 +161,7 @@ RUN chmod +x build-alibaba-image.sh && ./build-alibaba-image.sh && \
     cp /build/output-alibaba/grub.cfg /grub.cfg && \
     cp /build/output/initramfs-paypal-auth.img /initramfs-paypal-auth.img && \
     cp /build/paypal-auth-vm-bin /paypal-auth-vm-bin && \
+    cp /build/tls-proxy-bin /tls-proxy-bin && \
     cp /build/packages.txt /packages.txt && \
     sha256sum /disk-alibaba.raw
 

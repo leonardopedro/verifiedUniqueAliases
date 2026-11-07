@@ -39,6 +39,11 @@ esp_mount/
 tmp-*/
 docker-output/
 dstack-output/
+
+# Dual-service (TLSNotary proxy) build outputs: reproducible from
+# build-tls-proxy-image.sh; the disk is hundreds of MB and the initramfs is a
+# measured-boot input that must be rebuilt, never committed.
+output-tls-proxy/
 test-repro/out*/
 
 # Scratch Scripts

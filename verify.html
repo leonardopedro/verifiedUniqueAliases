@@ -1924,7 +1924,7 @@ Wmw2oAio9A==
     // ========================================================================
     var EXPECTED_RTMR0 = '06a32a2f92ea455dd628bc41be9bb5910c2782a2eb93c646c6a5ddebd70291839f197792d289cca528572b6d910294db';
     var EXPECTED_RTMR1 = '6fa0352319182f7ec8cb713223cbc1853506caf719c64d04475a26975ae8ebf72003f592dcf0aafe392cc74de33d3f90';
-    var EXPECTED_RTMR2 = 'a4b8bf51326c8f9f86257ae060c53c2d293b52818b406c3c855d1e753859c6d88e6a8582c7e298ac4449e5471d1fa0fd';
+    var EXPECTED_RTMR2 = 'f1bec4aefdc4e3fa676d09984a675d38efbc99e0da6969827d2dc6e12700f97c8465da5a6c91b4e27849c7cee9e60d41';
     var EXPECTED_RTMR3 = '000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000';
 
     // ========================================================================
@@ -1974,7 +1974,15 @@ Wmw2oAio9A==
     // produced disk 88b9bcb4…, live-confirmed by the post-swap envelope
     // self-reporting 131e0108… (RTMR2 rotated 6a91b77f… → a4b8bf51… because the
     // initrd carries the new binary; MRTD/RTMR0/1/3 held).
-    var EXPECTED_ENCLAVE_SHA256 = '131e0108df288330b1d37ca9d1977a0c7c5ab45b974ea0b083c021fe57cb8a40';
+    // v210 rotation (2026-11-07): the DUAL-SERVICE binary — every PayPal
+    // behaviour of v209 is untouched; the changes are the boot-time loopback
+    // raise (the TLS proxy's attestation API binds 127.0.0.1 and crash-looped
+    // with EADDRNOTAVAIL without it) and the relay-target /etc/hosts pin plus
+    // its egress allowlist. Digest of the podman build that produced disk
+    // 2bd2195a…, live-confirmed by the post-swap envelope self-reporting
+    // bddce14e… (RTMR2 rotated a4b8bf51… → f1bec4ae… because the initrd carries
+    // /tls-proxy next to the new binary; MRTD/RTMR0/1/3 held).
+    var EXPECTED_ENCLAVE_SHA256 = 'bddce14e39f40e32eb990c1ec1b229408eb945d5c16389149d703e9338e75e25';
 
     // ========================================================================
     // v162 (audit VULN-04): GOLDEN PCR PINS — CI-captured constants for the

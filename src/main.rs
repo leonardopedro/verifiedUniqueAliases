@@ -89,6 +89,24 @@ mod enclave_init {
         }
     }
 
+    /// Open exactly ONE inbound TCP port for an optional service (the
+    /// TLSNotary proxy). The boot ruleset admits only 80/443 — right for the
+    /// PayPal flow — so a service that must be reachable elsewhere asks for that
+    /// port here, instead of the ruleset being loosened for everyone.
+    pub fn open_service_port(port: u16) {
+        let rule = format!("insert rule inet filter input tcp dport {} accept", port);
+        match std::process::Command::new("/usr/sbin/nft").arg(&rule).status() {
+            Ok(s) if s.success() => kmsg(&format!("nft: opened inbound tcp/{}", port)),
+            _ => {
+                kmsg(&format!(
+                    "FATAL: could not open inbound tcp/{} — halting (the service would be unreachable)",
+                    port
+                ));
+                poweroff();
+            }
+        }
+    }
+
     // =========================================================================
     // v168 (independent security audit — plan Phases 1.1 / 4.1 / 4.2): boot
     // artifact + kernel hardening and post-boot egress lockdown.
@@ -221,6 +239,19 @@ mod enclave_init {
             // == hardened_client() pin set (api-m.paypal.com / api-m.sandbox) ==
             "add rule inet filter output ip daddr { 104.16.124.74, 146.75.123.1 } tcp dport 443 accept".into(),
         ];
+        // The relay targets the proxy may serve, at the addresses boot-time DNS
+        // gave them. Without this the proxy's SYN to a rotated CDN address is
+        // dropped by the policy and the session stalls until its timeout.
+        if let Some(relay_ips) = RELAY_TARGET_IPS.get().filter(|v| !v.is_empty()) {
+            commands.push(format!(
+                "add rule inet filter output ip daddr {{ {} }} tcp dport 443 accept",
+                relay_ips.join(", ")
+            ));
+            kmsg(&format!(
+                "Relay targets reachable after lockdown: 443 to {}",
+                relay_ips.join(", ")
+            ));
+        }
         if !sink_addrs.is_empty() {
             let set = sink_addrs
                 .iter()
@@ -463,6 +494,15 @@ mod enclave_init {
     }
 
     pub async fn configure_network() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Loopback already carries 127.0.0.1/8 (the kernel initialises it) but
+        // starts DOWN, and binding an address of a down interface fails with
+        // EADDRNOTAVAIL. The PayPal listener binds 0.0.0.0 so it never noticed;
+        // the TLS proxy's attestation API binds 127.0.0.1 and crash-looped with
+        // "cannot bind the attestation API on 127.0.0.1:8081: Cannot assign
+        // requested address" (exit 1, supervisor backoff) until this ran.
+        let _ = std::process::Command::new("/sbin/ip").args(["link", "set", "lo", "up"]).status();
+        kmsg("Loopback raised (127.0.0.1 up)");
+
         let iface = {
             let mut found = None;
             for _ in 0..60 {
@@ -529,7 +569,63 @@ mod enclave_init {
                 }
             }
         }
+
+        // A relay session resolves the name the prover committed to when it
+        // starts, but the post-boot lockdown drops DNS and leaves only the
+        // PayPal endpoint IPs reachable on 443. Without a mapping in
+        // /etc/hosts, getaddrinfo cannot answer after that and every session
+        // dies at connect. Pin the names now, while DNS is still open (the
+        // firewall's IP allowlist, not this file, is the boundary).
+        pin_relay_targets(&["api-m.paypal.com", "api-m.sandbox.paypal.com"]);
         Ok(())
+    }
+
+    /// Boot-resolved addresses of the relay targets, kept so `egress_lockdown`
+    /// can allow exactly the addresses /etc/hosts hands the proxy. Empty when
+    /// DNS answered nothing, in which case no extra rule is added.
+    static RELAY_TARGET_IPS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+    /// Write the IPv4 addresses an allowed relay target had at boot into
+    /// /etc/hosts, so the proxy can still resolve it after DNS is locked down,
+    /// and remember them for the firewall allowlist.
+    fn pin_relay_targets(names: &[&str]) {
+        use std::net::ToSocketAddrs;
+        let mut granted: Vec<String> = Vec::new();
+        let mut lines = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+        if !lines.is_empty() && !lines.ends_with('\n') {
+            lines.push('\n');
+        }
+        for name in names {
+            match (*name, 443u16).to_socket_addrs() {
+                Ok(addrs) => {
+                    let ips: Vec<String> = addrs
+                        .filter(|a| a.is_ipv4())
+                        .map(|a| a.ip().to_string())
+                        .collect();
+                    if ips.is_empty() {
+                        kmsg(&format!(
+                            "relay target {name}: no IPv4 address at boot — sessions to it cannot resolve after lockdown"
+                        ));
+                        continue;
+                    }
+                    lines.push_str(&format!("{} {}\n", ips.join(" "), name));
+                    for ip in &ips {
+                        if !granted.contains(ip) {
+                            granted.push(ip.clone());
+                        }
+                    }
+                    kmsg(&format!(
+                        "relay target {name} pinned in /etc/hosts to {}",
+                        ips.join(", ")
+                    ));
+                }
+                Err(e) => kmsg(&format!("relay target {name}: resolution failed: {e}")),
+            }
+        }
+        if let Err(e) = std::fs::write("/etc/hosts", lines) {
+            kmsg(&format!("cannot write /etc/hosts: {e}"));
+        }
+        let _ = RELAY_TARGET_IPS.set(granted);
     }
 
     /// Fail closed: publish the recorded reason to the out-of-mainland report
@@ -1845,6 +1941,71 @@ struct Config {
     /// only reports to the local kernel log, exactly as before.
     #[serde(default)]
     self_report: Option<selfreport::SinkConfig>,
+    /// Which webservices this enclave runs (user request): the PayPal OAuth
+    /// flow and the TLSNotary web-attestation proxy in the same VM, either one
+    /// alone, or both. Absent = PayPal only, which is exactly the behaviour
+    /// before this field existed: no child process, no extra listen port, no
+    /// extra firewall hole, no extra dependency in the build.
+    #[serde(default)]
+    services: Option<Services>,
+}
+
+/// Service selection for the enclave.
+///
+/// Defaults reproduce the original single-service deployment (`paypal: true`,
+/// no proxy). The two services are independent: `paypal: false` runs the proxy
+/// alone, and leaving `tls_proxy` out (or `enabled: false`) runs PayPal alone —
+/// on this very image, since the dual-service disk ships both binaries.
+#[derive(Clone, Debug, serde::Deserialize)]
+struct Services {
+    #[serde(default = "service_default_on")]
+    paypal: bool,
+    #[serde(default)]
+    tls_proxy: Option<TlsProxyConfig>,
+}
+
+fn service_default_on() -> bool {
+    true
+}
+
+impl Services {
+    /// The proxy, when it is actually switched on. `Some(cfg)` with
+    /// `enabled: false` is the same as absent.
+    fn proxy(&self) -> Option<&TlsProxyConfig> {
+        self.tls_proxy.as_ref().filter(|p| p.enabled)
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct TlsProxyConfig {
+    #[serde(default = "service_default_on")]
+    enabled: bool,
+    /// Inbound TCP port for TLSNotary prover sessions (must be reachable by the
+    /// prover; the boot firewall opens exactly this port when the service is
+    /// on).
+    #[serde(default = "proxy_default_session_port")]
+    session_port: u16,
+    /// Loopback HTTP port for the signed-attestation API of the proxy.
+    #[serde(default = "proxy_default_api_port")]
+    api_port: u16,
+    /// Idle budget for one prover session, seconds.
+    #[serde(default = "proxy_default_timeout")]
+    session_timeout_secs: u64,
+    /// PEM key that signs attestations. Absent = a fresh per-boot key, so
+    /// nothing long-lived is written anywhere (same model as the PayPal
+    /// attestation key).
+    #[serde(default)]
+    signing_key_pem: Option<String>,
+}
+
+fn proxy_default_session_port() -> u16 {
+    8443
+}
+fn proxy_default_api_port() -> u16 {
+    8081
+}
+fn proxy_default_timeout() -> u64 {
+    120
 }
 
 #[derive(Clone)]
@@ -2033,7 +2194,33 @@ fn hardened_client() -> reqwest::Client {
 // ----------------------------------------------------------------------------
 // Fail-Closed Credential Ingestion (No Hardcoded Secrets Allowed)
 // ----------------------------------------------------------------------------
+fn services_from_env() -> Option<Services> {
+    // Same precedence as the rest of the config: environment wins over
+    // user_data, and both go through the same serde shape so there is exactly
+    // one definition of what `services` means.
+    std::env::var("PAV_SERVICES_JSON")
+        .ok()
+        .and_then(|s| serde_json::from_str::<Services>(&s).ok())
+}
+
 fn require_credentials(config: Config) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
+    // Proxy-only deployment: there is no PayPal app to configure, and requiring
+    // its credentials would make `services.paypal = false` unbootable — the one
+    // configuration this check must not break. What it still refuses is a VM
+    // that would serve nothing at all.
+    let services = config.services.clone().unwrap_or(Services {
+        paypal: true,
+        tls_proxy: None,
+    });
+    if !services.paypal {
+        if services.proxy().is_none() {
+            return Err("FAIL-CLOSED: services.paypal=false and no enabled services.tls_proxy \
+                 — this enclave would serve nothing."
+                .into());
+        }
+        return Ok(config);
+    }
+
     fn is_missing(val: &str) -> bool {
         let t = val.trim();
         t.is_empty() || t.starts_with("MISSING_") || t.starts_with("YOUR_") || t.contains("***REMOVED***")
@@ -2089,6 +2276,7 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
             self_report: std::env::var("PAV_SELFREPORT_JSON")
                 .ok()
                 .and_then(|s| serde_json::from_str::<selfreport::SinkConfig>(&s).ok()),
+            services: services_from_env(),
         });
     }
 
@@ -3165,6 +3353,146 @@ async fn callback(
 // ----------------------------------------------------------------------------
 // Runtime Main Loop
 // ----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Second webservice: TLSNotary proxy supervision (v2xx, user request)
+// ---------------------------------------------------------------------------
+// PID 1 has no shell and no PATH worth trusting, so the binary path is explicit
+// and defaults to what the dual-service initramfs installs.
+fn tls_proxy_binary() -> String {
+    std::env::var("TLS_PROXY_BIN").unwrap_or_else(|_| "/tls-proxy".to_string())
+}
+
+static PROXY_SUPERVISOR: std::sync::OnceLock<Arc<ProxySupervisor>> = std::sync::OnceLock::new();
+
+struct ProxySupervisor {
+    session_port: u16,
+    api_port: u16,
+    alive: Arc<AtomicBool>,
+    restarts: Arc<AtomicU64>,
+    last: Arc<RwLock<Option<String>>>,
+}
+
+/// Start the proxy child and keep it up.
+///
+/// The proxy is a separate process on purpose: it links the tlsn tree, which
+/// the PayPal-only image must not carry, and a crash in a TLSNotary session must
+/// not take the OAuth flow down with it. Restart backoff is 2 s → 60 s so a
+/// permanently broken binary cannot spin the VM.
+fn spawn_tls_proxy(cfg: &TlsProxyConfig) -> Arc<ProxySupervisor> {
+    let bin = tls_proxy_binary();
+    let sup = Arc::new(ProxySupervisor {
+        session_port: cfg.session_port,
+        api_port: cfg.api_port,
+        alive: Arc::new(AtomicBool::new(false)),
+        restarts: Arc::new(AtomicU64::new(0)),
+        last: Arc::new(RwLock::new(None)),
+    });
+    let cfg = cfg.clone();
+    let task_sup = sup.clone();
+    tokio::spawn(async move {
+        let mut backoff = Duration::from_secs(2);
+        loop {
+            let mut cmd = tokio::process::Command::new(&bin);
+            cmd.env("TLS_PROXY_LISTEN", format!("0.0.0.0:{}", cfg.session_port))
+                .env("TLS_PROXY_HTTP_LISTEN", format!("127.0.0.1:{}", cfg.api_port))
+                .env(
+                    "TLS_PROXY_SESSION_TIMEOUT",
+                    cfg.session_timeout_secs.to_string(),
+                )
+                .env("TLS_PROXY_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                // stderr is inherited: PID 1's stderr is the serial console,
+                // and a proxy that cannot say why it died is undebuggable in a
+                // VM with no shell.
+                .stderr(std::process::Stdio::inherit());
+            if let Some(pem) = &cfg.signing_key_pem {
+                cmd.env("TLS_PROXY_SIGNING_KEY_PEM", pem);
+            }
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    task_sup.alive.store(true, Ordering::Relaxed);
+                    info!("tls-proxy started (pid {})", child.id().unwrap_or(0));
+                    let status = child.wait().await;
+                    task_sup.alive.store(false, Ordering::Relaxed);
+                    task_sup.restarts.fetch_add(1, Ordering::Relaxed);
+                    let msg = match status {
+                        Ok(s) => format!("exited: {s}"),
+                        Err(e) => format!("wait failed: {e}"),
+                    };
+                    warn!("tls-proxy {} — restarting in {:?}", msg, backoff);
+                    *task_sup.last.write() = Some(msg);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(60));
+                }
+                Err(e) => {
+                    task_sup.alive.store(false, Ordering::Relaxed);
+                    error!("cannot start {}: {} — retrying in {:?}", bin, e, backoff);
+                    *task_sup.last.write() = Some(format!("spawn failed: {e}"));
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(60));
+                }
+            }
+        }
+    });
+    sup
+}
+
+/// `/proxy/health` — says whether the second webservice is alive, without
+/// requiring an operator to reach its loopback API.
+async fn proxy_health() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match PROXY_SUPERVISOR.get() {
+        Some(sup) => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "service": "tls-proxy",
+                "enabled": true,
+                "running": sup.alive.load(Ordering::Relaxed),
+                "session_port": sup.session_port,
+                "api_port": sup.api_port,
+                "restarts": sup.restarts.load(Ordering::Relaxed),
+                "last": sup.last.read().clone(),
+            })),
+        )
+            .into_response(),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"service": "tls-proxy", "enabled": false})),
+        )
+            .into_response(),
+    }
+}
+
+/// Refuse the PayPal OAuth surface when `services.paypal` is false: a provider
+/// surface with no credentials behind it is an attack surface, not a feature.
+async fn paypal_disabled_gate(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    const PAYPAL_PATHS: [&str; 7] = [
+        "/",
+        "/verify.html",
+        "/attest/login-session",
+        "/callback",
+        "/e2ee-blob",
+        "/debug/envelope",
+        "/tls-cert.pem",
+    ];
+    if PAYPAL_PATHS.contains(&req.uri().path()) {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": "the PayPal webservice is disabled on this VM",
+                "services": {"paypal": false},
+            })),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     enclave_init::mount_filesystems();
     // Boot self-report: resolve the sink from the ESP before anything can
@@ -3215,6 +3543,43 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // wins because it is measured with the image.
         selfreport::init(config.self_report.clone());
         selfreport::progress();
+
+        // --- service selection -------------------------------------------------
+        // Both webservices can run in this VM; each can run alone. `services`
+        // absent means PayPal only, and then nothing below changes the boot:
+        // no child process, no extra port, no extra firewall rule.
+        let services = config.services.clone().unwrap_or(Services {
+            paypal: true,
+            tls_proxy: None,
+        });
+        let paypal_enabled = services.paypal;
+        if !paypal_enabled {
+            info!("services.paypal=false — the PayPal OAuth routes are not served");
+        }
+        let proxy_supervisor = match services.proxy() {
+            Some(cfg) => {
+                // The prover dials this port from outside, and the boot
+                // firewall admits only 80/443; open exactly this one hole
+                // rather than loosening the ruleset for the PayPal flow.
+                enclave_init::open_service_port(cfg.session_port);
+                let sup = spawn_tls_proxy(cfg);
+                if let Some(slot) = PROXY_SUPERVISOR.get() {
+                    let _ = slot; // already set on a re-entrant boot path
+                } else {
+                    let _ = PROXY_SUPERVISOR.set(sup.clone());
+                }
+                info!(
+                    "TLS proxy enabled: TLSNotary sessions on :{}, attestation API on 127.0.0.1:{}",
+                    cfg.session_port, cfg.api_port
+                );
+                Some(sup)
+            }
+            None => {
+                info!("TLS proxy disabled (no services.tls_proxy, or enabled=false)");
+                None
+            }
+        };
+        let _ = &proxy_supervisor;
 
         // v165 Phase 3: BOOT-TIME FAIL-CLOSED QUOTE PROBE. Before any traffic
         // is accepted, require a silicon-signed TD Quote from configfs TSM /
@@ -3385,6 +3750,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .route("/verify.html", get(serve_landing))
             .route("/attest/login-session", axum::routing::options(login_session_cors).post(attest_login_session))
             .route("/debug/envelope", get(debug_envelope))
+            // v2xx: one line of truth about the second webservice on the public
+            // origin, so an operator can see whether the proxy child is alive
+            // without reaching the loopback API.
+            .route("/proxy/health", get(proxy_health))
             // v189 (user request): the enclave's own TLS chain as a PEM file,
             // offered by verify.html BEFORE the PayPal login (see handler).
             .route("/tls-cert.pem", get(serve_tls_cert))
@@ -3406,6 +3775,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }),
             )
             .with_state(state.clone());
+
+        // v2xx: `services.paypal=false` runs the proxy alone. The OAuth routes
+        // are not served then — a provider surface with no credentials behind
+        // it is an attack surface, not a feature. Everything else (landing,
+        // health, TLS certificate) stays, because the proxy needs the same
+        // host to be reachable.
+        let app = if paypal_enabled {
+            app
+        } else {
+            app.layer(axum::middleware::from_fn(paypal_disabled_gate))
+        };
 
         let http_listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 80))).await?;
         let http_app = app.clone();
@@ -3612,8 +3992,75 @@ mod security_tests {
             dns_api_token: None,
             dns_zone: None,
             self_report: None,
+            services: None,
         };
         assert!(require_credentials(bad).is_err());
+    }
+
+    /// The service switch is fail-closed in both directions, so both directions
+    /// are pinned: a proxy-only enclave must boot without a PayPal app (there is
+    /// none to configure), and a configuration that would serve nothing must be
+    /// refused rather than starting an enclave with no listeners.
+    #[test]
+    fn proxy_only_services_do_not_require_paypal_credentials() {
+        let cfg = Config {
+            paypal_client_id: String::new(),
+            paypal_client_secret: String::new(),
+            paypal_verified_client_id: None,
+            paypal_verified_client_secret: None,
+            domain: String::new(),
+            eab_key_id: None,
+            eab_hmac_key: None,
+            staging: false,
+            dns_api_token: None,
+            dns_zone: None,
+            self_report: None,
+            services: Some(Services {
+                paypal: false,
+                tls_proxy: Some(TlsProxyConfig {
+                    enabled: true,
+                    session_port: 8443,
+                    api_port: 8081,
+                    session_timeout_secs: 120,
+                    signing_key_pem: None,
+                }),
+            }),
+        };
+        assert!(require_credentials(cfg).is_ok());
+    }
+
+    #[test]
+    fn services_that_would_serve_nothing_are_refused() {
+        let cfg = Config {
+            paypal_client_id: String::new(),
+            paypal_client_secret: String::new(),
+            paypal_verified_client_id: None,
+            paypal_verified_client_secret: None,
+            domain: String::new(),
+            eab_key_id: None,
+            eab_hmac_key: None,
+            staging: false,
+            dns_api_token: None,
+            dns_zone: None,
+            self_report: None,
+            services: Some(Services {
+                paypal: false,
+                tls_proxy: None,
+            }),
+        };
+        assert!(require_credentials(cfg).is_err());
+    }
+
+    /// Defaults must reproduce the pre-existing deployment exactly: no
+    /// `services` block means PayPal on and no proxy process.
+    #[test]
+    fn absent_services_means_paypal_only() {
+        let services = Services {
+            paypal: true,
+            tls_proxy: None,
+        };
+        assert!(services.paypal);
+        assert!(services.proxy().is_none());
     }
 
     #[test]

@@ -1,0 +1,62 @@
+name: Build dual-service (PayPal + TLSNotary proxy) VM image
+
+# The second confidential-VM workflow. `build-attest.yml` keeps building the
+# PayPal-only image exactly as before; this one builds the SAME pipeline with
+# `--build-arg TLS_PROXY=1`, which adds tls-proxy/ (a TLSNotary proxy-mode
+# verifier that attests arbitrary websites) to the initramfs next to /init.
+#
+# The service mix is a runtime decision, not an image decision: a config with
+# `services.tls_proxy.enabled=false` (or no `services` block at all) runs the
+# PayPal webservice alone on this image, and `services.paypal=false` runs the
+# proxy alone.
+on:
+  push:
+    branches: [main, tls-proxy]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  attestations: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail before the expensive build if the proxy crate cannot even be
+      # parsed against the pinned tlsn revision — a broken manifest here would
+      # otherwise surface 20 minutes into the image build.
+      - name: Proxy crate manifest check
+        run: cargo metadata --manifest-path tls-proxy/Cargo.toml --format-version 1 >/dev/null
+
+      - uses: docker/setup-buildx-action@v3
+
+      # TLS_PROXY=1: rust-builder additionally compiles tls-proxy/, and
+      # build-initramfs-tools.sh packs it as /tls-proxy. Everything else is the
+      # attested pipeline the PayPal-only image uses.
+      - name: Build the dual-service disk image
+        run: bash build-tls-proxy-image.sh
+
+      - name: Report the artifacts that get pinned
+        run: |
+          set -euo pipefail
+          cat output-tls-proxy/SHA256SUMS
+          ls -l output-tls-proxy
+          # The initramfs digest is an RTMR2 input and the binary digests are
+          # what verify.html's self-measure row checks; both change versus the
+          # PayPal-only image, so make that impossible to overlook in the log.
+          echo "::notice::dual-service image — rotate RTMR2/self-measure pins before auditing"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: disk-tls-proxy
+          path: |
+            output-tls-proxy/disk-tls-proxy.raw
+            output-tls-proxy/tls-proxy-bin
+            output-tls-proxy/initramfs-dual.img
+            output-tls-proxy/SHA256SUMS
+          retention-days: 30
+          if-no-files-found: error

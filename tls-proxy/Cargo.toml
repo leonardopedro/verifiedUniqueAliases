@@ -1,0 +1,59 @@
+# tls-proxy — TLSNotary web-attestation proxy for the confidential VM
+#
+# Deliberately a SEPARATE crate, not a second binary in the parent package:
+# the PayPal-only image must keep compiling exactly the dependency set it
+# always did. `tlsn` is a large tree (mpc-tls, mux, formats, webpki), and an
+# image that will not run the proxy should not pay for it — nor should the
+# parent Cargo.lock gain a git dependency.
+#
+# The parent package has no [workspace] table, so this directory is an
+# independent package with its own lockfile; `cargo build` here does not touch
+# ../Cargo.lock.
+[package]
+name = "tls-proxy"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Pinned to the exact commit the local ../tlsn checkout is on, so the image CI
+# builds and the source a reviewer reads are the same sources. Bump both
+# together (and re-run the tests in ../tlsn) when moving to a new revision.
+tlsn = { git = "https://github.com/tlsnotary/tlsn", rev = "01fab038b10d0ed0c8865c0afe1f6d14559fb90e", default-features = false }
+
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+axum = "0.8"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Attestation signing reuses the same primitives the enclave's PayPal flow
+# already ships (OpenSSL + SHA-256), so the auditor needs no new verifier.
+openssl = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# The end-to-end test attests a REAL TLS session: this is tlsn's own fixture
+# HTTPS server (certificate for test-server.io) plus its CA, at the same pinned
+# revision, so the test exercises the wire protocol rather than a mock.
+tls-server-fixture = { git = "https://github.com/tlsnotary/tlsn", rev = "01fab038b10d0ed0c8865c0afe1f6d14559fb90e", package = "tls-server-fixture" }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1"
+
+[profile.release]
+opt-level = 3
+lto = false
+codegen-units = 1
+strip = true
+panic = "unwind"

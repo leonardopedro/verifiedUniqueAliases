@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TLSNotary Proxy Attestation Auditor</title>
+<!-- Offline auditor for tls-proxy attestations (docs/tls-proxy.md).
+
+     Deliberately dependency-free: unlike verify.html (which loads SRI-pinned
+     node-forge for X.509 chain walking), every check here is RSA PKCS#1 v1.5 /
+     SHA-256 through the browser's own WebCrypto. An auditor can save this page,
+     pull the plug, and still verify an attestation — there is no CDN to trust
+     and nothing to fetch.
+
+     The page fetches NOTHING and sends NOTHING. It reads the pasted attestation
+     as bytes and verifies the enclave's signature over the exact bytes the
+     enclave signed. -->
+<style>
+    :root {
+        --bg: #0a0c10;
+        --card: #161b22;
+        --primary: #58a6ff;
+        --success: #3fb950;
+        --error: #f85149;
+        --warning: #d29922;
+        --text: #c9d1d9;
+        --text-dim: #8b949e;
+        --accent: #1f6feb;
+    }
+    * { box-sizing: border-box; }
+    body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+        margin: 0;
+        padding: 40px 20px;
+        display: flex;
+        justify-content: center;
+        line-height: 1.6;
+    }
+    .container { max-width: 900px; width: 100%; }
+    header { text-align: center; margin-bottom: 36px; }
+    h1 {
+        font-size: 2.1rem;
+        margin: 0;
+        background: linear-gradient(135deg, #fff 0%, #58a6ff 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-weight: 600;
+    }
+    p.subtitle { color: var(--text-dim); font-size: 1.02rem; margin-top: 10px; }
+    .card {
+        background: var(--card);
+        border: 1px solid #30363d;
+        border-radius: 16px;
+        padding: 24px;
+        margin-bottom: 24px;
+    }
+    label { display: block; margin-bottom: 12px; font-weight: 600; }
+    textarea {
+        width: 100%;
+        height: 220px;
+        background: #0d1117;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        color: var(--primary);
+        font-family: ui-monospace, 'JetBrains Mono', monospace;
+        font-size: 0.82rem;
+        padding: 12px;
+        resize: vertical;
+        outline: none;
+    }
+    button {
+        width: 100%;
+        margin-top: 16px;
+        padding: 14px;
+        background: var(--accent);
+        color: white;
+        border: none;
+        border-radius: 12px;
+        font-size: 1.05rem;
+        font-weight: 600;
+        cursor: pointer;
+    }
+    button:hover { filter: brightness(1.2); }
+    a { color: #58a6ff; text-decoration: underline; font-weight: 600; }
+    a:hover { color: #90caf9; }
+    .file-input {
+        width: 100%;
+        background: #0d1117;
+        border: 1px dashed #30363d;
+        padding: 10px;
+        border-radius: 8px;
+        color: var(--text-dim);
+        font-size: 0.85rem;
+        cursor: pointer;
+        margin-bottom: 14px;
+    }
+    .results { display: none; }
+    .status-card {
+        background: rgba(88, 166, 255, 0.05);
+        border: 1px solid rgba(88, 166, 255, 0.2);
+        border-radius: 16px;
+        padding: 24px;
+    }
+    .verdict {
+        text-align: center;
+        padding: 18px;
+        border-radius: 12px;
+        font-weight: 600;
+        font-size: 1.1rem;
+        margin-bottom: 22px;
+    }
+    .verdict.pass { background: rgba(63, 185, 80, 0.12); color: var(--success); border: 1px solid rgba(63, 185, 80, 0.35); }
+    .verdict.fail { background: rgba(248, 81, 73, 0.12); color: var(--error); border: 1px solid rgba(248, 81, 73, 0.35); }
+    .check-item {
+        display: flex;
+        align-items: flex-start;
+        margin-bottom: 14px;
+        padding: 12px;
+        background: rgba(255, 255, 255, 0.02);
+        border-radius: 8px;
+        border-left: 4px solid #30363d;
+    }
+    .check-icon { font-size: 1.3rem; margin-right: 14px; width: 26px; text-align: center; }
+    .check-text h4 { margin: 0; font-size: 0.98rem; }
+    .check-text p { margin: 3px 0 0; font-size: 0.88rem; color: var(--text-dim); word-break: break-word; }
+    .verified { border-left-color: var(--success); }
+    .failed { border-left-color: var(--error); }
+    .warning { border-left-color: var(--warning); }
+    .verified .check-icon { color: var(--success); }
+    .failed .check-icon { color: var(--error); }
+    .warning .check-icon { color: var(--warning); }
+    pre {
+        background: #0d1117;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 12px;
+        overflow-x: auto;
+        font-size: 0.78rem;
+        color: var(--text);
+        white-space: pre-wrap;
+        word-break: break-all;
+    }
+    details { margin-top: 16px; }
+    summary { cursor: pointer; color: var(--primary); font-weight: 600; }
+    .note { font-size: 0.85rem; color: var(--text-dim); margin-top: 18px; }
+</style>
+</head>
+<body>
+<div class="container">
+    <header>
+        <h1>TLSNotary Proxy Attestation Auditor</h1>
+        <p class="subtitle">Checks that an enclave-signed record of a notarized HTTPS session is intact — offline, in your browser, with no third-party code.</p>
+    </header>
+
+    <div class="card">
+        <label for="attestationInput">Attestation JSON (from <code>GET :8081/attestations/&lt;id&gt;</code>)</label>
+        <input class="file-input" type="file" id="attestationFile" accept=".json,.txt,application/json">
+        <textarea id="attestationInput" spellcheck="false" placeholder='{"version":"tls-proxy/1","session_id":"…", …}'></textarea>
+        <button id="auditBtn" type="button">Audit attestation</button>
+        <p class="note">
+            Nothing is uploaded. Paste the response body exactly as you received it: the signature covers the
+            <em>bytes</em> of the first ten fields, so this page reads your text rather than re-serializing it.
+            Re-formatted (pretty-printed) input is accepted too, and the page says so when it has to strip
+            whitespace to rebuild the signed bytes.
+        </p>
+    </div>
+
+    <div class="results" id="results">
+        <div class="status-card">
+            <div class="verdict" id="verdict"></div>
+            <div id="rows"></div>
+            <details>
+                <summary>Signed byte string (what the enclave's signature covers)</summary>
+                <pre id="signedBytes"></pre>
+            </details>
+            <details>
+                <summary>Notarized transcript (as revealed by the prover)</summary>
+                <pre id="transcript"></pre>
+            </details>
+            <p class="note">
+                This page proves the record was produced and signed by the holder of
+                <code>enclave_pubkey_pem</code> and has not changed since. It does <em>not</em> prove that key is
+                the enclave's: that link is the hardware quote over the VM, checked by
+                <a href="verify.html">verify.html</a> against the attested disk. See
+                <a href="docs/tls-proxy.md">docs/tls-proxy.md</a> for the full chain.
+            </p>
+        </div>
+    </div>
+</div>
+
+<script>
+// The ten fields the enclave signs, in the order it signs them
+// (tls-proxy/src/main.rs: SignedBody). Order is part of the signature: a
+// reordered document must fail, not be silently re-sorted.
+const SIGNED_FIELDS = [
+    'version', 'session_id', 'server_name', 'notarized_at', 'sent_len',
+    'received_len', 'sent_sha256', 'received_sha256', 'sent_b64', 'received_b64',
+    'truncated',
+];
+// NOTE: 11 names above on purpose? No — the signed body has ten serialized
+// fields plus `truncated`, making eleven. Keep this list in lock-step with
+// SignedBody in tls-proxy/src/main.rs; the harness pins the count.
+const SIGNED_FIELD_COUNT = 11;
+
+function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+    ));
+}
+
+function hex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function sha256(bytes) {
+    return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+}
+
+function b64ToBytes(s) {
+    const clean = String(s == null ? '' : s).replace(/\s+/g, '');
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(clean) || clean.length % 4 !== 0) {
+        throw new Error('not valid base64');
+    }
+    const bin = atob(clean);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+}
+
+function pemToSpkiDer(pem) {
+    const m = /-----BEGIN PUBLIC KEY-----([\s\S]*?)-----END PUBLIC KEY-----/.exec(String(pem || ''));
+    if (!m) throw new Error('enclave_pubkey_pem is not a PEM SubjectPublicKeyInfo key');
+    return b64ToBytes(m[1]);
+}
+
+// Strip insignificant whitespace WITHOUT touching string contents, so the
+// result is exactly what a compact serialization of the same document is.
+// Only whitespace outside strings is dropped; escapes are left verbatim.
+function minifyJson(text) {
+    let out = '';
+    let i = 0;
+    let inStr = false;
+    while (i < text.length) {
+        const c = text[i];
+        if (inStr) {
+            out += c;
+            if (c === '\\') { out += text[i + 1] || ''; i += 2; continue; }
+            if (c === '"') inStr = false;
+            i++;
+            continue;
+        }
+        if (c === '"') { inStr = true; out += c; i++; continue; }
+        if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { i++; continue; }
+        out += c;
+        i++;
+    }
+    return out;
+}
+
+// A tiny JSON scanner that records each TOP-LEVEL member's byte span. The
+// signature covers a byte range of the document, so the auditor must be able
+// to cut exactly that range out of the text it was given — re-serializing
+// would let escaping/ordering differences hide a modification.
+function scanTopLevel(raw) {
+    let i = 0;
+    const n = raw.length;
+    const members = [];
+    const err = (m) => { throw new Error(m + ' (offset ' + i + ')'); };
+    const ws = () => { while (i < n && (raw[i] === ' ' || raw[i] === '\t' || raw[i] === '\r' || raw[i] === '\n')) i++; };
+    function str() {
+        const start = i;
+        if (raw[i] !== '"') err('expected a string');
+        i++;
+        while (i < n) {
+            const c = raw[i];
+            if (c === '\\') { i += 2; continue; }
+            if (c === '"') { i++; return JSON.parse(raw.slice(start, i)); }
+            i++;
+        }
+        err('unterminated string');
+    }
+    function value() {
+        ws();
+        const c = raw[i];
+        if (c === '{' || c === '[') {
+            const close = c === '{' ? '}' : ']';
+            i++;
+            ws();
+            if (raw[i] === close) { i++; return; }
+            for (;;) {
+                ws();
+                if (c === '{') { str(); ws(); if (raw[i] !== ':') err("expected ':'"); i++; }
+                value();
+                ws();
+                if (raw[i] === ',') { i++; continue; }
+                if (raw[i] === close) { i++; return; }
+                err('expected "," or "' + close + '"');
+            }
+        }
+        if (c === '"') { str(); return; }
+        const m = /^(?:-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)/.exec(raw.slice(i));
+        if (!m) err('unexpected token');
+        i += m[0].length;
+    }
+    ws();
+    if (raw[i] !== '{') err('the attestation must be a JSON object');
+    i++;
+    ws();
+    if (raw[i] === '}') { i++; return { members, docEnd: i }; }
+    for (;;) {
+        ws();
+        const keyStart = i;
+        const key = str();
+        ws();
+        if (raw[i] !== ':') err("expected ':'");
+        i++;
+        value();
+        members.push({ key, start: keyStart, end: i });
+        ws();
+        if (raw[i] === ',') { i++; continue; }
+        if (raw[i] === '}') { i++; break; }
+        err('expected "," or "}"');
+    }
+    return { members, docEnd: i };
+}
+
+function checkDnsName(name) {
+    if (typeof name !== 'string' || name.length === 0) return 'server_name is missing';
+    if (name.length > 253) return 'server_name is longer than 253 octets';
+    if (/^\[|^[0-9.]+$/.test(name)) return 'server_name is an IP literal, not a DNS name';
+    if (/[:/@?#\s]/.test(name)) return 'server_name contains a port, scheme, path or whitespace';
+    const labels = name.split('.');
+    for (const l of labels) {
+        if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(l)) return 'label "' + l + '" is not a valid DNS label';
+    }
+    if (labels.length < 2) return 'server_name has no dot: not a public DNS name';
+    return null;
+}
+
+// Pure verification. No DOM, so scripts/test-verify-proxy.mjs drives it directly.
+async function auditAttestation(rawText) {
+    const row = (id, title, state, desc) => ({ id, title, state, desc });
+    const rows = [];
+    let parsed;
+    try {
+        parsed = JSON.parse(rawText);
+    } catch (e) {
+        return { ok: false, rows: [row('parse', 'Attestation is JSON', false, 'not parseable: ' + esc(e.message))], signedText: '', transcript: '' };
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return { ok: false, rows: [row('parse', 'Attestation is a JSON object', false, 'the input is not an object')], signedText: '', transcript: '' };
+    }
+
+    // 1. Exactly the signed fields, in the signed order, with no duplicates.
+    let scan;
+    try {
+        scan = scanTopLevel(rawText);
+    } catch (e) {
+        return { ok: false, rows: [row('parse', 'Attestation structure', false, esc(e.message))], signedText: '', transcript: '' };
+    }
+    const keys = scan.members.map(m => m.key);
+    const dupes = keys.filter((k, idx) => keys.indexOf(k) !== idx);
+    const orderOk = dupes.length === 0
+        && keys.length === SIGNED_FIELD_COUNT + 3
+        && keys.slice(0, SIGNED_FIELD_COUNT).every((k, idx) => k === SIGNED_FIELDS[idx])
+        && keys.slice(SIGNED_FIELD_COUNT).join(',') === 'enclave_pubkey_pem,signature_alg,signature_b64';
+    rows.push(row('shape', 'Expected fields, in the signed order', orderOk,
+        orderOk
+            ? 'the ' + SIGNED_FIELD_COUNT + ' signed fields come first, in order, followed by the key and signature'
+            : 'unexpected shape — duplicate keys: ' + (dupes.length ? esc(dupes.join(', ')) : 'none')
+              + '; top-level order: ' + esc(keys.join(', '))));
+    if (!orderOk) {
+        return { ok: false, rows, signedText: '', transcript: '' };
+    }
+
+    // 2. The signed byte range, cut out of the exact text supplied.
+    const signed = scan.members.slice(0, SIGNED_FIELD_COUNT);
+    const exactText = '{' + rawText.slice(signed[0].start, signed[signed.length - 1].end) + '}';
+    const signedText = exactText;
+    const signedSha = hex(await sha256(new TextEncoder().encode(signedText)));
+
+    // 3. The enclave signature (RSA PKCS#1 v1.5 over SHA-256).
+    let mode = 'exact';
+    let sigOk = false;
+    let keyFp = '';
+    let failReason = '';
+    try {
+        if (parsed.signature_alg !== 'RSA-PKCS1-v1_5-SHA256') {
+            throw new Error('signature_alg is ' + esc(parsed.signature_alg) + ', expected RSA-PKCS1-v1_5-SHA256');
+        }
+        const spki = pemToSpkiDer(parsed.enclave_pubkey_pem);
+        keyFp = hex(await sha256(spki));
+        const key = await crypto.subtle.importKey('spki', spki, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+        const signature = b64ToBytes(parsed.signature_b64);
+        const verifyOver = async (text) => crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, signature, new TextEncoder().encode(text));
+        sigOk = await verifyOver(signedText);
+        if (!sigOk) {
+            // Tolerate re-formatting: the same bytes, whitespace outside strings dropped.
+            const compact = '{' + minifyJson(rawText.slice(signed[0].start, signed[signed.length - 1].end)) + '}';
+            if (compact !== signedText && await verifyOver(compact)) {
+                sigOk = true;
+                mode = 'minified';
+            }
+        }
+        if (!sigOk) failReason = 'the signature does not verify over these bytes with this key';
+    } catch (e) {
+        failReason = esc(e.message);
+    }
+    const signedDisplay = signedText;
+    rows.push(row('bytes', 'Signed bytes reconstructed from your input', true,
+        'SHA-256 ' + signedSha + ' · ' + signedText.length + ' bytes'
+        + (mode === 'minified' ? ' · input was re-formatted; whitespace outside strings was dropped' : '')));
+    rows.push(row('signature', 'Enclave signature', sigOk,
+        sigOk
+            ? 'RSA PKCS#1 v1.5 · SHA-256 · key SHA-256 ' + keyFp
+            : failReason));
+
+    // 4. The transcript bytes really hash to the signed digests.
+    const digestRow = async (id, label, b64, digestHex, declaredLen) => {
+        try {
+            const bytes = b64ToBytes(b64);
+            const got = hex(await sha256(bytes));
+            const want = String(digestHex || '').toLowerCase();
+            const hashOk = /^[0-9a-f]{64}$/.test(want) && got === want;
+            const lenOk = Number(declaredLen) === bytes.length;
+            rows.push(row(id, label + ' digest', hashOk && lenOk, hashOk && lenOk
+                ? bytes.length + ' bytes · SHA-256 ' + got
+                : (hashOk ? '' : 'SHA-256 mismatch: signed ' + esc(digestHex) + ', computed ' + got)
+                  + (lenOk ? '' : ' · declared length ' + esc(declaredLen) + ', actual ' + bytes.length)));
+            return bytes;
+        } catch (e) {
+            rows.push(row(id, label + ' digest', false, 'cannot decode: ' + esc(e.message)));
+            return null;
+        }
+    };
+    const sentBytes = await digestRow('sentDigest', 'Request', parsed.sent_b64, parsed.sent_sha256, parsed.sent_len);
+    const recvBytes = await digestRow('recvDigest', 'Response', parsed.received_b64, parsed.received_sha256, parsed.received_len);
+
+    // 5. The claimed site: a DNS name, since the proxy only ever dials :443 on
+    //    the name the prover committed to.
+    const nameErr = checkDnsName(parsed.server_name);
+    rows.push(row('name', 'Notarized server name', nameErr === null, nameErr === null
+        ? esc(parsed.server_name) + ' (port 443, resolved by the enclave)'
+        : esc(nameErr) + ' — claimed name: ' + esc(String(parsed.server_name))));
+
+    // 6. Timestamps are self-reported; only a grossly impossible one is flagged.
+    const t = Number(parsed.notarized_at);
+    const plausible = Number.isFinite(t) && t > 1577836800 && t < 4102444800; // 2020..2100 (seconds)
+    const now = Date.now() / 1000;
+    const ahead = plausible ? t - now : 0;
+    rows.push(row('time', 'Notarization time', plausible ? (ahead > 86400 ? 'warning' : true) : false,
+        plausible
+            ? new Date(t * 1000).toISOString().replace('.000Z', 'Z') + (ahead > 86400 ? " · ahead of this machine's clock — the enclave's clock is not trusted by this page" : '')
+            : 'notarized_at is not a plausible Unix timestamp in seconds: ' + esc(parsed.notarized_at)));
+
+    // 7. Truncation is signed, so it is knowable rather than guessed.
+    rows.push(row('truncated', 'Transcript completeness', parsed.truncated === false ? true : 'warning',
+        parsed.truncated === false
+            ? 'the full notarized transcript is stored'
+            : 'the stored transcript is a TRUNCATED prefix of the session (the signed digests cover only this part)'));
+
+    // 8. The one thing this page cannot do, stated as a row rather than a footnote.
+    rows.push(row('binding', 'Key bound to the enclave hardware', 'warning',
+        "not checked here — this page verifies the record, not who holds the key. Bind enclave_pubkey_pem "
+        + '(SHA-256 ' + esc(keyFp || '(unavailable)') + ") to the VM's hardware quote in verify.html."));
+
+    const ok = rows.every(r => r.state !== false);
+    let transcript = '';
+    if (sentBytes && recvBytes) {
+        const dec = new TextDecoder('utf-8', { fatal: false });
+        transcript = dec.decode(sentBytes) + '\n----- notarized boundary -----\n' + dec.decode(recvBytes);
+    }
+    return { ok, rows, signedText: signedDisplay, signedSha, mode, transcript };
+}
+
+const ICONS = { true: '✅', false: '❌', warning: '⚠️' };
+
+function renderAudit(res) {
+    const verdict = document.getElementById('verdict');
+    if (verdict) {
+        verdict.className = 'verdict ' + (res.ok ? 'pass' : 'fail');
+        verdict.textContent = res.ok
+            ? 'Signature and digests verified — this record is intact'
+            : 'NOT VERIFIED — do not rely on this attestation';
+    }
+    const rowsEl = document.getElementById('rows');
+    if (rowsEl) {
+        rowsEl.innerHTML = res.rows.map(r => {
+            const cls = r.state === true ? 'verified' : (r.state === 'warning' ? 'warning' : 'failed');
+            return '<div class="check-item ' + cls + '" id="row-' + esc(r.id) + '">'
+                + '<div class="check-icon">' + ICONS[cls === 'verified' ? 'true' : cls === 'warning' ? 'warning' : 'false'] + '</div>'
+                + '<div class="check-text"><h4>' + esc(r.title) + '</h4><p>' + (r.desc || '') + '</p></div>'
+                + '</div>';
+        }).join('');
+    }
+    const signedEl = document.getElementById('signedBytes');
+    if (signedEl) signedEl.textContent = res.signedText || '(none)';
+    const trEl = document.getElementById('transcript');
+    if (trEl) trEl.textContent = res.transcript || '(no transcript decoded)';
+    const results = document.getElementById('results');
+    if (results) results.style.display = 'block';
+}
+
+async function runProxyAudit() {
+    const input = document.getElementById('attestationInput');
+    const raw = input ? input.value : '';
+    const res = await auditAttestation(raw);
+    renderAudit(res);
+    return res.ok;
+}
+
+if (typeof document !== 'undefined' && document.getElementById) {
+    document.addEventListener('DOMContentLoaded', () => {
+        const btn = document.getElementById('auditBtn');
+        if (btn) btn.addEventListener('click', () => { runProxyAudit(); });
+        const file = document.getElementById('attestationFile');
+        if (file) file.addEventListener('change', (e) => {
+            const f = e.target.files && e.target.files[0];
+            if (!f) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                const input = document.getElementById('attestationInput');
+                if (input) { input.value = String(reader.result); runProxyAudit(); }
+            };
+            reader.readAsText(f);
+        });
+    });
+}
+</script>
+</body>
+</html>

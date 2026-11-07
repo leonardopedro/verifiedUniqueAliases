@@ -131,6 +131,18 @@ fi
 echo "🚀 Installing Enclave Init..."
 # Use our robust helper to ensure all shared libraries (libc, libssl, libcrypto, etc.) are included
 copy_bin_and_deps "$BIN_PATH"
+# Optional second service binary: the TLSNotary proxy. TLS_PROXY_BIN is set by
+# the dual-service build (Dockerfile.alibaba ARG TLS_PROXY=1) and points at an
+# EMPTY placeholder in the PayPal-only image, where this must add nothing — the
+# initramfs digest is a measured-boot input.
+if [[ -s ${TLS_PROXY_BIN:-} ]]; then
+    chmod +x "$TLS_PROXY_BIN"
+    copy_bin_and_deps "$TLS_PROXY_BIN"
+    # copy_bin_and_deps keeps the binary at its own path (/build/tls-proxy-bin);
+    # PID 1 spawns /tls-proxy, so put it where the enclave looks for it.
+    cp -p "$TLS_PROXY_BIN" ./tls-proxy
+    chmod 755 ./tls-proxy
+fi
 copy_bin_and_deps "tpm2"
 copy_bin_and_deps "tpm2_nvread"
 copy_bin_and_deps "tpm2_createprimary"
@@ -173,6 +185,18 @@ done
 # 6. Inject required binaries and their dependencies
 echo "🔍 Resolving and copying dependencies..."
 copy_bin_and_deps "$BIN_PATH"
+# Optional second service binary: the TLSNotary proxy. TLS_PROXY_BIN is set by
+# the dual-service build (Dockerfile.alibaba ARG TLS_PROXY=1) and points at an
+# EMPTY placeholder in the PayPal-only image, where this must add nothing — the
+# initramfs digest is a measured-boot input.
+if [[ -s ${TLS_PROXY_BIN:-} ]]; then
+    chmod +x "$TLS_PROXY_BIN"
+    copy_bin_and_deps "$TLS_PROXY_BIN"
+    # copy_bin_and_deps keeps the binary at its own path (/build/tls-proxy-bin);
+    # PID 1 spawns /tls-proxy, so put it where the enclave looks for it.
+    cp -p "$TLS_PROXY_BIN" ./tls-proxy
+    chmod 755 ./tls-proxy
+fi
 
 echo "  Adding TPM2 tools..."
 for tool in tpm2 tpm2_createpolicy tpm2_createprimary tpm2_create tpm2_load \
