@@ -32,13 +32,33 @@ echo "   engine : $ENGINE"
 echo "   image  : $TAG"
 echo "=============================================================="
 
-# --security-opt/-cap-add are what the initramfs stage needs for its chroot
-# mounts; Docker grants them as root, rootless podman maps SYS_ADMIN inside the
-# build user namespace. Same flags the relay build uses.
-$ENGINE build \
-    --build-arg TLS_PROXY=1 \
-    --security-opt seccomp=unconfined --cap-add=SYS_ADMIN \
-    -f Dockerfile.alibaba -t "$TAG" .
+# Engine-correct build flags. The two engines need DIFFERENT sets and getting
+# this wrong fails in seconds, not minutes:
+#   * --security-opt/--cap-add exist for podman build only. `docker buildx
+#     build` (what `docker build` is on any current runner) has no such flags
+#     and dies with "unknown flag: --cap-add" immediately — that was the first
+#     CI failure of this workflow.
+#   * --load is docker-only and REQUIRED whenever buildx runs a
+#     docker-container builder (setup-buildx-action sets one as default):
+#     without it the build succeeds into the cache and the `create` below then
+#     fails with "no such image".
+BUILD_FLAGS=(--build-arg TLS_PROXY=1 -f Dockerfile.alibaba -t "$TAG")
+if [[ "$ENGINE" == "docker" ]]; then
+    BUILD_FLAGS+=(--load)
+else
+    BUILD_FLAGS+=(--security-opt seccomp=unconfined --cap-add=SYS_ADMIN)
+fi
+
+# Same retry-and-annotate shape as build-attest.yml: raw job logs need
+# repo-admin access, so the tail of a failed attempt goes into a check-run
+# annotation where it is publicly readable.
+for attempt in 1 2; do
+    if $ENGINE build "${BUILD_FLAGS[@]}" . 2>&1 | tee /tmp/dual-build.log; then
+        break
+    fi
+    echo "::error title=$ENGINE build failed (attempt $attempt)::$(tail -c 1800 /tmp/dual-build.log | tr '\n' '|')"
+    [[ "$attempt" == 1 ]] && { echo "build attempt 1 failed — retrying once"; sleep 20; } || exit 1
+done
 
 mkdir -p "$OUT_DIR"
 $ENGINE rm -f tmp-tls-proxy 2>/dev/null || true
