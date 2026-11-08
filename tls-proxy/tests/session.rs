@@ -589,6 +589,85 @@ async fn closes_a_session_that_never_speaks() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+/// The operator's list must name the host a recorded session was about.
+///
+/// v217 shipped a `list` that read `server_name` from a `body` object which
+/// `#[serde(flatten)]` never creates: over HTTP every row was
+/// `"server_name": null` while `/attestations/{id}` still carried the host,
+/// and the enclave's `/proxy/attestations` — which fingerprints exactly the
+/// string this route returns — therefore published no host at all. Unit tests
+/// on the projection did not exist, so only a session driven through the real
+/// binary over the real API pins this down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_over_http_names_the_host_of_a_recorded_session(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _serial = SERIAL.lock().await;
+    let fixture_port = start_fixture().await;
+    let target = format!("127.0.0.1:{fixture_port}");
+    let proxy = Proxy::start(&[("TLS_PROXY_TARGET_ADDR", target.as_str())]).await;
+
+    // Before any session there is nothing to project, and the empty answer is
+    // still the documented shape (not `null`).
+    let (status, body) = http_get(proxy.api_port, "/attestations").await?;
+    assert_eq!(status, 200, "{body}");
+    let empty: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(empty["count"], 0, "{body}");
+    assert_eq!(empty["sessions"], serde_json::json!([]), "{body}");
+
+    let socket = TcpStream::connect(("127.0.0.1", proxy.session_port)).await?;
+    prover(socket).await?;
+
+    let mut row = None;
+    for _ in 0..100 {
+        let (_, body) = http_get(proxy.api_port, "/attestations").await?;
+        let list: serde_json::Value = serde_json::from_str(&body)?;
+        if let Some(first) = list["sessions"].as_array().and_then(|s| s.first()) {
+            row = Some(first.clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let row = row.expect("the recorded session should be listed");
+
+    // The regression, exactly: a null here is what the operator saw on the
+    // live origin, and it is what the enclave would fingerprint into nothing.
+    assert_eq!(
+        row["server_name"], SERVER_DOMAIN,
+        "the list must name the host the session was made against, got: {row}"
+    );
+    assert!(
+        row.get("body").is_none(),
+        "the signed body is flattened into the envelope; a nested `body` key is \
+         the bug that produced null hosts: {row}"
+    );
+    let mut keys: Vec<&str> = row
+        .as_object()
+        .expect("a row is an object")
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["notarized_at", "server_name", "session_id"],
+        "the list projects three fields and withholds the transcript: {row}"
+    );
+    assert!(
+        row["notarized_at"].as_u64().unwrap_or(0) > 0,
+        "an operator needs a time to line the session up with the log: {row}"
+    );
+
+    // The list and the detail must agree about the host; v217's symptom was
+    // that they disagreed, one null and one named.
+    let id = row["session_id"].as_str().expect("session_id");
+    let (status, one) = http_get(proxy.api_port, &format!("/attestations/{id}")).await?;
+    assert_eq!(status, 200, "{one}");
+    let detail: serde_json::Value = serde_json::from_str(&one)?;
+    assert_eq!(detail["server_name"], row["server_name"], "{detail}");
+    assert_eq!(detail["session_id"], id);
+    Ok(())
+}
+
 /// A proxy with no trust anchor must refuse to start rather than attest
 /// sessions it cannot validate.
 #[test]

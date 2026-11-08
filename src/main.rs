@@ -4509,6 +4509,11 @@ mod security_tests {
             "the list must use the refusal ring's fingerprint, not its own scheme"
         );
         assert!(first.starts_with("host:"), "{first}");
+        // The exact token the live origin answered for this host after v217b.
+        // Pinned as a literal so a change in the prefix width, the hash or the
+        // case is caught here rather than by an auditor comparing the two
+        // public documents and finding they no longer agree.
+        assert_eq!(fingerprint_hosts("www.sandbox.paypal.com"), "host:0a191a6a");
         assert!(!list.to_string().contains("paypal"), "{list}");
         assert!(!list.to_string().contains("ycombinator"), "{list}");
         // The fields an operator is actually looking for survive untouched.
