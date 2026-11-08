@@ -66,13 +66,15 @@ jobs:
       - name: Attest the dual-service initramfs
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: Initramfs (dual-service: PayPal + TLSNotary proxy)
+          # Quoted: the colon inside "dual-service: PayPal" would otherwise end
+          # the plain scalar and make the whole workflow file invalid.
+          subject-name: "Initramfs (dual-service: PayPal + TLSNotary proxy)"
           subject-path: output-tls-proxy/initramfs-dual.img
 
       - name: Attest the TLSNotary proxy binary
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: TLSNotary proxy binary (dual-service)
+          subject-name: "TLSNotary proxy binary (dual-service)"
           subject-path: output-tls-proxy/tls-proxy-bin
 
       - uses: actions/upload-artifact@v4
