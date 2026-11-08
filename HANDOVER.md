@@ -1072,3 +1072,9 @@ operator passed `--ForceStop true`. Root cause was two-fold and neither half exi
 - **`poweroff()` is not a power-off.** `enclave_init::poweroff()` halts and parks on purpose (fail-closed evidence). Anything that needs the instance actually released must go through `power_off_now()`.
 - **A missing module looks exactly like a hostile hypervisor.** With `button`/`evdev` absent there is no error anywhere — the guest just never reacts. Check `lsmod`/initramfs contents before blaming the platform.
 - **The input path is a safety surface.** Only `EV_KEY`/`KEY_POWER`/value `1` from a device whose `EVIOCGNAME` contains `Power Button` may trigger a shutdown; the two unit tests (`a_power_button_press_is_honoured`, `only_a_press_powers_the_machine_off`) pin the gate against a release/repeat/other key.
+
+**Not proven by the v218 cycle (state honestly, do not assume):**
+- **Stop mid-session.** The 43 s figure came from an idle instance (empty store). A power-off while a notarized session is in flight will still cut that session — `power_off_now()` does not drain, and the store is in-memory, so the session is lost by design. Only the *timing* with work in flight is unmeasured.
+- **One sample.** 43 s is a single observation, not a distribution; the pre-fix 260 s was also a single observation.
+- **No local reproduction.** This host has no `qemu-system-x86_64`, so the input gate is covered by the two unit tests and by the live hypervisor stop, not by a synthetic button press.
+- **SIGTERM path is untested live.** The ACPI press is what the hypervisor sent; the signal handler is unit-reachable only, since nothing in the boot chain sends PID 1 a SIGTERM today.
