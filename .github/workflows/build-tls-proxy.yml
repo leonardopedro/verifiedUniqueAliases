@@ -11,7 +11,9 @@ name: Build dual-service (PayPal + TLSNotary proxy) VM image
 # proxy alone.
 on:
   push:
-    branches: [main, tls-proxy]
+    # `alibabacloud` is the repository's default branch (and the one the image
+    # is deployed from); without it this workflow only ran on side branches.
+    branches: [main, tls-proxy, alibabacloud]
   workflow_dispatch:
 
 permissions:
