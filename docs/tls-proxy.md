@@ -338,13 +338,20 @@ Sessions recorded against the deployed notary on 2026-11-08:
 | `www.sandbox.paypal.com/robots.txt` | `200` | 107 B / 3,429 B |
 | `www.sandbox.paypal.com/signin` | `200`, 3 runs of 5 (one on a retry) | ~103 B / ~38,000 B |
 
-**Where the minute goes, and why a session occasionally dies.** The timings above
-are the shape of every session: a second to reach the notary, then **29–41 s
-before the commit is accepted**, then a **2–4 s** TLS handshake and request, then
-the proof. The long wait is the notary dialling the site: it connects to the
-committed host from Beijing before it answers the commit, so the SYNs and the
-edge's own queueing are charged to the prover's commit. The MPC handshake itself
-is not slow — 1.8 s for a 33 KB page.
+**Where the wait goes, and what actually shortens it.** A session spends its time
+before `commit accepted` — **8–41 s** through the deployed notary — and then a
+**2–4 s** TLS handshake and proof. That commit phase is MPC setup between prover
+and notary, **not** the notary's dial: the notary logs its own connect at **35 ms**
+(`relaying TLS to www.sandbox.paypal.com (146.75.123.1:443)`, immediately after
+`accepted`), and a TCP connect to PayPal from the operator host measures 27–40 ms.
+Pinning an edge address therefore saves a DNS lookup and nothing else.
+
+What does move it is distance to the notary. Same prover, same page, same sandbox
+host, with `tls-proxy` running on the operator's own machine (loopback notary):
+commit **3.5 s**, whole session **6.1 s**, 200 OK — against 8–41 s commit through
+`101.200.178.251` (215 ms RTT). The commit is round-trip bound on a long link,
+and the deployed notary is a 2-vCPU spot instance, which is why its own number
+varies from run to run.
 
 That single dial is also the flaky part, which is why `LIVE_ATTEMPTS` exists and
 defaults to 3. Observed failure shapes, all with the same binary and path:
