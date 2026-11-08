@@ -5,7 +5,8 @@
   "scripts": {
     "test": "node scripts/test-verify-security.mjs",
     "test:proxy": "node scripts/test-verify-proxy.mjs",
-    "check:relay-targets": "node scripts/check-relay-targets.mjs"
+    "check:relay-targets": "node scripts/check-relay-targets.mjs",
+    "check:workflows": "node scripts/check-workflows.mjs"
   },
   "devDependencies": {
     "circomlib": "^2.0.5",

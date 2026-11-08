@@ -28,6 +28,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # This file is the reason the guard exists: its attest step's subject-name
+      # was once unquoted with a ": " inside, which made the whole workflow
+      # invalid YAML and GitHub showed the push as a run with zero jobs (zeros
+      # hidden, no logs) while the image still got built. Validates every file
+      # in .github/workflows, including the default-branch trigger.
+      - name: Workflow files are valid and trigger on the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: node scripts/check-workflows.mjs
+
       # Relay targets are an egress boundary that the docs promise is validated
       # at boot; a committed config listing one the docs and example never
       # describe is drift no compiler catches, and the operator would only find

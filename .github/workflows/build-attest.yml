@@ -23,6 +23,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Fail fast on a workflow file GitHub would silently ignore. An unquoted
+      # step name containing ": " invalidated build-tls-proxy.yml once and
+      # GitHub reported the push as a run with ZERO jobs — the image built,
+      # nothing was attested, and no log said why. The same guard also catches
+      # a `push:` filter that omits the default branch (the other way this
+      # workflow went dark). Checks every file in .github/workflows.
+      - name: Workflow files are valid and trigger on the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: node scripts/check-workflows.mjs
+
       # Fail fast before the expensive image build: the auditor page is the
       # trust surface every login depends on, so its offline regression suite
       # (real runAudit() driven with synthetic TDX fixtures — 155+ checks)

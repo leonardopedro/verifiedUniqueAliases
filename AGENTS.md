@@ -1086,17 +1086,24 @@ from `HEAD` yields initramfs `8513c7ea0a62c760699a0e0995f5c174d81ca84c41eb0e80fe
 and proxy binary `e9b157e8…`, and both digests return **3 attestations** from
 the public API — byte-identical to what CI built in run `42460523152`.
 
-The deployed disk predates `ead1d8d` ("Build the dual-service disk with
+The deployed disk predated `ead1d8d` ("Build the dual-service disk with
 engine-correct flags"), so its initramfs was produced by the older recipe and
-no CI run will ever attest that digest. Nothing to fix in the workflow; the
-remediation is a deploy of the current image plus a pin rotation:
+no CI run will ever attest that digest. **RESOLVED 2026-11-08** by a two-cycle
+swap that now runs the attested build (lineage and digests: HANDOVER.md §0.23):
 
 1. import `output-tls-proxy/disk-tls-proxy.raw`, `ReplaceSystemDisk`, start;
 2. `node scripts/calculate-golden-rtmr.mjs --report <live> --update` to rotate
    `EXPECTED_RTMR2` (verify.html + its `index.html` mirror + README digest);
 3. rebuild the disk so the ESP copy of `verify.html` carries the new pin, then
-   import/replace again (two swaps: the pin can only be read from a boot);
+   import/replace again (two swaps: the pin can only be read from a boot).
+   `verify.html` is NOT in the measured chain, so only step 2's RTMR2 moves —
+   the rebuild itself rotates no pin;
 4. re-run `scripts/e2e-sandbox.mjs` and the offline auditor.
+
+Result: live `EFI/BOOT/initrd.img` is `8513c7ea…` (attested), `EXPECTED_RTMR2`
+`b48af75b…`, `EXPECTED_ENCLAVE_SHA256` `9cb1007d…`, MRTD/RTMR0/1/3 held. The
+shipped disk `443ccfcf…` is bitwise reproducible: a `--no-cache` rebuild
+produced the identical disk, initramfs and proxy binary.
 
 Other workflow facts learned here: `build-tls-proxy.yml` must list
 `alibabacloud` (the default branch) or the image is only built on side branches,

@@ -985,3 +985,33 @@ E2E + harness + PII all passing.**
 | Alibaba STS/OAuth profile | `~/.aliyun/config.json` |
 | Self-report RAM key (PutObject `boot/*` only, created 2026-10-24) | RAM user `pav-selfreport`; secret returned ONCE at creation — local mirror `/tmp/pav-ak.id` + `/tmp/pav-ak.secret` (ephemeral, 600) |
 | OSS presign helpers | `/tmp/oss-url.mjs`, `/tmp/oss-puturl.mjs`, `/tmp/sign-oss.mjs` |
+
+---
+
+## 0.23 v216 cycle — dual-service redeploy + pin rotation: the auditor's provenance row (2026-11-08)
+
+**Why**: the auditor's "GitHub provenance / initramfs" row was red. Root cause was
+not the pipeline: the deployed disk predated `ead1d8d` ("Build the dual-service
+disk with engine-correct flags", 2026-11-07 19:44 — 19 min after the deploy
+commit `dece2ae`), so its measured `EFI/BOOT/initrd.img` was `b2789c24…` and the
+public attestations API returns **404** for it. The current recipe reproduces
+`8513c7ea…`, which the API resolves to **3 attestations** (identical to CI run
+`42460523152` on the default branch). Two workflow defects had also been
+silencing attestations entirely and are fixed in this commit set:
+`subject-name` was an unquoted YAML scalar containing `": "` (→ invalid file →
+runs with **zero jobs**, no logs) and the trigger list omitted `alibabacloud`,
+the branch the image ships from. `scripts/check-workflows.mjs` now fails any
+workflow that would run zero jobs, contains that YAML construction, or filters
+`push:` without the default branch.
+
+| Item | Value |
+|---|---|
+| **Build lineage** | `bash build-tls-proxy-image.sh` (podman, Debian snapshot pinned) → disk `443ccfcf7c309045be1192b2e6e5b92efac3bd5ce953ad9ee45d5c863edd9456` (md5 `4736eafe11c5230ee2df9ab9a96c792d`), initramfs `8513c7ea0a62c760699a0e0995f5c174d81ca84c41eb0e80fe1d7f1f4a9e186e`, proxy bin `e9b157e821e20997c43242a412eed7906a740e575e3d944b115ae5797995e717` |
+| **Reproducibility — proven, not asserted** | A second build via `CONTAINER_ENGINE=/tmp/podman-nocache.sh bash build-tls-proxy-image.sh` (**`--no-cache`**, wrapper injects the flag into `build` subcommands) produced **byte-identical** disk + initramfs + proxy binary. Two consecutive local builds, and the shipped image equals both. Wrapper needs `#!/usr/bin/env bash` on NixOS (there is no `/bin/bash`). |
+| **Two-cycle swap** | Cycle 1 (`m-2zeibiq6bbe5x9n0o94c`, disk `9780b45d…`, pre-rotation `verify.html`) booted only to read the new quote → RTMR2 `954fc320…` → **`b48af75b…`**, self-report **`9cb1007d…`**; MRTD/RTMR0/1/3 held. Cycle 2 shipped `m-2ze2ncqumj1veapx9wt4` (disk `443ccfcf…`) with the rotated `verify.html`. `verify.html` is deliberately **not** in the measured chain, so its own edit rotates nothing — one rotation, not two. |
+| **Re-arm order (again)** | `StopInstance --ForceStop` → `ReplaceSystemDisk --SystemDisk.Size 1` → `ModifyInstanceAttribute --UserData` (prod config, **byte-identical** readback, 4,477 B) → `StartInstance` → `/proxy/health` 200 in ~60 s. Images need `Features.NvmeSupport=supported` via the flat-wire RPC (`aliyun` CLI rejects the flag) or `ReplaceSystemDisk` refuses. |
+| **Relay path** | HK bucket `paypal-tdx-relay-1792227992` (public endpoint, PUT `200`, ETag == MD5) → relay ECS `i-2zefiag79exwsshidi3z` → Beijing **intranet** PUT `200` + readback MD5 → `ImportImage` (flat `DiskDeviceMapping.1.Format=raw`). Both legs marked `RELAYPROXY-SUCCESS`. `RunCommand` limits: `--CommandContent` above the size cap is rejected (`CmdContent.ExceedLimit`) and must be sent with `--ContentEncoding PlainText`; oversized scripts go through a HK object + a tiny bootstrap command. |
+| **Rotated pins (verify.html + `index.html` mirror + README digest)** | `EXPECTED_RTMR2` `954fc320…` → `b48af75b402c07cff61dd2e66aafe8cf0d8e8b8ac8a9ca5ddf21bdc4e0a731a83ce5fb4c50a10a1c1a011a7cac2d9838` (rotated with `node scripts/calculate-golden-rtmr.mjs --report /tmp/env216b.json --update`), `EXPECTED_ENCLAVE_SHA256` `da21fb45…` → `9cb1007d117561eef1d101125530b83aeca0ed4dcf6dff9b6bf7d2371a500d94`; `verify.html` = **265,825 B**, `55cac6bb9781852421ecf7b5b86f94d3eb87dc872b2126c47fc21ae480b2789b` == README == `index.html`. |
+| **Live confirmation** | `GET /debug/envelope` on the redeployed VM reports `binary=9cb1007d…`, `disk_manifest["EFI/BOOT/initrd.img"]=8513c7ea…` (**the CI-attested digest**), `verify.html=55cac6bb…`, and a quote whose RTMR2 is `b48af75b…` with MRTD/RTMR0/1/3 unchanged. |
+| **Offline auditor suite** | `node scripts/test-verify-security.mjs` → **492 passed / 1 failed**, the single failure being the GitHub-Pages parity row (`pages=5adc6a14… repo=55cac6bb…`, "GitHub API unavailable — could not classify") — expected before the push to `main` publishes Pages; `api.github.com` was returning **504 HTML** pages throughout this session, so any API-dependent row must be re-checked once it recovers. |
+| **OPEN — browser e2e blocked by PayPal, not by us** | `node scripts/e2e-sandbox.mjs verified` fails at `PayPal login did not navigate after 3 submit attempts`. Diagnosis: the authorize page now serves PayPal's anti-bot interstitial — **only** hidden inputs `adsddtoken`, `adsddsign`, `adsddm`, `adsddcaptcha` and **no `#email`/`#btnNext`/`#btnLogin`**, so the harness types into nothing. The same sandbox credentials log in fine when the *plain* `https://www.sandbox.paypal.com/signin` page is driven with `page.fill()` (landed on `/myaccount/summary`), which isolates it to the `signin/authorize` interstitial challenging the headless browser. **Headed retry done 2026-11-08** (`Xvfb :99` + `headless: false` copy of the harness, deleted afterwards): identical `step-1 status` / popup landing and the same three submits that never navigate, so this is **server-side anti-bot on the authorize popup, not headless detection**. A human-driven real browser is the only remaining route; no enclave change is implied. |
