@@ -1134,3 +1134,61 @@ The press arrives **~27–35 s** after `StopInstance` is called (`d:false` until
 - **`enable_time()` is not enough for any runtime that talks to the network.** The panic is inside tokio's `TcpStream`, far from the builder line.
 - **No console on this instance type.** `GetInstanceConsoleOutput` is empty, so a wedged PID 1 is invisible; the fix has to be measured from outside (`/proxy/health`) and guarded in-process (watchdog).
 - **A "mid-session" test can silently not be one.** The first attempt released the socket at t+15, before the press arrived at t+27, so it measured another idle stop. Gate the release on observing `draining:true` *with* `active_sessions:1`.
+
+## 0.27 The old box was the watchdog's "prod", and deleting it meant fixing that first (2026-11-08, end of cycle)
+
+### What was asked and what it turned up
+
+Delete stopped instance `i-2ze61uxzdt23qm6sx75e` (`paypal-auth-vm`, 20 GiB `cloud_auto`
+delete-with-instance, no EIP, no data disks), then its image `m-2zeb9skvrja58qzpao8s`. The deletion
+itself was clean — instance gone in one poll, disk released with it, image deleted after. What it
+exposed is that **self-healing has been inert for days**:
+
+- The OOS reconciler's contract is `a tagged instance exists (ANY status) -> do not touch it`. The
+  `pav-watchdog=prod` tag was on the **stopped old box**, not on live prod. So every reconcile found
+  a "prod", checked its EIP, and left the running box unmanaged: if `i-2ze1zdxis0hcsg91qbh5` had been
+  evicted, nothing would have rebuilt it.
+- Worse, `deploy-oos-watchdog.sh` bakes user_data from *the tagged instance* rather than from
+  `dist/config.json`, precisely so a redeploy cannot silently undo a secrets push. With the tag on the
+  dead box that safety feature worked against us: the first `deploy` this cycle baked the old box's
+  **v207-era 4,376-byte config** into `pav-watchdog`, and both `pav-watchdog-hb` and `pav-spot-notice`
+  still pinned the image about to be deleted. Deleting the image alone would have broken every
+  relaunch path while `status` kept looking healthy.
+
+### Order that made it safe
+
+1. `add-tags pav-watchdog=prod` on live prod **first** — while both boxes were tagged the rule is
+   "leave alone", so no window could spawn a duplicate or steal the reserved EIP.
+2. `remove-tags` on the old box, so the reconciler's `.0` is prod and nothing else.
+3. Re-baked: `pav-watchdog` now carries prod's live blob (**5,972 b64 chars, decoded sha
+   `4fda21a7…`**, byte-equal to the running box), `pav-watchdog-hb` and `pav-spot-notice` both carry
+   **`m-2ze7c8jev53ikz43ybj8`** (v220).
+4. Deleted the instance, then the image.
+5. `deploy-oos-watchdog.sh run` → `Success` with `{"instanceId":"i-2ze1zdxis0hcsg91qbh5",
+   "eipStatus":"InUse"}`: it found prod, ensured the EIP, created nothing.
+6. Second `deploy` (needed because the `.0` ordering was ambiguous on the first) re-baked from the
+   now-only-tagged prod — that is the run whose blob matches.
+
+`dist/config.json` was refreshed in the same motion: `spec.imageId` → v220, `capturedFrom` →
+`{instanceId: i-2ze1zdxis0hcsg91qbh5, imageId: v220}`, `userDataB64` → prod's current blob, and
+`spec.instanceName` normalised back to `paypal-auth-vm` (prod's own name had drifted to
+`paypal-auth-vm-v209`; OOS keys on the **tag**, the FC path keys on the *name*, which is why the drift
+mattered and why the FC zip was rebuilt too). That file is gitignored — it holds real secrets.
+
+**Inventory after:** five self-owned images (`v220` live, `v218` rollback, `v217b`, `v216b`, `v216a`),
+one `paypal-auth-vm*` instance (prod), tag on prod only.
+
+### Leftover this exposed (not touched)
+
+`DeleteImage` does **not** delete the image's backbone snapshot: 32 snapshots exist for 5 images.
+**25 are orphans** (`SnapshotForImage-*` whose image name no longer exists, ~25 GiB, including
+`v219`, `v217` and the just-deleted old box's `s-2zeb9skvrja58qzrv75g`), 5 match live images, and 2
+are deliberate non-image forensic snapshots (`v172-forensic-bootprobe`,
+`paypal-v172-esp-forensic-eip-boot`) that must stay.
+
+**Traps:**
+- **Tag ownership is the whole watchdog.** Verify `DescribeInstances --Tag.1.Key pav-watchdog` points
+  at the *running* box before any cleanup that touches instances; a tag on a stopped box disables
+  healing silently, and `deploy` will then bake that box's stale secrets.
+- **Deleting an image leaves a 1 GiB snapshot.** Budget for it: image cleanup without snapshot
+  cleanup frees the name, not the storage.
