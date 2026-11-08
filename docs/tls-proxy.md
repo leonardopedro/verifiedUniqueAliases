@@ -277,6 +277,71 @@ lowers it to 64 bytes, since the fixture website cannot be made to answer with
 9 MiB), and a peer that connects and never speaks (closed at the session
 timeout, counted failed, no attestation).
 
+## Live smoke against the deployed notary (PayPal sandbox)
+
+`tls-proxy/tests/live.rs` runs the same prover path a real client would, but
+against the **deployed** notary and a real sandbox page, so "does the service
+actually relay PayPal's sandbox?" is a command instead of an anecdote. It is
+`#[ignore]`d: it needs egress and a reachable notary.
+
+```sh
+# every PayPal sandbox host the notary allows, one session each
+for target in "sandbox.paypal.com /" \
+              "sandbox.paypal.com /robots.txt" \
+              "www.sandbox.paypal.com /robots.txt"; do
+  set -- $target
+  LIVE_NOTARY=101.200.178.251:8443 LIVE_SERVER=$1 LIVE_PATH=$2 \
+    cargo test --manifest-path tls-proxy/Cargo.toml --test live -- --ignored --nocapture
+  echo "--- $1$2: exit $?"
+done
+```
+
+The default target (`api-m.paypal.com/`) needs only the notary address:
+`cargo test --manifest-path tls-proxy/Cargo.toml --test live -- --ignored --nocapture`.
+
+Knobs: `LIVE_NOTARY`, `LIVE_SERVER` (must be on the notary's relay-target
+allowlist — see *Relay targets*), `LIVE_PATH`, `LIVE_CA_BUNDLE` (default: the
+host bundle, so the relayed chain has to reach a real public root).
+
+A passing run prints, in this order, and ends in `test result: ok`:
+
+```
+connected to notary 101.200.178.251:8443; committing sandbox.paypal.com
+commit accepted — the notary is relaying TLS to sandbox.paypal.com
+relayed TLS handshake started
+relayed response status: 301 Moved Permanently
+transcript: sent 89 B, received 5528 B
+response head: HTTP/1.1 301 Moved Permanently | Connection: close | …
+prover finished: presentation complete
+```
+
+Sessions recorded against the deployed notary on 2026-11-08:
+
+| Target | Result | Transcript |
+|---|---|---|
+| `sandbox.paypal.com/` | `301` | 89 B sent / 5,528 B received |
+| `sandbox.paypal.com/robots.txt` | `200` | 99 B / 3,479 B |
+| `www.sandbox.paypal.com/robots.txt` | `200` | 107 B / 3,429 B |
+| `www.sandbox.paypal.com/signin` | `200`, 2 runs of 3 | ~114 B / ~39,373 B |
+
+**Expect an occasional failure, and re-run it.** PayPal's edge sometimes drops
+the relayed connection while the MPC handshake is still in flight; the prover
+then fails with `hyper::Error(IncompleteMessage)` (or `server closed during TLS
+handshake`) and `GET /proxy/refusals` on the origin shows `failed to receive
+proxy finished message caused by: unexpected end of file`. This is a timing
+race, not a limit: the same path, same binary and the same 39 KB page pass
+intermittently, and a surviving session relays the **whole** page (the 34,442 B
+`/signin` body arrives complete, headers and all). Re-run before treating a
+failure as a regression; the notary's refusal reason is the difference between
+"the site closed on us" and "our side refused".
+
+NixOS, if you rebuild the tests locally: `openssl-sys` links only against an
+ELFCLASS64 store output, e.g.
+`OPENSSL_LIB_DIR=/nix/store/kysvfcf8d8v26rr32xfqji8ri2lczlqk-openssl-3.6.5/lib`
+with `OPENSSL_INCLUDE_DIR=…-openssl-3.6.5-dev/include`. Other `openssl-3.6.5`
+outputs in the store are 32-bit and fail with `incompatible with
+elf64-x86-64`.
+
 ## Limits worth knowing
 
 - Transcripts over 8 MiB are refused rather than stored: the whole transcript
