@@ -1128,7 +1128,7 @@ The press arrives **~27–35 s** after `StopInstance` is called (`d:false` until
 | Pins rotated | `EXPECTED_RTMR2` `d35d2633…` → **`44cfbca3c83ad95c…`**; `EXPECTED_ENCLAVE_SHA256` `cb94953e…` → **`a729c827…`** (verify.html **and** index.html); README `verify.html` digest → `8eb0ec0c…`. MRTD/RTMR0/1/3 unchanged. |
 | Tests | enclave **40 passed** (drain gate ×2, drain runtime ×1); tls-proxy 2 unit + **7 integration**, including `drain_refuses_new_sessions_and_keeps_the_record` |
 | `user_data` | re-pushed after the swap; readback equals the file minus the trailing newline (`len 5972`, sha `880ec5f9…`) |
-| Superseded | v219 `m-2zebw9kc74cbersuejq2` (never served a session; kept as the record of the hang) |
+| Superseded | v219 `m-2zebw9kc74cbersuejq2` — deleted; this section is the record of the hang |
 
 **Traps:**
 - **`enable_time()` is not enough for any runtime that talks to the network.** The panic is inside tokio's `TcpStream`, far from the builder line.
