@@ -3657,18 +3657,7 @@ async fn proxy_health() -> axum::response::Response {
 /// stays at `GET :8081/refusals` and in the boot log.
 async fn proxy_refusals() -> axum::response::Response {
     use axum::response::IntoResponse;
-    let unavailable = |code: axum::http::StatusCode, detail: serde_json::Value| {
-        (
-            code,
-            axum::Json(serde_json::json!({
-                "service": "tls-proxy",
-                "enabled": true,
-                "running": false,
-                "last": detail,
-            })),
-        )
-            .into_response()
-    };
+    let unavailable = proxy_unavailable;
 
     let Some(sup) = PROXY_SUPERVISOR.get() else {
         return (
@@ -3684,60 +3673,9 @@ async fn proxy_refusals() -> axum::response::Response {
         );
     }
 
-    // Loopback only: the child's API binds 127.0.0.1, so this is an in-guest
-    // read, not a second network hop an attacker could redirect.
-    let url = format!("http://127.0.0.1:{}/refusals", sup.api_port);
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(4))
-        .build()
-    {
-        Ok(client) => client,
-        Err(e) => {
-            error!("proxy refusals: cannot build the loopback client: {e}");
-            return unavailable(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                serde_json::json!(format!("cannot build the loopback client: {e}")),
-            );
-        }
-    };
-
-    let body = match client.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => match resp.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                warn!("proxy refusals: cannot read the loopback answer: {e}");
-                return unavailable(
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    serde_json::json!(format!("cannot read the loopback answer: {e}")),
-                );
-            }
-        },
-        Ok(resp) => {
-            let status = resp.status();
-            warn!("proxy refusals: loopback API answered {status}");
-            return unavailable(
-                axum::http::StatusCode::BAD_GATEWAY,
-                serde_json::json!(format!("loopback API answered {status}")),
-            );
-        }
-        Err(e) => {
-            warn!("proxy refusals: loopback API unreachable: {e}");
-            return unavailable(
-                axum::http::StatusCode::BAD_GATEWAY,
-                serde_json::json!(format!("loopback API unreachable: {e}")),
-            );
-        }
-    };
-
-    let mut parsed: serde_json::Value = match serde_json::from_str(&body) {
+    let mut parsed = match proxy_loopback_json("refusals", sup.api_port, "/refusals").await {
         Ok(value) => value,
-        Err(e) => {
-            warn!("proxy refusals: loopback answer is not JSON: {e}");
-            return unavailable(
-                axum::http::StatusCode::BAD_GATEWAY,
-                serde_json::json!(format!("loopback answer is not JSON: {e}")),
-            );
-        }
+        Err((code, detail)) => return unavailable(code, serde_json::json!(detail)),
     };
     if let Some(records) = parsed.get_mut("refusals").and_then(|v| v.as_array_mut()) {
         for record in records.iter_mut() {
@@ -3758,6 +3696,143 @@ async fn proxy_refusals() -> axum::response::Response {
         );
     }
     axum::Json(parsed).into_response()
+}
+
+/// `/proxy/attestations` — the sessions this boot has attested, on the public
+/// origin.
+///
+/// The proxy records an attestation in guest RAM and serves it on the loopback
+/// API, which means an operator on a managed importer (no shell, no serial
+/// console) cannot even tell whether their session was recorded or what its id
+/// is. This route relays the list: session id, when it was notarised, which host
+/// it is about — the last of those fingerprinted exactly as `/proxy/refusals`
+/// fingerprints a host, so the list never publishes who other provers were
+/// looking at.
+///
+/// The transcript bytes and the signature stay where they are. They are what a
+/// prover downloads over `GET :8081/attestations/<id>` (or takes from
+/// `verify.html`), and publishing an attestation body on a shared origin would
+/// hand every visitor everyone else's transcripts.
+async fn proxy_attestations() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let unavailable = proxy_unavailable;
+
+    let Some(sup) = PROXY_SUPERVISOR.get() else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"service": "tls-proxy", "enabled": false})),
+        )
+            .into_response();
+    };
+    if !sup.alive.load(Ordering::Relaxed) {
+        return unavailable(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!(sup.last.read().clone()),
+        );
+    }
+
+    let mut parsed = match proxy_loopback_json("attestations", sup.api_port, "/attestations").await {
+        Ok(value) => value,
+        Err((code, detail)) => return unavailable(code, serde_json::json!(detail)),
+    };
+    redact_attestation_hosts(&mut parsed);
+    if let Some(map) = parsed.as_object_mut() {
+        map.insert("service".into(), serde_json::json!("tls-proxy"));
+        map.insert("running".into(), serde_json::json!(true));
+        map.insert(
+            "redaction".into(),
+            serde_json::json!(
+                "`server_name` is replaced by host:<sha256 prefix>; the committed name \
+                 and the transcript are served by the loopback API (GET :8081/attestations/<id>)"
+            ),
+        );
+    }
+    axum::Json(parsed).into_response()
+}
+
+/// The 503/502 shape both proxy relays answer with when the child cannot be
+/// read: an operator gets the same envelope as `/proxy/health`, plus why.
+fn proxy_unavailable(
+    code: axum::http::StatusCode,
+    detail: serde_json::Value,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        code,
+        axum::Json(serde_json::json!({
+            "service": "tls-proxy",
+            "enabled": true,
+            "running": false,
+            "last": detail,
+        })),
+    )
+        .into_response()
+}
+
+/// Read a JSON document from the proxy child's loopback API.
+///
+/// Loopback only: the child's API binds 127.0.0.1, so this is an in-guest read,
+/// not a second network hop an attacker could redirect.
+async fn proxy_loopback_json(
+    what: &str,
+    api_port: u16,
+    path: &str,
+) -> Result<serde_json::Value, (axum::http::StatusCode, String)> {
+    let url = format!("http://127.0.0.1:{api_port}{path}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .map_err(|e| {
+            error!("proxy {what}: cannot build the loopback client: {e}");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot build the loopback client: {e}"),
+            )
+        })?;
+    let resp = client.get(&url).send().await.map_err(|e| {
+        warn!("proxy {what}: loopback API unreachable: {e}");
+        (
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("loopback API unreachable: {e}"),
+        )
+    })?;
+    let status = resp.status();
+    if !status.is_success() {
+        warn!("proxy {what}: loopback API answered {status}");
+        return Err((
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("loopback API answered {status}"),
+        ));
+    }
+    let body = resp.text().await.map_err(|e| {
+        warn!("proxy {what}: cannot read the loopback answer: {e}");
+        (
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("cannot read the loopback answer: {e}"),
+        )
+    })?;
+    serde_json::from_str(&body).map_err(|e| {
+        warn!("proxy {what}: loopback answer is not JSON: {e}");
+        (
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("loopback answer is not JSON: {e}"),
+        )
+    })
+}
+
+/// Fingerprint every `server_name` in an attestation list, in place.
+///
+/// The same fingerprint `/proxy/refusals` uses, so an operator can line a
+/// session up with the refusal it replaced without either document naming the
+/// host.
+fn redact_attestation_hosts(parsed: &mut serde_json::Value) {
+    if let Some(sessions) = parsed.get_mut("sessions").and_then(|v| v.as_array_mut()) {
+        for session in sessions.iter_mut() {
+            if let Some(name) = session.get("server_name").and_then(|v| v.as_str()) {
+                session["server_name"] = serde_json::json!(fingerprint_hosts(name));
+            }
+        }
+    }
 }
 
 /// Replace host-shaped tokens in a refusal reason with a stable fingerprint.
@@ -4115,6 +4190,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // alive, this says why a session was refused when there is no
             // shell and no serial console to read.
             .route("/proxy/refusals", get(proxy_refusals))
+            // The recorded sessions, for the same reason: without this an
+            // operator cannot even see whether their session was attested,
+            // because the attestation list lives on the loopback API. Hosts are
+            // fingerprinted; transcript bytes stay on loopback.
+            .route("/proxy/attestations", get(proxy_attestations))
             // v189 (user request): the enclave's own TLS chain as a PEM file,
             // offered by verify.html BEFORE the PayPal login (see handler).
             .route("/tls-cert.pem", get(serve_tls_cert))
@@ -4395,6 +4475,55 @@ mod security_tests {
         // Punctuation around a host is preserved, the host itself is not.
         let bracketed = fingerprint_hosts("(example.co.uk).");
         assert!(bracketed.starts_with("(host:") && bracketed.ends_with(")."), "{bracketed}");
+    }
+
+    /// `/proxy/attestations` relays the child's list, and the host each session
+    /// is about must not leave the VM — the same rule `/proxy/refusals`
+    /// enforces. What an operator still gets: the id, the time, and a
+    /// fingerprint that lines up with the refusal ring.
+    #[test]
+    fn attestation_list_never_names_the_host() {
+        let mut list = serde_json::json!({
+            "count": 2,
+            "sessions": [
+                {"session_id": "aa", "server_name": "api-m.sandbox.paypal.com", "notarized_at": 1},
+                {"session_id": "bb", "server_name": "news.ycombinator.com", "notarized_at": 2}
+            ]
+        });
+        redact_attestation_hosts(&mut list);
+
+        let sessions = list["sessions"].as_array().unwrap();
+        let first = sessions[0]["server_name"].as_str().unwrap();
+        assert_eq!(
+            first,
+            fingerprint_hosts("api-m.sandbox.paypal.com"),
+            "the list must use the refusal ring's fingerprint, not its own scheme"
+        );
+        assert!(first.starts_with("host:"), "{first}");
+        assert!(!list.to_string().contains("paypal"), "{list}");
+        assert!(!list.to_string().contains("ycombinator"), "{list}");
+        // The fields an operator is actually looking for survive untouched.
+        assert_eq!(sessions[0]["session_id"], "aa");
+        assert_eq!(sessions[1]["notarized_at"], 2);
+        assert_eq!(list["count"], 2);
+    }
+
+    /// A record with no host (or a shape the child changed) must not panic the
+    /// public route: redaction is best-effort, and a missing field stays missing.
+    #[test]
+    fn attestation_redaction_tolerates_odd_records() {
+        let mut list = serde_json::json!({
+            "count": 2,
+            "sessions": [{"session_id": "cc"}, {"session_id": "dd", "server_name": null}]
+        });
+        redact_attestation_hosts(&mut list);
+        assert_eq!(list["sessions"][0]["session_id"], "cc");
+        assert!(list["sessions"][1]["server_name"].is_null());
+
+        // Not a list at all: left alone rather than replaced.
+        let mut odd = serde_json::json!({"error": "no such attestation in this boot"});
+        redact_attestation_hosts(&mut odd);
+        assert_eq!(odd["error"], "no such attestation in this boot");
     }
 
     /// v169 (audit finding: identity preimage binding). verify.html recomputes

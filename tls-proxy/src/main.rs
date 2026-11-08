@@ -477,10 +477,13 @@ async fn list(State(st): State<Arc<ProxyState>>) -> Json<serde_json::Value> {
     let sessions: Vec<serde_json::Value> = store
         .iter()
         .map(|(id, v)| {
+            // Both live in the signed body, not at the top of the envelope;
+            // a plain `get` here listed every session with a null host, which
+            // is the one field an operator is looking for.
             serde_json::json!({
                 "session_id": id,
-                "server_name": v.get("server_name"),
-                "notarized_at": v.get("notarized_at"),
+                "server_name": v.pointer("/body/server_name"),
+                "notarized_at": v.pointer("/body/notarized_at"),
             })
         })
         .collect();

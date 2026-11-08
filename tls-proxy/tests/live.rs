@@ -12,11 +12,22 @@
 //! `www.sandbox.paypal.com` with `LIVE_PATH=/checkoutnow` to attest that page
 //! rather than the sandbox's bare origin.
 //!
+//! `LIVE_ATTEMPTS` (default 3) retries a session that ends before a verdict.
+//! That is not papering over a defect: a real site's edge will sometimes close
+//! while the relayed TLS handshake is still in flight, because every MPC round
+//! costs a prover↔notary round trip. It is the ordinary way this service fails
+//! on a page it usually serves — measured at 2 of 3 runs on a 33 KB
+//! `www.sandbox.paypal.com/signin` — so the test retries and reports which
+//! attempt passed, rather than turning a coin flip into a red build.
+//!
 //! The prover is the same shape as `tests/session.rs`, minus the fixture: the
 //! root store comes from the host bundle, so the relayed certificate has to
 //! chain to a real public CA exactly as a browser's would.
 
-use std::{future::IntoFuture, time::Duration};
+use std::{
+    future::IntoFuture,
+    time::{Duration, Instant},
+};
 
 use http_body_util::Empty;
 use hyper::{body::Bytes, Request};
@@ -56,23 +67,26 @@ fn roots_from_bundle(path: &str) -> Result<Vec<CertificateDer>, Box<dyn std::err
     Ok(out)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs a deployed notary and real internet egress"]
-async fn live_relay_of_a_real_website() -> Result<(), Box<dyn std::error::Error>> {
-    let notary = std::env::var("LIVE_NOTARY").unwrap_or_else(|_| "101.200.178.251:8443".into());
-    let server = std::env::var("LIVE_SERVER").unwrap_or_else(|_| "api-m.paypal.com".into());
-    let ca_bundle = std::env::var("LIVE_CA_BUNDLE")
-        .unwrap_or_else(|_| "/etc/ssl/certs/ca-certificates.crt".into());
-    // A host is what the notary authorises; the page is the prover's choice.
-    let path = std::env::var("LIVE_PATH").unwrap_or_else(|_| "/".into());
-    let path = if path.starts_with('/') { path } else { format!("/{path}") };
+/// One attempt: a fresh session to the notary, one request, one proof.
+///
+/// Everything that can be left behind by a failed attempt — the session
+/// driver, the relayed socket — is created inside this function, so a retry
+/// starts from a clean slate instead of sharing a half-closed session.
+async fn one_session(
+    notary: &str,
+    server: &str,
+    path: &str,
+    roots: Vec<CertificateDer>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Timings, because where a session spends its ~1 minute decides whether an
+    // edge-side close is a race we can win or a wall: commit is one exchange,
+    // the handshake is many, the proof is pure compute.
+    let t0 = Instant::now();
+    let lap = |what: &str| eprintln!("[{:>6.1}s] {what}", t0.elapsed().as_secs_f64());
 
-    let roots = roots_from_bundle(&ca_bundle)?;
-    assert!(!roots.is_empty(), "{ca_bundle} had no certificates");
-
-    let socket = TcpStream::connect(&notary).await?;
+    let socket = TcpStream::connect(notary).await?;
     socket.set_nodelay(true)?;
-    eprintln!("connected to notary {notary}; committing {server}");
+    lap(&format!("connected to notary {notary}; committing {server}"));
 
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
@@ -82,19 +96,19 @@ async fn live_relay_of_a_real_website() -> Result<(), Box<dyn std::error::Error>
         .new_prover(ProverConfig::builder().build()?)?
         .commit(
             ProxyTlsConfig::builder()
-                .server_name(DnsName::try_from(server.as_str())?)
+                .server_name(DnsName::try_from(server)?)
                 .build()?,
         )
         .await?;
-    eprintln!("commit accepted — the notary is relaying TLS to {server}");
+    lap(&format!("commit accepted — the notary is relaying TLS to {server}"));
 
     let (tls_connection, prover) = prover.connect(
         TlsClientConfig::builder()
-            .server_name(ServerName::Dns(server.as_str().try_into()?))
+            .server_name(ServerName::Dns(server.try_into()?))
             .root_store(RootCertStore { roots })
             .build()?,
     )?;
-    eprintln!("relayed TLS handshake started");
+    lap("relayed TLS handshake started");
 
     let tls_connection = TokioIo::new(tls_connection.compat());
     let prover_task = tokio::spawn(prover.into_future());
@@ -105,18 +119,18 @@ async fn live_relay_of_a_real_website() -> Result<(), Box<dyn std::error::Error>
 
     let request = Request::builder()
         .uri(format!("https://{server}{path}"))
-        .header("Host", server.as_str())
+        .header("Host", server)
         .header("Connection", "close")
         .method("GET")
         .body(Empty::<Bytes>::new())?;
     let response = tokio::time::timeout(Duration::from_secs(120), request_sender.send_request(request))
         .await??;
-    eprintln!("relayed response status: {}", response.status());
+    lap(&format!("relayed response status: {}", response.status()));
 
     let mut prover = prover_task.await??;
     let sent = prover.transcript().sent().len();
     let received = prover.transcript().received().len();
-    eprintln!("transcript: sent {sent} B, received {received} B");
+    lap(&format!("transcript: sent {sent} B, received {received} B"));
     let head = prover.transcript().received();
     eprintln!(
         "response head: {}",
@@ -132,6 +146,56 @@ async fn live_relay_of_a_real_website() -> Result<(), Box<dyn std::error::Error>
     prover.close().await?;
     handle.close();
     driver_task.await??;
-    eprintln!("prover finished: presentation complete");
+    lap("prover finished: presentation complete");
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a deployed notary and real internet egress"]
+async fn live_relay_of_a_real_website() -> Result<(), Box<dyn std::error::Error>> {
+    let notary = std::env::var("LIVE_NOTARY").unwrap_or_else(|_| "101.200.178.251:8443".into());
+    let server = std::env::var("LIVE_SERVER").unwrap_or_else(|_| "api-m.paypal.com".into());
+    let ca_bundle = std::env::var("LIVE_CA_BUNDLE")
+        .unwrap_or_else(|_| "/etc/ssl/certs/ca-certificates.crt".into());
+    // A host is what the notary authorises; the page is the prover's choice.
+    let path = std::env::var("LIVE_PATH").unwrap_or_else(|_| "/".into());
+    let path = if path.starts_with('/') { path } else { format!("/{path}") };
+    let attempts: u32 = std::env::var("LIVE_ATTEMPTS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .filter(|n: &u32| *n > 0)
+        .unwrap_or(3);
+
+    let roots = roots_from_bundle(&ca_bundle)?;
+    assert!(!roots.is_empty(), "{ca_bundle} had no certificates");
+
+    for attempt in 1..=attempts {
+        eprintln!("--- attempt {attempt}/{attempts}: {server}{path}");
+        match one_session(&notary, &server, &path, roots.clone()).await {
+            Ok(()) => {
+                if attempt > 1 {
+                    eprintln!("--- passed on attempt {attempt}/{attempts}");
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                // The expected shape: the site's edge closes mid-handshake or
+                // mid-response, and the notary logs "failed to receive proxy
+                // finished message". A refusal of OURS (an over-8-MiB
+                // transcript, a non-proxy commit) fails the same way, so the
+                // message is kept verbatim in the report.
+                eprintln!("--- attempt {attempt}/{attempts} failed: {e}");
+                if attempt == attempts {
+                    return Err(format!(
+                        "no verdict in {attempts} attempt(s); last error: {e}"
+                    )
+                    .into());
+                }
+                // Let the notary reap the abandoned session before the next
+                // one, so the retry is not refused as a concurrent session.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    unreachable!("the loop returns on the final attempt")
 }

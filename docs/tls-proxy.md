@@ -135,6 +135,7 @@ nothing, and stops demanding PayPal app credentials only for the proxy-only case
 | `GET :8081/refusals` | why the last 32 sessions were refused, newest last |
 | `GET https://<domain>/proxy/health` | same liveness answer on the public origin |
 | `GET https://<domain>/proxy/refusals` | the refusal ring on the public origin, hostnames fingerprinted |
+| `GET https://<domain>/proxy/attestations` | the recorded sessions on the public origin: id, host fingerprint, time |
 
 `/refusals` answers the operator's question "why was that session rejected?"
 without a shell: each entry is `{at, kind, reason}`, where `kind` is `rejected`
@@ -161,10 +162,20 @@ would cost the diagnosis without hiding anything. The `redaction` field in the
 response says this in-band, and the unredacted text remains at
 `GET :8081/refusals` and in the boot log for whoever does have a shell.
 
-The attestation API binds loopback on purpose: it is read by whoever already has
-a shell on the VM (or a future in-guest collector), not by the internet. Session
-traffic never passes through the HTTPS listener, so the PayPal TLS certificate is
-not involved in a proof.
+`/proxy/attestations` answers the other half of the same question — "was my
+session recorded, and under which id?" — for the same operator with no shell. It
+relays `GET :8081/attestations` with each `server_name` replaced by the very
+fingerprint `/proxy/refusals` uses, so a session can be lined up with the refusal
+it replaced without either document naming a host. It publishes the **list only**:
+ids, fingerprints, timestamps. The transcript bytes and the signature stay on the
+loopback API (`GET :8081/attestations/{id}`), because serving them on a shared
+origin would hand every visitor everyone else's transcripts.
+
+The attestation API binds loopback on purpose: the bytes are read by whoever
+already has a shell on the VM (or a future in-guest collector), and the two
+public routes relay nothing but the refusal ring and the session list. Session
+traffic never passes through the HTTPS listener either, so the PayPal TLS
+certificate is not involved in a proof.
 
 ## The attestation
 
@@ -301,18 +312,21 @@ The default target (`api-m.paypal.com/`) needs only the notary address:
 
 Knobs: `LIVE_NOTARY`, `LIVE_SERVER` (must be on the notary's relay-target
 allowlist — see *Relay targets*), `LIVE_PATH`, `LIVE_CA_BUNDLE` (default: the
-host bundle, so the relayed chain has to reach a real public root).
+host bundle, so the relayed chain has to reach a real public root), and
+`LIVE_ATTEMPTS` (default 3), which retries a session that ends without a verdict
+and reports the attempt that passed.
 
 A passing run prints, in this order, and ends in `test result: ok`:
 
 ```
-connected to notary 101.200.178.251:8443; committing sandbox.paypal.com
-commit accepted — the notary is relaying TLS to sandbox.paypal.com
-relayed TLS handshake started
-relayed response status: 301 Moved Permanently
-transcript: sent 89 B, received 5528 B
-response head: HTTP/1.1 301 Moved Permanently | Connection: close | …
-prover finished: presentation complete
+--- attempt 1/3: www.sandbox.paypal.com/signin
+[   1.3s] connected to notary 101.200.178.251:8443; committing www.sandbox.paypal.com
+[  36.6s] commit accepted — the notary is relaying TLS to www.sandbox.paypal.com
+[  36.6s] relayed TLS handshake started
+[  38.4s] relayed response status: 200 OK
+[  43.8s] transcript: sent 103 B, received 38002 B
+[  47.4s] prover finished: presentation complete
+test result: ok
 ```
 
 Sessions recorded against the deployed notary on 2026-11-08:
@@ -322,18 +336,26 @@ Sessions recorded against the deployed notary on 2026-11-08:
 | `sandbox.paypal.com/` | `301` | 89 B sent / 5,528 B received |
 | `sandbox.paypal.com/robots.txt` | `200` | 99 B / 3,479 B |
 | `www.sandbox.paypal.com/robots.txt` | `200` | 107 B / 3,429 B |
-| `www.sandbox.paypal.com/signin` | `200`, 2 runs of 3 | ~114 B / ~39,373 B |
+| `www.sandbox.paypal.com/signin` | `200`, 3 runs of 5 (one on a retry) | ~103 B / ~38,000 B |
 
-**Expect an occasional failure, and re-run it.** PayPal's edge sometimes drops
-the relayed connection while the MPC handshake is still in flight; the prover
-then fails with `hyper::Error(IncompleteMessage)` (or `server closed during TLS
-handshake`) and `GET /proxy/refusals` on the origin shows `failed to receive
-proxy finished message caused by: unexpected end of file`. This is a timing
-race, not a limit: the same path, same binary and the same 39 KB page pass
-intermittently, and a surviving session relays the **whole** page (the 34,442 B
-`/signin` body arrives complete, headers and all). Re-run before treating a
-failure as a regression; the notary's refusal reason is the difference between
-"the site closed on us" and "our side refused".
+**Where the minute goes, and why a session occasionally dies.** The timings above
+are the shape of every session: a second to reach the notary, then **29–41 s
+before the commit is accepted**, then a **2–4 s** TLS handshake and request, then
+the proof. The long wait is the notary dialling the site: it connects to the
+committed host from Beijing before it answers the commit, so the SYNs and the
+edge's own queueing are charged to the prover's commit. The MPC handshake itself
+is not slow — 1.8 s for a 33 KB page.
+
+That single dial is also the flaky part, which is why `LIVE_ATTEMPTS` exists and
+defaults to 3. Observed failure shapes, all with the same binary and path:
+`hyper::Error(IncompleteMessage)`, `server closed during TLS handshake`,
+`session closed while the prover was connected` (a full `200 OK` arrived first),
+and on the origin `GET /proxy/refusals` reporting `failed to receive proxy
+finished message caused by: unexpected end of file`. None of them is a size
+limit: the same 33 KB page passes intermittently, and a surviving session relays
+the **whole** page, the declared 33,069 B body included. Re-run before treating a
+failure as a regression, and read the refusal reason — it separates "the site
+closed on us" from "our side refused".
 
 NixOS, if you rebuild the tests locally: `openssl-sys` links only against an
 ELFCLASS64 store output, e.g.
