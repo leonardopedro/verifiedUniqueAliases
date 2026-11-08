@@ -129,6 +129,13 @@ mod enclave_init {
     /// against hypervisor argument injection is (a) determinism — this exact
     /// pinned string — plus (b) verify_cmdline() below and (c) the auditor's
     /// RTMR pins over the measured boot chain.
+    ///
+    /// Console note: the TDX firmware this platform ships today stops the
+    /// console-capture stream at its own TD-stage lines, so nothing the guest
+    /// writes reaches `GetInstanceConsoleOutput`. `earlyprintk=serial,...` was
+    /// built and booted to test that (v215 probe) and it made no difference, so
+    /// the cmdline stays at the audited baseline rather than carrying an entry
+    /// that would force an RTMR pin rotation for no captured output.
     pub const EXPECTED_CMDLINE: &str =
         "console=tty0 console=ttyS0,115200n8 net.ifnames=0 biosdevname=0 swiotlb=524288";
 

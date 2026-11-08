@@ -1,4 +1,7 @@
 target/
+# tls-proxy is its own crate with its own target/; without this line a local
+# `cargo test` turns the build context into gigabytes and the COPY step stalls.
+tls-proxy/target/
 .git/
 .gitignore
 *.md

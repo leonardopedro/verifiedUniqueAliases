@@ -1038,3 +1038,35 @@ tests. Everything below is fixed and covered by a regression test.
   per-event coverage to re-verify on demand.
 - `verify.html` served from the unmeasured ESP stays (pins must not live in
   the measured initrd — self-reference), but it is now fenced by item 2.
+
+---
+
+## Serial console capture on the TDX instance (2026-11-08)
+
+`aliyun ecs GetInstanceConsoleOutput` on `i-2ze1zdxis0hcsg91qbh5` now returns
+**firmware output only**: the 64 KiB snapshot ends mid-line right after the
+TDVF line `Intel Tdx Started with (GPAW: 52, Cpus: 2)` and contains no
+`Linux version`, no `Command line:`, no `printk:` line. The October dumps
+(`/tmp/live171-console.txt`, `/tmp/prod-console2.txt`) from the same instance
+did carry `printk: legacy console [ttyS0] enabled`, and the `grub.cfg` /
+cmdline in the currently deployed image is unchanged from those boots.
+
+Evidence that this is the platform, not the image:
+
+- A build carrying `earlyprintk=serial,ttyS0,115200` (v215 probe, disk
+  `64008975…`) booted to a healthy `/proxy/health` yet the console snapshot
+  still ended at the firmware TD-start line — an early console writing 0x3F8
+  directly produced nothing new, so guest UART writes are not being captured
+  at all.
+- Imported images must be flagged NVMe-capable (`Features.NvmeSupport=supported`
+  via the flat-wire RPC) or `ReplaceSystemDisk` refuses with
+  `The specified instance type requires NVMe but the image does not support
+  NVMe` — unrelated to consoles but hit on the same swap path.
+- The probe was reverted (`earlyprintk` removed from `build-alibaba-image.sh`
+  and `EXPECTED_CMDLINE`) and production restored to image
+  `m-2ze2ncqumj1v4hje435y`, so the published RTMR2 pin `954fc320…` stays valid.
+  Do not re-add `earlyprintk` unless the platform starts capturing guest
+  output — it changes the measured cmdline event and forces a pin rotation.
+
+Diagnose a boot without the console via `https://login.airma.de/proxy/health`
+(`running`, `restarts`, `last`), `/proxy/refusals`, and `/debug/envelope`.
