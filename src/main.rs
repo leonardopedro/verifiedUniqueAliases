@@ -54,6 +54,153 @@ mod enclave_init {
         modprobe("nft_chain_filter");
         modprobe("nft_reject_ipv4");
         modprobe("nft_limit");
+        // Shutdown path: the hypervisor's graceful stop is an ACPI power-button
+        // press, which only reaches userspace through the button driver and the
+        // evdev input interface. Neither is built into Debian's cloud kernel
+        // (`CONFIG_ACPI_BUTTON=m`, `CONFIG_INPUT_EVDEV=m`) and neither was in
+        // the initramfs, so a stop request used to reach nothing at all.
+        modprobe("button");
+        modprobe("evdev");
+    }
+
+    /// Watch for the hypervisor's shutdown request and honour it.
+    ///
+    /// Nothing here existed before: this process is PID 1, `poweroff()` in this
+    /// module parks instead of powering off (it is the fail-closed halt), and no
+    /// handler was ever installed for a signal or for ACPI. A graceful
+    /// `StopInstance` therefore sat in `Stopping` until the platform gave up and
+    /// force-stopped it.
+    pub fn arm_shutdown_handling() {
+        unsafe {
+            // SIGTERM is what a container runtime or an init-style stop sends;
+            // PID 1 ignores it by default, so today a stop request that used
+            // this signal was silently discarded.
+            libc::signal(libc::SIGTERM, shutdown_on_signal as libc::sighandler_t);
+        }
+        std::thread::spawn(watch_power_button);
+        kmsg("shutdown handling armed (ACPI power button + SIGTERM)");
+    }
+
+    extern "C" fn shutdown_on_signal(_sig: libc::c_int) {
+        // Async-signal-safe by construction: one syscall, no allocation, no
+        // logging through stdio on a console that may have stopped draining.
+        power_off_now();
+    }
+
+    /// Power the machine off for real. Deliberately distinct from `poweroff()`,
+    /// which is the fail-closed halt-and-park: a shutdown request must release
+    /// the instance, not preserve evidence indefinitely.
+    fn power_off_now() -> ! {
+        unsafe {
+            libc::sync();
+            libc::reboot(libc::RB_POWER_OFF);
+        }
+        // The kernel refused (it can, e.g. when not privileged inside a
+        // namespace). Park rather than spin; the platform will force-stop.
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
+    /// One `struct input_event` frame: `timeval` (16 bytes on x86_64), then the
+    /// type, code and value.
+    const INPUT_EVENT_LEN: usize = 24;
+    pub const EV_KEY: u16 = 0x01;
+    pub const KEY_POWER: u16 = 116;
+
+    /// True only for a power button being *pressed*: a release, a repeat, or any
+    /// other key on the device must not power the machine off.
+    pub fn is_power_press(frame: &[u8]) -> bool {
+        frame.len() == INPUT_EVENT_LEN
+            && u16::from_ne_bytes([frame[16], frame[17]]) == EV_KEY
+            && u16::from_ne_bytes([frame[18], frame[19]]) == KEY_POWER
+            && i32::from_ne_bytes([frame[20], frame[21], frame[22], frame[23]]) == 1
+    }
+
+    fn watch_power_button() {
+        use std::collections::HashSet;
+        let mut armed: HashSet<std::path::PathBuf> = HashSet::new();
+        loop {
+            if let Ok(dir) = std::fs::read_dir("/dev/input") {
+                for entry in dir.flatten() {
+                    let path = entry.path();
+                    let is_event = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().starts_with("event"))
+                        .unwrap_or(false);
+                    // A node is watched once; `insert` is the de-duplication.
+                    if is_event && armed.insert(path.clone()) {
+                        std::thread::spawn(move || watch_input_node(path));
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
+
+    fn watch_input_node(path: std::path::PathBuf) {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        // Only the ACPI power button is allowed to power this machine off. An
+        // event node that happens to report KEY_POWER for another reason (a
+        // vendor HID quirk, a test device) is ignored by name.
+        let name = evdev_name(&file);
+        if !name.contains("Power Button") {
+            return;
+        }
+        kmsg(&format!("watching {} ({}) for a power button press", path.display(), name));
+        let mut pending: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            match (&file).read(&mut chunk) {
+                Ok(0) => std::thread::sleep(std::time::Duration::from_millis(250)),
+                Ok(n) => {
+                    pending.extend_from_slice(&chunk[..n]);
+                    let mut frames = 0;
+                    while pending.len() >= INPUT_EVENT_LEN {
+                        let frame: Vec<u8> = pending.drain(..INPUT_EVENT_LEN).collect();
+                        if is_power_press(&frame) {
+                            kmsg("ACPI power button pressed: powering off");
+                            power_off_now();
+                        }
+                        frames += 1;
+                        if frames > 256 {
+                            break;
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(250))
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// `EVIOCGNAME`: the answering device's name, empty when it cannot be read.
+    fn evdev_name(file: &std::fs::File) -> String {
+        use std::os::unix::io::AsRawFd;
+        const IOC_READ: libc::c_ulong = 2;
+        const EVIOCGNAME_NR: libc::c_ulong = 0x06;
+        let mut buf = [0u8; 256];
+        let request = (IOC_READ << 30)
+            | ((buf.len() as libc::c_ulong) << 16)
+            | ((b'E' as libc::c_ulong) << 8)
+            | EVIOCGNAME_NR;
+        let rc = unsafe { libc::ioctl(file.as_raw_fd(), request, buf.as_mut_ptr()) };
+        if rc < 0 {
+            return String::new();
+        }
+        let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..end]).to_string()
     }
 
     pub fn setup_firewall() {
@@ -3935,6 +4082,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     enclave_init::verify_cmdline();
     selfreport::stage("drivers");
     enclave_init::load_drivers();
+    selfreport::stage("shutdown");
+    enclave_init::arm_shutdown_handling();
     selfreport::stage("measure");
     let boot_manifest = enclave_init::measure_boot_components();
     selfreport::stage("firewall");
@@ -4343,6 +4492,47 @@ mod security_tests {
                  "domain":"notary.example","services":{services}}}"#
         ))
         .expect("config parses")
+    }
+
+    /// The shutdown path must fire on a power button press and on nothing else.
+    /// These frames are built the way the kernel builds them: `timeval`, then
+    /// type, code and value as native-endian words.
+    fn input_frame(ev_type: u16, code: u16, value: i32) -> Vec<u8> {
+        let mut frame = vec![0u8; 24];
+        frame[16..18].copy_from_slice(&ev_type.to_ne_bytes());
+        frame[18..20].copy_from_slice(&code.to_ne_bytes());
+        frame[20..24].copy_from_slice(&value.to_ne_bytes());
+        frame
+    }
+
+    #[test]
+    fn a_power_button_press_is_honoured() {
+        assert!(enclave_init::is_power_press(&input_frame(
+            enclave_init::EV_KEY,
+            enclave_init::KEY_POWER,
+            1
+        )));
+    }
+
+    #[test]
+    fn only_a_press_powers_the_machine_off() {
+        // A release, a repeat, another key and another event type must all be
+        // ignored: this gate is the difference between a shutdown and a VM that
+        // powers itself off while serving a session.
+        for (ev_type, code, value, why) in [
+            (enclave_init::EV_KEY, enclave_init::KEY_POWER, 0, "release"),
+            (enclave_init::EV_KEY, enclave_init::KEY_POWER, 2, "repeat"),
+            (enclave_init::EV_KEY, 30, 1, "another key (KEY_A)"),
+            (0x00, enclave_init::KEY_POWER, 1, "SYN_REPORT"),
+            (0x04, enclave_init::KEY_POWER, 1, "MSC_SCAN"),
+        ] {
+            assert!(
+                !enclave_init::is_power_press(&input_frame(ev_type, code, value)),
+                "{why} must not power the machine off"
+            );
+        }
+        // A partial frame is not an event at all.
+        assert!(!enclave_init::is_power_press(&[0u8; 23]));
     }
 
     /// Relay targets are the proxy's egress boundary, and they are optional:

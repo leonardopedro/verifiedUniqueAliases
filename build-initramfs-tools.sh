@@ -99,7 +99,7 @@ chmod 644 /etc/iscsi/initiatorname.iscsi 2>/dev/null || true
 # reached the initramfs — so /dev/tdx_guest and
 # /sys/kernel/config/tsm/report were absent at runtime (live-observed
 # 2026-10-19: TDX evidence probe found zero modules).
-PLATFORM_MODULES="tdx-guest tsm virtio_net virtio_scsi virtio_blk nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct configfs"
+PLATFORM_MODULES="tdx-guest tsm button evdev virtio_net virtio_scsi virtio_blk nvme nvme_core vfat nls_cp437 nls_ascii nf_tables nft_chain_filter nft_reject_ipv4 nft_limit nf_conntrack nft_ct configfs"
 echo "🏗️ Building initramfs for Alibaba Cloud Intel TDX"
 
 # Force inclusion of hardware modules

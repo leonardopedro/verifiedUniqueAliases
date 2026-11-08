@@ -1042,3 +1042,33 @@ commit `2235933`). |
 | **Trap: `RunCommand` flag** | `--InstanceIds` is **rejected** by this CLI (`'--InstanceIds' is not a valid parameter or flag … Did you mean: InstanceId`); the working form is `--InstanceId.1 <id>` (RepeatList). Bare `--InstanceId` also does not populate the list. |
 | **Trap: stale local binary** | `cargo test --bin tls-proxy` builds the **test harness**, not `target/debug/tls-proxy`. A loopback check run straight after a test session re-ran the *old* binary and showed the old `null` host — misleading "the fix did not work" evidence. `cargo build --bin tls-proxy` first. |
 | **State left behind** | prod `i-2ze1zdxis0hcsg91qbh5` Running, EIP 101.200.178.251, image `m-2ze7liy7l0dobz3gg77g`, disk `d-2zeexizgfuircb08txou`; rollback image `m-2ze2ncqumj1veapx9wt4` (v216b) plus the superseded v217 image `m-2zec1dghhbv77kixm9yc`. Relay `i-2zefiag79exwsshidi3z` stopped (`--StoppedMode StopCharging`) after the legs. |
+
+## 0.25 v218 — the enclave now honours a graceful stop (2026-11-08, later)
+
+A graceful `StopInstance` used to sit in `Stopping` for **260 s** and only ended when the
+operator passed `--ForceStop true`. Root cause was two-fold and neither half existed:
+
+| Half | Why it was missing | Fix |
+|---|---|---|
+| **Receiver** | Debian's cloud kernel builds the ACPI button and evdev as **modules** (`CONFIG_ACPI_BUTTON=m`, `CONFIG_INPUT_EVDEV=m`; `CONFIG_ACPI_TINY_POWER_BUTTON` — the driver that signals PID 1 directly — is **not set** in Debian). The initramfs shipped neither `button.ko` nor `evdev.ko`, so a power-button press had nothing to deliver it to. | `PLATFORM_MODULES` in `build-initramfs-tools.sh` gained `button evdev`; `load_drivers()` modprobes both. Verified in the built initramfs: `drivers/acpi/button.ko` + `drivers/input/evdev.ko` are present. |
+| **Handler** | This process is PID 1 and installed no handler. Worse, `enclave_init::poweroff()` is **not** a power-off — it is the fail-closed halt-and-park (self-report + sleep), so nothing could ever release the instance. | New `arm_shutdown_handling()`: a SIGTERM handler (PID 1 ignores it by default) and a watcher on `/dev/input/event*`. `is_power_press()` fires **only** on `EV_KEY/KEY_POWER/value==1`, and the node's `EVIOCGNAME` must contain `Power Button` — a release, repeat, another key, or another input device can never power the machine off. Both paths call `power_off_now()` → `reboot(RB_POWER_OFF)`, deliberately distinct from the parked `poweroff()`. |
+
+**Ground truth (live, on the real TDX hypervisor):**
+
+| Step | Result |
+|---|---|
+| Boot v218 after `ReplaceSystemDisk` | `/proxy/health` **200 at t+65 s**; all four routes 200; config intact (`enabled:true`, ports 8081/8443) |
+| **Graceful** `StopInstance` (no `--ForceStop`) | **Stopped in 43 s** — down from 260 s + mandatory force-stop |
+| `StartInstance` again | `/proxy/health` 200 in 57 s, `restarts:0`, fresh TDX quote (`configfs_tsm`) |
+
+| Item | Value |
+|---|---|
+| Build lineage | disk sha256 `b499ca19b3b3859646d9c3260ba417e82e05440fc9fa2982824b2c39571b786d` (md5 `25050eb9718dc1901ca4d34f19a172be`, 55,574,528 B), initramfs `396fdf99efbf6c6ca553cb523ff8480f69a72415e08b065895a6d3c72b70b3ef`, enclave `/init` `cb94953e4eec939e80e049e984893b0d0ef71fe485f3732835c8bb9696575bf5` (contains `shutdown handling armed`, `ACPI power button pressed`), proxy bin `b1d573f0…` (unchanged) |
+| Image / disk | **`m-2ze9lskiq4fprc48auuy`** (`paypal-tdx-esp-v218-202611081958`, 1 GiB, UEFI, `Features.NvmeSupport=supported` via the flat-wire RPC; import 70 s) / prod disk **`d-2ze7o6b0hjbwtye6xp1q`** |
+| `user_data` | re-pushed after the swap, readback identical to the pre-swap capture (5,973 B b64, sha256 `11c9fcf6…`) |
+| Pins rotated | `EXPECTED_RTMR2` `424ae32f…` → **`d35d263340656b3c37fc9156e1ec18557f3d709931d32435ea21aea815d980caa475e652a79d74bb85944433e4f910e7`**; `EXPECTED_ENCLAVE_SHA256` `9cb1007d…` → **`cb94953e…`** (both in `verify.html` **and** `index.html` — `calculate-golden-rtmr.mjs --update` only rewrites `verify.html`); MRTD/RTMR0/1/3 byte-held; README `verify.html` digest rotated. Offline auditor suite: 492/1 pre-push (Pages row), green after `main` republished. |
+
+**New traps:**
+- **`poweroff()` is not a power-off.** `enclave_init::poweroff()` halts and parks on purpose (fail-closed evidence). Anything that needs the instance actually released must go through `power_off_now()`.
+- **A missing module looks exactly like a hostile hypervisor.** With `button`/`evdev` absent there is no error anywhere — the guest just never reacts. Check `lsmod`/initramfs contents before blaming the platform.
+- **The input path is a safety surface.** Only `EV_KEY`/`KEY_POWER`/value `1` from a device whose `EVIOCGNAME` contains `Power Button` may trigger a shutdown; the two unit tests (`a_power_button_press_is_honoured`, `only_a_press_powers_the_machine_off`) pin the gate against a release/repeat/other key.
