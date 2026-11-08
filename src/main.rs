@@ -3677,13 +3677,7 @@ async fn proxy_refusals() -> axum::response::Response {
         Ok(value) => value,
         Err((code, detail)) => return unavailable(code, serde_json::json!(detail)),
     };
-    if let Some(records) = parsed.get_mut("refusals").and_then(|v| v.as_array_mut()) {
-        for record in records.iter_mut() {
-            if let Some(reason) = record.get("reason").and_then(|v| v.as_str()) {
-                record["reason"] = serde_json::Value::String(fingerprint_hosts(reason));
-            }
-        }
-    }
+    redact_refusal_reasons(&mut parsed);
     if let Some(map) = parsed.as_object_mut() {
         map.insert("service".into(), serde_json::json!("tls-proxy"));
         map.insert("running".into(), serde_json::json!(true));
@@ -3818,6 +3812,21 @@ async fn proxy_loopback_json(
             format!("loopback answer is not JSON: {e}"),
         )
     })
+}
+
+/// Fingerprint the host inside every refusal reason, in place.
+///
+/// The counterpart of `redact_attestation_hosts` and deliberately built on the
+/// same `fingerprint_hosts`, so one host reads as one token in both public
+/// documents and an operator can line a session up with the refusal it replaced.
+fn redact_refusal_reasons(parsed: &mut serde_json::Value) {
+    if let Some(records) = parsed.get_mut("refusals").and_then(|v| v.as_array_mut()) {
+        for record in records.iter_mut() {
+            if let Some(reason) = record.get("reason").and_then(|v| v.as_str()) {
+                record["reason"] = serde_json::Value::String(fingerprint_hosts(reason));
+            }
+        }
+    }
 }
 
 /// Fingerprint every `server_name` in an attestation list, in place.
@@ -4506,6 +4515,155 @@ mod security_tests {
         assert_eq!(sessions[0]["session_id"], "aa");
         assert_eq!(sessions[1]["notarized_at"], 2);
         assert_eq!(list["count"], 2);
+    }
+
+    /// The two public relays are one contract: the same envelope when the child
+    /// is missing or unreadable, and the same fingerprint when a host is
+    /// redacted. Nothing else pins that down, and drift here is silent — a route
+    /// that started answering a bare `{}` on 503, or redacted with a second
+    /// scheme, still looks fine in a browser.
+    #[test]
+    fn proxy_relays_share_one_redaction_and_envelope() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let read = |resp: axum::response::Response| {
+            rt.block_on(axum::body::to_bytes(resp.into_body(), 1 << 20))
+                .expect("body")
+        };
+
+        // 1. No proxy on this boot: both relays answer the same 404, so an
+        //    operator cannot get two different stories depending on the route.
+        let refusals = rt.block_on(proxy_refusals());
+        let attestations = rt.block_on(proxy_attestations());
+        assert_eq!(refusals.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(refusals.status(), attestations.status());
+        let refusals_body = read(refusals);
+        let attestations_body = read(attestations);
+        assert_eq!(
+            refusals_body, attestations_body,
+            "both relays must answer an unconfigured proxy identically"
+        );
+        let absent: serde_json::Value = serde_json::from_slice(&refusals_body).unwrap();
+        assert_eq!(absent["service"], "tls-proxy");
+        assert_eq!(absent["enabled"], false);
+
+        // 2. Every failure path answers the same envelope, and keeps its status:
+        //    the shape is what a reader parses, the code is what tells them
+        //    whether the child is down (503) or unreachable (502/500).
+        for (code, detail) in [
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "child is not running",
+            ),
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                "loopback API unreachable: connection refused",
+            ),
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "cannot build the loopback client: tls backend",
+            ),
+        ] {
+            let resp = proxy_unavailable(code, serde_json::json!(detail));
+            assert_eq!(resp.status(), code);
+            let body: serde_json::Value = serde_json::from_slice(&read(resp)).unwrap();
+            assert_eq!(body["service"], "tls-proxy");
+            assert_eq!(body["enabled"], true);
+            assert_eq!(body["running"], false);
+            assert_eq!(body["last"], detail);
+            let mut keys: Vec<&str> = body
+                .as_object()
+                .expect("object")
+                .keys()
+                .map(|k| k.as_str())
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["enabled", "last", "running", "service"]);
+        }
+
+        // 3. One fetch path serves both routes, so there is one timeout, one
+        //    JSON parse and one mapping from the child's answers to ours.
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let app = axum::Router::new()
+                .route(
+                    "/refusals",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({"refusals": []}))
+                    }),
+                )
+                .route(
+                    "/attestations",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({"count": 0, "sessions": []}))
+                    }),
+                )
+                .route(
+                    "/boom",
+                    axum::routing::get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+                );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let refusals = proxy_loopback_json("refusals", port, "/refusals")
+                .await
+                .expect("refusal ring");
+            assert_eq!(refusals["refusals"], serde_json::json!([]));
+            let attestations = proxy_loopback_json("attestations", port, "/attestations")
+                .await
+                .expect("attestation list");
+            assert_eq!(attestations["count"], 0);
+
+            let (code, detail) = proxy_loopback_json("attestations", port, "/boom")
+                .await
+                .expect_err("a failing child is an error, not a body");
+            assert_eq!(code, axum::http::StatusCode::BAD_GATEWAY);
+            assert!(detail.contains("500"), "{detail}");
+
+            // A closed port: the port is real but nothing listens on it, which
+            // is what a child that died after the liveness check looks like.
+            let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let dead_port = dead.local_addr().unwrap().port();
+            drop(dead);
+            let (code, detail) = proxy_loopback_json("refusals", dead_port, "/refusals")
+                .await
+                .expect_err("a dead child is an error");
+            assert_eq!(code, axum::http::StatusCode::BAD_GATEWAY);
+            assert!(detail.starts_with("loopback API unreachable"), "{detail}");
+
+            server.abort();
+        });
+
+        // 4. Same redaction: one host, two documents, one token.
+        let host = "api-m.sandbox.paypal.com";
+        let mut refused = serde_json::json!({
+            "refusals": [{
+                "at": 1,
+                "kind": "rejected",
+                "reason": format!("refused {host}: committed name mismatch"),
+            }]
+        });
+        redact_refusal_reasons(&mut refused);
+        let mut attested = serde_json::json!({
+            "count": 1,
+            "sessions": [{"session_id": "aa", "server_name": host, "notarized_at": 1}]
+        });
+        redact_attestation_hosts(&mut attested);
+
+        let session_token = attested["sessions"][0]["server_name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let reason = refused["refusals"][0]["reason"].as_str().unwrap();
+        assert_eq!(session_token, fingerprint_hosts(host));
+        assert!(
+            reason.contains(&session_token),
+            "both documents must show the same token for the same host: {reason}"
+        );
+        assert!(!refused.to_string().contains(host));
+        assert!(!attested.to_string().contains(host));
     }
 
     /// A record with no host (or a shape the child changed) must not panic the
