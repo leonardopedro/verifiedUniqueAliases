@@ -249,17 +249,30 @@ cmd_selftest() {
         for (const d of ((j.Disks || {}).Disk || [])) console.log("  disk:", d.Category, d.Size + "GiB", d.Type);
       '
     echo "deleting selftest box $NEWID"
-    for _ in 1 2 3 4 5; do
-      aliyun ecs DeleteInstance --RegionId "$REGION" --InstanceId "$NEWID" --Force true >/dev/null 2>&1
-      sleep 4
-      aliyun ecs DescribeInstances --RegionId "$REGION" --InstanceIds "[\"$NEWID\"]" 2>/dev/null \
+    # A box that is still `Pending` CANNOT be deleted: DeleteInstance refuses
+    # until the instance reaches a deletable state, and the refusal is the only
+    # signal (the API answers an error, not a status). The old 5x4s loop threw
+    # that error away, so a slow TDX spot cold start looked like five
+    # "state: Running" lines and left the box behind, billing. Retry over a
+    # budget longer than a cold start and say why each attempt failed.
+    local st out
+    for _ in $(seq 1 24); do
+      st=$(aliyun ecs DescribeInstances --RegionId "$REGION" --InstanceIds "[\"$NEWID\"]" 2>/dev/null \
         | node -e '
           const fs = require("fs");
-          let j; try { j = JSON.parse(fs.readFileSync(0, "utf8")); } catch (e) { console.log("  state: GONE"); process.exit(0); }
+          let j; try { j = JSON.parse(fs.readFileSync(0, "utf8")); } catch (e) { process.stdout.write("GONE"); process.exit(0); }
           const i = ((j.Instances || {}).Instance || [])[0];
-          console.log("  state:", i ? i.Status : "GONE");
-        '
+          process.stdout.write(i ? i.Status : "GONE");
+        ')
+      [ "$st" = "GONE" ] && { echo "  state: GONE"; return 0; }
+      if out=$(aliyun ecs DeleteInstance --RegionId "$REGION" --InstanceId "$NEWID" --Force true 2>&1); then
+        echo "  delete accepted ($st)"
+      else
+        echo "  delete refused ($st): $(printf '%s' "$out" | tr '\n' ' ' | head -c 160)"
+      fi
+      sleep 5
     done
+    echo "WARNING: selftest box $NEWID still exists after 120s — release it by hand" >&2
   fi
 }
 

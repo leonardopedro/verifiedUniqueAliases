@@ -1192,3 +1192,59 @@ are deliberate non-image forensic snapshots (`v172-forensic-bootprobe`,
   healing silently, and `deploy` will then bake that box's stale secrets.
 - **Deleting an image leaves a 1 GiB snapshot.** Budget for it: image cleanup without snapshot
   cleanup frees the name, not the storage.
+
+## 0.28 Sandbox e2e, prod rename, snapshot pile, and a selftest that hid its own error (2026-11-08, closing)
+
+### Sandbox e2e — both hosts pass, first attempt
+
+Run against the live notary (`LIVE_NOTARY=101.200.178.251:8443`, `cargo test --test live -- --ignored`):
+
+| Host / path | Result |
+|---|---|
+| `api-m.paypal.com/` (production API) | **pass, attempt 1, 11.7 s** |
+| `api-m.sandbox.paypal.com/` | **pass, attempt 1, 10.3 s** |
+| `www.sandbox.paypal.com/signin` | **pass, attempt 1, 11.3 s** |
+
+`/proxy/attestations` → `count:3` with three distinct `host:` fingerprints; `/proxy/health` →
+`sessions_ok:3`. The `www.sandbox.../signin` page is the one this module's header warns fails "2 of 3
+runs" on a 33 KB transcript — it passed, so the earlier flakiness is not currently reproducing.
+
+**`sessions_failed` counts aborted sockets, not lost notarisations.** A stray `failed:1` appeared and
+`/proxy/refusals` explained it exactly: `kind:"rejected", reason:"io error: commitment protocol failed
+to receive request caused by: unexpected end of file"`. Proven by experiment — opening a TCP socket to
+:8443 and closing it straight away increments `sessions_failed` and writes that same record
+(1→2). So treat that counter as "connections that never became a session"; a passing prover run can
+still leave one behind.
+
+**The 8 h clock skew is expected, not new.** The enclave answers `Date: Mon, 09 Nov 2026 07:47 GMT`
+while Cloudflare/Google/example.com all answer `23:48 GMT`. This is the documented provider clock
+(Beijing wall time read as UTC); signed report times already come from PayPal's `Date` header (R3-3),
+so only labelled fallback fields carry the skew.
+
+### Housekeeping completed
+
+- **25 orphan snapshots deleted** (0 failures). `DeleteImage` never removes the backbone snapshot, so
+  the earlier image purge had left 1 GiB behind each. What remains is exactly 7: one per live image
+  (v220, v218, v217b, v216b, v216a) plus the two forensic snapshots
+  (`paypal-v172-esp-forensic-eip-boot`, `v172-forensic-bootprobe`). Guard used for the delete: snapshot
+  name `SnapshotForImage-<image_name>` with `<image_name>` absent from the live image list.
+- **Prod renamed** `paypal-auth-vm-v209` → **`paypal-auth-vm`**, so the name-based path (FC zip,
+  `PROD_NAME`) and the tag-based path (OOS) now resolve to the same box (`i-2ze1zdxis0hcsg91qbh5`).
+
+### Watchdog selftest: proves the rebuild, and was leaking boxes
+
+`bash watchdog/deploy-oos-watchdog.sh selftest` builds a throwaway box from the live image with the
+prod spec (verified: `cloud_auto 1 GiB` system disk, `eipStatus: InUse` — it never takes the EIP) and
+then deletes it. The delete loop was broken in a way that hid itself: it retried `DeleteInstance
+--Force true` five times at 4 s intervals with the error sent to `/dev/null`. A TDX spot cold start
+takes longer than that, and the API answers **`IncorrectInstanceStatus.Initializing` while the
+instance already reports `Status: Running`** — so the loop printed five innocuous `state: Running`
+lines and left a billable box behind (one orphan had to be released by hand).
+
+Fixed: retry over 24×5 s, print the refusal, and warn loudly if the box survives 120 s. Re-run:
+creation `Success`, five `delete refused (Running): … Initializing`, then `delete accepted` →
+`state: GONE`, and the `oos-selftest` tag list is empty afterwards.
+
+**Trap:** on this platform `Status: Running` is not "ready" — `IncorrectInstanceStatus.Initializing`
+is the only signal that creation is still in progress, and it is an *error* from the mutating call,
+never a status you can poll for.
