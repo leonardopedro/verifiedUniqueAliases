@@ -1070,3 +1070,36 @@ Evidence that this is the platform, not the image:
 
 Diagnose a boot without the console via `https://login.airma.de/proxy/health`
 (`running`, `restarts`, `last`), `/proxy/refusals`, and `/debug/envelope`.
+
+---
+
+## Why the auditor's GitHub-provenance initramfs row is red (2026-11-08)
+
+The auditor looks the **measured** `EFI/BOOT/initrd.img` hash from the report's
+`disk_manifest` up in `GET /repos/…/attestations/sha256:<digest>`. For the
+currently deployed dual-service disk that hash is
+`b2789c242173ea8a032a35450a79c1b4970c9e8abbdb98e089dd2fcc0990c58f` and the API
+returns **404**, so the row reads "NO GitHub attestation exists".
+
+The pipeline itself is fine and reproducible: `bash build-tls-proxy-image.sh`
+from `HEAD` yields initramfs `8513c7ea0a62c760699a0e0995f5c174d81ca84c41eb0e80fe1d7f1f4a9e186e`
+and proxy binary `e9b157e8…`, and both digests return **3 attestations** from
+the public API — byte-identical to what CI built in run `42460523152`.
+
+The deployed disk predates `ead1d8d` ("Build the dual-service disk with
+engine-correct flags"), so its initramfs was produced by the older recipe and
+no CI run will ever attest that digest. Nothing to fix in the workflow; the
+remediation is a deploy of the current image plus a pin rotation:
+
+1. import `output-tls-proxy/disk-tls-proxy.raw`, `ReplaceSystemDisk`, start;
+2. `node scripts/calculate-golden-rtmr.mjs --report <live> --update` to rotate
+   `EXPECTED_RTMR2` (verify.html + its `index.html` mirror + README digest);
+3. rebuild the disk so the ESP copy of `verify.html` carries the new pin, then
+   import/replace again (two swaps: the pin can only be read from a boot);
+4. re-run `scripts/e2e-sandbox.mjs` and the offline auditor.
+
+Other workflow facts learned here: `build-tls-proxy.yml` must list
+`alibabacloud` (the default branch) or the image is only built on side branches,
+and an unquoted `subject-name` containing `: ` silently makes the whole workflow
+file invalid — GitHub then reports the push as a run with **zero jobs**, so no
+attestation is ever created.
