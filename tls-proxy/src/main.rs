@@ -472,20 +472,27 @@ async fn health(State(st): State<Arc<ProxyState>>) -> Json<serde_json::Value> {
     }))
 }
 
+/// Project a stored attestation down to the three fields an operator needs.
+///
+/// The signed body is **flattened** into the envelope (`Attestation` carries
+/// `#[serde(flatten)] body`), so `server_name` and `notarized_at` live at the
+/// top level of the stored value — the same place `GET /attestations/{id}`
+/// serves them from. Reading them under a `body` key instead lists every
+/// session with a null host, which is the one field an operator is looking
+/// for.
+fn summarize_session(id: &str, value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": id,
+        "server_name": value.get("server_name"),
+        "notarized_at": value.get("notarized_at"),
+    })
+}
+
 async fn list(State(st): State<Arc<ProxyState>>) -> Json<serde_json::Value> {
     let store = st.attestations.lock().unwrap();
     let sessions: Vec<serde_json::Value> = store
         .iter()
-        .map(|(id, v)| {
-            // Both live in the signed body, not at the top of the envelope;
-            // a plain `get` here listed every session with a null host, which
-            // is the one field an operator is looking for.
-            serde_json::json!({
-                "session_id": id,
-                "server_name": v.pointer("/body/server_name"),
-                "notarized_at": v.pointer("/body/notarized_at"),
-            })
-        })
+        .map(|(id, v)| summarize_session(id, v))
         .collect();
     Json(serde_json::json!({
         "count": sessions.len(),
@@ -630,4 +637,51 @@ async fn main() -> Result<(), BoxError> {
     }
     http_task.abort();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The envelope `record_attestation` stores and `GET /attestations/{id}`
+    /// serves: signed fields flattened to the top level beside the signature.
+    fn stored_envelope(server_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "version": "tls-proxy/1",
+            "session_id": "aa",
+            "server_name": server_name,
+            "notarized_at": 1_790_000_000u64,
+            "sent_len": 107,
+            "received_len": 3429,
+            "sent_sha256": "00",
+            "received_sha256": "00",
+            "sent_b64": "",
+            "received_b64": "",
+            "truncated": false,
+            "enclave_pubkey_pem": "pem",
+            "signature_alg": "RSA-PKCS1-v1_5-SHA256",
+            "signature_b64": "sig",
+        })
+    }
+
+    #[test]
+    fn list_projection_reports_the_committed_host() {
+        let row = summarize_session("aa", &stored_envelope("www.sandbox.paypal.com"));
+        assert_eq!(row["session_id"], "aa");
+        assert_eq!(row["server_name"], "www.sandbox.paypal.com");
+        assert_eq!(row["notarized_at"], 1_790_000_000u64);
+        // The projection is the operator's index, not evidence: no transcript
+        // bytes, no signature, no key.
+        assert_eq!(row.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn list_projection_tolerates_a_record_without_a_host() {
+        let mut envelope = stored_envelope("");
+        envelope.as_object_mut().unwrap().remove("server_name");
+        let row = summarize_session("bb", &envelope);
+        assert_eq!(row["session_id"], "bb");
+        assert!(row["server_name"].is_null());
+        assert_eq!(row["notarized_at"], 1_790_000_000u64);
+    }
 }
