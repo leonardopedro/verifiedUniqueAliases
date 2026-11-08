@@ -86,8 +86,25 @@ fn der_to_pem(der: &[u8]) -> String {
 /// A bare HTTP/1.1 GET with `Connection: close`, read to EOF. The API is
 /// loopback-only and returns small JSON, so a client library would be noise.
 async fn http_get(port: u16, path: &str) -> Result<(u16, String), Box<dyn std::error::Error>> {
+    http_send("GET", port, path).await
+}
+
+/// `POST` with no body: the drain endpoint takes no arguments, and a body would
+/// only give the axum extractor something to reject.
+async fn http_post(port: u16, path: &str) -> Result<(u16, String), Box<dyn std::error::Error>> {
+    http_send("POST", port, path).await
+}
+
+async fn http_send(
+    method: &str,
+    port: u16,
+    path: &str,
+) -> Result<(u16, String), Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
-    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\
+         Connection: close\r\n\r\n"
+    );
     stream.write_all(req.as_bytes()).await?;
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).await?;
@@ -687,4 +704,86 @@ fn refuses_to_start_without_a_ca_bundle() {
         stderr.contains("cannot read the CA bundle"),
         "the failure must name the missing bundle, got: {stderr}"
     );
+}
+
+/// A shutdown must take no new work but must not throw away the record.
+///
+/// Powering off with a notarisation in flight destroys the prover's transcript
+/// mid-handshake, and nothing tells them why. So the drain does two things at
+/// once: refuse new sessions (so the count can actually reach zero) and leave
+/// the sessions already recorded untouched (so a stop does not look like a
+/// notary that forgot what it proved). This drives the real binary: the flag
+/// only exists behind the loopback API, and the refusal is only observable on
+/// the session port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_refuses_new_sessions_and_keeps_the_record(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _serial = SERIAL.lock().await;
+    let fixture_port = start_fixture().await;
+    let target = format!("127.0.0.1:{fixture_port}");
+    let proxy = Proxy::start(&[("TLS_PROXY_TARGET_ADDR", target.as_str())]).await;
+
+    // One completed session first: this is the work a drain must preserve.
+    let socket = TcpStream::connect(("127.0.0.1", proxy.session_port)).await?;
+    prover(socket).await?;
+    let mut recorded = 0;
+    for _ in 0..100 {
+        let (_, body) = http_get(proxy.api_port, "/attestations").await?;
+        let list: serde_json::Value = serde_json::from_str(&body)?;
+        recorded = list["count"].as_u64().unwrap_or(0);
+        if recorded == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(recorded, 1, "the session should be recorded before draining");
+
+    // Idle drain: accepted, and it says nothing is in flight — the number the
+    // enclave waits on before it powers the machine off.
+    let (status, body) = http_post(proxy.api_port, "/drain").await?;
+    assert_eq!(status, 200, "{body}");
+    let drained: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(drained["draining"], true, "{body}");
+    assert_eq!(drained["active_sessions"], 0, "{body}");
+
+    // Repeating it is harmless: a second power-button press must not undo the
+    // drain or resurrect work.
+    let (status, body) = http_post(proxy.api_port, "/drain").await?;
+    assert_eq!(status, 200, "{body}");
+
+    // A late prover gets the connection closed instead of a notarisation.
+    let mut late = TcpStream::connect(("127.0.0.1", proxy.session_port)).await?;
+    let mut buf = [0u8; 32];
+    match tokio::time::timeout(Duration::from_secs(5), late.read(&mut buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        other => panic!("a drained proxy must close a new session, got {other:?}"),
+    }
+
+    // The refusal is on the ring, so an operator can see why their session
+    // never started.
+    let refusals = proxy.refusals().await;
+    let last = refusals["refusals"]
+        .as_array()
+        .and_then(|r| r.last())
+        .cloned()
+        .expect("a refusal should be recorded");
+    assert_eq!(last["kind"], "draining", "{refusals}");
+    assert!(
+        last["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("shutdown requested"),
+        "{refusals}"
+    );
+
+    // And the earlier attestation survived the drain: the record is the point.
+    let health = proxy.health().await;
+    assert_eq!(health["draining"], true, "{health}");
+    assert_eq!(health["active_sessions"], 0, "{health}");
+    assert_eq!(health["sessions_ok"], 1, "{health}");
+    let (status, body) = http_get(proxy.api_port, "/attestations").await?;
+    assert_eq!(status, 200, "{body}");
+    let list: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(list["count"], 1, "a drain must not discard the record: {body}");
+    Ok(())
 }

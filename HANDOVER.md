@@ -1078,3 +1078,59 @@ operator passed `--ForceStop true`. Root cause was two-fold and neither half exi
 - **One sample.** 43 s is a single observation, not a distribution; the pre-fix 260 s was also a single observation.
 - **No local reproduction.** This host has no `qemu-system-x86_64`, so the input gate is covered by the two unit tests and by the live hypervisor stop, not by a synthetic button press.
 - **SIGTERM path is untested live.** The ACPI press is what the hypervisor sent; the signal handler is unit-reachable only, since nothing in the boot chain sends PID 1 a SIGTERM today.
+
+## 0.26 v220 — a stop now drains in-flight sessions, and the drain itself had a bug (2026-11-08, later still)
+
+### What the drain does
+
+A notarisation in flight holds the prover's transcript and the proof of which host it came
+from. Powering off through it destroys work the prover cannot recreate and gives them no
+answer that says why. v220 makes the stop wait instead:
+
+| Piece | Where | Behaviour |
+|---|---|---|
+| `active_sessions` counter | proxy | Incremented on accept, decremented by the session task itself, so no session slips between accept and spawn |
+| `POST /drain` | proxy loopback API | Sets `draining`; **refuses new sessions** (logged on the refusal ring as `kind:"draining"`), leaves running ones untouched, returns the in-flight count |
+| `drain_step()` | enclave | Pure gate: `Done` at 0, `Wait` under budget, `GiveUp(n)` at the budget |
+| `DRAIN_BUDGET = 120 s` | enclave | Equal to the proxy's own `TLS_PROXY_SESSION_TIMEOUT`: a session that outlives it is already dead, and it stays well inside the platform's ~260 s stop window |
+| `shutdown_worker` | enclave | The single path from "requested" to "off" for both the power button and SIGTERM; the signal handler only stores a flag (async-signal-safe) |
+| `shutdown_watchdog` | enclave | Budget + 15 s hard stop, so a wedged or panicked drain can never leave the instance in `Stopping` |
+| `/proxy/health` | enclave | Now relays `active_sessions`, `draining`, `sessions_ok/failed` — the stop is observable from outside while the instance is `Stopping` |
+
+### The bug this cycle found on the hypervisor
+
+**v219's first graceful stop hung for 7+ minutes in `Stopping` and needed `--ForceStop`.** The
+drain ran on a `current_thread` runtime built with `.enable_time()` only; with the IO driver
+disabled, tokio's `TcpStream` panics (`A Tokio 1.x context was found, but IO is disabled`), the
+worker thread died, and nothing ever called `reboot(RB_POWER_OFF)`. `GetInstanceConsoleOutput`
+returns empty on this instance type, so the only symptom was a stuck status.
+
+Fixed by `drain_runtime()` → `.enable_all()`, pinned by
+`the_drain_runtime_can_reach_the_loopback_api`, which uses the **production** builder — flipping
+it back to `enable_time()` fails the test with exactly that panic (verified, then reverted).
+
+### Measurements (live, v220, `m-2ze7c8jev53ikz43ybj8`)
+
+| Scenario | Result |
+|---|---|
+| Idle graceful stop ×5 | **42, 42, 42, 43, 41 s** — the 43 s in §0.25 was not a one-off |
+| Boot to `/proxy/health` 200 | 48–54 s, every cycle |
+| Session held open, stop requested | Instance sat in `Stopping` with `active_sessions:1`; at **t+35 s** the press arrived and it reported **`draining:true` with `active_sessions:1`** — no cut |
+| Same, session held 20 s *after* the drain began | Stayed `Stopping` with `a:1 d:true` from **t+35 to t+55**; released at t+55 → **Stopped at t+71** (drain + shutdown), only after the count reached 0 |
+
+The press arrives **~27–35 s** after `StopInstance` is called (`d:false` until then), so an idle
+42 s stop is roughly 27 s of hypervisor latency plus ~15 s of shutdown — not 42 s of drain.
+
+| Item | Value |
+|---|---|
+| Image / disk | **`m-2ze7c8jev53ikz43ybj8`** (`paypal-tdx-esp-v220-202611082314`, UEFI, NVMe supported) / prod disk **`d-2ze7tjfd7n1dyg57s51y`** |
+| Build lineage | disk md5 `6e095794e9e1c51e369cd2354edb56c9` (55,574,528 B, sha256 `58472d70…`), initramfs `8fa3f088…`, enclave `/init` `a729c82753a8691e60bba17d46f7fb73add2d5942383fd570e24425d89ac9cb7`, proxy bin `2148b101…` |
+| Pins rotated | `EXPECTED_RTMR2` `d35d2633…` → **`44cfbca3c83ad95c…`**; `EXPECTED_ENCLAVE_SHA256` `cb94953e…` → **`a729c827…`** (verify.html **and** index.html); README `verify.html` digest → `8eb0ec0c…`. MRTD/RTMR0/1/3 unchanged. |
+| Tests | enclave **40 passed** (drain gate ×2, drain runtime ×1); tls-proxy 2 unit + **7 integration**, including `drain_refuses_new_sessions_and_keeps_the_record` |
+| `user_data` | re-pushed after the swap; readback equals the file minus the trailing newline (`len 5972`, sha `880ec5f9…`) |
+| Superseded | v219 `m-2zebw9kc74cbersuejq2` (never served a session; kept as the record of the hang) |
+
+**Traps:**
+- **`enable_time()` is not enough for any runtime that talks to the network.** The panic is inside tokio's `TcpStream`, far from the builder line.
+- **No console on this instance type.** `GetInstanceConsoleOutput` is empty, so a wedged PID 1 is invisible; the fix has to be measured from outside (`/proxy/health`) and guarded in-process (watchdog).
+- **A "mid-session" test can silently not be one.** The first attempt released the socket at t+15, before the press arrived at t+27, so it measured another idle stop. Gate the release on observing `draining:true` *with* `active_sessions:1`.

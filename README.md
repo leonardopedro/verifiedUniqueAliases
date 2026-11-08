@@ -96,7 +96,7 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 265,825 bytes | `d02f7cabedd399e46c3c8cf013154d80aa25c9f38856b3edbb6baef249fccfe8` |
+| `verify.html` | 265,825 bytes | `8eb0ec0cb941e76b79a0d1f38635f20ba658d1ed868af745a137a46972116474` |
 | `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
 | `zk-rsa.html` | 100,001 bytes | `a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40` |
 | `privacy.html` | 4,673 bytes | `e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8` |
@@ -104,7 +104,7 @@ the file it describes:
 
 ```bash
 sha256sum verify.html zk.html zk-rsa.html privacy.html terms.html
-# d02f7cabedd399e46c3c8cf013154d80aa25c9f38856b3edbb6baef249fccfe8  verify.html
+# 8eb0ec0cb941e76b79a0d1f38635f20ba658d1ed868af745a137a46972116474  verify.html
 # 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
 # a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40  zk-rsa.html
 # e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8  privacy.html

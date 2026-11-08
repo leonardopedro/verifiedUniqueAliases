@@ -26,7 +26,8 @@
 //!   TCP  TLS_PROXY_LISTEN        (default 0.0.0.0:8443) one TLSNotary session
 //!                                per accepted connection
 //!   HTTP TLS_PROXY_HTTP_LISTEN   (default 127.0.0.1:8081, loopback only)
-//!        GET /health             counters + whether this process is live
+//!        GET  /health            counters, in-flight sessions, drain state
+//!        POST /drain             stop accepting sessions; let running ones finish
 //!        GET /attestations       ids, server names, timestamps
 //!        GET /attestations/{id}  the signed attestation
 //!        GET /refusals           why recent sessions were refused (bounded)
@@ -46,7 +47,7 @@ use std::{
     collections::VecDeque,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -55,7 +56,7 @@ use std::{
 use axum::{
     extract::{Path as AxumPath, State},
     http::StatusCode,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use base64::Engine as _;
@@ -189,6 +190,13 @@ struct ProxyState {
     sessions_total: AtomicU64,
     sessions_ok: AtomicU64,
     sessions_failed: AtomicU64,
+    /// Sessions accepted and not yet finished. A shutdown waits for this to
+    /// reach zero before powering off, so this counter is the difference
+    /// between a drain and a cut.
+    active_sessions: AtomicU64,
+    /// Set by `POST /drain`. New sessions are refused; running ones are not
+    /// touched. The process keeps serving its record while draining.
+    draining: AtomicBool,
     /// Newest last; bounded by MAX_STORED_ATTESTATIONS.
     attestations: Mutex<VecDeque<(String, serde_json::Value)>>,
     /// Newest last; bounded by MAX_STORED_REFUSALS.
@@ -467,8 +475,30 @@ async fn health(State(st): State<Arc<ProxyState>>) -> Json<serde_json::Value> {
         "sessions_total": st.sessions_total.load(Ordering::Relaxed),
         "sessions_ok": st.sessions_ok.load(Ordering::Relaxed),
         "sessions_failed": st.sessions_failed.load(Ordering::Relaxed),
+        "active_sessions": st.active_sessions.load(Ordering::Relaxed),
+        "draining": st.draining.load(Ordering::Relaxed),
         "attestations": st.attestations.lock().unwrap().len(),
         "refusals": st.refusals.lock().unwrap().len(),
+    }))
+}
+
+/// `POST /drain` — begin a graceful stop.
+///
+/// New sessions are refused from here on; sessions already accepted keep
+/// running and their attestations are still recorded. Nothing in this handler
+/// aborts a notarisation: a session in flight holds the prover's transcript and
+/// their proof that the bytes came from the host, which is not recoverable if
+/// it is cut mid-handshake.
+///
+/// The answer carries the current in-flight count, which is what the caller
+/// waits on. Repeating the call is harmless and returns the current count.
+async fn drain(State(st): State<Arc<ProxyState>>) -> Json<serde_json::Value> {
+    st.draining.store(true, Ordering::SeqCst);
+    let active = st.active_sessions.load(Ordering::SeqCst);
+    info!("drain: refusing new sessions, {active} in flight");
+    Json(serde_json::json!({
+        "draining": true,
+        "active_sessions": active,
     }))
 }
 
@@ -590,12 +620,15 @@ async fn main() -> Result<(), BoxError> {
         sessions_total: AtomicU64::new(0),
         sessions_ok: AtomicU64::new(0),
         sessions_failed: AtomicU64::new(0),
+        active_sessions: AtomicU64::new(0),
+        draining: AtomicBool::new(false),
         attestations: Mutex::new(VecDeque::new()),
         refusals: Mutex::new(VecDeque::new()),
     });
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/drain", post(drain))
         .route("/attestations", get(list))
         .route("/attestations/{id}", get(get_one))
         .route("/refusals", get(refusals))
@@ -625,7 +658,23 @@ async fn main() -> Result<(), BoxError> {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
                 let st = state.clone();
-                in_flight.spawn(async move { handle_session(stream, peer, st).await });
+                // After a drain request the listener stays bound (the record is
+                // still served) but takes no new work: the prover sees the
+                // connection close before any handshake bytes are spent, and
+                // the reason is on the loopback refusal ring.
+                if st.draining.load(Ordering::SeqCst) {
+                    st.remember_refusal("draining", "shutdown requested: new session refused".into());
+                    drop(stream);
+                    continue;
+                }
+                // Counted before the spawn and decremented by the task itself,
+                // so the count never misses a session that is between accept
+                // and spawn.
+                st.active_sessions.fetch_add(1, Ordering::SeqCst);
+                in_flight.spawn(async move {
+                    handle_session(stream, peer, st.clone()).await;
+                    st.active_sessions.fetch_sub(1, Ordering::SeqCst);
+                });
             }
             // Reap finished sessions so the set does not grow with uptime.
             Some(_) = in_flight.join_next(), if !in_flight.is_empty() => {}

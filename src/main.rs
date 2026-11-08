@@ -11,6 +11,8 @@ mod enclave_init {
     use socket2::{Domain, Protocol, Socket, Type};
     use std::net::Ipv4Addr;
     use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     pub fn kmsg(msg: &str) {
         if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
@@ -63,6 +65,44 @@ mod enclave_init {
         modprobe("evdev");
     }
 
+    /// Set by the SIGTERM handler: the handler itself may do nothing else.
+    static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+    /// Why the shutdown started, recorded for the log line the operator reads.
+    /// Never written from signal context.
+    static SHUTDOWN_REASON: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    /// How long a graceful stop waits for sessions already in flight.
+    ///
+    /// Equal to the proxy's default idle budget for one session
+    /// (`TLS_PROXY_SESSION_TIMEOUT`, 120 s): a notarisation that outlives its
+    /// own timeout is already dead, so waiting longer cannot save it. It also
+    /// stays well inside the platform's stop window — the pre-fix instance sat
+    /// in `Stopping` for 260 s before the platform force-stopped it.
+    pub const DRAIN_BUDGET: Duration = Duration::from_secs(120);
+
+    /// What the drain loop should do next, kept pure so it can be tested
+    /// without an HTTP client, a proxy child, or a clock.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum DrainStep {
+        /// Nothing in flight: the machine can power off.
+        Done,
+        /// Sessions still running, budget left: keep waiting.
+        Wait,
+        /// Budget spent with this many sessions still running: power off anyway
+        /// and say so, rather than hold the instance open forever.
+        GiveUp(u64),
+    }
+
+    pub fn drain_step(active: u64, waited: Duration, budget: Duration) -> DrainStep {
+        if active == 0 {
+            DrainStep::Done
+        } else if waited >= budget {
+            DrainStep::GiveUp(active)
+        } else {
+            DrainStep::Wait
+        }
+    }
+
     /// Watch for the hypervisor's shutdown request and honour it.
     ///
     /// Nothing here existed before: this process is PID 1, `poweroff()` in this
@@ -73,18 +113,180 @@ mod enclave_init {
     pub fn arm_shutdown_handling() {
         unsafe {
             // SIGTERM is what a container runtime or an init-style stop sends;
-            // PID 1 ignores it by default, so today a stop request that used
-            // this signal was silently discarded.
+            // PID 1 ignores it by default, so a stop request that used this
+            // signal was silently discarded.
             libc::signal(libc::SIGTERM, shutdown_on_signal as libc::sighandler_t);
         }
         std::thread::spawn(watch_power_button);
-        kmsg("shutdown handling armed (ACPI power button + SIGTERM)");
+        std::thread::spawn(shutdown_worker);
+        std::thread::spawn(shutdown_watchdog);
+        kmsg("shutdown handling armed (ACPI power button + SIGTERM, drains sessions)");
+    }
+
+    /// Ask for a shutdown from a context that may allocate and log.
+    ///
+    /// Idempotent: the second and later requests are ignored, so a power-button
+    /// press arriving while a drain is already running cannot restart it or
+    /// reset the budget.
+    pub fn request_shutdown(reason: &str) {
+        if SHUTDOWN_REQUESTED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        *SHUTDOWN_REASON.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason.to_string());
+        kmsg(&format!("shutdown requested: {reason}"));
     }
 
     extern "C" fn shutdown_on_signal(_sig: libc::c_int) {
-        // Async-signal-safe by construction: one syscall, no allocation, no
+        // Async-signal-safe by construction: one store, no allocation, no
         // logging through stdio on a console that may have stopped draining.
-        power_off_now();
+        // The worker does the drain and the syscall.
+        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    }
+
+    /// The single path from "shutdown requested" to the machine being off.
+    ///
+    /// Both the power button and SIGTERM set the flag; this thread is what
+    /// drains, logs, and powers off, so there is exactly one place where a
+    /// shutdown can go wrong.
+    fn shutdown_worker() {
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+            if !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                continue;
+            }
+            let reason = SHUTDOWN_REASON
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .unwrap_or_else(|| "SIGTERM".to_string());
+            drain_then_power_off(&reason);
+        }
+    }
+
+    /// The runtime the drain runs on.
+    ///
+    /// **`enable_all()`, not `enable_time()`**: the drain calls the proxy's
+    /// loopback API, and with the IO driver disabled the connect never
+    /// completes — the worker parks forever and the hypervisor sits in
+    /// `Stopping` with no console to say why. That is not hypothetical: it is
+    /// exactly what v219 did on its first graceful stop, which then needed a
+    /// force-stop. Pinned by `the_drain_runtime_can_reach_the_loopback_api`.
+    pub(crate) fn drain_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+    }
+
+    /// Last line of defence: if the drain worker itself wedges or panics, the
+    /// machine still must not sit in `Stopping` forever.
+    ///
+    /// The budget is the drain budget plus a grace period, so this only fires
+    /// when the normal path has already failed — the process exiting without
+    /// releasing the instance is the failure mode that costs an operator a
+    /// force-stop and tells them nothing.
+    fn shutdown_watchdog() {
+        let deadline = Duration::from_secs(DRAIN_BUDGET.as_secs() + 15);
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                continue;
+            }
+            let started = Instant::now();
+            while started.elapsed() < deadline {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            kmsg("shutdown watchdog: the drain did not finish, powering off anyway");
+            power_off_now();
+        }
+    }
+
+    /// Let in-flight notarised sessions finish, then power off.
+    ///
+    /// A notarisation in flight holds the prover's transcript and the proof of
+    /// which host it came from; cutting it at power-off discards work the prover
+    /// cannot recover, and the prover gets no answer that explains why. So the
+    /// proxy is told to take no new sessions and this waits for the count to
+    /// reach zero, bounded by [`DRAIN_BUDGET`] so a wedged session cannot pin the
+    /// instance open.
+    fn drain_then_power_off(reason: &str) -> ! {
+        let api_port = crate::PROXY_SUPERVISOR.get().map(|sup| sup.api_port);
+        let Some(api_port) = api_port else {
+            kmsg(&format!("shutdown ({reason}): no proxy child yet, powering off"));
+            power_off_now();
+        };
+
+        let rt = match drain_runtime() {
+            Ok(rt) => rt,
+            Err(e) => {
+                kmsg(&format!("shutdown ({reason}): no drain runtime ({e}), powering off"));
+                power_off_now();
+            }
+        };
+
+        let started = Instant::now();
+        let active = match rt.block_on(crate::proxy_loopback_call(
+            "drain",
+            api_port,
+            reqwest::Method::POST,
+            "/drain",
+        )) {
+            Ok(value) => {
+                kmsg(&format!(
+                    "drain ({reason}): proxy accepts no new sessions, {} in flight",
+                    value
+                        .get("active_sessions")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                ));
+                value
+                    .get("active_sessions")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+            }
+            Err((_, detail)) => {
+                // No proxy to drain: nothing can be in flight through it.
+                kmsg(&format!("drain ({reason}): proxy unreachable ({detail}), powering off"));
+                power_off_now();
+            }
+        };
+
+        let mut remaining = active;
+        loop {
+            match drain_step(remaining, started.elapsed(), DRAIN_BUDGET) {
+                DrainStep::Done => {
+                    kmsg(&format!(
+                        "drain ({reason}): no sessions in flight, powering off after {}s",
+                        started.elapsed().as_secs()
+                    ));
+                    power_off_now();
+                }
+                DrainStep::GiveUp(stuck) => {
+                    kmsg(&format!(
+                        "drain ({reason}): budget of {}s spent with {stuck} still in flight, \
+                         powering off (those sessions are lost)",
+                        DRAIN_BUDGET.as_secs()
+                    ));
+                    power_off_now();
+                }
+                DrainStep::Wait => {}
+            }
+            std::thread::sleep(Duration::from_millis(250));
+            // The health answer is authoritative: a session that finished
+            // between polls shows up as a lower count, and an unreachable API
+            // means the child is gone and nothing is in flight.
+            remaining = match rt.block_on(crate::proxy_loopback_call(
+                "drain",
+                api_port,
+                reqwest::Method::GET,
+                "/health",
+            )) {
+                Ok(value) => value
+                    .get("active_sessions")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                Err(_) => 0,
+            };
+        }
     }
 
     /// Power the machine off for real. Deliberately distinct from `poweroff()`,
@@ -168,8 +370,7 @@ mod enclave_init {
                     while pending.len() >= INPUT_EVENT_LEN {
                         let frame: Vec<u8> = pending.drain(..INPUT_EVENT_LEN).collect();
                         if is_power_press(&frame) {
-                            kmsg("ACPI power button pressed: powering off");
-                            power_off_now();
+                            request_shutdown("ACPI power button pressed");
                         }
                         frames += 1;
                         if frames > 256 {
@@ -3768,19 +3969,43 @@ fn spawn_tls_proxy(cfg: &TlsProxyConfig) -> Arc<ProxySupervisor> {
 async fn proxy_health() -> axum::response::Response {
     use axum::response::IntoResponse;
     match PROXY_SUPERVISOR.get() {
-        Some(sup) => (
-            axum::http::StatusCode::OK,
-            axum::Json(serde_json::json!({
-                "service": "tls-proxy",
-                "enabled": true,
-                "running": sup.alive.load(Ordering::Relaxed),
-                "session_port": sup.session_port,
-                "api_port": sup.api_port,
-                "restarts": sup.restarts.load(Ordering::Relaxed),
-                "last": sup.last.read().clone(),
-            })),
-        )
-            .into_response(),
+        Some(sup) => {
+            let running = sup.alive.load(Ordering::Relaxed);
+            // Only the child knows what is in flight, and during a shutdown that
+            // is the number worth watching: it is what the drain waits on. Best
+            // effort — a dead child reports `null`, not a failure of this route,
+            // which must stay answerable precisely when things are going wrong.
+            let child = if running {
+                proxy_loopback_json("health", sup.api_port, "/health")
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            let field = |name: &str| {
+                child
+                    .as_ref()
+                    .and_then(|v| v.get(name).cloned())
+                    .unwrap_or(serde_json::Value::Null)
+            };
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "service": "tls-proxy",
+                    "enabled": true,
+                    "running": running,
+                    "session_port": sup.session_port,
+                    "api_port": sup.api_port,
+                    "restarts": sup.restarts.load(Ordering::Relaxed),
+                    "last": sup.last.read().clone(),
+                    "active_sessions": field("active_sessions"),
+                    "draining": field("draining"),
+                    "sessions_ok": field("sessions_ok"),
+                    "sessions_failed": field("sessions_failed"),
+                })),
+            )
+                .into_response()
+        }
         None => (
             axum::http::StatusCode::NOT_FOUND,
             axum::Json(serde_json::json!({"service": "tls-proxy", "enabled": false})),
@@ -3919,6 +4144,20 @@ async fn proxy_loopback_json(
     api_port: u16,
     path: &str,
 ) -> Result<serde_json::Value, (axum::http::StatusCode, String)> {
+    proxy_loopback_call(what, api_port, reqwest::Method::GET, path).await
+}
+
+/// One call to the child's loopback API, any method.
+///
+/// Split out because the shutdown drain needs `POST /drain` while the public
+/// relay routes need `GET`: the drain is a state change and must not be
+/// reachable by anything that can merely fetch a page.
+async fn proxy_loopback_call(
+    what: &str,
+    api_port: u16,
+    method: reqwest::Method,
+    path: &str,
+) -> Result<serde_json::Value, (axum::http::StatusCode, String)> {
     let url = format!("http://127.0.0.1:{api_port}{path}");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(4))
@@ -3930,7 +4169,7 @@ async fn proxy_loopback_json(
                 format!("cannot build the loopback client: {e}"),
             )
         })?;
-    let resp = client.get(&url).send().await.map_err(|e| {
+    let resp = client.request(method, &url).send().await.map_err(|e| {
         warn!("proxy {what}: loopback API unreachable: {e}");
         (
             axum::http::StatusCode::BAD_GATEWAY,
@@ -4533,6 +4772,101 @@ mod security_tests {
         }
         // A partial frame is not an event at all.
         assert!(!enclave_init::is_power_press(&[0u8; 23]));
+    }
+
+    #[test]
+    fn a_drain_waits_for_the_last_session_and_then_stops() {
+        use enclave_init::{drain_step, DrainStep, DRAIN_BUDGET};
+        use std::time::Duration;
+
+        // Idle: power off at once, no waiting at all.
+        assert_eq!(
+            drain_step(0, Duration::ZERO, DRAIN_BUDGET),
+            DrainStep::Done
+        );
+        // One session in flight and budget left: keep waiting, do not cut it.
+        assert_eq!(
+            drain_step(1, Duration::from_secs(5), DRAIN_BUDGET),
+            DrainStep::Wait
+        );
+        // The last session finishing mid-drain is the point of the exercise:
+        // the next poll sees zero and powers off.
+        assert_eq!(
+            drain_step(0, Duration::from_secs(5), DRAIN_BUDGET),
+            DrainStep::Done
+        );
+    }
+
+    /// A wedged session must not pin the instance open: the budget ends the wait
+    /// and says how many sessions it abandoned.
+    #[test]
+    fn a_stuck_session_ends_the_drain_at_the_budget() {
+        use enclave_init::{drain_step, DrainStep, DRAIN_BUDGET};
+        use std::time::Duration;
+
+        assert_eq!(
+            drain_step(2, DRAIN_BUDGET, DRAIN_BUDGET),
+            DrainStep::GiveUp(2)
+        );
+        assert_eq!(
+            drain_step(1, DRAIN_BUDGET + Duration::from_secs(1), DRAIN_BUDGET),
+            DrainStep::GiveUp(1)
+        );
+        // The budget is the proxy's own session timeout, so a session that
+        // survives it is already dead rather than merely slow.
+        assert_eq!(DRAIN_BUDGET, Duration::from_secs(120));
+    }
+
+    /// A whole graceful stop hung on this once: the drain runs on its own
+    /// current-thread runtime, and that runtime was built with `enable_time()`
+    /// only. The HTTP client then has no IO driver, the connect never completes,
+    /// the worker parks, and the instance sits in `Stopping` until an operator
+    /// force-stops it — with no console to say why. This test uses the
+    /// production builder, so narrowing it back to timers fails here instead of
+    /// on a hypervisor.
+    #[test]
+    fn the_drain_runtime_can_reach_the_loopback_api() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback server");
+        listener.set_nonblocking(true).expect("non-blocking accept");
+        let port = listener.local_addr().expect("address").port();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 1024];
+                        let _ = stream.read(&mut buf);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        );
+                        return;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        });
+
+        let rt = enclave_init::drain_runtime().expect("the drain runtime builds");
+        let answered = rt.block_on(async move {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .expect("build a client");
+            client
+                .get(format!("http://127.0.0.1:{port}/health"))
+                .send()
+                .await
+                .is_ok()
+        });
+        let _ = server.join();
+        assert!(
+            answered,
+            "the drain runtime must be able to reach the loopback API"
+        );
     }
 
     /// Relay targets are the proxy's egress boundary, and they are optional:
