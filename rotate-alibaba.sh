@@ -423,6 +423,7 @@ phase_verify() {
     if [[ $DRY_RUN == 1 ]]; then
         say "   [dry-run] would poll $PROD_URL for 200, compare /debug/envelope binary_sha256 to $BIN_SHA,"
         say "   [dry-run] then run: node scripts/check-manifest-parity.mjs $PROD_URL $DISK_FILE"
+        say "   [dry-run] then run: node scripts/check-live-tls-cert.mjs --url $PROD_URL"
         return 0
     fi
 
@@ -450,6 +451,15 @@ phase_verify() {
     printf '%s\n' "$parity" | grep -E 'SAME|EXCLUDED|RESULT' | tail -10
     printf '%s\n' "$parity" | grep -q 'PARITY OK' || die "parity checker did not report PARITY OK"
     ok "deployed ESP == $DISK_FILE"
+
+    # v227 made /tls-cert.pem the visitor's proof of the channel, so the served
+    # body, the live handshake and session_context.tls_certificate_pem must all
+    # be the same leaf. A proxy or a stale report copy breaks it silently.
+    local certchk
+    certchk=$(node scripts/check-live-tls-cert.mjs --url "$PROD_URL" 2>&1) || {
+        printf '%s\n' "$certchk" | tail -20; die "live TLS certificate binding failed"; }
+    printf '%s\n' "$certchk" | grep -E '✅|❌|RESULT' | tail -10
+    ok "certificate download == live handshake == report"
 }
 
 # ── run ──────────────────────────────────────────────────────────────────────

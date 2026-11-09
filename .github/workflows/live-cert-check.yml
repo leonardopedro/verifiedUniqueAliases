@@ -1,0 +1,42 @@
+# Live TLS certificate binding check (v227/v228)
+#
+# The landing tells a visitor to compare the certificate saved from
+# /tls-cert.pem with the padlock in their browser, and the attestation report
+# names the same PEM. Three bytes must be identical: the download, the leaf the
+# handshake presented, and session_context.tls_certificate_pem. A TLS proxy in
+# front of the enclave, or a report built before the certificate was loaded,
+# breaks that silently — this job is the only thing that notices.
+#
+# It runs against the deployed service, not a build, so it is scheduled rather
+# than tied to a commit: a failing run means "production is lying about its own
+# channel", which no build-time test can observe.
+name: live-tls-cert
+
+on:
+  schedule:
+    # Daily, off the hour so it does not collide with the image builds.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Enclave base URL to check"
+        required: false
+        default: "https://login.airma.de"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Compare download, handshake leaf and report certificate
+        env:
+          TARGET_URL: ${{ github.event.inputs.url || 'https://login.airma.de' }}
+        run: node scripts/check-live-tls-cert.mjs --url "$TARGET_URL"

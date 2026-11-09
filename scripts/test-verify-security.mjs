@@ -91,6 +91,11 @@ globalThis.fetch = async () => {
 // and stash win any name overlap). zk-rsa.html loads last (zkRsa-prefixed,
 // no overlaps by construction).
 (0, eval)(script);
+// zk.html is a SEPARATE page with its own copy of the auditor-isolation gate
+// (it is served from its own origin), so it re-defines trustedAuditorContext
+// when it is eval'ed below. Keep a reference to the AUDITOR's gate — the one
+// this file is about — or the tests silently exercise zk.html's rule instead.
+const auditorTrustedContext = globalThis.trustedAuditorContext;
 (0, eval)(zkScript);
 (0, eval)(zkRsaScript);
 
@@ -1469,7 +1474,7 @@ console.log('\nTest 24: auditor isolation — key generation refused outside fil
   const setLoc = (loc) => { if (loc === null) delete globalThis.location; else globalThis.location = loc; };
   const el = (id) => document.getElementById(id);
   setLoc({ protocol: 'https:', host: 'login.airma.de', origin: 'https://login.airma.de' });
-  check('enclave-origin copy is untrusted', trustedAuditorContext() === false);
+  check('enclave-origin copy is untrusted', auditorTrustedContext() === false);
   el('localEnclaveHost').value = 'https://login.airma.de';
   await executePreflightAndLogin('verified');
   check('secure-login refuses on the enclave origin',
@@ -1487,11 +1492,14 @@ console.log('\nTest 24: auditor isolation — key generation refused outside fil
   check('key notice announces the refusal on-page',
     /NO KEY GENERATED HERE/.test(el('keyNotice').innerText), el('keyNotice').innerText.slice(0, 120));
   setLoc({ protocol: 'file:', host: '', origin: 'null' });
-  check('file:// copy is trusted', trustedAuditorContext() === true);
+  check('file:// copy is trusted', auditorTrustedContext() === true);
   setLoc({ protocol: 'https:', host: 'leonardopedro.github.io', origin: 'https://leonardopedro.github.io' });
-  check('GitHub Pages copy is trusted', trustedAuditorContext() === true);
+  // v227: Pages was the recommended auditor copy until the landing stopped
+  // offering it. It is a mirror the owner can republish, so it is untrusted
+  // like any other network origin — only a saved file:// copy may hold keys.
+  check('GitHub Pages copy is NOT trusted', auditorTrustedContext() === false);
   setLoc({ protocol: 'https:', host: 'attacker.example', origin: 'https://attacker.example' });
-  check('any other https origin is untrusted', trustedAuditorContext() === false);
+  check('any other https origin is untrusted', auditorTrustedContext() === false);
   setLoc(null);
 }
 

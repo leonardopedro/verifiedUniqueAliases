@@ -448,8 +448,7 @@ Wmw2oAio9A==
     <div id="resultsArea" class="results">
         <div class="status-card">
             <!-- v164: unlocked only by a fully green audit — the saved JSON is
-                 the user's portable evidence, auditable OFFLINE in any copy of
-                 the auditor (external GitHub Pages copy / saved local copy). -->
+                 the user's portable evidence, auditable OFFLINE in any copy of                  the auditor (a saved local copy). -->
             <button id="reportDownloadBtn" onclick="downloadReportFile()" style="display:none; width:100%; margin-bottom:18px;">💾 Download Attestation Report (JSON)</button>
             <div class="timestamp-box">
                 Account Security Bound at:<br>
@@ -576,8 +575,8 @@ Wmw2oAio9A==
 <script>
     // v184 (user request): pre-fill the enclave address so the flow works with
     // zero typing (the field stays fully editable). A copy served over http(s)
-    // — i.e. by the enclave itself — gets its own origin; a trusted local
-    // (file://) or GitHub Pages copy defaults to the production enclave. Runs
+    // — i.e. by the enclave itself — gets its own origin; a local (file://)
+    // copy has no origin to borrow and defaults to the production enclave. Runs
     // synchronously at script start, before any DOMContentLoaded auto-login.
     (function () {
         try {
@@ -935,24 +934,25 @@ Wmw2oAio9A==
     // boot-time CACHED envelope (≥15 min) for the ops/rotation tooling only.
 
     // ========================================================================
-    // v168 (plan Phase 3.3): AUDITOR ISOLATION. The copy of this page served
-    // by the enclave's own origin is UNTRUSTED under the collusion threat
-    // model: the domain owner can rewrite this script at will (and the ESP
-    // copy is unmeasured), so any key generated here would be exposed to
-    // hostile script (Web Auditor Tampering). Key generation, the secure
-    // login and decryption therefore run ONLY in a TRUSTED auditor context:
-    // a saved local copy (file://) or the pinned GitHub Pages copy.
+    // v168 (plan Phase 3.3): AUDITOR ISOLATION. Any copy of this page served
+    // over http(s) is UNTRUSTED under the collusion threat model: whoever owns
+    // that origin can rewrite this script at will (the enclave's ESP copy is
+    // unmeasured too), so any key generated there would be exposed to hostile
+    // script (Web Auditor Tampering). Key generation, the secure login and
+    // decryption therefore run ONLY from a saved local copy (file://).
+    // v227: GitHub Pages used to be whitelisted here — it was the recommended
+    // auditor origin until the landing stopped offering it. It is a mirror the
+    // owner can republish at any time, so it grants no more trust than any
+    // other origin and the entry is gone; nothing but file:// is trusted.
     // Paste-report offline auditing needs no keys and stays available
     // everywhere. (var — the offline harness drives these directly.)
     // ========================================================================
-    var TRUSTED_AUDITOR_HOSTS = ['leonardopedro.github.io'];
     function trustedAuditorContext() {
         if (typeof location === 'undefined') return true; // headless harness
-        if (location.protocol === 'file:') return true;
-        return TRUSTED_AUDITOR_HOSTS.indexOf(location.host) !== -1;
+        return location.protocol === 'file:';
     }
     function untrustedOriginError() {
-        return new Error('UNTRUSTED AUDITOR ORIGIN: this page is served by the enclave\'s own webserver — its owner can rewrite this script at will, so keys generated here would be exposed (Web Auditor Tampering defense). Key generation and logins are REFUSED here. Download verify.html from the project GitHub and open it as a local file (file://) to run the secure login — the yellow card at the top of this page has the save button and the exact keystrokes. Paste-report auditing on this copy is still safe.');
+        return new Error('UNTRUSTED AUDITOR ORIGIN: this page was served over the network, so whoever controls that origin can rewrite this script at will and any key generated here would be exposed (Web Auditor Tampering defense). Key generation and logins are REFUSED here. Save verify.html from raw.githubusercontent.com and open it as a local file (file://) to run the secure login — the yellow card at the top of this page has the save button and the exact keystrokes. Paste-report auditing on this copy is still safe.');
     }
 
     // ========================================================================
@@ -1106,7 +1106,7 @@ Wmw2oAio9A==
         progress('Preparing your session…');
         try {
             // v168 (plan Phase 3.3): keys only ever exist in a TRUSTED auditor
-            // context (file:// / GitHub Pages), never in the enclave-served copy.
+            // context (a saved file:// copy), never in a network-served copy.
             if (!trustedAuditorContext()) throw untrustedOriginError();
             rememberSelectedFlow(flow);
             const enclaveBase = ((document.getElementById('localEnclaveHost') || {}).value || '').trim().replace(/\/+$/, '');
@@ -2377,8 +2377,8 @@ Wmw2oAio9A==
     // a tampered blob or a swapped enclave fails closed and nothing is ever
     // downloaded. After a login the report is auto-downloaded (?afterlogin=1)
     // so the user holds a portable JSON they can audit OFFLINE in ANY copy of
-    // the auditor (GitHub Pages copy / saved local copy) — the copy served by
-    // the webservice is a convenience, never the only auditor.
+    // the auditor (paste-only rows work everywhere) — the copy served by the
+    // webservice is a convenience, never the only auditor.
     // (typeof guard: the node security harness evals this script headless.)
     if (typeof window !== 'undefined') window.addEventListener('DOMContentLoaded', async () => {
         const say = m => { try { const el = document.getElementById('secureLoginStatus'); if (el) el.innerText = m; } catch (e) {} };
@@ -2461,7 +2461,7 @@ Wmw2oAio9A==
                 if (postLogin) {
                     say('✅ Your PayPal login COMPLETED — the encrypted attestation was downloaded automatically by the callback page. Load that file (encrypted-attestation-report.json) into the “Attestation JSON report” box of a TRUSTED auditor (your saved file:// verify.html, downloaded from raw.githubusercontent.com) and run the audit there — decryption only ever happens in the copy that generated the key, never on this owner-controlled origin (Web Auditor Tampering defense).');
                 } else {
-                    say('⚠️ UNTRUSTED AUDITOR COPY — this page is served by the enclave\'s own webserver, which its owner controls. The secure login and key generation are DISABLED here (Web Auditor Tampering defense). Save this file from the project GitHub and open it locally (file://) to log in. Paste-report auditing below still works on this copy.');
+                    say('⚠️ UNTRUSTED AUDITOR COPY — this page was served over the network, by an origin its owner controls. The secure login and key generation are DISABLED here (Web Auditor Tampering defense). Save this file from raw.githubusercontent.com and open it locally (file://) to log in. Paste-report auditing below still works on this copy.');
                 }
             }
         } catch (e) { /* no location (harness) — skip */ }

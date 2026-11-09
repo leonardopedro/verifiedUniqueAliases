@@ -183,7 +183,7 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 302,528 bytes | `c36d8a7e70e53dd70206be2d9f313d8e6ad7aaae40015c806d736febfbe94cb5` |
+| `verify.html` | 302,620 bytes | `6a4afc9462c240d0e853073a74ae8b97b8339a33e4a4c472c65a5e352728cf1b` |
 | `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
 | `zk-rsa.html` | 100,001 bytes | `a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40` |
 | `privacy.html` | 4,673 bytes | `e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8` |
@@ -191,7 +191,7 @@ the file it describes:
 
 ```bash
 sha256sum verify.html zk.html zk-rsa.html privacy.html terms.html
-# c36d8a7e70e53dd70206be2d9f313d8e6ad7aaae40015c806d736febfbe94cb5  verify.html
+# 6a4afc9462c240d0e853073a74ae8b97b8339a33e4a4c472c65a5e352728cf1b  verify.html
 # 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
 # a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40  zk-rsa.html
 # e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8  privacy.html
@@ -353,7 +353,17 @@ GitHub Pages still serves a **mirror of the file for reading** and the legal
 documents (the tests enforce that Pages is linked only for the legal documents).
 It is **not** a redirect target and not trusted as one: an origin outside the
 measured image can change under a Return URL that PayPal keeps forever, which is
-exactly the false assurance a "stable URL" gives.
+exactly the false assurance a "stable URL" gives. The auditor agrees: only a
+saved `file://` copy may generate keys — any network-served copy, Pages
+included, is refused for the secure login.
+
+`scripts/check-live-tls-cert.mjs` enforces the certificate claim against the
+deployed service: the PEM served by `/tls-cert.pem`, the leaf the live handshake
+presented and `session_context.tls_certificate_pem` must be the same
+certificate. It runs as the last gate of every rotation and daily from
+`.github/workflows/live-cert-check.yml`, because a TLS proxy in front of the
+enclave — or a report built before the certificate was loaded — breaks that
+equality without breaking anything a build-time test can see.
 
 #### Page-owned redirects (optional, self-hosted)
 

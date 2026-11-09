@@ -3686,6 +3686,15 @@ async fn debug_envelope(
             }
         },
         "session_context": {
+            // v228: the certificate this boot terminates TLS with, byte-for-byte
+            // what GET /tls-cert.pem serves and what the browser's padlock
+            // showed. v227 made that download the visitor's proof of the
+            // channel, but the pre-login envelope named only the KEY — so the
+            // only way to check the download against a report was to log in
+            // first. The certificate is public handshake material (the key is
+            // already here); naming it makes the binding checkable before any
+            // session exists.
+            "tls_certificate_pem": state.tls_cert_pem.read().clone().unwrap_or_default(),
             // v223: the key a prover seals a PayPal code to, named in the
             // attestation itself so "verify, then encrypt" needs no second
             // channel. Empty only in the window before the listener exists.
