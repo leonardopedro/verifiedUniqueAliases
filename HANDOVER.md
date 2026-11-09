@@ -2068,7 +2068,7 @@ source and no seal flow runs. jsDelivr's `/gh/` path answers the same way. So a
 custom domain needs a front that emits `text/html` — a ~20-line Cloudflare
 Worker (snippet in README → *Hosting the page on a custom domain*), Netlify,
 nginx, or GitHub Pages' own CNAME. Verified for all candidates: the bytes are
-the committed page, sha256 `d37c59a9…`, identical to the copy inside the
+the committed page, sha256 `b9cce40b…`, identical to the copy inside the
 measured ESP.
 
 **Not done, because it needs the account owner:** the Worker + record, then the
@@ -2079,7 +2079,7 @@ config-only rotation (no rebuild):
    to `seal_redirect_uris` (Stop → `ModifyInstanceAttribute --UserData` → Start);
 3. register the same string as the PayPal app's Return URL.
 
-Then verify: `curl -I` shows `text/html`, page digest == `d37c59a9…`,
+Then verify: `curl -I` shows `text/html`, page digest == `b9cce40b…`,
 `/attest/login-session` returns it signed, and a real login lands back on that
 page and jumps to `/callback?code_enc=…`. Note `@main` is mutable behind a
 permanently registered Return URL — pin `@<commit>` if the page must be frozen

@@ -236,6 +236,12 @@ phase_stage() {
         return 0
     fi
 
+    # The OSS presigner reads the STS token straight off the CLI profile, and
+    # only a CLI call refreshes it — a token that expired while the build ran
+    # surfaces as InvalidAccessKeyId on the first PUT. Poke the CLI first.
+    aliyun sts GetCallerIdentity >/dev/null 2>&1 \
+        || warn "sts GetCallerIdentity failed — presigned URLs may be signed with a stale token"
+
     # Relay legs (the path that works from outside mainland China).
     [[ -n "$STAGE_BUCKET" ]] || die "set ALI_STAGE_BUCKET (HK relay bucket) or RELAY_MODE=direct"
     [[ -n "$RELAY_INSTANCE_ID" ]] || die "set ALI_RELAY_INSTANCE_ID (cn-beijing relay) or RELAY_MODE=direct"

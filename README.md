@@ -183,7 +183,7 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 301,312 bytes | `d37c59a9830acf2166eb2895c7e790592cf62bc5425e21e949428284003ac16b` |
+| `verify.html` | 301,928 bytes | `b9cce40b33a4d058898996ab3751234b67b1a8fcc8b2730150b637ae8ffd1c57` |
 | `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
 | `zk-rsa.html` | 100,001 bytes | `a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40` |
 | `privacy.html` | 4,673 bytes | `e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8` |
@@ -191,7 +191,7 @@ the file it describes:
 
 ```bash
 sha256sum verify.html zk.html zk-rsa.html privacy.html terms.html
-# d37c59a9830acf2166eb2895c7e790592cf62bc5425e21e949428284003ac16b  verify.html
+# b9cce40b33a4d058898996ab3751234b67b1a8fcc8b2730150b637ae8ffd1c57  verify.html
 # 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
 # a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40  zk-rsa.html
 # e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8  privacy.html
@@ -383,7 +383,7 @@ directly on `raw.githubusercontent.com` fails the last two, so the hostname
 needs a front that terminates TLS for it and rewrites the content type.
 
 `raw.githubusercontent.com` sends `content-type: text/plain; charset=utf-8`
-together with `x-content-type-options: nosniff` (301,312 bytes, the right
+together with `x-content-type-options: nosniff` (301,928 bytes, the right
 bytes, the wrong type). With `nosniff` the browser refuses to execute it, so
 the visitor sees the HTML source and the seal flow never runs. jsDelivr's
 `/gh/` path behaves the same way. Only a front that emits `text/html` — GitHub
@@ -428,7 +428,7 @@ Pages, a Cloudflare Worker, Netlify, or nginx — can host the auditor.
 
   Route `audit.airma.de/*` to it (Workers route or a proxied CNAME to the
   Worker's hostname). Both origins return the committed bytes — sha256
-  `d37c59a9…`, identical to `verify.html` in the repo and inside the measured
+  `b9cce40b…`, identical to `verify.html` in the repo and inside the measured
   ESP. The page then lives at
   `https://audit.airma.de/leonardopedro/verifiedUniqueAliases/main/verify.html`;
   allowlist that exact string:
