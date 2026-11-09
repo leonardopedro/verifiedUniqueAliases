@@ -527,17 +527,19 @@ Wmw2oAio9A==
             </div>
         </div>
     </div>
-    <!-- v194 (split): the ZK engine moved to zk.html (served by the pinned
-         GitHub Pages origin) so the circuit layer can be iterated on WITHOUT
-         an enclave rebuild. This card is the HANDOFF — revealed ONLY by a
-         green audit (the engine's own gate), it opens the pinned zk.html and
-         passes THIS tab's stashed identity via postMessage. The audit rows
-         above never depend on anything in there. -->
+    <!-- v194 (split): the ZK engine lives in zk.html so the circuit layer can
+         be iterated on WITHOUT an enclave rebuild. This card is the HANDOFF —
+         revealed ONLY by a green audit (the engine's own gate). v229: the
+         handoff is two files (raw zk.html + zk-handoff.json), not a
+         postMessage to a third-party origin. The audit rows above never depend
+         on anything in there. -->
     <div id="zkHandoffCard" class="status-card" style="display:none; margin-top:20px;">
         <label>🔐 ZK escrow credential <span style="font-weight:400; color:var(--text-dim);">(optional — selective disclosure)</span></label>
-        <p style="color: var(--text-dim); font-size: 0.85rem;">Proves — <b>without showing your identity</b> — that this audited quote is bound to a <b>verified</b> PayPal identity, and escrows the plaintext to a recipient key you choose. The prover lives on <b>zk.html</b> at the pinned GitHub Pages origin, so the ZK layer can improve without touching the measured enclave image. The button below opens it and hands over <b>only</b> the identity this audit verified — in your browser (postMessage, pinned origin; nothing is uploaded, and the identity bytes never touch any server).</p>
-        <a id="zkOpenBtn" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/zk.html" target="_blank" onclick="return openZkProver(this.href)" style="display:block; margin-top:12px; padding:14px; text-align:center; background:#8957e5; color:#fff; border-radius:10px; font-weight:600; text-decoration:none; cursor:pointer;">⚡ Get the ZK escrow prover (zk.html from the GitHub repo — save it, open it locally) →</a>
-        <p id="zkHandoffStatus" style="margin:8px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);"></p>
+        <p style="color: var(--text-dim); font-size: 0.85rem;">Proves — <b>without showing your identity</b> — that this audited quote is bound to a <b>verified</b> PayPal identity, and escrows the plaintext to a recipient key you choose. The prover is <b>zk.html</b>, taken from the project repository and opened as a local file, so the ZK layer can improve without touching the measured enclave image. It hands over <b>only</b> the identity this audit verified, and it does so as two files you save — nothing is uploaded, no third-party origin runs the prover, and the identity never touches a server.</p>
+        <p style="color: var(--text-dim); font-size: 0.82rem; margin:10px 0 0;">1️⃣ save <b>zk.html</b> from <code>raw.githubusercontent.com</code> and open it from disk; 2️⃣ download the identity bundle below and load it with zk.html's file picker.</p>
+        <a id="zkOpenBtn" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/zk.html" target="_blank" style="display:block; margin-top:10px; padding:12px; text-align:center; background:#238636; color:#fff; border-radius:10px; font-weight:600; text-decoration:none; cursor:pointer;">💾 Save zk.html (raw — open it from disk) →</a>
+        <button type="button" id="zkBundleBtn" onclick="return downloadZkHandoff()" style="display:block; width:100%; margin-top:10px; padding:12px; text-align:center; background:#8957e5; color:#fff; border-radius:10px; font-weight:600; border:none; cursor:pointer;">📦 Download the audited identity bundle (zk-handoff.json)</button>
+        <p id="zkHandoffStatus" style="margin:8px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);">Save both files, open zk.html from disk, then load the bundle there.</p>
     </div>
 
     <!-- v224 (user directive): SEAL THE PAYPAL CODE TO THE ATTESTED TLS KEY.
@@ -4163,48 +4165,35 @@ Wmw2oAio9A==
     }
 
     // ========================================================================
-    // v194 (split) — the ZK proving/verification engine moved to zk.html on
-    // the pinned GitHub Pages origin (same SRI philosophy: pinned URL, pinned
-    // artifacts, fail-closed). What stays here is the GATE + HANDOFF:
-    //   * a green audit still stashes zkIdentityJson/zkIdentityHashHex — the
-    //     EXACT bytes the preimage gate hashed (one serializer);
-    //   * the button on #zkHandoffCard opens the pinned zk.html and posts
-    //     that stash (+ the canonical report text) to it every 250 ms until
-    //     it acks — zk.html re-verifies everything fail-closed on its side
-    //     (band, hash re-derivation, SIGNED raw-hash cross-check) before the
-    //     identity is usable there.
-    // The message channel is pinned: we only ever post to the Pages origin
-    // and only accept the ack FROM it.
+    // v194 (split) — the ZK proving/verification engine lives in zk.html so the
+    // circuit layer can change without an enclave rebuild. What stays here is
+    // the GATE + HANDOFF:
+    //   * a green audit stashes zkIdentityJson/zkIdentityHashHex — the EXACT
+    //     bytes the preimage gate hashed (one serializer);
+    //   * v229 (user directive): the handoff is a FILE, not a postMessage.
+    //     Until now the button opened a Pages-hosted zk.html and posted the
+    //     stash to that origin — which meant trusting a third-party origin to
+    //     run the prover, the same false assurance v227 removed from the
+    //     auditor. Now the card hands the user two artifacts from the verified
+    //     source: zk.html from raw.githubusercontent.com (saved and opened as
+    //     file://), and a bundle JSON the same way. zk.html re-verifies the
+    //     bundle fail-closed on its side (band, hash re-derivation, SIGNED
+    //     raw-hash cross-check) before the identity is usable there.
+    // Nothing is posted anywhere; both hops are files the user carries.
     // ========================================================================
-    var ZK_PROVER_URL = 'https://leonardopedro.github.io/verifiedUniqueAliases/zk.html';
-    var ZK_PROVER_ORIGIN = 'https://leonardopedro.github.io';
-    var zkHandoffTimer = null;
+    var ZK_PROVER_URL = 'https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/zk.html';
 
     function zkHandoffSay(m, color) {
         var st = document.getElementById('zkHandoffStatus');
         if (st) { st.innerText = m; st.style.color = color || 'var(--text-dim)'; }
     }
 
-    if (typeof window !== 'undefined' && window.addEventListener) {
-        window.addEventListener('message', function(ev) {
-            if (ev.origin !== ZK_PROVER_ORIGIN) return;   // fail closed
-            var d = ev.data;
-            if (!d || (d.pavZkAck !== true && d.pavZkAck !== false)) return;
-            if (zkHandoffTimer) { clearInterval(zkHandoffTimer); zkHandoffTimer = null; }
-            if (d.pavZkAck === true) {
-                zkHandoffSay('✅ identity verified + accepted by zk.html — generate the credential there.', '#3fb950');
-            } else {
-                zkHandoffSay('❌ zk.html refused the handed-over identity (its fail-closed checks failed) — re-run the audit, then try again.', '#f85149');
-            }
-        });
-    }
-
-    // Click handler for the "⚡ Open the ZK escrow prover" link. Opens the
-    // pinned zk.html and posts the stash until it acks (a cold tab's message
-    // listener may not exist on the first frames). Returns false so the
-    // anchor never navigates on its own (popup-blocker-safe: window.open
-    // runs inside the click handler).
-    function openZkProver(href) {
+    // ② Download the audited identity bundle. It is exactly what the old
+    // postMessage carried — the canonical report text plus the audited identity
+    // hash — so zk.html runs the same fail-closed re-verification. A file the
+    // user saves is a hop that cannot be rewritten by whichever origin happens
+    // to be serving a page at the time.
+    function downloadZkHandoff() {
         try {
             if (!zkIdentityJson || !zkIdentityHashHex) {
                 zkHandoffSay('❌ no audited identity in this session — run a GREEN audit first', '#f85149');
@@ -4215,33 +4204,24 @@ Wmw2oAio9A==
                 zkHandoffSay('❌ the audited report is no longer in the textarea — re-run the audit', '#f85149');
                 return false;
             }
-            var w = window.open(href || ZK_PROVER_URL, '_blank');
-            if (!w) {
-                zkHandoffSay('⚠️ your browser blocked the popup — allow popups for this origin, click again, or open zk.html from the link and paste the report there.', '#d29922');
-                return false;
-            }
-            zkHandoffSay('⏳ handing the audited identity to zk.html (pinned origin — nothing is uploaded, the bytes stay in these two tabs)…', '#d29922');
-            var payload = {
+            var bundle = JSON.stringify({
                 pavZkHandoff: true,
                 identityJson: zkIdentityJson,
                 identityHashHex: zkIdentityHashHex,
                 reportText: text,
-            };
-            if (zkHandoffTimer) { clearInterval(zkHandoffTimer); zkHandoffTimer = null; }
-            var tries = 0;
-            zkHandoffTimer = setInterval(function() {
-                tries++;
-                try { if (w && !w.closed) w.postMessage(payload, ZK_PROVER_ORIGIN); } catch (e) { /* target gone */ }
-                if (!w || w.closed) {
-                    if (zkHandoffTimer) { clearInterval(zkHandoffTimer); zkHandoffTimer = null; }
-                    zkHandoffSay('⚠️ the zk.html tab was closed before it acknowledged — open it again and keep it open.', '#d29922');
-                } else if (tries >= 40) {
-                    if (zkHandoffTimer) { clearInterval(zkHandoffTimer); zkHandoffTimer = null; }
-                    zkHandoffSay('⚠️ zk.html did not acknowledge in 10 s — open it from the link and paste the report there instead.', '#d29922');
-                }
-            }, 250);
-        } catch (e) { zkHandoffSay('❌ ' + e.message, '#f85149'); }
-        return false;
+            }, null, 2);
+            var blob = new Blob([bundle], { type: 'application/json' });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = 'zk-handoff.json';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(function() { URL.revokeObjectURL(url); }, 4000);
+            zkHandoffSay('✅ zk-handoff.json saved — open your saved zk.html (file://) and load it there.', '#3fb950');
+            return false;
+        } catch (e) { zkHandoffSay('❌ ' + e.message, '#f85149'); return false; }
     }
 
     // ========================================================================

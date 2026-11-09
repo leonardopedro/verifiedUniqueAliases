@@ -7,10 +7,14 @@
 # front of the enclave, or a report built before the certificate was loaded,
 # breaks that silently — this job is the only thing that notices.
 #
-# It runs against the deployed service, not a build, so it is scheduled rather
-# than tied to a commit: a failing run means "production is lying about its own
-# channel", which no build-time test can observe.
-name: live-tls-cert
+# The same job also probes the only PayPal Return URL there is: /callback must
+# refuse missing, forged and PayPal-denied input with a sealed plain-text
+# status instead of exchanging anything or emitting an error page.
+#
+# Both run against the deployed service, not a build, so they are scheduled
+# rather than tied to a commit: a failing run means "production is lying about
+# its own channel", which no build-time test can observe.
+name: live-service-checks
 
 on:
   schedule:
@@ -40,3 +44,8 @@ jobs:
         env:
           TARGET_URL: ${{ github.event.inputs.url || 'https://login.airma.de' }}
         run: node scripts/check-live-tls-cert.mjs --url "$TARGET_URL"
+
+      - name: Refuse bogus callbacks in sealed plain text
+        env:
+          TARGET_URL: ${{ github.event.inputs.url || 'https://login.airma.de' }}
+        run: node scripts/check-live-callback.mjs --url "$TARGET_URL"

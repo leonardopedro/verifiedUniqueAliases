@@ -424,6 +424,7 @@ phase_verify() {
         say "   [dry-run] would poll $PROD_URL for 200, compare /debug/envelope binary_sha256 to $BIN_SHA,"
         say "   [dry-run] then run: node scripts/check-manifest-parity.mjs $PROD_URL $DISK_FILE"
         say "   [dry-run] then run: node scripts/check-live-tls-cert.mjs --url $PROD_URL"
+        say "   [dry-run] then run: node scripts/check-live-callback.mjs --url $PROD_URL"
         return 0
     fi
 
@@ -460,6 +461,14 @@ phase_verify() {
         printf '%s\n' "$certchk" | tail -20; die "live TLS certificate binding failed"; }
     printf '%s\n' "$certchk" | grep -E '✅|❌|RESULT' | tail -10
     ok "certificate download == live handshake == report"
+
+    # The only Return URL PayPal knows: junk must be refused in sealed plain
+    # text, not exchanged and not answered with a framework error page.
+    local cbchk
+    cbchk=$(node scripts/check-live-callback.mjs --url "$PROD_URL" 2>&1) || {
+        printf '%s\n' "$cbchk" | tail -20; die "live callback refusal check failed"; }
+    printf '%s\n' "$cbchk" | grep -E '✅|❌|RESULT' | tail -8
+    ok "callback refuses missing/forged/denied input in sealed plain text"
 }
 
 # ── run ──────────────────────────────────────────────────────────────────────

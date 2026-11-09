@@ -183,16 +183,16 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 303,074 bytes | `71e71f9ffae8196de6939100278a7598391f3ee2851cdc678cee955a0b9b4311` |
-| `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
+| `verify.html` | 302,273 bytes | `c36666d5e59cf7010d13137191073aaeb51986d0f3f4393b558aa43b7c79db57` |
+| `zk.html` | 111,997 bytes | `06d0fe314ee00d78e57e7f32feb21cb0121698a00aabdf4f8e41ad6279aa8263` |
 | `zk-rsa.html` | 100,001 bytes | `a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40` |
 | `privacy.html` | 4,673 bytes | `e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8` |
 | `terms.html` | 3,663 bytes | `9e8daa06da92308c19aa85b1cf33ee44d92be19b0daebe031eecc952002fb61f` |
 
 ```bash
 sha256sum verify.html zk.html zk-rsa.html privacy.html terms.html
-# 71e71f9ffae8196de6939100278a7598391f3ee2851cdc678cee955a0b9b4311  verify.html
-# 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
+# c36666d5e59cf7010d13137191073aaeb51986d0f3f4393b558aa43b7c79db57  verify.html
+# 06d0fe314ee00d78e57e7f32feb21cb0121698a00aabdf4f8e41ad6279aa8263  zk.html
 # a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40  zk-rsa.html
 # e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8  privacy.html
 # 9e8daa06da92308c19aa85b1cf33ee44d92be19b0daebe031eecc952002fb61f  terms.html
@@ -543,7 +543,7 @@ CHROMIUM_PATH=$(command -v chromium) node scripts/e2e-login-download.mjs
 | `src/intel_tdx.rs` | TDX evidence acquisition: DCAP quote, CCEL replay, PCK/TCB handling |
 | `src/paypal.pem` | Embedded TLS trust root for the pinned PayPal API endpoints — **DigiCert Global Root G2** (SHA-256 `cb3ccbb7…ab1cb5f`, fingerprint pinned by test `paypal_api_root_is_digicert_g2_v179`) |
 | `verify.html` | Browser auditor: TD Quote parser, PCK chain walk to the pinned Intel root, WebCrypto, GitHub attestation lookup |
-| `zk.html` | Standalone ZK escrow prover/verifier (GitHub Pages origin): Groth16 prove + verify, authority-key handling, fail-closed identity handoff/paste gate |
+| `zk.html` | Standalone ZK escrow prover/verifier (saved copy; raw.githubusercontent.com): Groth16 prove + verify, authority-key handling, fail-closed identity handoff/paste gate |
 | `zk-rsa.html` | Standalone RSA ZK escrow prover/verifier: OpenPGP/S-MIME/raw key parsing, Guillou–Quisquater Fiat–Shamir proof of key possession, hybrid escrow encryption, in-page verifier — zero network requests |
 | `zk/rsa-test/` | TEST-ONLY fixture keys (PGP/X.509/PEM) + generators for the zk-rsa harness tests |
 | `build-alibaba-docker.sh` | The reproducible build (Debian Trixie pinned snapshots) |

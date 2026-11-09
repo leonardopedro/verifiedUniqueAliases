@@ -192,15 +192,19 @@
 
 <div class="container">
     <header>
-        <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Back to the auditor (verify.html)</a>
+        <a href="https://login.airma.de/" style="color: var(--text-dim); text-decoration: none; font-weight: 600; display: block; margin-bottom: 20px;">← Back to the auditor landing (verify.html is distributed from raw.githubusercontent.com)</a>
         <h1>ZK Escrow Credential</h1>
         <p class="subtitle">Prove — <b>without showing your identity</b> — that an audited quote is bound to a <b>verified</b> PayPal identity, and escrow the plaintext to a recipient key you choose.</p>
     </header>
 
     <div class="input-card" style="margin-bottom: 20px;">
         <label>1️⃣ Identity to prove — loaded from a GREEN audit, or pasted</label>
-        <p style="color: var(--text-dim); font-size: 0.9rem;">This page is served by <b>GitHub Pages</b> (not the enclave), so its ZK engine can be improved without ever touching the measured enclave image. It proves over exactly the identity bytes a <a href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html" style="color:#64b5f6;">verify.html</a> audit verified, via either path: <b>(1)</b> open it from the auditor's “⚡ Open the ZK escrow prover” button after a green audit — the identity is handed over in your browser (postMessage, pinned origin, nothing is uploaded); <b>(2)</b> paste the decrypted attestation report below — the same fail-closed preimage gate the auditor runs is re-checked here. Nothing on this page ever sends your identity anywhere: the proof runs in this tab (Circom/Groth16 WASM) and carries only the hardware-bound hash, the verified bit and the ciphertext.</p>
-        <p id="zkHandoffStatus" style="margin:8px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);">Waiting for an identity — open this page from a green-audited verify.html tab, or paste the report below.</p>
+        <p style="color: var(--text-dim); font-size: 0.9rem;">This is the ZK prover, taken from the project repository and opened from disk, so the circuit layer can be improved without ever touching the measured enclave image. It proves over exactly the identity bytes a <code>verify.html</code> audit verified, via either path: <b>(1)</b> load the <code>zk-handoff.json</code> bundle that verify.html downloads after a green audit; <b>(2)</b> paste the decrypted attestation report below — the same fail-closed preimage gate the auditor runs is re-checked here either way. Nothing on this page ever sends your identity anywhere: the proof runs in this tab (Circom/Groth16 WASM) and carries only the hardware-bound hash, the verified bit and the ciphertext.</p>
+        <p id="zkHandoffStatus" style="margin:8px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);">Waiting for an identity — load the bundle from verify.html, or paste the report below.</p>
+        <div style="margin-top:12px;">
+            <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Or load the handoff bundle verify.html downloaded (<code>zk-handoff.json</code>)</label>
+            <input type="file" id="zkHandoffBundleFile" accept=".json" class="file-input" onchange="zkHandoffFromBundleFile(this)" style="margin-top:6px;">
+        </div>
         <div style="margin-top:12px; border-top:1px dashed #30363d; padding-top:10px;">
             <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Paste the DECRYPTED attestation report (JSON) — the file the login auto-downloads, or the 💾 download after a passing audit</label>
             <textarea id="zkReportPaste" spellcheck="false" placeholder='{"attestation_report": { … }}' style="width:100%; height:110px; margin-top:8px; padding:8px; border-radius:4px; border:1px solid #30363d; background:#0d1117; color:#58a6ff; font-family:'JetBrains Mono',monospace; font-size:0.75rem; box-sizing:border-box;"></textarea>
@@ -209,13 +213,14 @@
         </div>
     </div>
 
-    <!-- v194 (split): the ZK proving/verification engine now lives on its
-         OWN page (this one), served by the pinned GitHub Pages origin, so the
-         circuit/UI can be iterated on without an enclave rebuild. The auditor
-         (verify.html) hands the green-audited identity over via postMessage,
-         or the report is pasted below — both paths land in the same fail-
-         closed stash the engine proves from. Verification stays offline
-         (embedded vkey). -->
+    <!-- v194 (split): the ZK proving/verification engine lives on its OWN page
+         (this one), so the circuit/UI can be iterated on without an enclave
+         rebuild. v229: verify.html hands the green-audited identity over as a
+         bundle FILE (zk-handoff.json) the user loads here, or the report is
+         pasted below — both paths land in the same fail-closed stash the
+         engine proves from. Nothing is posted between origins, and only a
+         saved file:// copy of this page may generate keys. Verification stays
+         offline (embedded vkey). -->
     <div id="zkCard" class="status-card" style="margin-top:20px;">
         <label>🔐 ZK escrow credential <span style="font-weight:400; color:var(--text-dim);">(optional — selective disclosure)</span></label>
         <p style="color: var(--text-dim); font-size: 0.85rem;">Proves — <b>without showing your identity</b> — that this audited quote is bound to a <b>verified</b> PayPal identity, and escrows the plaintext to a recipient key you choose. Everything runs inside this tab (Circom/Groth16 WASM); the identity bytes never leave the page and the proof carries only the hardware-bound hash, the verified bit and ciphertext. The <b>example</b> escrow key below is PUBLIC (testability only — circom.md §7): paste your own BabyJubjub x/y for a real recipient.</p>
@@ -947,17 +952,17 @@
     }
 
     // Same Web Auditor Tampering defense the auditor keeps for its keys:
-    // key generation runs only in a TRUSTED context (file://, the pinned
-    // Pages origin, or the headless harness) — never on an origin somebody
-    // else controls. (zk.html is itself served from the pinned origin.)
-    var TRUSTED_AUDITOR_HOSTS = ['leonardopedro.github.io'];
+    // key generation runs only from a saved local copy (file://) — never on an
+    // origin somebody else controls. v229 (user directive): the Pages mirror
+    // used to be whitelisted because this page was handed the identity by a
+    // Pages-hosted opener; the handoff is now a file the user carries, so the
+    // mirror grants nothing and the entry is gone. Only file:// is trusted.
     function trustedAuditorContext() {
         if (typeof location === 'undefined') return true; // headless harness
-        if (location.protocol === 'file:') return true;
-        return TRUSTED_AUDITOR_HOSTS.indexOf(location.host) !== -1;
+        return location.protocol === 'file:';
     }
     function untrustedOriginError() {
-        return new Error('UNTRUSTED AUDITOR ORIGIN: this copy of zk.html is served by an origin whose owner can rewrite it at will, so keys generated here would be exposed (Web Auditor Tampering defense). Key generation is REFUSED here — take zk.html from the project GitHub (or its GitHub Pages copy) and open it as a local file (file://).');
+        return new Error('UNTRUSTED AUDITOR ORIGIN: this copy of zk.html was served over the network, so whoever controls that origin can rewrite it at will and keys generated here would be exposed (Web Auditor Tampering defense). Key generation is REFUSED here — save zk.html from raw.githubusercontent.com and open it as a local file (file://).');
     }
 
     function zkSetIdentityStatus(m, color) {
@@ -1044,31 +1049,37 @@
         return zkStashIdentity(parsed.identityJson, parsed.declaredHash, text);
     }
 
-    // HANDOFF path: accept only from PINNED opener origins — the Pages
-    // origin (where this page is served) and the measured enclave origin
-    // `https://login.airma.de`, whose verify.html copy opens this page via
-    // the ⚡ button (v194 split: an enclave-copy handoff must ack, not spin
-    // out its 10 s timeout — the enclave is the most trustworthy opener
-    // there is, and zkStashIdentity re-verifies every handed-over identity
-    // fail-closed below REGARDLESS of origin: band, hash re-derivation,
-    // SIGNED raw-hash cross-check). A file:// auditor cannot authenticate
-    // itself in a message (origin "null") → its users take the paste path.
-    var ZK_HANDOFF_ORIGIN = 'https://leonardopedro.github.io';
-    var ZK_HANDOFF_ORIGINS = [ZK_HANDOFF_ORIGIN, 'https://login.airma.de'];
-    if (typeof window !== 'undefined' && window.addEventListener) {
-        window.addEventListener('message', function(ev) {
-            if (ZK_HANDOFF_ORIGINS.indexOf(ev.origin) === -1) return;   // fail closed
-            var d = ev.data;
-            if (!d || d.pavZkHandoff !== true) return;
-            zkSetHandoffStatus('⏳ verifying the handed-over identity against the report…', '#d29922');
-            zkStashIdentity(d.identityJson, d.identityHashHex, d.reportText).then(function(ok) {
-                try { if (ev.source) ev.source.postMessage({ pavZkAck: ok === true }, ev.origin); } catch (e) { /* opener gone */ }
-                if (ok) zkSetHandoffStatus('✅ audited identity received from the auditor tab — generate the credential below.', '#3fb950');
-                else zkSetHandoffStatus('❌ the handed-over identity failed verification here — re-run the audit in verify.html and try again.', '#f85149');
-            });
-        });
-        // tell a waiting opener this page is ready to receive (it retries)
-        try { if (window.opener) window.opener.postMessage({ pavZkReady: true }, '*'); } catch (e) { /* no opener — cold open */ }
+    // HANDOFF path (v229): a bundle FILE saved by verify.html — never a
+    // postMessage from whichever origin happens to hold a tab. The bundle is
+    // the same payload the old channel carried (canonical report text + the
+    // audited identity hash), and zkStashIdentity re-verifies it fail-closed
+    // below regardless of where it came from: band, hash re-derivation and the
+    // SIGNED raw-hash cross-check all run here.
+    function zkHandoffFromBundleFile(inp) {
+        var f = inp && inp.files && inp.files[0];
+        if (!f) return;
+        var r = new FileReader();
+        r.onload = function() {
+            try {
+                var b = JSON.parse(String(r.result));
+                if (!b || b.pavZkHandoff !== true) {
+                    throw new Error('this file is not a handoff bundle from verify.html (no pavZkHandoff marker)');
+                }
+                var text = b.reportText;
+                if (!text) throw new Error('the bundle carries no report text — the credential would bind nothing');
+                var textStr = typeof text === 'string' ? text : JSON.stringify(text);
+                zkSetHandoffStatus('⏳ verifying the bundled identity against the report…', '#d29922');
+                var parsed = zkIdentityFromReportText(textStr);
+                zkStashIdentity(parsed.identityJson, parsed.declaredHash, textStr).then(function(ok2) {
+                    if (ok2) zkSetHandoffStatus('✅ audited identity loaded from the bundle — generate the credential below.', '#3fb950');
+                    else zkSetHandoffStatus('❌ the bundled identity failed verification here — re-run the audit in verify.html and download a fresh bundle.', '#f85149');
+                });
+            } catch (e) {
+                zkSetHandoffStatus('❌ ' + e.message, '#f85149');
+            }
+        };
+        r.readAsText(f);
+        inp.value = '';   // allow re-loading the same file after a re-audit
     }
 
 </script>

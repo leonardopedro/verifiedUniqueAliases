@@ -2726,11 +2726,20 @@ console.log('\nTest 39: ZK escrow credential card — prove/verify wiring (v188,
   check('green login audit passes', res.ok === true, `alert=${res.alert}`);
   const zkCard = document.getElementById('zkHandoffCard');
   check('ZK handoff card revealed by the green login audit', zkCard.style.display === 'block');
-  check('auditor carries the pinned zk.html link + postMessage sender',
+  // v229 (user directive): the handoff is two files, not a postMessage to a
+  // third-party origin — the auditor must offer raw zk.html + a bundle, and
+  // must no longer contain the Pages-pinned channel at all.
+  check('auditor hands off via raw zk.html + a bundle file',
     html.includes('id="zkOpenBtn"')
-      && html.includes('onclick="return openZkProver(this.href)"')
-      && html.includes("ZK_PROVER_URL = 'https://leonardopedro.github.io/verifiedUniqueAliases/zk.html'")
-      && html.includes('ev.origin !== ZK_PROVER_ORIGIN'));
+      && html.includes('id="zkBundleBtn"')
+      && html.includes('function downloadZkHandoff()')
+      && html.includes("ZK_PROVER_URL = 'https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/zk.html'"));
+  check('the Pages postMessage channel is gone from the auditor',
+    !/ZK_PROVER_ORIGIN|pavZkAck|postMessage\(payload, ZK_PROVER_ORIGIN\)/.test(html));
+  check('zk.html refuses a network copy and accepts the bundle by file',
+    zkHtml.includes('id="zkHandoffBundleFile"')
+      && zkHtml.includes('function zkHandoffFromBundleFile(')
+      && !/ZK_HANDOFF_ORIGINS|pavZkAck/.test(zkHtml));
   check('the ZK CARD itself lives in zk.html, not in the auditor (v194 split)',
     zkHtml.includes('id="zkCard"') && !html.includes('id="zkCard"'));
   check('stash === the canonical preimage bytes the gate hashed',
@@ -2739,6 +2748,62 @@ console.log('\nTest 39: ZK escrow credential card — prove/verify wiring (v188,
   check('stash hash === identityHashOf(fixture) (one-serializer guarantee)',
     globalThis.zkIdentityHashHex === identityHashOf(who),
     `stash=${globalThis.zkIdentityHashHex && globalThis.zkIdentityHashHex.slice(0, 16)}`);
+
+  // ---- (1b) v229: the handoff FILE round-trips into zk.html -----------------
+  // The old postMessage channel is gone, so the file path is the only automatic
+  // handoff: verify.html must produce a bundle carrying the audited hash and the
+  // canonical report text, and zk.html must accept exactly that file.
+  let bundleText = '';
+  {
+    const origCreate2 = document.createElement, origBody2 = document.body;
+    const origCuo2 = URL.createObjectURL, origRuo2 = URL.revokeObjectURL, origSt2 = globalThis.setTimeout;
+    let savedBlob = null;
+    document.createElement = () => ({ href: '', download: '', click() {}, remove() {} });
+    document.body = { appendChild() {}, removeChild() {} };
+    URL.createObjectURL = (b) => { savedBlob = b; return 'blob:zk'; };
+    URL.revokeObjectURL = () => {};
+    globalThis.setTimeout = () => 0;
+    const dl = downloadZkHandoff();
+    document.createElement = origCreate2; document.body = origBody2;
+    URL.createObjectURL = origCuo2; URL.revokeObjectURL = origRuo2; globalThis.setTimeout = origSt2;
+    bundleText = savedBlob ? await savedBlob.text() : '';
+    let b = null; try { b = JSON.parse(bundleText); } catch { /* asserted below */ }
+    check('bundle download carries the audited hash + canonical report text',
+      dl === false && b && b.pavZkHandoff === true
+        && b.identityHashHex === identityHashOf(who)
+        && typeof b.reportText === 'string' && b.reportText.includes('attestation_report'),
+      `bytes=${bundleText.length}`);
+  }
+  {
+    // Drive zk.html's own loader with that file (FileReader stubbed to answer
+    // synchronously) and wait for its fail-closed verification to finish.
+    const origFR = globalThis.FileReader;
+    globalThis.FileReader = function () {
+      const self = this;
+      this.readAsText = (f) => { self.result = f._text; self.onload(); };
+    };
+    globalThis.zkIdentityJson = null;
+    globalThis.zkIdentityHashHex = null;
+    zkHandoffFromBundleFile({ files: [{ _text: bundleText }], value: '' });
+    const deadline = Date.now() + 2000;
+    while (!globalThis.zkIdentityJson && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    if (origFR === undefined) delete globalThis.FileReader; else globalThis.FileReader = origFR;
+    check('zk.html accepts the bundle and re-verifies the same identity',
+      globalThis.zkIdentityJson === canonicalId && globalThis.zkIdentityHashHex === identityHashOf(who),
+      `stash=${globalThis.zkIdentityJson ? globalThis.zkIdentityJson.length : 'null'}`);
+    check('zk.html rejects a bundle that is not a handoff',
+      (() => {
+        const el = document.getElementById('zkHandoffStatus');
+        const before = el.innerText;
+        globalThis.FileReader = function () { const s = this; this.readAsText = (f) => { s.result = f._text; s.onload(); }; };
+        zkHandoffFromBundleFile({ files: [{ _text: JSON.stringify({ hello: 'world' }) }], value: '' });
+        if (origFR === undefined) delete globalThis.FileReader; else globalThis.FileReader = origFR;
+        return /not a handoff bundle/i.test(el.innerText) && el.innerText !== before;
+      })(),
+      document.getElementById('zkHandoffStatus').innerText.slice(0, 120));
+  }
 
   // ---- (2) a FAILING audit must not overwrite a prior green stash --------
   const other = { user_id: 'EVIL', sub: 'other', verified_account: 'true', payer_id: null };
