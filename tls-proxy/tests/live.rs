@@ -12,6 +12,11 @@
 //! `www.sandbox.paypal.com` with `LIVE_PATH=/checkoutnow` to attest that page
 //! rather than the sandbox's bare origin.
 //!
+//! `LIVE_PUBLIC` (e.g. `login.airma.de`) makes the harness walk the public
+//! attestation list, discover which id this session's digests unlock, and print
+//! the full download URL — no hand-built query string, and no need to compute the
+//! digests yourself.
+//!
 //! `LIVE_ATTEMPTS` (default 3) retries a session that ends before a verdict.
 //! That is insurance, not the expected path: a real site's edge will sometimes
 //! close while the relayed TLS handshake is still in flight, because every MPC
@@ -84,7 +89,7 @@ async fn one_session(
     server: &str,
     path: &str,
     roots: Vec<CertificateDer>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(String, String), Box<dyn std::error::Error>> {
     // Timings, because where a session spends its ~1 minute decides whether an
     // edge-side close is a race we can win or a wall: commit is one exchange,
     // the handshake is many, the proof is pure compute.
@@ -154,23 +159,71 @@ async fn one_session(
     prover.prove(&config).await?;
     prover.close().await?;
     handle.close();
-    driver_task.await??;
-
-    // The record is fetched from outside the box by whoever holds the revealed
+    driver_task.await??;    // The record is fetched from outside the box by whoever holds the revealed
     // transcript; these are the two digests it signs over, so print them here —
     // the prover is the only party that can compute them, and this harness just
     // proved it is one.
-    {
+    let (sent_digest, received_digest) = {
         use sha2::{Digest, Sha256};
         let hex = |bytes: &[u8]| hex::encode(Sha256::digest(bytes));
+        let pair = (hex(&sent_bytes), hex(&received_bytes));
         eprintln!(
             "    capability: sent_sha256={} received_sha256={}",
-            hex(&sent_bytes),
-            hex(&received_bytes)
+            pair.0, pair.1
         );
-    }
+        pair
+    };
     lap("prover finished: presentation complete");
-    Ok(())
+
+    Ok((sent_digest, received_digest))
+}
+
+/// Ask the deployed origin which of its ids these digests unlock, and hand back
+/// the clickable download URL.
+///
+/// The notary cannot tell a prover their id: the list is public and the record is
+/// keyed by a capability only the prover holds. So the prover does the obvious
+/// thing — walk the list and try its own pair, which succeeds for exactly one
+/// session. Best effort on purpose: this test exists to prove the relay, and an
+/// origin that is unreachable should say so rather than fail the session it just
+/// notarised.
+async fn public_fetch_url(
+    origin: &str,
+    sent: &str,
+    received: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let base = format!("https://{}", origin.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let list: serde_json::Value = client
+        .get(format!("{base}/proxy/attestations"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let ids: Vec<String> = list["sessions"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r["session_id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    for id in ids.iter().rev() {
+        let url = format!(
+            "{base}/proxy/attestations/{id}?sent_sha256={sent}&received_sha256={received}"
+        );
+        if client.get(&url).send().await?.status() == reqwest::StatusCode::OK {
+            return Ok(url);
+        }
+    }
+    Err(format!(
+        "no session on {base} accepts this transcript ({} listed)",
+        ids.len()
+    )
+    .into())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -195,9 +248,20 @@ async fn live_relay_of_a_real_website() -> Result<(), Box<dyn std::error::Error>
     for attempt in 1..=attempts {
         eprintln!("--- attempt {attempt}/{attempts}: {server}{path}");
         match one_session(&notary, &server, &path, roots.clone()).await {
-            Ok(()) => {
+            Ok((sent, received)) => {
                 if attempt > 1 {
                     eprintln!("--- passed on attempt {attempt}/{attempts}");
+                }
+                if let Ok(origin) = std::env::var("LIVE_PUBLIC") {
+                    match public_fetch_url(&origin, &sent, &received).await {
+                        Ok(url) => eprintln!("    fetch your record: {url}"),
+                        Err(e) => eprintln!("    fetch url unavailable: {e}"),
+                    }
+                } else {
+                    eprintln!(
+                        "    set LIVE_PUBLIC=<domain> to have this harness print the \
+                         ready-to-open download URL"
+                    );
                 }
                 return Ok(());
             }

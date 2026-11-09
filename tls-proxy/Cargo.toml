@@ -42,6 +42,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+# Only the live test uses it, to talk to the deployed origin over HTTPS: the
+# prover asks the public list which id its digests unlock, so it can print a
+# ready-to-click download URL instead of two opaque hex strings.
+reqwest = { version = "=0.12.24", default-features = false, features = ["native-tls", "json"] }
 # The end-to-end test attests a REAL TLS session: this is tlsn's own fixture
 # HTTPS server (certificate for test-server.io) plus its CA, at the same pinned
 # revision, so the test exercises the wire protocol rather than a mock.
