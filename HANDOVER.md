@@ -2186,3 +2186,98 @@ both buckets (deleting them needs the relay started).
    config-only allowlist push — no rebuild.
 3. The **browser E2E** for the sealed redirect: PayPal answers 403 to this
    host and there is no account or browser here.
+
+---
+
+## 0.43 — v227: the enclave's own callback is the only return leg (2026-11-09)
+
+### The correction
+
+The v226 landing linked the GitHub Pages copy so PayPal could hand *that page*
+the code. That was wrong on grounds of trust, not of mechanics: an origin
+outside the measured image can change under a Return URL that PayPal keeps
+forever, so "a stable https URL" is an assurance the attestation never makes.
+Only the repository bytes are checkable, and `raw.githubusercontent.com` serves
+them as a download — it cannot execute, which is the property being relied on.
+
+**Return URL stays `https://login.airma.de/callback`.** The callback is not just
+the default, it is the point: PayPal hands the code straight back to the attested
+process over TLS, so nothing sits between PayPal and the exchange, and
+`https://login.airma.de/tls-cert.pem` lets the visitor save **the certificate
+that connection actually used** and compare its fingerprint with the padlock in
+their own browser. The report repeats that PEM as
+`session_context.tls_certificate_pem`, so the key a sealed `code_enc` must name
+is the key of a certificate the user held in their hand.
+
+### What changed
+
+- **Landing** (`LANDING_HTML`): the blue *Open verify.html in this browser*
+  button and its step 4 are gone; the second button is now
+  **Download this connection's TLS certificate** (`/tls-cert.pem`, served as
+  `application/x-pem-file`, `attachment`), with the padlock-fingerprint
+  instruction and the statement that PayPal returns to
+  `https://login.airma.de/callback`. Steps are three again.
+- **Page**: `pageRedirectUri()` no longer tells users to "use the GitHub Pages
+  copy"; it explains the file:// limitation and that the enclave's `/callback`
+  is the default return leg. The two *UNTRUSTED AUDITOR ORIGIN* messages now
+  point at the saved local file only. The seal toggle survives for operators who
+  host the page themselves — it is just no longer the recommended path.
+- **Config**: `seal_redirect_uris` trimmed to `["https://login.airma.de/callback"]`
+  (14 keys, 6,064 B b64, readback sha256 `7a1d1c09…`). No rebuild was needed for
+  this — it rides the rotation's own user_data push.
+- **README**: the old "register the Pages URL as Return URL" checklist and the
+  custom-domain/Worker recipe are replaced by *Redirect URIs: the enclave owns
+  the return leg* — the measured `text/plain`/`nosniff` and
+  `SSL: no alternative certificate subject name` facts stay, the encouragement
+  to host the auditor does not.
+- **CI**: three new checks in `test-verify-security.mjs` — the landing never
+  links a Pages auditor, it offers `/tls-cert.pem` and names the callback, and
+  `pageRedirectUri` may not recommend a Pages copy again. Security suite is
+  **503 passed, 0 failed**.
+
+### A real bug in the rotation script
+
+Phase 3 polled a **stopped** relay: `RunCommand` against a `Stopped` instance
+never returns an InvokeId, so the leg waited out its 30-minute budget and died
+with `relay leg failed: TIMEOUT`. The help text had always said
+"`ALI_RELAY_INSTANCE_ID` — stopped cn-beijing relay", and cleanup leaves it
+`Stopped` (`StopCharging`) after every rotation, so this would have hit every
+future run. `relay_ensure_running()` now starts it, waits for `Running`, and
+gives the cloud agent 15 s before the first command.
+
+> Local `cargo test` cannot run on this host (`openssl-sys` needs system
+> libssl-dev); the containerised build is the compile gate, and it compiled and
+> reproduced.
+
+### Two passes, as before
+
+| | image | disk sha256 | binary | RTMR2 |
+|---|---|---|---|---|
+| v227b | `m-2ze2yp6ozth4ynfqp7a6` (superseded) | `c813d013…` | `f2c29e9d…` | `faba03c0…` |
+| **v227c (live)** | **`m-2zej7uzl9mr49avdfwyj`** | **`9f3238e1…`** | `f2c29e9d…` (identical) | `faba03c0…` (held) |
+
+The landing edit is compiled in, so pass 1 rotated **RTMR2 `3ca54e8d…` →
+`faba03c0…`** (MRTD `e0199499…`, RTMR0 `06a32a2f…`, RTMR1 `6fa035…`, RTMR3 held)
+and the pins were rotated against the live quote (`EXPECTED_RTMR2`,
+`EXPECTED_ENCLAVE_SHA256` → `f2c29e9d…`). Pass 2 shipped the rotated page: the
+binary came out byte-identical, so the pin held — the property that makes a
+page-only release safe.
+
+Live after the swap: envelope `binary_sha256 = f2c29e9d…` == pin; envelope
+`disk_manifest.verify.html = c36d8a7e…` (302,528 B) == repo == Pages;
+live RTMR2 `faba03c0…` == `EXPECTED_RTMR2`; deployed ESP == the local disk
+(`PARITY OK`); landing carries `/tls-cert.pem` and no Pages auditor.
+
+### State
+
+Live `i-2ze1zdxis0hcsg91qbh5`, image `m-2zej7uzl9mr49avdfwyj`; rollback
+`m-2ze4m8a0ea3g4p7s5eqy` (v226b, pins of that era — expect the stale-auditor
+warning if you roll back without rotating them). Superseded v227b image and its
+snapshot deleted; relay stopped again; `/tmp` config and report captures removed.
+
+### Still needs the operator
+
+1. **PayPal app**: keep the Return URL at `https://login.airma.de/callback` —
+   nothing to add, and do **not** add the Pages URL.
+2. **Browser E2E**: PayPal answers 403 to this host, so the real login round trip
+   still needs a human with an account.
