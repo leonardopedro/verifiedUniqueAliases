@@ -1396,6 +1396,31 @@ fn canonical_custom_info(raw: &str) -> Option<String> {
     }
 }
 
+/// The HTTPS listener's public key, in the two forms a report publishes: the
+/// SPKI PEM itself, and the SHA-256 of its DER for display and pinning.
+///
+/// v223 (user directive): a report must name the key a prover can seal the
+/// PayPal code to. Publishing the fingerprint here is what lets the user check
+/// the first (data-free) attestation and then hand the code to exactly that
+/// instance — the private half never leaves TDX-protected RAM and is regenerated
+/// on every boot.
+fn attested_tls_key(state: &AppState) -> (String, String) {
+    use sha2::Digest;
+    let pem = state.tls_pubkey_pem.read().clone().unwrap_or_default();
+    let sha256 = pubkey_fingerprint(&pem);
+    (pem, sha256)
+}
+
+/// SHA-256 of a public key's DER as published in `tls_public_key_sha256`.
+fn pubkey_fingerprint(pem: &str) -> String {
+    use sha2::Digest;
+    openssl::pkey::PKey::public_key_from_pem(pem.as_bytes())
+        .ok()
+        .and_then(|k| k.public_key_to_der().ok())
+        .map(|der| hex::encode(sha2::Sha256::digest(&der)))
+        .unwrap_or_default()
+}
+
 // Sign the canonical (sorted-key) JSON of an attestation_report with the
 // enclave's ephemeral RSA key. serde_json's Map is a BTreeMap (sorted), so
 // to_string() is byte-identical to verify.html's JSON.stringify(reorder(...)).
@@ -2442,6 +2467,15 @@ struct AppState {
     https_ready: Arc<AtomicBool>,
     staging: bool,
     tls_cert_pem: Arc<RwLock<Option<String>>>,
+    // v223 (user directive — attested hand-off): the HTTPS listener's public
+    // key, exactly as it appears in the leaf certificate, so a report names the
+    // key a prover can seal the PayPal code to; and the matching private key,
+    // kept so that code can be decrypted here and nowhere else. The key is
+    // generated in RAM each boot and never written to disk, so the value in a
+    // report identifies THIS instance — a replaced VM cannot open a ciphertext
+    // sealed to the key the user verified.
+    tls_pubkey_pem: Arc<RwLock<Option<String>>>,
+    tls_private_key: Arc<RwLock<Option<openssl::pkey::PKey<openssl::pkey::Private>>>>,
     enclave_identity: EphemeralEnclaveIdentity,
     ip_stats: Arc<RwLock<std::collections::BTreeMap<IpAddr, u64>>>,
     global_egress_bytes: Arc<AtomicU64>,
@@ -2581,6 +2615,59 @@ struct CallbackQuery {
     code: Option<String>,
     state: Option<String>,
     error: Option<String>,
+    /// v223 (user directive): the PayPal code, RSA-OAEP/SHA-256 sealed to the
+    /// TLS public key this boot published in its attestation. A user who has
+    /// audited that attestation can hand the code to exactly that instance;
+    /// any other VM (fresh RAM key every boot) cannot open it.
+    code_enc: Option<String>,
+}
+
+/// Open `code_enc`, which must have been sealed to the TLS key named in this
+/// boot's attestation.
+///
+/// The key is RSA-4096 generated in RAM at boot; the ciphertext is bounded so a
+/// hostile caller cannot make the enclave chew on a megabyte of garbage, and
+/// every failure is a refusal rather than a fallback to the query string.
+fn decrypt_sealed_code(state: &AppState, b64: &str) -> Result<String, String> {
+    let key = state
+        .tls_private_key
+        .read()
+        .clone()
+        .ok_or_else(|| "this boot has no TLS key yet".to_string())?;
+    rsa_oaep_open(&key, b64)
+}
+
+/// Open an RSA-OAEP/SHA-256 seal with the given key, bounded to one ciphertext.
+fn rsa_oaep_open(
+    key: &openssl::pkey::PKey<openssl::pkey::Private>,
+    b64: &str,
+) -> Result<String, String> {
+    use base64::engine::general_purpose::STANDARD as B64STD;
+    use base64::Engine as _;
+    use openssl::rsa::Padding;
+
+    let ciphertext = B64STD
+        .decode(b64.trim())
+        .map_err(|_| "code_enc is not valid base64".to_string())?;
+    if ciphertext.len() != key.size() as usize {
+        return Err(format!(
+            "sealed code is {} bytes, but this key is {} bytes",
+            ciphertext.len(),
+            key.size()
+        ));
+    }
+    let mut ctx = openssl::pkey_ctx::PkeyCtx::new(&key).map_err(|e| e.to_string())?;
+    ctx.decrypt_init().map_err(|e| e.to_string())?;
+    ctx.set_rsa_padding(Padding::PKCS1_OAEP).map_err(|e| e.to_string())?;
+    ctx.set_rsa_oaep_md(openssl::md::Md::sha256()).map_err(|e| e.to_string())?;
+    ctx.set_rsa_mgf1_md(openssl::md::Md::sha256()).map_err(|e| e.to_string())?;
+    let mut plaintext = vec![0u8; key.size() as usize];
+    let len = ctx
+        .decrypt(&ciphertext, Some(&mut plaintext))
+        .map_err(|_| "cannot open the sealed code with this boot's TLS key".to_string())?;
+    plaintext.truncate(len);
+    String::from_utf8(plaintext)
+        .map_err(|_| "the sealed code is not valid UTF-8".to_string())
 }
 
 fn zeroize_str(s: &mut String) {
@@ -3431,6 +3518,7 @@ async fn debug_envelope(
         &binary_sha256,
         &state.boot_manifest,
     );
+    let (tls_pubkey_pem, tls_pubkey_sha256) = attested_tls_key(&state);
     let mut report_data = [0u8; 64];
     report_data[0..32].copy_from_slice(&nonce);
     let quote_res = tpm::quote(&hex::encode(nonce), Some(report_data));
@@ -3453,7 +3541,13 @@ async fn debug_envelope(
                 "disk_manifest": &state.boot_manifest,
             }
         },
-        "session_context": {},
+        "session_context": {
+            // v223: the key a prover seals a PayPal code to, named in the
+            // attestation itself so "verify, then encrypt" needs no second
+            // channel. Empty only in the window before the listener exists.
+            "tls_public_key_pem": tls_pubkey_pem,
+            "tls_public_key_sha256": tls_pubkey_sha256,
+        },
         "hardware_level_attestation": quote_res,
         "timestamp_ms": chrono::Utc::now().timestamp_millis() as u64,
     });
@@ -3530,7 +3624,25 @@ async fn callback(
         return status.into_response();
     }
 
-    let code = query.code.clone().unwrap_or_default();
+    let mut code = query.code.clone().unwrap_or_default();
+    // v223: prefer the sealed form. A caller that sealed to the attested TLS key
+    // proves the code only ever existed inside this instance; a caller that sent
+    // it in the query keeps the old behaviour, so nothing that works today breaks.
+    if let Some(sealed) = query.code_enc.as_deref().filter(|s| !s.trim().is_empty()) {
+        if !code.trim().is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                "send the code either sealed (code_enc) or in the query, not both",
+            )
+                .into_response();
+        }
+        match decrypt_sealed_code(&state, sealed) {
+            Ok(opened) => code = opened,
+            Err(reason) => {
+                return (StatusCode::BAD_REQUEST, format!("cannot open the sealed code: {reason}")).into_response();
+            }
+        }
+    }
     let state_param = query.state.clone().unwrap_or_default();
 
     // R3-4: a denied/cancelled consent (or a bare /callback hit) is rejected
@@ -3732,6 +3844,7 @@ async fn callback(
     // the wrong P_client/nonce and the auditor's recomputation fails closed.
     // [0..32] stays the SEC-02 identity/code nonce (formula unchanged).
     report_data[32..64].copy_from_slice(&client_session_binding(&client_pub, &client_nonce));
+    let (tls_pubkey_pem, tls_pubkey_sha256) = attested_tls_key(&state);
     let quote_res = tpm::quote(&hex::encode(nonce), Some(report_data));
 
     // v168 (plan Phase 2.2): FAIL-CLOSED report minting.
@@ -3779,6 +3892,14 @@ async fn callback(
         },
         "session_context": {
             "tls_certificate_pem": state.tls_cert_pem.read().clone().unwrap_or_default(),
+            // v223 (user directive): the public half of the key that terminates
+            // TLS for this boot, so a report is also the answer to "what do I
+            // encrypt the PayPal code to?". Sealing the code to this key is what
+            // makes the second attestation provably the same enclave: the key is
+            // generated in RAM at boot, never persisted, and named in the first
+            // attestation the user checks.
+            "tls_public_key_pem": tls_pubkey_pem,
+            "tls_public_key_sha256": tls_pubkey_sha256,
             // v179 (plan Phase 1.1): the client session bound into the quote's
             // report_data[32..64] is echoed here for transparency. The auditor
             // compares the QUOTE bytes against ITS OWN session values — this
@@ -4671,6 +4792,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             https_ready: Arc::new(AtomicBool::new(false)),
             staging: config.staging,
             tls_cert_pem: Arc::new(RwLock::new(None)),
+            tls_pubkey_pem: Arc::new(RwLock::new(None)),
+            tls_private_key: Arc::new(RwLock::new(None)),
             enclave_identity,
             ip_stats: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             global_egress_bytes: Arc::new(AtomicU64::new(0)),
@@ -4806,6 +4929,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         };
 
+        // Publish the key the certificate carries, and keep the private half:
+        // the reported fingerprint is what a prover seals a code to, so the two
+        // must be the same key object the listener uses.
+        let tls_pubkey_pem = String::from_utf8_lossy(
+            &ephemeral_tls_key
+                .public_key_to_pem()
+                .map_err(|e| format!("cannot export the TLS public key: {e}"))?,
+        )
+        .to_string();
+        *state.tls_pubkey_pem.write() = Some(tls_pubkey_pem);
+        *state.tls_private_key.write() = Some(ephemeral_tls_key.clone());
         *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&cert_chain_pem).to_string());
         let ssl_acceptor = build_in_memory_ssl_acceptor(&cert_chain_pem, &ephemeral_tls_key)?;
         // v168 (plan Phase 4.1): config fetched + cert in RAM — IMDS, DNS and
@@ -5327,6 +5461,59 @@ mod security_tests {
         );
         assert!(!refused.to_string().contains(host));
         assert!(!attested.to_string().contains(host));
+    }
+
+    /// v223: what a prover seals to is what the report names. A code sealed to
+    /// the reported TLS key must open here, and only with that boot's key.
+    #[test]
+    fn a_code_sealed_to_the_reported_key_opens_and_a_foreign_key_does_not() {
+        use base64::Engine as _;
+        use openssl::rsa::Padding;
+
+        let key = openssl::pkey::PKey::from_rsa(openssl::rsa::Rsa::generate(2048).unwrap()).unwrap();
+        let pem = String::from_utf8(key.public_key_to_pem().unwrap()).unwrap();
+
+        let seal = |pem: &str, code: &str| -> String {
+            let pubkey = openssl::pkey::PKey::public_key_from_pem(pem.as_bytes()).unwrap();
+            let mut ctx = openssl::pkey_ctx::PkeyCtx::new(&pubkey).unwrap();
+            ctx.encrypt_init().unwrap();
+            ctx.set_rsa_padding(Padding::PKCS1_OAEP).unwrap();
+            ctx.set_rsa_oaep_md(openssl::md::Md::sha256()).unwrap();
+            ctx.set_rsa_mgf1_md(openssl::md::Md::sha256()).unwrap();
+            let mut out = vec![0u8; pubkey.size() as usize];
+            let n = ctx.encrypt("A1b2C3-the-paypal-code".as_bytes(), Some(&mut out)).unwrap();
+            out.truncate(n);
+            let _ = code;
+            base64::engine::general_purpose::STANDARD.encode(out)
+        };
+
+        // The report's fingerprint names this key and nothing else.
+        assert_eq!(pubkey_fingerprint(&pem).len(), 64);
+        assert_eq!(pubkey_fingerprint(&pem), pubkey_fingerprint(&pem));
+        assert_ne!(pubkey_fingerprint(&pem), pubkey_fingerprint("not a key"));
+
+        let sealed = seal(&pem, "A1b2C3-the-paypal-code");
+        assert_eq!(
+            rsa_oaep_open(&key, &sealed).unwrap(),
+            "A1b2C3-the-paypal-code"
+        );
+
+        // A different boot's key cannot open it — the whole point of sealing.
+        let other = openssl::pkey::PKey::from_rsa(openssl::rsa::Rsa::generate(2048).unwrap()).unwrap();
+        assert!(rsa_oaep_open(&other, &sealed).is_err());
+
+        // Junk, wrong-size, and tampered seals fail closed, never silently.
+        assert!(rsa_oaep_open(&key, "not base64!!").is_err());
+        assert!(rsa_oaep_open(&key, "AAAA").is_err());
+        let mut tampered = base64::engine::general_purpose::STANDARD
+            .decode(&sealed)
+            .unwrap();
+        tampered[10] ^= 0x01;
+        assert!(rsa_oaep_open(
+            &key,
+            &base64::engine::general_purpose::STANDARD.encode(tampered)
+        )
+        .is_err());
     }
 
     /// The download route's two guards, pinned directly: a digest that is not

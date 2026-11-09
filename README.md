@@ -53,6 +53,33 @@ GitHub Actions CI attestation (Sigstore, per-commit)
 > (e.g. `boot.binary_sha256`) never gate anything — code identity is decided exclusively
 > by the silicon pins over the hardware quote.
 
+### Sealing the PayPal code to the attested key
+
+Every report carries the HTTPS listener's public key — `session_context.tls_public_key_pem`
+and its DER digest `tls_public_key_sha256`. That key is generated in RAM on each boot and
+never written to disk, so naming it in a report is what ties an attestation to one running
+instance.
+
+The payoff is a two-step hand-off: audit the data-free attestation first, then seal the
+PayPal `code` to the key that attestation named and send it in place of `code`:
+
+```bash
+# 1. the key, out of the report you already audited
+jq -r '.attestation_report.session_context.tls_public_key_pem' envelope.json > tls_pub.pem
+printf '%s' "$PAYPAL_CODE" > code.txt
+
+# 2. RSA-OAEP/SHA-256, the only padding the enclave accepts
+openssl pkeyutl -encrypt -pubin -inkey tls_pub.pem \
+  -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+  -pkeyopt rsa_mgf1_md:sha256 -in code.txt | base64 -w0
+
+# 3. GET https://login.airma.de/callback?state=<state>&code_enc=<that base64>
+```
+
+A different VM — a replaced instance, a swapped image — cannot open the seal: its key was
+born after the attestation you checked. Sending `code` in the query still works, so nothing
+that predates this changes shape; sending both is refused.
+
 ---
 
 ## 🏗️ Build & Verifiability Workflow
@@ -96,7 +123,7 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 265,825 bytes | `43de8479211a4086dcf85fd747b6e1ebb831ca4217f955e509757f110437b148` |
+| `verify.html` | 265,825 bytes | `f8bd612ca540eac41dfae17672a1467b479475c662d49f793ced19e019f05a1a` |
 | `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
 | `zk-rsa.html` | 100,001 bytes | `a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40` |
 | `privacy.html` | 4,673 bytes | `e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8` |
@@ -104,7 +131,7 @@ the file it describes:
 
 ```bash
 sha256sum verify.html zk.html zk-rsa.html privacy.html terms.html
-# 43de8479211a4086dcf85fd747b6e1ebb831ca4217f955e509757f110437b148  verify.html
+# f8bd612ca540eac41dfae17672a1467b479475c662d49f793ced19e019f05a1a  verify.html
 # 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
 # a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40  zk-rsa.html
 # e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8  privacy.html

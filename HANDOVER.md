@@ -1649,3 +1649,89 @@ nothing). Images kept: v222b (live), v222a (rotation probe), v221b, v220
 (rollback), v218, v217b, v216b, v216a. `relay188` running for the transfer;
 stop it economically when done. Probe-image cleanup is the operator's call — same
 as v221a, which was deleted with its snapshot on request.
+
+## 0.37 v223 — the attestation names the TLS key, and the code can be sealed to it (2026-11-09)
+
+A report used to carry the TLS *certificate* but never said, in so many words,
+"this is the key this instance holds". v223 publishes both halves of that
+statement — `session_context.tls_public_key_pem` (SPKI) and
+`tls_public_key_sha256` — in the data-free `/debug/envelope` report and in the
+login report alike, and accepts the PayPal code sealed to that key:
+`GET /callback?state=…&code_enc=<base64 RSA-OAEP/SHA-256>`.
+
+### What it buys
+
+The key is RSA-4096, generated **in RAM on every boot** and never written to
+disk (the ACME key and the listener key are the same object). So a seal made to
+a verified report's key can only be opened by the instance that report
+described. That is the two-step hand-off the user asked for:
+
+1. audit the report (measurements, TLS key fingerprint) **before any user data
+   exists** — `/debug/envelope` is exactly that;
+2. seal the code to the key that report named and send it in place of `code`.
+
+A replaced VM, a swapped image, or a later boot answers `400 cannot open the
+sealed code`: its key was born after the attestation the user checked.
+
+### Refusals, verified live on v223b
+
+| Attempt | Answer |
+|---|---|
+| sealed to the **current** report's key (bogus `state`) | `403 Invalid or expired session` — i.e. the seal opened, and the failure is the state, not the ciphertext |
+| sealed to a **previous boot's** key, replayed | `400 cannot open the sealed code with this boot's TLS key` |
+| sealed to an unrelated key | same `400` |
+| `code` **and** `code_enc` in one request | `400 send the code either sealed (code_enc) or in the query, not both` |
+| ciphertext of the wrong length, or not base64 | `400`, bounded before any RSA operation |
+
+The query form (`code=…`) is untouched, so nothing that worked before v223
+changes shape. `verify.html` was not modified: the key lives in the signed
+report it already renders, and the README documents the `openssl pkeyutl`
+recipe and the URL shape.
+
+### Release
+
+| | Cycle A (rotation source) | Cycle B (shipped) |
+|---|---|---|
+| Image | `m-2zedfw4w7k4n7bfsgsso` (`…v223a-202611091045`) | **`m-2ze9lskiq4fq22uadm3j`** (`…v223b-202611091057`) |
+| Disk | sha256 `08997886…`, md5 `c234d209…` | sha256 **`4e35437a…`**, md5 `acba09dc…` |
+| initrd | `722f1848…` | **`722f1848…`** (identical) |
+| Enclave `/init` | `5acc1eb5…` | `5acc1eb5…` |
+| tls-proxy | `a13eabe7…` (unchanged — v222's binary) | `a13eabe7…` |
+
+Rotated: `EXPECTED_RTMR2 4de4917a… → 068f0efc…` and `EXPECTED_ENCLAVE_SHA256
+0616aed1… → 5acc1eb5…`; MRTD / RTMR0 / RTMR1 / RTMR3 held. `verify.html` is now
+**`f8bd612c…`** (README row updated). Prod disk `d-2ze2zxb3t87jivl7tge`,
+`user_data` re-pushed (`4fda21a7…`), `/proxy/health` 200 at **t+55 s** both
+cycles. Live reports: key fingerprint `e0f08349…` on A, `c3a50c8e…` on B — the
+per-boot rotation is visible in the attestation itself, which is the point.
+
+Watchdog `dist/config.json` and all three OOS templates moved to v223b; a real
+reconcile answered `Success {"instanceId":"i-2ze1zdxis0hcsg91qbh5","eipStatus":"InUse"}`.
+
+### Traps hit this cycle
+
+1. **A stopped relay cannot run Cloud Assistant** — `relay188` was stopped for
+   economy after v222, and every transfer silently produced no output until it
+   was started again. Check `Status` first.
+2. **One relay invocation must stay under the ~60 s RunCommand default.** The
+   HK GET (public endpoint, ~25 s at 2.2 MB/s) plus the Beijing PUT does not
+   fit; splitting GET and PUT into two calls works, because `/tmp` survives.
+3. **The HK presigned PUT can 403 at 64 KiB** with a freshly signed URL
+   (`SignatureDoesNotMatch` semantics vary with the attempt). Regenerating the
+   URL and retrying succeeded; always confirm `put_hk=200 sent=<full size>`
+   before trusting the object.
+4. **A truncated hash is not a hash.** Substituting a pin from a 16-character
+   preview silently wrote a fabricated 64-hex value into `verify.html`;
+   `grep -c <true hash>` caught it. Always paste the full digest from
+   `sha256sum`.
+
+Test coverage: `cargo test` 44/44, including a seal/open roundtrip
+(`a_code_sealed_to_the_reported_key_opens_and_a_foreign_key_does_not`) that also
+pins the refusal of a foreign key, junk base64, wrong-size seals and tampered
+ciphertext.
+
+### State left behind
+
+Prod `i-2ze1zdxis0hcsg91qbh5`, image `m-2ze9lskiq4fq22uadm3j`, disk
+`d-2ze2zxb3t87jivl7tge`. Images kept: v223b (live), v223a (rotation probe),
+v222b, v221b, v220 (rollback), v218, v217b, v216b, v216a. `relay188` running.
