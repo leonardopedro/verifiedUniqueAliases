@@ -2009,3 +2009,82 @@ presigner `/tmp/oss-sign.mjs` remain — delete before handing this box on.
 (`https://leonardopedro.github.io/verifiedUniqueAliases/verify.html`), or the
 checkbox path dies at the authorize screen. The enclave side is already live and
 allowlisted; see README → *Adding a sealed-redirect URI*.
+
+---
+
+## 0.41 — rotation is one command, and the custom-domain redirect (2026-11-09)
+
+### `rotate-alibaba.sh`
+
+The v225c rotation was run by hand, and each hop had a failure mode that boots
+the wrong bytes: a truncated OSS upload, an import from a stale object, a
+`user_data` push before the swap (discarded with the old disk). The sequence is
+now a checklist script with a **digest gate per hop**, refusing to continue
+until the previous one proves itself:
+
+| Phase | Gate |
+|---|---|
+| preflight | `verify.html` == `index.html`, config JSON parses, instance exists, tree maps to a commit |
+| build | disk sha256/md5/size + binary sha recorded (fails if the ESP did not assemble) |
+| stage | OSS `Content-Length` == local size **and** `ETag` == local md5 — on the HK object *and* on the Beijing object (relay legs), or `RELAY_MODE=direct` |
+| import | `Description` read back and must carry the local `sha256=`, `Features.NvmeSupport=supported`, status `Available` |
+| rotate | `StopInstance --ForceStop` → `ReplaceSystemDisk --SystemDisk.Size 1` → `ModifyInstanceAttribute --UserData` → readback sha256 → start; prints the rollback disk |
+| verify | HTTPS 200, `boot_measurements.binary_sha256` == the binary just built, `check-manifest-parity.mjs` → **PARITY OK** |
+
+Two calls the CLI cannot make are committed as `scripts/`: `ecs-rpc.mjs` (the
+CLI rejects `Features.NvmeSupport`) and `oss-presign.mjs` (the relay legs need
+presigned HK PUT/GET and Beijing intranet PUT). `import-alibaba-image.sh` now
+honours `ALI_IMAGE_NAME` so the checklist can name the image.
+
+Exercised live, read-only: `--dry-run` (all six phases, digests of the deployed
+disk) and `--from verify` → `binary f2ea2d1b…` matches the envelope,
+**PARITY OK**. The write phases were **not** re-run (prod was already on v225c);
+they are the literal §0.40 command sequence plus assertions.
+
+### Custom domain: CNAME → raw is not enough
+
+A plain CNAME at `raw.githubusercontent.com` looks like it serves the auditor,
+but the browser validates the certificate against the custom hostname and raw's
+cert covers only `*.githubusercontent.com`:
+
+```
+$ curl --resolve audit.airma.de:443:185.199.108.133 \
+    https://audit.airma.de/leonardopedro/verifiedUniqueAliases/main/verify.html
+curl: (60) SSL: no alternative certificate subject name matches target hostname 'audit.airma.de'
+```
+
+`airma.de` is on Cloudflare (`vick/teagan.ns.cloudflare.com`), so the working
+shape is a **proxied** CNAME (`audit` → `raw.githubusercontent.com`, orange
+cloud): Cloudflare terminates TLS for the custom hostname and pulls the path
+from raw with the right SNI. Origin pull verified — raw and jsDelivr both
+return the committed page, sha256 `d37c59a9…`, identical to the copy inside the
+measured ESP.
+
+**Not done, because it needs the DNS owner:** the record itself. And a
+config-only rotation (no rebuild) is waiting on it:
+
+1. create `CNAME audit → raw.githubusercontent.com`, proxied;
+2. add `https://audit.airma.de/leonardopedro/verifiedUniqueAliases/main/verify.html`
+   to `seal_redirect_uris` (Stop → `ModifyInstanceAttribute --UserData` → Start);
+3. register the same string as the PayPal app's Return URL.
+
+Then verify: page digest == `d37c59a9…`, `/attest/login-session` returns it
+signed, and a real login lands back on that page and jumps to `/callback?code_enc=…`.
+Note `@main` is mutable behind a permanently registered Return URL — pin
+`@<commit>` if the page must be frozen per release.
+
+### Browser E2E for the sealed redirect: blocked, precisely
+
+No browser on this host, no PayPal account credentials here, and PayPal answers
+**HTTP 403** at the authorize screen to a request from a datacenter IP (body
+echoes the `redirect_uri` and `state` but serves no login form). The enclave
+side is proven by curl (signed `redirect_uri`, both slots, slot interchange
+refused); the browser leg needs a human session after the Return URL is
+registered.
+
+### Cleanup state
+
+`/tmp/pav-userdata.b64` and `/tmp/pav-userdata-v225.json` deleted (live
+secrets). Staging OSS objects (`disk225.raw|disk226.raw` in both buckets) remain
+— deleting them needs the relay started, which costs more than they do.
+`/tmp/pav-userdata.json` (30 Oct, superseded) remains.
