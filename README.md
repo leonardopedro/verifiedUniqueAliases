@@ -61,7 +61,18 @@ never written to disk, so naming it in a report is what ties an attestation to o
 instance.
 
 The payoff is a two-step hand-off: audit the data-free attestation first, then seal the
-PayPal `code` to the key that attestation named and send it in place of `code`:
+PayPal `code` to the key that attestation named and send it in place of `code`.
+
+**In the browser (no tools):** open `verify.html`, audit the data-free report — its
+**🔑 Attested TLS Key** row shows the fingerprint and fills the key into the card below —
+then paste the PayPal redirect URL (`…/callback?code=…&state=…`) and press
+**“Seal the code and open the callback.”** The code is encrypted by WebCrypto
+(RSA-OAEP/SHA-256, empty label) inside the page, and the page remembers which key it
+sealed to: a later report naming any **other** key fails the audit with
+*“DIFFERENT BOOT”*, because the TLS key is minted in RAM at boot and never persisted.
+Nothing about the code is stored or uploaded in plaintext.
+
+With a shell, the same seal:
 
 ```bash
 # 1. the key, out of the report you already audited
@@ -123,7 +134,7 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 265,825 bytes | `f8bd612ca540eac41dfae17672a1467b479475c662d49f793ced19e019f05a1a` |
+| `verify.html` | 283,700 bytes | `1f3c8ba0d34b571483fc1e0f7d9807bd0867587d4fd0b354cb0f7125acfd4432` |
 | `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
 | `zk-rsa.html` | 100,001 bytes | `a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40` |
 | `privacy.html` | 4,673 bytes | `e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8` |
@@ -131,7 +142,7 @@ the file it describes:
 
 ```bash
 sha256sum verify.html zk.html zk-rsa.html privacy.html terms.html
-# f8bd612ca540eac41dfae17672a1467b479475c662d49f793ced19e019f05a1a  verify.html
+# 1f3c8ba0d34b571483fc1e0f7d9807bd0867587d4fd0b354cb0f7125acfd4432  verify.html
 # 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
 # a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40  zk-rsa.html
 # e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8  privacy.html

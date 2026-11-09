@@ -1735,3 +1735,98 @@ ciphertext.
 Prod `i-2ze1zdxis0hcsg91qbh5`, image `m-2ze9lskiq4fq22uadm3j`, disk
 `d-2ze2zxb3t87jivl7tge`. Images kept: v223b (live), v223a (rotation probe),
 v222b, v221b, v220 (rollback), v218, v217b, v216b, v216a. `relay188` running.
+
+---
+
+## 0.38 — v224: the seal step and the attested-key row land in verify.html
+
+**Ask.** (a) Put the seal step in `verify.html` — take the attested key, encrypt
+the PayPal code in the browser, open the callback in one click. (b) Show the
+attested TLS key fingerprint and flag any report whose key differs from the one
+this browser sealed to. (c) Delete the v223a rotation probe and the older
+v216/v217 probes.
+
+**No enclave change, no redeploy.** Everything here is the auditor page plus
+cloud housekeeping; the deployed image stays `m-2ze9lskiq4fq22uadm3j` (v223b),
+whose `/callback` already accepts `code_enc`.
+
+### (a) The seal card (`#sealCard`)
+
+The audit's 🔑 row fills `#sealKeyInput` with `session_context.tls_public_key_pem`.
+The user pastes the PayPal redirect URL (or a bare code) and presses
+**“Seal the code and open the callback”**:
+
+1. `parseCallbackUrl` takes `code` **and** `state` from the pasted URL — the two
+   can never be paired by hand wrongly, and the code never travels in the clear.
+2. WebCrypto `importKey('spki', …, {name:'RSA-OAEP', hash:'SHA-256'})` then
+   `encrypt({name:'RSA-OAEP'}, …)`. **Empty OAEP label; MGF1-SHA-256** — the exact
+   parameters `rsa_oaep_open` in `src/main.rs` sets (`Padding::PKCS1_OAEP`,
+   `set_rsa_oaep_md(sha256)`, `set_rsa_mgf1_md(sha256)`).
+3. Ciphertext (512 B for RSA-4096) is shipped as **standard base64 with padding**
+   — `code_enc` is decoded with `STANDARD`, not URL-safe, and `encodeURIComponent`
+   protects the `+`.
+4. The page records `{host, sha256, at}` in `localStorage` under
+   `pav_sealed_tls_key_v1` and navigates to `/callback?code_enc=…&state=…`.
+   **The code itself is never stored** (checked by test).
+
+Honest limit, stated on the card: the user has to see the code before the enclave
+does. The flow is “log in in another tab, press Esc/Stop when PayPal bounces back
+to `/callback?code=…`, copy that URL”. Without that (or a redirect_uri you
+control), the enclave consumes the code on arrival and there is nothing to seal —
+the card cannot manufacture that property.
+
+### (b) The attested-key row (`#tlsKeyCheck`)
+
+Rendered after the TLS-certificate row, from the report:
+
+- `sha256(SPKI DER of tls_public_key_pem)` vs `tls_public_key_sha256` —
+  **self-consistency**, refused when they disagree (internally inconsistent
+  report).
+- vs the remembered seal: **different fingerprint ⇒ audit FAILS** with
+  “DIFFERENT BOOT — this is not the VM you sealed to”, naming both fingerprints
+  and the host the seal was made for. The TLS key is minted in RAM per boot and
+  never persisted, so a different key is a different (or rebooted) instance.
+  No sealed record ⇒ informational green row with the fingerprint.
+- A report with no key at all (pre-v223, or listener not up) is an amber skip,
+  never a pass.
+
+### Verification actually run
+
+- **Wire compatibility:** node WebCrypto (same parameters as the page) sealed a
+  code; `openssl pkeyutl -decrypt … oaep/sha256/mgf1-sha256` opened it to the
+  plaintext. 512 B ciphertext, 684-char base64.
+- **Live, against prod:** a browser-style seal to the live key
+  (`c3a50c8e…`) answered **403 invalid session** (the seal opened; the junk state
+  failed), while the same shape sealed to a foreign key answered **400 “cannot
+  open the sealed code with this boot’s TLS key”**. Declared vs computed
+  fingerprints matched (`c3a50c8e…`).
+- **Page-level:** `node /tmp/test-seal-page.mjs` eval’d the real page script with
+  DOM stubs and drove the actual button — 16/16, including “the shell recipe
+  opens it to the PayPal code”, “the code is NOT stored”, “no key → refuses”,
+  “code without state → refuses”, “a different key is called out”. (That script
+  is an ad-hoc harness, not committed.)
+- `scripts/test-verify-security.mjs` **492 passed / 0 failed** once the README
+  digest was rotated (the Pages check needs the push). `scripts/test-verify-proxy.mjs`
+  44/44.
+- `verify.html` 283,700 B / `1f3c8ba0d34b571483fc1e0f7d9807bd0867587d4fd0b354cb0f7125acfd4432`,
+  `index.html` byte-identical, README digest row updated. No pin rotated — the
+  page does not feed RTMR2 (it ships on the unmeasured ESP).
+
+### (c) Probe cleanup
+
+Deleted with `DeleteImage … --Force true`, then their snapshots:
+
+| Image | Snapshot |
+|---|---|
+| `m-2zedfw4w7k4n7bfsgsso` (v223a) | `s-2zedfw4w7k4n7bfn3f9i` |
+| `m-2zeibiq6bbe5x9n0o94c` (v216a) | `s-2zeibiq6bbe5x9n2a552` |
+| `m-2ze2ncqumj1veapx9wt4` (v216b) | `s-2ze2ncqumj1veappt8v1` |
+| `m-2ze7liy7l0dobz3gg77g` (v217b) | `s-2ze7liy7l0dobz3krl2y` |
+
+9 images / 9 snapshots → **5 / 5**, still 1:1: v223b (live), v222b, v221b, v220,
+v218. `DescribeInstances` confirmed nothing but prod (`m-…uadm3j`, Running) and
+the stopped `relay188` before deletion. Note the CLI's `DescribeImages` fails with
+`InvalidOperation.NotSupportedEndpoint` for `cn-beijing-i`; `/tmp/ecs-call.mjs`
+(signed RPC, `RegionId=cn-beijing`) works.
+
+`relay188` left **stopped** (economy mode) after this cycle.

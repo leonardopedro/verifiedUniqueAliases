@@ -485,6 +485,19 @@ Wmw2oAio9A==
                 </div>
             </div>
 
+            <!-- v224 (user directive): the key a sealed PayPal code must be
+                 encrypted to, named by the attestation itself. Two duties: the
+                 reported fingerprint must hash the reported PEM, and a report
+                 naming a key OTHER than the one this browser sealed to is a
+                 DIFFERENT BOOT — fail closed. -->
+            <div id="tlsKeyCheck" class="check-item">
+                <div class="check-icon">🔑</div>
+                <div class="check-text">
+                    <h4>Attested TLS Key</h4>
+                    <p id="tlsKeyDesc">Names the key this boot terminates TLS with — the key a sealed PayPal code must be encrypted to.</p>
+                </div>
+            </div>
+
             <div id="policeCheck" class="check-item">
                 <div class="check-icon">🚔</div>
                 <div class="check-text">
@@ -505,6 +518,33 @@ Wmw2oAio9A==
         <p style="color: var(--text-dim); font-size: 0.85rem;">Proves — <b>without showing your identity</b> — that this audited quote is bound to a <b>verified</b> PayPal identity, and escrows the plaintext to a recipient key you choose. The prover lives on <b>zk.html</b> at the pinned GitHub Pages origin, so the ZK layer can improve without touching the measured enclave image. The button below opens it and hands over <b>only</b> the identity this audit verified — in your browser (postMessage, pinned origin; nothing is uploaded, and the identity bytes never touch any server).</p>
         <a id="zkOpenBtn" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/zk.html" target="_blank" onclick="return openZkProver(this.href)" style="display:block; margin-top:12px; padding:14px; text-align:center; background:#8957e5; color:#fff; border-radius:10px; font-weight:600; text-decoration:none; cursor:pointer;">⚡ Get the ZK escrow prover (zk.html from the GitHub repo — save it, open it locally) →</a>
         <p id="zkHandoffStatus" style="margin:8px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);"></p>
+    </div>
+
+    <!-- v224 (user directive): SEAL THE PAYPAL CODE TO THE ATTESTED TLS KEY.
+         The audit above says WHICH key this boot terminates TLS with; this
+         card encrypts the PayPal code to that key IN THIS BROWSER, so the code
+         exists in plaintext only here and inside the audited boot. The TLS key
+         is minted in RAM at boot and never persisted, so a different VM (or a
+         reboot of this one) cannot open the ciphertext — the second, data-
+         bearing attestation cannot come from a swapped instance. -->
+    <div id="sealCard" class="status-card" style="margin-top:20px;">
+        <label>🔑 Seal the PayPal code to the attested key <span style="font-weight:400; color:var(--text-dim);">(optional — binds the second attestation to the same boot)</span></label>
+        <p style="color: var(--text-dim); font-size: 0.85rem;">
+            <b>1.</b> Audit a <b>data-free</b> attestation above — the 🔑 row names the key this boot terminates TLS with.
+            <b>2.</b> Log in with PayPal in another tab. When PayPal sends you back to <code>/callback?code=…&amp;state=…</code>, press <b>Esc</b> (or the Stop button) before that page loads and copy the URL — the code must reach this page before anything consumes it.
+            <b>3.</b> Paste the URL below: the code is encrypted <b>here</b>, with WebCrypto RSA-OAEP/SHA-256, to exactly the key you audited, and the callback opens with <code>code_enc</code> instead of a clear code.
+            Only that boot holds the private half, so a replaced or rebooted instance answers “cannot open the sealed code with this boot’s TLS key” rather than handing back a report.
+        </p>
+        <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Attested TLS public key (auto-filled by the audit above)</label>
+        <textarea id="sealKeyInput" spellcheck="false" oninput="sealShowKeyFingerprint()" placeholder="-----BEGIN PUBLIC KEY----- … (session_context.tls_public_key_pem from the report you audited)" style="height:110px;"></textarea>
+        <p id="sealKeyStatus" style="margin:6px 0 0; font-size:0.82rem; word-break:break-all; color:var(--text-dim);"></p>
+        <label style="margin-top:12px; font-weight:400; color:var(--text-dim); font-size:0.9rem;">PayPal code — or the whole redirect URL</label>
+        <input type="text" id="sealCodeInput" spellcheck="false" placeholder="C21AA… or https://…/callback?code=C21AA…&amp;state=eyJ2Ijo…" style="width:100%; padding:10px; border-radius:4px; border:1px solid #30363d; background:#0d1117; color:#e6edf3;">
+        <label style="margin-top:12px; font-weight:400; color:var(--text-dim); font-size:0.9rem;">Session state (filled from the pasted URL, or from this tab’s login session)</label>
+        <input type="text" id="sealStateInput" spellcheck="false" placeholder="eyJ2Ijoi… (the state from the same redirect)" style="width:100%; padding:10px; border-radius:4px; border:1px solid #30363d; background:#0d1117; color:#e6edf3;">
+        <button onclick="sealCodeAndOpen(); return false;" style="margin-top:14px;">🔒 Seal the code and open the callback</button>
+        <a id="sealOpenLink" href="#" style="display:none; margin-top:10px; word-break:break-all; font-size:0.8rem; color:#58a6ff;"></a>
+        <p id="sealStatus" style="margin:8px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);"></p>
     </div>
     </div>
 </div>
@@ -797,6 +837,9 @@ Wmw2oAio9A==
     // verified — [0..32] stays strictly enforced, the slot is informational.
     var auditorSessionBindingHex = null;
     var lastAuditedPubKeyPem = null;
+    // v224: the TLS public key named by the report that last passed the audit,
+    // and the seal this browser performed against it (see sealCodeAndOpen).
+    var lastAuditedTlsKeyPem = null;
     // v199: the envelope that last passed the audit, and the Police copy once
     // it has been decrypted — whichever arrives second completes the compare.
     var lastAuditedEnvelope = null;
@@ -3813,6 +3856,49 @@ Wmw2oAio9A==
                 updateStatus('tlsCheck', 'warning', "ℹ️ Optional channel cross-check not requested — paste your browser's TLS certificate (field above) to bind this report to the live connection. Every other row does not depend on it.");
             }
 
+            // 6b. v224 (user directive): ATTESTED TLS KEY — what a sealed PayPal
+            // code must be encrypted to. Two duties, both fail-closed:
+            //   (a) the reported fingerprint must hash the reported PEM
+            //       (an internally inconsistent report is refused), and
+            //   (b) if this browser already sealed a code, the report must name
+            //       THAT key. The TLS key is minted in RAM every boot, so a
+            //       different key means a different (or rebooted) instance: the
+            //       seal cannot be opened there, and the report in hand is not
+            //       the boot the user sealed to. Never silently accept it.
+            {
+                const sc = report.session_context || {};
+                const keyPem = String(sc.tls_public_key_pem || '').trim();
+                const declaredFp = String(sc.tls_public_key_sha256 || '').trim().toLowerCase();
+                if (!keyPem) {
+                    updateStatus('tlsKeyCheck', 'warning',
+                        'ℹ️ This report names no TLS key (pre-v223 enclave, or the listener had not started yet) — there is nothing to seal a PayPal code to. Re-run the data-free attestation once the enclave is listening.');
+                } else {
+                    const fp = await tlsKeyFingerprint(keyPem);
+                    lastAuditedTlsKeyPem = keyPem;
+                    const keyField = document.getElementById('sealKeyInput');
+                    if (keyField && !keyField.value.trim()) keyField.value = keyPem;
+                    try { sealShowKeyFingerprint(); } catch (e) { /* no DOM */ }
+                    if (declaredFp && declaredFp !== fp) {
+                        updateStatus('tlsKeyCheck', false,
+                            '❌ <b>Attested key fingerprint does not hash the PEM this report ships:</b> it declares <code>' + esc(declaredFp.slice(0, 24)) + '…</code> but the key hashes to <code>' + fp.slice(0, 24) + '…</code>. The report is internally inconsistent — refusing it.');
+                        throw new Error('TLS KEY SELF-CONSISTENCY FAILED: session_context.tls_public_key_sha256 does not hash session_context.tls_public_key_pem.');
+                    }
+                    const sealed = sealedKeyRecord();
+                    if (sealed) {
+                        if (sealed.sha256 !== fp) {
+                            updateStatus('tlsKeyCheck', false,
+                                '❌ <b>DIFFERENT BOOT — this is not the VM you sealed to.</b> This browser sealed a PayPal code to key <code>' + sealed.sha256.slice(0, 24) + '…</code>' + (sealed.host ? ' on <code>' + esc(sealed.host) + '</code>' : '') + ', but this report names <code>' + fp.slice(0, 24) + '…</code>. The TLS key is generated in RAM at every boot and never persisted, so the sealed code cannot be opened by whoever produced these bytes — and this attestation does not describe the instance you audited. Start again from a fresh data-free attestation.');
+                            throw new Error('TLS KEY MISMATCH: the report names key ' + fp.slice(0, 16) + '… but this browser sealed the PayPal code to ' + sealed.sha256.slice(0, 16) + '… — the enclave changed between the two attestations.');
+                        }
+                        updateStatus('tlsKeyCheck', true,
+                            '✅ <b>Same boot as the key you sealed to.</b> Fingerprint <code>' + fp.slice(0, 32) + '…</code> (SHA-256 of the SPKI DER, consistent with the reported value) matches the key this browser encrypted your PayPal code to on <code>' + esc(sealed.host || 'this enclave') + '</code> — so these bytes come from the instance that could open it.');
+                    } else {
+                        updateStatus('tlsKeyCheck', true,
+                            '🔑 This boot’s TLS key: <code>' + fp.slice(0, 32) + '…</code> (SHA-256 of the SPKI DER, consistent with the reported value). Seal your PayPal code to it in the card below — only this boot holds the private half, and only the boot that opened your seal can produce the data-bearing report.');
+                    }
+                }
+            }
+
             // v177: SANDBOX deployments pass the INTEGRITY audit (silicon
             // root + MRTD/RTMR pins + every binding verified) but must never
             // render as a verified PRODUCTION identity. The identity row is
@@ -4028,6 +4114,176 @@ Wmw2oAio9A==
         } catch (e) { zkHandoffSay('❌ ' + e.message, '#f85149'); }
         return false;
     }
+
+    // ========================================================================
+    // v224 (user directive) — SEALING THE PAYPAL CODE TO THE ATTESTED TLS KEY.
+    //
+    // The report names the public half of the key this boot terminates TLS
+    // with (session_context.tls_public_key_pem). The private half is generated
+    // in RAM at boot, never persisted, and dies with the instance. So:
+    //   * encrypt the PayPal code to THAT key, in this browser, and the only
+    //     party that can open it is the boot whose attestation you just read;
+    //   * a replaced VM, a rebooted VM, or the webservice owner's second
+    //     instance simply cannot open it — the enclave answers "cannot open the
+    //     sealed code with this boot's TLS key" instead of a report.
+    // That is what makes the SECOND (data-bearing) attestation provably the
+    // same machine as the FIRST (data-free) one.
+    //
+    // Wire format (pinned by src/main.rs rsa_oaep_open): RSA-OAEP with SHA-256
+    // for both the OAEP digest and MGF1, empty label, ciphertext = exactly the
+    // modulus size, transported as STANDARD base64 (with padding) in `code_enc`.
+    // ========================================================================
+    var SEAL_RECORD_KEY = 'pav_sealed_tls_key_v1';
+
+    function bytesToB64Std(u8) {
+        var s = '';
+        for (var i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+        return btoa(s);
+    }
+
+    // SHA-256 of an SPKI PEM's DER, lowercase hex — the same value the enclave
+    // reports as tls_public_key_sha256 (src/main.rs pubkey_fingerprint).
+    async function tlsKeyFingerprint(pem) {
+        const der = pemToBytes(pem);
+        const d = new Uint8Array(await crypto.subtle.digest('SHA-256', der));
+        return Array.from(d).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    // The seal this browser performed: which key, for which enclave, when. The
+    // code itself is NEVER stored — only the fact that a code was sealed to a
+    // fingerprint, so a later report naming another key can be refused.
+    function sealedKeyRecord() {
+        try {
+            const o = JSON.parse(localStorage.getItem(SEAL_RECORD_KEY) || 'null');
+            if (o && typeof o.sha256 === 'string' && /^[0-9a-f]{64}$/.test(o.sha256)) return o;
+        } catch (e) { /* no storage */ }
+        return null;
+    }
+
+    function rememberSealedKey(rec) {
+        try { localStorage.setItem(SEAL_RECORD_KEY, JSON.stringify(rec)); } catch (e) { /* no storage */ }
+        try { sessionStorage.setItem(SEAL_RECORD_KEY, JSON.stringify(rec)); } catch (e) { /* no storage */ }
+    }
+
+    function sealSay(msg, color) {
+        const el = document.getElementById('sealStatus');
+        if (!el) return;
+        el.innerText = msg;
+        el.style.color = color || 'var(--text-dim)';
+    }
+
+    function sealKeySay(html, color) {
+        const el = document.getElementById('sealKeyStatus');
+        if (!el) return;
+        el.innerHTML = html;
+        el.style.color = color || 'var(--text-dim)';
+    }
+
+    // Live fingerprint of whatever key is in the seal field, plus whether it is
+    // the key this tab already sealed to.
+    async function sealShowKeyFingerprint() {
+        const el = document.getElementById('sealKeyInput');
+        const pem = el && el.value ? String(el.value).trim() : '';
+        if (!pem) {
+            sealKeySay('No key yet — audit a report above (its 🔑 row names one) or paste the key by hand.');
+            return;
+        }
+        let fp;
+        try { fp = await tlsKeyFingerprint(pem); }
+        catch (e) { sealKeySay('⚠️ That does not parse as a PEM public key (' + esc(e.message) + ').', '#d29922'); return; }
+        const sealed = sealedKeyRecord();
+        let tail = '';
+        let color = 'var(--text-dim)';
+        if (sealed) {
+            if (sealed.sha256 === fp) { tail = ' — <b>the key this tab sealed to</b> ✓'; color = '#3fb950'; }
+            else { tail = ' — ⚠️ NOT the key this tab sealed to (' + esc(sealed.sha256.slice(0, 24)) + '…' + (sealed.host ? ' on ' + esc(sealed.host) : '') + ')'; color = '#d29922'; }
+        }
+        sealKeySay('Fingerprint (SHA-256 of the SPKI DER): <code>' + fp.slice(0, 32) + '…</code>' + tail, color);
+    }
+
+    // Accept either a bare code or the whole PayPal redirect URL. A URL wins:
+    // it carries the state token the code was minted for, so the two can never
+    // be paired by hand wrongly.
+    function parseCallbackUrl(raw) {
+        const s = String(raw || '').trim();
+        const out = { code: '', state: '' };
+        if (!s) return out;
+        if (s.indexOf('code=') !== -1) {
+            let q = s;
+            const qi = q.indexOf('?');
+            if (qi !== -1) q = q.slice(qi + 1);
+            const hi = q.indexOf('#');
+            if (hi !== -1) q = q.slice(0, hi);
+            q.split('&').forEach(function (kv) {
+                const i = kv.indexOf('=');
+                if (i === -1) return;
+                const k = kv.slice(0, i);
+                let v = kv.slice(i + 1);
+                try { v = decodeURIComponent(v.replace(/\+/g, ' ')); } catch (e) { /* keep raw */ }
+                if (k === 'code') out.code = v;
+                else if (k === 'state') out.state = v;
+            });
+            if (out.code) return out;
+        }
+        out.code = s;
+        return out;
+    }
+
+    // One click: encrypt the code to the audited key, remember WHICH key it went
+    // to, then open /callback with code_enc (never a plaintext code). Nothing
+    // leaves this page unencrypted — no network call happens for the sealing
+    // itself, and the code is not stored anywhere.
+    async function sealCodeAndOpen() {
+        try {
+            const keyEl = document.getElementById('sealKeyInput');
+            const pem = keyEl && keyEl.value ? String(keyEl.value).trim() : '';
+            if (!pem) throw new Error('no attested TLS key in the field above — audit a data-free report first (its 🔑 row fills it in), or paste the key from that report.');
+            const host = ((document.getElementById('localEnclaveHost') || {}).value || '').trim().replace(/\/+$/, '');
+            if (!/^https:\/\/[^\/]+/.test(host)) throw new Error('enter the enclave origin (https://<enclave>) in the enclave-address field of the login card.');
+            const parsed = parseCallbackUrl((document.getElementById('sealCodeInput') || {}).value);
+            const code = parsed.code;
+            if (!code) throw new Error('paste the PayPal code (or the whole redirect URL) first — there is nothing to seal yet.');
+            const stField = ((document.getElementById('sealStateInput') || {}).value || '').trim();
+            const st = parsed.state || stField;
+            if (!st) throw new Error('no session state: the PayPal redirect URL carries it (?state=…) — paste the whole URL, or start the login from this tab so the state is remembered.');
+
+            sealSay('⏳ encrypting in this browser to the audited key (RSA-OAEP/SHA-256)…', '#d29922');
+            const der = pemToBytes(pem);
+            const fp = await tlsKeyFingerprint(pem);
+            let key;
+            try {
+                key = await crypto.subtle.importKey('spki', der, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['encrypt']);
+            } catch (e) {
+                throw new Error('that key cannot be used for RSA-OAEP/SHA-256 (' + e.message + ') — it must be the RSA TLS public key from session_context.tls_public_key_pem, not the enclave signing key.');
+            }
+            const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, key, new TextEncoder().encode(code)));
+            const b64 = bytesToB64Std(ct);
+            rememberSealedKey({ host: host, sha256: fp, at: Date.now() });
+            await sealShowKeyFingerprint();
+
+            const url = host + '/callback?code_enc=' + encodeURIComponent(b64) + '&state=' + encodeURIComponent(st);
+            const a = document.getElementById('sealOpenLink');
+            if (a) { a.href = url; a.style.display = 'block'; a.innerText = '↗ open the sealed callback (if the automatic jump was blocked)'; }
+            sealSay('🔒 Sealed ' + ct.length + ' bytes to key ' + fp.slice(0, 16) + '… — opening the callback; a copy of the encrypted attestation will download there.', '#3fb950');
+            try { window.location.assign(url); } catch (e) { sealSay('⚠️ the automatic jump was blocked (' + e.message + ') — use the link above.', '#d29922'); }
+        } catch (e) {
+            sealSay('❌ ' + e.message, '#f85149');
+        }
+        return false;
+    }
+
+    // Prefill the state from this tab's last login session (if any). The pasted
+    // redirect URL always wins inside sealCodeAndOpen, so a stale value here is
+    // never used silently.
+    (function () {
+        try {
+            const sess = JSON.parse(localStorage.getItem('pav_local_session') || 'null');
+            const st = document.getElementById('sealStateInput');
+            if (st && !st.value && sess && sess.state) st.value = String(sess.state);
+            const k = document.getElementById('sealKeyInput');
+            if (k && !k.value) sealShowKeyFingerprint();
+        } catch (e) { /* no DOM / no storage */ }
+    })();
 
 </script>
 
