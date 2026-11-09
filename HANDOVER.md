@@ -1830,3 +1830,93 @@ the stopped `relay188` before deletion. Note the CLI's `DescribeImages` fails wi
 (signed RPC, `RegionId=cn-beijing`) works.
 
 `relay188` left **stopped** (economy mode) after this cycle.
+
+---
+
+## 0.39 — v225: sealed redirect (no race), second seal slot, seal harness in CI
+
+**Ask.** (a) Make the seal flow work without racing the redirect — the enclave
+hands the user's browser a `redirect_uri` the browser controls, so the code
+arrives sealed by construction. (b) Commit the page-level seal harness as
+`scripts/test-seal-page.mjs`. (c) Extend the DATA-FREE report with a second seal
+slot so a code and a custom nonce can be bound to the same boot in one step.
+
+### (a) Caller-selectable, allowlisted `redirect_uri`
+
+- `Config.seal_redirect_uris` (aliases `paypal_redirect_uris`, `redirect_uris`)
+  is parsed once at startup into `AppState.allowed_redirect_uris`; bad entries
+  warn + drop. The default `/callback` URL is always present.
+- `normalize_redirect_uri` deliberately does **not** normalise (no trailing
+  slash, no case folding): PayPal compares byte-for-byte and so does the
+  allowlist, so a "helpful" rewrite would silently target an unregistered URI.
+  https only, no query/fragment/userinfo/space.
+- `/attest/login-session` takes an optional `redirect_uri`, rejects anything
+  off-list with 400, signs the accepted value into `signed_fields`, and binds it
+  into the untrusted `state` as `"u"`. `/callback` re-validates `"u"` against the
+  allowlist and uses it for the token exchange (previously the exchange would
+  have used the fixed value and failed for any other redirect). Old state tokens
+  without `"u"` fall back to the default.
+
+### (b) Second seal slot
+
+- New independent RSA-4096 boot key (`seal_pubkey_pem` / `seal_private_key`),
+  generated after the TLS key, before the listener serves.
+- Both reports publish `session_context.seal_slots = {code:{pem,sha256},
+  nonce:{pem,sha256}}`; the code slot is the TLS key, the nonce slot the new key.
+- **The slots also travel in the signed login response** (`signed_fields.seal_slots`)
+  so the page can seal on the return leg with **no attestation fetch** — that
+  keeps v180's rule intact ("no pre-login attestation"; the harness asserts the
+  page never references `/debug/envelope` again) and means the page seals to a
+  key this enclave signed, not to a key read off an unverified route.
+- `/callback` accepts `nonce_enc`, opened with the nonce key only (a code sealed
+  to the nonce key answers 400, and vice versa — `the_two_seal_slots_do_not_interchange`).
+  The nonce is canonicalised like `custom_info` (≤512 B, empty → `NONE`) and the
+  login report signs `user_nonce` + `user_nonce_sha256`.
+
+### (c) Page
+
+- Login card: checkbox `#sealedRedirectToggle` sends
+  `redirect_uri = location.origin + location.pathname`; the enclave-signed value
+  must equal it or the page reports **REDIRECT SUBSTITUTION**.
+- Marker `pav_sealed_login_v1 = {host, redirect, state, p_enc, slots, nonce, at}`
+  (never the code). On return, `finishSealedLogin()` seals code (and optional
+  nonce), verifies each slot's signed `sha256` against the sealed fingerprint,
+  clears the code from the address bar, stores the nonce commitment as
+  `pav_sealed_nonce_v1 = {sha256, at}`, and opens `/callback?code_enc…&nonce_enc…&state…`.
+- Seal card: new `#sealNonceInput` (optional), so a pasted redirect URL seals
+  both slots by hand too. New audit block "6c": slot PEM→sha256 self-consistency
+  for both slots, plus `report.user_nonce_sha256` == the nonce this browser
+  sealed (missing/mismatch = hard fail, `#nonceCheck` row).
+
+### (d) The harness is committed
+
+`scripts/test-seal-page.mjs` (two modes, both offline and deterministic):
+
+- `card` — pasted key/code/state, the button driven through the page's own
+  script with DOM stubs; opens the result with `openssl pkeyutl`.
+- `sealed-return` — seeds the login marker, sets `location.search` to a real
+  PayPal return URL, and checks that the page jumps to `/callback` on its own
+  with the code sealed and absent from the URL; also pins the slot
+  self-consistency comparison and fails if the page fetches anything.
+
+CI: `.github/workflows/build-attest.yml` runs both modes right after the
+`verify.html` security suite.
+
+### Verification
+
+- `nix-shell -p openssl pkg-config --run "cargo test"` → **46 passed, 0 failed**
+  (includes the two new unit tests).
+- `node scripts/test-seal-page.mjs card` → green; `sealed-return` → green.
+- `scripts/test-verify-security.mjs` **492 passed / 1 failed** — only the Pages
+  parity check, which resolves once this commit lands on `main`.
+  `scripts/test-verify-proxy.mjs` 44/44.
+- `verify.html` 299,638 B / `11435c5e28c7e22acac20c5d109ede8214a405ed404cac9e21f6d53b626eb9f1`,
+  `index.html` byte-identical, README digest row rotated. No pin rotated (the
+  page ships unmeasured).
+
+### Deployment caveat
+
+The live image (v223b) has **neither** the second slot nor `redirect_uri`
+support, so the sealed-redirect path and `nonce_enc` only work after the next
+build + rotation. The card path is unaffected. Config must also list the Pages
+auditor URL in `seal_redirect_uris` and PayPal must have it registered.

@@ -72,6 +72,55 @@ sealed to: a later report naming any **other** key fails the audit with
 *“DIFFERENT BOOT”*, because the TLS key is minted in RAM at boot and never persisted.
 Nothing about the code is stored or uploaded in plaintext.
 
+#### Two seal slots in one report (v225)
+
+One data-free report names **both** things you may seal:
+
+```json
+"session_context": {
+  "tls_public_key_pem": "…",  "tls_public_key_sha256": "…",
+  "seal_slots": {
+    "code":  { "pem": "…", "sha256": "…" },
+    "nonce": { "pem": "…", "sha256": "…" }
+  }
+}
+```
+
+`code` is the HTTPS key above; `nonce` is a **separate** RSA-4096 key minted on
+the same boot, used for nothing else. Seal your PayPal code to `code` and a
+custom nonce (an order id, a hash, a commitment) to `nonce`, and present both
+at once:
+
+```
+GET /callback?state=<state>&code_enc=<b64>&nonce_enc=<b64>
+```
+
+The enclave opens `code_enc` with the TLS key and `nonce_enc` with the nonce key
+only — a swap is refused — and the login report then signs `user_nonce` and
+`user_nonce_sha256` next to the hardware quote. That is the proof that one boot
+received and decrypted both, with no second attestation round-trip. The page's
+audit checks each slot hashes to its own PEM and that `user_nonce_sha256` equals
+the nonce your browser sealed (a mismatch is a hard failure, not a warning).
+
+#### No redirect race: the page is the redirect_uri (v225)
+
+The old hand-off meant auditing *before* PayPal redirected, then pasting the
+code back fast enough — a race the user could lose. Instead the page asks for a
+`redirect_uri` **it owns**: tick *“Let this page receive the code and seal it”*
+on the login card, and the enclave signs `redirect_uri = <this page's URL>` into
+the login session. PayPal returns the code here, this tab seals it to the slot
+keys it received (signed) at login, wipes the code from the address bar, and
+opens `/callback?code_enc=…`. The clear code is never handed onward.
+
+`redirect_uri` is caller-selectable only from an operator allowlist:
+`seal_redirect_uris` in the enclave config (aliases `paypal_redirect_uris`,
+`redirect_uris`). Entries must be **exact** `https://` URLs — no query, no
+fragment, no userinfo — and the default `/callback` is always included. The
+chosen URI rides in the untrusted `state` (`"u"`) and is re-validated against
+the same allowlist at `/callback` before it can reach the token exchange. The
+same URL must also be registered as a redirect URI in the PayPal app, or PayPal
+refuses the authorize URL.
+
 With a shell, the same seal:
 
 ```bash
@@ -134,7 +183,7 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 283,700 bytes | `1f3c8ba0d34b571483fc1e0f7d9807bd0867587d4fd0b354cb0f7125acfd4432` |
+| `verify.html` | 299,638 bytes | `11435c5e28c7e22acac20c5d109ede8214a405ed404cac9e21f6d53b626eb9f1` |
 | `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
 | `zk-rsa.html` | 100,001 bytes | `a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40` |
 | `privacy.html` | 4,673 bytes | `e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8` |
@@ -142,7 +191,7 @@ the file it describes:
 
 ```bash
 sha256sum verify.html zk.html zk-rsa.html privacy.html terms.html
-# 1f3c8ba0d34b571483fc1e0f7d9807bd0867587d4fd0b354cb0f7125acfd4432  verify.html
+# 11435c5e28c7e22acac20c5d109ede8214a405ed404cac9e21f6d53b626eb9f1  verify.html
 # 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
 # a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40  zk-rsa.html
 # e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8  privacy.html

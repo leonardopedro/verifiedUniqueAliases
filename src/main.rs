@@ -1421,6 +1421,51 @@ fn pubkey_fingerprint(pem: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The `nonce` seal slot's public key, in the same two forms as the TLS slot.
+///
+/// v225 (user directive — two seals, one boot): a user may want to bind BOTH a
+/// PayPal code and a nonce of their own choosing to the same instance. A second
+/// boot key gives that a slot of its own, so a single data-free report names
+/// both targets and the callback can prove both seals arrived in this boot.
+fn attested_seal_key(state: &AppState) -> (String, String) {
+    let pem = state.seal_pubkey_pem.read().clone().unwrap_or_default();
+    let sha256 = pubkey_fingerprint(&pem);
+    (pem, sha256)
+}
+
+/// Validate a caller-supplied `redirect_uri` before it can reach an authorize
+/// URL: https only, no credentials, no query string, no fragment, no spaces.
+///
+/// Deliberately does NOT rewrite the value (no trailing-slash or case
+/// normalisation): PayPal compares `redirect_uri` byte-for-byte, and the
+/// allowlist below compares it the same way, so a "helpful" normalisation here
+/// would silently turn one registered URI into a different, unregistered one.
+fn normalize_redirect_uri(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() || t.len() > 512 {
+        return None;
+    }
+    let rest = t.strip_prefix("https://")?;
+    if rest.is_empty() || rest.starts_with('/') {
+        return None;
+    }
+    // `?`, `#`, whitespace and userinfo all change who receives the code.
+    if t.contains('?')
+        || t.contains('#')
+        || t.chars().any(char::is_whitespace)
+        || rest.contains('@')
+    {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+/// Exact-match membership in the redirect allowlist. Nothing about the
+/// candidate is trusted beyond `normalize_redirect_uri` having accepted it.
+fn redirect_uri_allowed(allowed: &[String], candidate: &str) -> bool {
+    allowed.iter().any(|a| a == candidate)
+}
+
 // Sign the canonical (sorted-key) JSON of an attestation_report with the
 // enclave's ephemeral RSA key. serde_json's Map is a BTreeMap (sorted), so
 // to_string() is byte-identical to verify.html's JSON.stringify(reorder(...)).
@@ -2371,6 +2416,19 @@ struct Config {
     /// extra firewall hole, no extra dependency in the build.
     #[serde(default)]
     services: Option<Services>,
+    /// v225 (user directive — no redirect race): extra `redirect_uri` values
+    /// this enclave may put in an authorize URL, besides its own
+    /// `https://{domain}/callback`.
+    ///
+    /// The authorize URL's `redirect_uri` decides WHO receives the PayPal
+    /// code, so a caller-named value is an open redirect unless it is already
+    /// known-good: the enclave only ever uses an EXACTLY matching entry from
+    /// this list (https, no query string, no fragment). A browser-controlled
+    /// page — e.g. the auditor page on GitHub Pages — has to be listed here by
+    /// the operator AND registered with PayPal, which is the honest limit of
+    /// this feature: the enclave cannot make PayPal accept an arbitrary URI.
+    #[serde(default, alias = "paypal_redirect_uris", alias = "redirect_uris")]
+    seal_redirect_uris: Vec<String>,
 }
 
 /// Service selection for the enclave.
@@ -2463,6 +2521,10 @@ struct AppState {
     paypal_verified_client_id: String,
     paypal_verified_client_secret: String,
     redirect_uri: String,
+    /// v225: `redirect_uri` above plus the operator's allowlist — the only
+    /// values this enclave will ever accept for a login session's
+    /// `redirect_uri`. Built (and validated) once at startup.
+    allowed_redirect_uris: Arc<Vec<String>>,
     domain: String,
     https_ready: Arc<AtomicBool>,
     staging: bool,
@@ -2476,6 +2538,12 @@ struct AppState {
     // sealed to the key the user verified.
     tls_pubkey_pem: Arc<RwLock<Option<String>>>,
     tls_private_key: Arc<RwLock<Option<openssl::pkey::PKey<openssl::pkey::Private>>>>,
+    /// v225 (second seal slot): a boot key INDEPENDENT of the TLS key, for a
+    /// user's own nonce. Published next to the TLS key in every report, so one
+    /// data-free report names both things a user may seal — the PayPal code
+    /// and a custom nonce — and one callback submission can carry both.
+    seal_pubkey_pem: Arc<RwLock<Option<String>>>,
+    seal_private_key: Arc<RwLock<Option<openssl::pkey::PKey<openssl::pkey::Private>>>>,
     enclave_identity: EphemeralEnclaveIdentity,
     ip_stats: Arc<RwLock<std::collections::BTreeMap<IpAddr, u64>>>,
     global_egress_bytes: Arc<AtomicU64>,
@@ -2620,6 +2688,11 @@ struct CallbackQuery {
     /// audited that attestation can hand the code to exactly that instance;
     /// any other VM (fresh RAM key every boot) cannot open it.
     code_enc: Option<String>,
+    /// v225 (second seal slot): the user's own nonce, RSA-OAEP/SHA-256 sealed
+    /// to the `nonce` slot of the SAME boot's report. Opened here and signed
+    /// into the report, so "this instance saw my code and my nonce, this boot"
+    /// is one report and one submission rather than two round-trips.
+    nonce_enc: Option<String>,
 }
 
 /// Open `code_enc`, which must have been sealed to the TLS key named in this
@@ -2890,6 +2963,10 @@ async fn fetch_config() -> Result<Config, Box<dyn std::error::Error + Send + Syn
                 .ok()
                 .and_then(|s| serde_json::from_str::<selfreport::SinkConfig>(&s).ok()),
             services: services_from_env(),
+            // v225: the allowlist is a deployment-level decision — it comes
+            // from the config document (or the sealed user-data JSON), never
+            // from the environment of a dev shell.
+            seal_redirect_uris: Vec::new(),
         });
     }
 
@@ -3072,6 +3149,11 @@ pub struct LoginSessionRequest {
     /// a SECOND, escrow-sealed copy of the attestation encrypted to. Empty /
     /// absent = no escrow (old auditor copies keep working unchanged).
     pub pgp_recipient: Option<String>,
+    /// v225: where the code should land. Absent/empty keeps the old behaviour
+    /// (this enclave's `/callback`); anything else must EXACTLY match an
+    /// operator-allowlisted URI, so a caller cannot aim a PayPal code at an
+    /// origin of its choosing.
+    pub redirect_uri: Option<String>,
 }
 
 /// v169 (independent audit): every response that carries attestation data,
@@ -3359,6 +3441,37 @@ async fn attest_login_session(
         }
     };
 
+    // v225 (user directive — no redirect race): the caller may name where the
+    // code should land, but ONLY from the operator's allowlist. This is the
+    // difference between "the code arrives at a page the user controls, which
+    // seals it before the enclave ever sees it" and an open redirect that
+    // hands PayPal codes to any origin that asks.
+    let requested_redirect = payload.redirect_uri.as_deref().map(str::trim).unwrap_or("");
+    let redirect_uri = if requested_redirect.is_empty() {
+        state.redirect_uri.clone()
+    } else {
+        match normalize_redirect_uri(requested_redirect) {
+            Some(u) if redirect_uri_allowed(&state.allowed_redirect_uris, &u) => u,
+            Some(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "redirect_uri is not one of this enclave's allow-listed redirect URIs \
+                     — the operator must add it to seal_redirect_uris (and register it \
+                     with PayPal) before a code can land there",
+                )
+                    .into_response()
+            }
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "redirect_uri must be an https:// URL with no query string, fragment \
+                     or userinfo",
+                )
+                    .into_response()
+            }
+        }
+    };
+
     // Self-describing state token (v180): the client session travels inside
     // the OAuth `state` and is re-parsed by /callback after PayPal redirects
     // back. It is UNTRUSTED input by construction — it becomes meaningful
@@ -3383,6 +3496,11 @@ async fn attest_login_session(
         "n": payload.client_nonce_hex.trim().to_ascii_lowercase(),
         "f": label.clone(),
         "c": custom_info_str,
+        // v225: the redirect this session will actually use, carried in the
+        // (untrusted) state so /callback can repeat it to PayPal — the token
+        // exchange rejects a redirect_uri that differs from the authorize
+        // URL's. Re-validated against the allowlist at the callback.
+        "u": redirect_uri,
         "r": random,
     });
     let state_token = B64URL.encode(state_obj.to_string().as_bytes());
@@ -3428,7 +3546,7 @@ async fn attest_login_session(
         // v169: the environment is signed (and app-pinned) at session time,
         // so a redirect into sandbox PayPal cannot be passed off as production.
         "paypal_environment": if state.staging { "sandbox" } else { "production" },
-        "redirect_uri": state.redirect_uri,
+        "redirect_uri": redirect_uri,
         "authorize_base": auth_base,
         "scope": scope,
         "custom_info": custom_info_str,
@@ -3445,6 +3563,20 @@ async fn attest_login_session(
     // it used to sign `r.fingerprint`, the PRIMARY — see target_fingerprint().)
     if let Some((_, fp)) = &pgp_stored {
         signed_fields["pgp_recipient_fingerprint"] = serde_json::Value::String(fp.clone());
+    }
+
+    // v225: both seal slots travel in the SIGNED login response. The page
+    // therefore has the keys it must seal to BEFORE PayPal, on a channel this
+    // enclave signed — so the return leg seals with no attestation fetch at
+    // all (v180: no pre-login attestation) and never has to trust a key read
+    // off an unverified route.
+    {
+        let (tls_pem, tls_sha) = attested_tls_key(&state);
+        let (seal_pem, seal_sha) = attested_seal_key(&state);
+        signed_fields["seal_slots"] = serde_json::json!({
+            "code": { "pem": tls_pem, "sha256": tls_sha },
+            "nonce": { "pem": seal_pem, "sha256": seal_sha },
+        });
     }
 
     let signed_fields_str = serde_json::to_string(&signed_fields).unwrap();
@@ -3519,6 +3651,7 @@ async fn debug_envelope(
         &state.boot_manifest,
     );
     let (tls_pubkey_pem, tls_pubkey_sha256) = attested_tls_key(&state);
+    let (seal_pubkey_pem, seal_pubkey_sha256) = attested_seal_key(&state);
     let mut report_data = [0u8; 64];
     report_data[0..32].copy_from_slice(&nonce);
     let quote_res = tpm::quote(&hex::encode(nonce), Some(report_data));
@@ -3545,8 +3678,16 @@ async fn debug_envelope(
             // v223: the key a prover seals a PayPal code to, named in the
             // attestation itself so "verify, then encrypt" needs no second
             // channel. Empty only in the window before the listener exists.
-            "tls_public_key_pem": tls_pubkey_pem,
-            "tls_public_key_sha256": tls_pubkey_sha256,
+            "tls_public_key_pem": &tls_pubkey_pem,
+            "tls_public_key_sha256": &tls_pubkey_sha256,
+            // v225 (second seal slot): BOTH things a user may seal, named by
+            // this one report. Sealing a code to `code` and a nonce to `nonce`
+            // and presenting both at /callback proves a single boot handled
+            // both — one report, one step, no second attestation round-trip.
+            "seal_slots": {
+                "code": { "pem": &tls_pubkey_pem, "sha256": &tls_pubkey_sha256 },
+                "nonce": { "pem": &seal_pubkey_pem, "sha256": &seal_pubkey_sha256 },
+            },
         },
         "hardware_level_attestation": quote_res,
         "timestamp_ms": chrono::Utc::now().timestamp_millis() as u64,
@@ -3643,6 +3784,37 @@ async fn callback(
             }
         }
     }
+    // v225 (second seal slot): the optional sealed nonce. Opened with its OWN
+    // key, never the TLS key, so a value sealed for one slot can never be
+    // replayed into the other; the plaintext is bounded exactly like
+    // custom_info (512 bytes) because it becomes a signed report field.
+    let mut user_nonce_raw = String::new();
+    if let Some(sealed) = query.nonce_enc.as_deref().filter(|s| !s.trim().is_empty()) {
+        let key = match state.seal_private_key.read().clone() {
+            Some(k) => k,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "cannot open the sealed nonce: this boot has no seal slot yet",
+                )
+                    .into_response()
+            }
+        };
+        match rsa_oaep_open(&key, sealed) {
+            Ok(opened) => user_nonce_raw = opened,
+            Err(reason) => {
+                return (StatusCode::BAD_REQUEST, format!("cannot open the sealed nonce: {reason}"))
+                    .into_response()
+            }
+        }
+    }
+    let user_nonce = match canonical_custom_info(&user_nonce_raw) {
+        Some(s) => s,
+        None => {
+            return (StatusCode::BAD_REQUEST, "the sealed nonce exceeds 512 bytes").into_response()
+        }
+    };
+    zeroize_str(&mut user_nonce_raw);
     let state_param = query.state.clone().unwrap_or_default();
 
     // R3-4: a denied/cancelled consent (or a bare /callback hit) is rejected
@@ -3717,6 +3889,18 @@ async fn callback(
         Some(s) => s,
         None => return invalid_session(),
     };
+    // v225: repeat the redirect_uri this session's authorize URL used, or
+    // PayPal refuses the exchange (a code is issued for one redirect URI).
+    // `u` arrives inside an UNTRUSTED state token, so it is only ever used
+    // when it still matches the startup allowlist; a token minted before this
+    // field existed falls back to the default, exactly as before.
+    let redirect_uri = match st.get("u").and_then(|v| v.as_str()) {
+        Some(raw) => match normalize_redirect_uri(raw) {
+            Some(u) if redirect_uri_allowed(&state.allowed_redirect_uris, &u) => u,
+            _ => return invalid_session(),
+        },
+        None => state.redirect_uri.clone(),
+    };
 
     // R3-1: resolve THIS state's PKCE verifier before any PayPal call.
     // No verifier (forged state, restarted enclave, expired TTL) ⇒ fail
@@ -3742,7 +3926,7 @@ async fn callback(
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", &code),
-            ("redirect_uri", &state.redirect_uri),
+            ("redirect_uri", &redirect_uri),
             // R3-1: the PKCE verifier PayPal REQUIRES because the authorize
             // URL carried code_challenge — an exchange without it (any
             // observer of the redirect holding the client secret) is refused
@@ -3845,6 +4029,7 @@ async fn callback(
     // [0..32] stays the SEC-02 identity/code nonce (formula unchanged).
     report_data[32..64].copy_from_slice(&client_session_binding(&client_pub, &client_nonce));
     let (tls_pubkey_pem, tls_pubkey_sha256) = attested_tls_key(&state);
+    let (seal_pubkey_pem, seal_pubkey_sha256) = attested_seal_key(&state);
     let quote_res = tpm::quote(&hex::encode(nonce), Some(report_data));
 
     // v168 (plan Phase 2.2): FAIL-CLOSED report minting.
@@ -3860,6 +4045,12 @@ async fn callback(
         "paypal_user_info": minimized,
         "paypal_user_info_raw_hash": paypal_user_raw_hash,
         "custom_info": custom_info,
+        // v225 (second seal slot): the nonce the user sealed to this boot's
+        // `nonce` slot, signed into the same report as the PayPal identity.
+        // "NONE" when the caller sent none, so the field is always present and
+        // always a plain commitment — never a surprise payload.
+        "user_nonce": user_nonce,
+        "user_nonce_sha256": hex::encode(sha2::Sha256::digest(user_nonce.as_bytes())),
         // v168 (plan Phase 3 — Malicious PayPal App defense): WHICH app
         // minted this identity is part of the signed report, so the auditor's
         // EXPECTED_APPS gate covers the login report itself, not just the
@@ -3898,8 +4089,16 @@ async fn callback(
             // makes the second attestation provably the same enclave: the key is
             // generated in RAM at boot, never persisted, and named in the first
             // attestation the user checks.
-            "tls_public_key_pem": tls_pubkey_pem,
-            "tls_public_key_sha256": tls_pubkey_sha256,
+            "tls_public_key_pem": &tls_pubkey_pem,
+            "tls_public_key_sha256": &tls_pubkey_sha256,
+            // v225 (second seal slot): the same two slots the data-free report
+            // names, so the login report itself says which keys were live for
+            // this boot. `user_nonce_sha256` above is what a nonce sealed to
+            // the `nonce` slot commits to.
+            "seal_slots": {
+                "code": { "pem": &tls_pubkey_pem, "sha256": &tls_pubkey_sha256 },
+                "nonce": { "pem": &seal_pubkey_pem, "sha256": &seal_pubkey_sha256 },
+            },
             // v179 (plan Phase 1.1): the client session bound into the quote's
             // report_data[32..64] is echoed here for transparency. The auditor
             // compares the QUOTE bytes against ITS OWN session values — this
@@ -4782,18 +4981,41 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let enclave_identity = EphemeralEnclaveIdentity::generate()?;
         info!("--- EPHEMERAL ENCLAVE RSA KEY GENERATED (RAM ONLY, {} bytes) ---", enclave_identity.pubkey_der.len());
 
+        // v225: the allowlist is built ONCE, here, so no request path can
+        // widen it. The enclave's own /callback is always first; the operator's
+        // extras are validated exactly like a caller-supplied value would be,
+        // and anything malformed is dropped loudly rather than silently used.
+        let redirect_uri = format!("https://{}/callback", config.domain);
+        let mut allowed_redirect_uris = vec![redirect_uri.clone()];
+        for raw in &config.seal_redirect_uris {
+            match normalize_redirect_uri(raw) {
+                Some(u) if !allowed_redirect_uris.contains(&u) => {
+                    info!("redirect_uri allow-listed for sealed logins: {u}");
+                    allowed_redirect_uris.push(u);
+                }
+                Some(_) => {}
+                None => warn!(
+                    "ignoring unusable seal_redirect_uris entry {raw:?}
+                     (https:// URL, no query string or fragment)"
+                ),
+            }
+        }
+
         let state = Arc::new(AppState {
             paypal_client_id: config.paypal_client_id.clone(),
             paypal_client_secret: config.paypal_client_secret.clone(),
             paypal_verified_client_id: config.paypal_verified_client_id.clone().unwrap_or_default(),
             paypal_verified_client_secret: config.paypal_verified_client_secret.clone().unwrap_or_default(),
-            redirect_uri: format!("https://{}/callback", config.domain),
+            redirect_uri,
+            allowed_redirect_uris: Arc::new(allowed_redirect_uris),
             domain: config.domain.clone(),
             https_ready: Arc::new(AtomicBool::new(false)),
             staging: config.staging,
             tls_cert_pem: Arc::new(RwLock::new(None)),
             tls_pubkey_pem: Arc::new(RwLock::new(None)),
             tls_private_key: Arc::new(RwLock::new(None)),
+            seal_pubkey_pem: Arc::new(RwLock::new(None)),
+            seal_private_key: Arc::new(RwLock::new(None)),
             enclave_identity,
             ip_stats: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             global_egress_bytes: Arc::new(AtomicU64::new(0)),
@@ -4940,6 +5162,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .to_string();
         *state.tls_pubkey_pem.write() = Some(tls_pubkey_pem);
         *state.tls_private_key.write() = Some(ephemeral_tls_key.clone());
+
+        // v225 (second seal slot): the user's nonce key. Independent of the
+        // TLS key on purpose — two slots, two purposes, both named by every
+        // report. Generated in the same RAM-only window as the TLS key, before
+        // the listener can answer a single request, so no report can ever name
+        // an empty slot.
+        info!("Generating the second seal slot (user-nonce key, RAM ONLY)...");
+        let seal_key = openssl::pkey::PKey::from_rsa(openssl::rsa::Rsa::generate(4096)?)?;
+        let seal_pubkey_pem = String::from_utf8_lossy(
+            &seal_key
+                .public_key_to_pem()
+                .map_err(|e| format!("cannot export the seal-slot public key: {e}"))?,
+        )
+        .to_string();
+        *state.seal_pubkey_pem.write() = Some(seal_pubkey_pem);
+        *state.seal_private_key.write() = Some(seal_key);
         *state.tls_cert_pem.write() = Some(String::from_utf8_lossy(&cert_chain_pem).to_string());
         let ssl_acceptor = build_in_memory_ssl_acceptor(&cert_chain_pem, &ephemeral_tls_key)?;
         // v168 (plan Phase 4.1): config fetched + cert in RAM — IMDS, DNS and
@@ -5516,6 +5754,78 @@ mod security_tests {
         .is_err());
     }
 
+    /// v225: the `nonce` slot is a different key from the `code` slot, so a
+    /// value sealed for one purpose must not open with the other's key — the
+    /// two slots are independent or they are not slots at all.
+    #[test]
+    fn the_two_seal_slots_do_not_interchange() {
+        use base64::Engine as _;
+        use openssl::rsa::Padding;
+
+        let code_key = openssl::pkey::PKey::from_rsa(openssl::rsa::Rsa::generate(2048).unwrap()).unwrap();
+        let nonce_key = openssl::pkey::PKey::from_rsa(openssl::rsa::Rsa::generate(2048).unwrap()).unwrap();
+        let seal_to = |key: &openssl::pkey::PKey<openssl::pkey::Private>, msg: &str| -> String {
+            let pubkey = openssl::pkey::PKey::public_key_from_pem(&key.public_key_to_pem().unwrap()).unwrap();
+            let mut ctx = openssl::pkey_ctx::PkeyCtx::new(&pubkey).unwrap();
+            ctx.encrypt_init().unwrap();
+            ctx.set_rsa_padding(Padding::PKCS1_OAEP).unwrap();
+            ctx.set_rsa_oaep_md(openssl::md::Md::sha256()).unwrap();
+            ctx.set_rsa_mgf1_md(openssl::md::Md::sha256()).unwrap();
+            let mut out = vec![0u8; pubkey.size() as usize];
+            let n = ctx.encrypt(msg.as_bytes(), Some(&mut out)).unwrap();
+            out.truncate(n);
+            base64::engine::general_purpose::STANDARD.encode(out)
+        };
+
+        // Each slot opens its own seal...
+        assert_eq!(rsa_oaep_open(&nonce_key, &seal_to(&nonce_key, "my-nonce-42")).unwrap(), "my-nonce-42");
+        assert_eq!(rsa_oaep_open(&code_key, &seal_to(&code_key, "A1b2C3")).unwrap(), "A1b2C3");
+        // ...and refuses the other slot's, in both directions.
+        assert!(rsa_oaep_open(&code_key, &seal_to(&nonce_key, "my-nonce-42")).is_err());
+        assert!(rsa_oaep_open(&nonce_key, &seal_to(&code_key, "A1b2C3")).is_err());
+
+        // The plaintext becomes a signed report field, so it is bounded and
+        // canonicalised exactly like custom_info.
+        assert_eq!(canonical_custom_info("  my-nonce-42 ").unwrap(), "my-nonce-42");
+        assert_eq!(canonical_custom_info("").unwrap(), "NONE");
+        assert!(canonical_custom_info(&"x".repeat(513)).is_none());
+    }
+
+    /// v225: `redirect_uri` decides who receives the PayPal code, so the only
+    /// values the enclave may use are exact allowlist entries with an https
+    /// scheme and nothing that can change the target (query, fragment,
+    /// userinfo, whitespace).
+    #[test]
+    fn redirect_uris_are_https_exact_and_allowlisted() {
+        let ours = "https://login.example.com/callback".to_string();
+        let page = "https://user.example.org/audit/verify.html".to_string();
+        let allowed = vec![ours.clone(), page.clone()];
+
+        assert_eq!(normalize_redirect_uri(&format!("  {page}  ")), Some(page.clone()));
+        assert!(redirect_uri_allowed(&allowed, &page));
+        // Exact match only: one extra character is a different origin target.
+        assert!(!redirect_uri_allowed(&allowed, &format!("{page}/")));
+        assert!(!redirect_uri_allowed(&allowed, "https://user.example.org/audit/verify.html?x=1"));
+        assert!(!redirect_uri_allowed(&allowed, "https://evil.example/audit/verify.html"));
+
+        // Anything that is not a plain https URL is refused outright.
+        for bad in [
+            "http://user.example.org/audit/verify.html",
+            "file:///tmp/verify.html",
+            "user.example.org/audit",
+            "https://",
+            "https:///path",
+            "https://user.example.org/a?b=c",
+            "https://user.example.org/a#frag",
+            "https://user:pw@user.example.org/a",
+            "https://user.example.org/a b",
+            "",
+        ] {
+            assert!(normalize_redirect_uri(bad).is_none(), "must refuse {bad:?}");
+        }
+        assert!(normalize_redirect_uri(&format!("https://{}/", "x".repeat(600))).is_none());
+    }
+
     /// The download route's two guards, pinned directly: a digest that is not
     /// 32 bytes of hex is not a digest, and an id that is not the notary's
     /// 16-byte hex session id is not an id. Both are refused before any child
@@ -5750,6 +6060,7 @@ mod security_tests {
             dns_zone: None,
             self_report: None,
             services: None,
+            seal_redirect_uris: Vec::new(),
         };
         assert!(require_credentials(bad).is_err());
     }
@@ -5783,6 +6094,7 @@ mod security_tests {
                     relay_targets: proxy_default_relay_targets(),
                 }),
             }),
+            seal_redirect_uris: Vec::new(),
         };
         assert!(require_credentials(cfg).is_ok());
     }
@@ -5805,6 +6117,7 @@ mod security_tests {
                 paypal: false,
                 tls_proxy: None,
             }),
+            seal_redirect_uris: Vec::new(),
         };
         assert!(require_credentials(cfg).is_err());
     }
