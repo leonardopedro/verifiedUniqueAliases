@@ -4447,6 +4447,22 @@ Wmw2oAio9A==
                 note('⚠️ PayPal returned a code to this page, but no sealed login in this tab matches it. If you meant to seal it, paste the redirect URL into the seal card below.', '#d29922');
                 return;
             }
+            // v225 negative path: the code must have come back to the URI this
+            // session asked PayPal for. A marker whose recorded redirect is a
+            // different page means the code was delivered somewhere else (a
+            // substituted return URL, or another tab's round) — refuse instead
+            // of sealing a code that this page never asked to receive.
+            try {
+                const here = pageRedirectUri();
+                if (marker.redirect && String(marker.redirect) !== here) {
+                    throw new Error('REDIRECT SUBSTITUTION ON RETURN: PayPal returned this code to ' + here + ' but this login session asked for ' + String(marker.redirect) + ' — refusing to seal it. Paste the redirect URL into the seal card below if it is yours.');
+                }
+            } catch (e) {
+                // pageRedirectUri throws on non-https copies (file://): there is
+                // nothing to compare against, and the login toggle could not
+                // have been used from there either.
+                if (/REDIRECT SUBSTITUTION/.test(e.message)) throw e;
+            }
             note('🔒 PayPal returned here — sealing the code to the key this boot signed…');
             // No fetch: the keys came in the S_enc-signed login response, so
             // nothing here relies on a fresh, unverified read (v180 keeps the
@@ -4465,9 +4481,14 @@ Wmw2oAio9A==
             const nonceText = String(marker.nonce || '').trim();
             if (nonceText) {
                 const noncePem = String(((slots.nonce || {}).pem) || '').trim();
-                if (!noncePem) throw new Error('a nonce was requested at login, but the report carries no nonce seal slot');
+                if (!noncePem) throw new Error('a nonce was requested at login, but the session carried no nonce seal slot');
                 const sn = await sealToPem(noncePem, nonceText);
-                if (String(((slots.nonce || {}).sha256) || '').toLowerCase() !== sn.fp) throw new Error('NONCE SLOT KEY MISMATCH: the report does not name the key it shipped');
+                if (String(((slots.nonce || {}).sha256) || '').toLowerCase() !== sn.fp) throw new Error('NONCE SLOT KEY MISMATCH: the session does not name the key it shipped');
+                // v225 negative path: the two slots are published as INDEPENDENT
+                // boot keys, and the audit says so. A session that ships one key
+                // in both slots is claiming a property it does not have, so a
+                // collapsed pair is refused rather than sealed twice.
+                if (sn.fp === s.fp) throw new Error('SLOT SUBSTITUTION: the code slot and the nonce slot are the SAME key — the two slots must be independent, so nothing was sealed. Reload and start a new login.');
                 noncePart = '&nonce_enc=' + encodeURIComponent(sn.b64);
                 try { localStorage.setItem(SEALED_NONCE_KEY, JSON.stringify({ sha256: await sha256Hex(nonceText), at: Date.now() })); } catch (e) { /* no storage */ }
             }

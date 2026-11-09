@@ -92,25 +92,38 @@ if (mode === 'sealed-return') {
   // signed them into the login response — the return leg seals from these and
   // fetches nothing (v180: the page never calls an attestation route).
   const derOf = (pem) => execFileSync('openssl', ['pkey', '-pubin', '-outform', 'DER'], { input: pem });
-  localStorage.setItem('pav_sealed_login_v1', JSON.stringify({
+  const slotsOf = (codePem, noncePem) => ({
+    code: { pem: codePem, sha256: sha256Hex(derOf(codePem)) },
+    nonce: { pem: noncePem, sha256: sha256Hex(derOf(noncePem)) },
+  });
+  const markerBase = {
     host: 'https://login.example',
     redirect: 'https://auditor.test/audit/verify.html',
     state,
     p_enc: 'PINNED-ENCLAVE-KEY',
-    slots: {
-      code: { pem: codeKey.pub, sha256: sha256Hex(derOf(codeKey.pub)) },
-      nonce: { pem: nonceKey.pub, sha256: sha256Hex(derOf(nonceKey.pub)) },
-    },
+    slots: slotsOf(codeKey.pub, nonceKey.pub),
     nonce,
     at: Date.now(),
-  }));
+  };
+  const setMarker = (over = {}) =>
+    localStorage.setItem('pav_sealed_login_v1', JSON.stringify({ ...markerBase, ...over }));
+  // Each case re-runs the page script: a refusal must be the page's own doing
+  // and must leave `jumped` empty. The stub only records; it never navigates.
+  const runReturn = async () => {
+    jumped = null;
+    delete elements['loginProgress'];
+    (0, eval)(script);
+    await new Promise((r) => setTimeout(r, 120));
+    return String((elements['loginProgress'] || {}).textContent || '');
+  };
+
+  setMarker();
   // A fetch here would mean the page reached for an attestation after login;
   // the harness fails on it instead of quietly serving a report.
   const fetched = [];
   globalThis.fetch = async (u) => { fetched.push(String(u)); throw new Error('unexpected fetch: ' + u); };
 
-  (0, eval)(script);
-  await new Promise((r) => setTimeout(r, 100));
+  let note = await runReturn();
 
   check('the return leg fetches nothing (keys came signed at login)', fetched.length === 0, fetched.join(', '));
 
@@ -139,6 +152,24 @@ if (mode === 'sealed-return') {
   const rec = JSON.parse(localStorage.getItem('pav_sealed_nonce_v1') || 'null');
   check('the nonce commitment is remembered as a hash, never the text', !!rec && rec.sha256 === sha256Hex(nonce) && !JSON.stringify(rec).includes(nonce), JSON.stringify(rec));
   check('the one-shot login marker is consumed', localStorage.getItem('pav_sealed_login_v1') === null);
+
+  // --- negative path 1: a slot whose signed fingerprint is not its key -------
+  setMarker({ slots: { ...markerBase.slots, code: { pem: codeKey.pub, sha256: 'deadbeef'.repeat(8) } } });
+  note = await runReturn();
+  check('a slot whose fingerprint does not hash its key is REFUSED', !jumped, 'page navigated: ' + jumped);
+  check('  …and the refusal names the inconsistency', /KEY SELF-CONSISTENCY/.test(note), note);
+
+  // --- negative path 2: both slots collapsed onto one key (swapped slot) -----
+  setMarker({ slots: slotsOf(codeKey.pub, codeKey.pub) });
+  note = await runReturn();
+  check('a session shipping ONE key in both slots is REFUSED (slots must be independent)', !jumped, 'page navigated: ' + jumped);
+  check('  …and the refusal names it a slot substitution', /SLOT SUBSTITUTION/.test(note), note);
+
+  // --- negative path 3: the code came back to a different redirect -----------
+  setMarker({ redirect: 'https://auditor.test/other.html' });
+  note = await runReturn();
+  check('a code delivered to a redirect this session did not sign is REFUSED', !jumped, 'page navigated: ' + jumped);
+  check('  …and the refusal names the return-leg substitution', /REDIRECT SUBSTITUTION ON RETURN/.test(note), note);
 
   console.log(bad === 0 ? '\n✅ sealed-return: all checks passed' : `\n❌ ${bad} failed`);
   process.exit(bad === 0 ? 0 : 1);

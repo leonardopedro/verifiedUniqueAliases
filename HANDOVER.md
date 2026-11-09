@@ -1914,9 +1914,98 @@ CI: `.github/workflows/build-attest.yml` runs both modes right after the
   `index.html` byte-identical, README digest row rotated. No pin rotated (the
   page ships unmeasured).
 
-### Deployment caveat
+### Deployment
 
-The live image (v223b) has **neither** the second slot nor `redirect_uri`
-support, so the sealed-redirect path and `nonce_enc` only work after the next
-build + rotation. The card path is unaffected. Config must also list the Pages
-auditor URL in `seal_redirect_uris` and PayPal must have it registered.
+Shipped the same day — see §0.40. (Before the rotation this section noted that
+v223b had neither feature; that caveat no longer applies.)
+
+---
+
+## 0.40 — v225 deployed: two seal slots and the sealed redirect are live
+
+**Ask.** Rebuild and rotate the enclave image so the second seal slot and the
+caller-chosen redirect go live.
+
+### Release
+
+| | Value |
+|---|---|
+| Image | **`m-2ze907s3a43t8l3sdh9r`** (`paypal-tdx-esp-v225c-202611091609`) |
+| Disk | sha256 **`462dbedd…`**, md5 `dea0b4d1…` (49,283,072 B, QCOW-less RAW ESP) |
+| Prod disk | `d-2ze06rpqpzc6zztfu0fk` (1 GiB `cloud_auto`) |
+| Instance | `i-2ze1zdxis0hcsg91qbh5`, EIP `101.200.178.251`, TLS 200 at **t+50 s** |
+| Config | `user_data` re-pushed while stopped — 6,160 B b64, `seal_redirect_uris` read back |
+
+Two rotations happened. The **first** image (`m-2ze9kw63…`, disk `0e92986b…`)
+was already serving when a live probe showed the nonce refusal saying *"cannot
+open the sealed nonce with this boot's **TLS key**"* — the nonce slot opened with
+the nonce key, so the diagnostic named the wrong slot. Since the live disk must
+be bitwise reproducible from the repo, a wording fix is still a new disk: the
+source was corrected (`rsa_oaep_open` now takes the slot name), `cargo test`
+re-pinned the message in `the_two_seal_slots_do_not_interchange`, and the second
+build (`m-2ze907s3…`) became prod. The first image and its snapshot were
+deleted.
+
+### Live verification (both boots)
+
+```
+GET /debug/envelope → session_context.seal_slots.code.sha256 == tls_public_key_sha256
+                    → seal_slots.nonce.sha256 is a DIFFERENT key
+POST /attest/login-session  redirect_uri=<Pages URL>  → 200, signed_fields carries
+     redirect_uri + both slots, signature verifies (PKCS1-SHA256 over sorted JSON)
+POST /attest/login-session  redirect_uri=https://evil.example/steal → 400
+     "redirect_uri is not one of this enclave's allow-listed redirect URIs …"
+POST /attest/login-session  redirect_uri=http://…                     → 400
+     "redirect_uri must be an https:// URL with no query string, fragment or userinfo"
+POST /attest/login-session  (no redirect_uri)                         → 200 (default)
+GET /callback?code_enc=<sealed to code slot>&state=<live>  → opened, then
+     500 "Token exchange failed with PayPal"  (the fake code was decrypted)
+GET /callback?code_enc=<sealed to NONCE slot>&state=<live> → 400
+     "cannot open the sealed code with this boot's TLS key"
+GET /callback?…&nonce_enc=<sealed to CODE slot>            → 400
+     "cannot open the sealed nonce with this boot's nonce key"
+GET /callback?…&nonce_enc=<sealed to NONCE slot>           → 500 PayPal (opened)
+```
+
+The `/callback` probes used a real session minted by the same boot, so they
+prove the slots are independent end-to-end and not just in unit tests. Per-boot
+keys rotated as designed: code `ca62bb3e…`/`407530d7…`, nonce `514f6f74…`/
+`11ad5fa0…` across the two boots.
+
+### Traps hit this cycle
+
+1. **`DescribeImages` returns TotalCount 0 by ImageId** on this endpoint but
+   finds the image by `ImageName` — the import helper's ID path silently looks
+   empty until the name path is used (`/tmp/ecs-call.mjs`, `RegionId=cn-beijing`).
+2. **`RunCommand` needs `--InstanceId.1`, not `--InstanceIds`** — the plural flag
+   is rejected outright by this CLI build.
+3. **A 49 MB HK GET does not fit in one RunCommand**, even with `--Timeout 300`
+   (the invocation fails with an empty output at the ~60 s mark). Ranged
+   resumption (`curl -C -`, one invocation per ~45 s, checking `stat -c%s`) took
+   5 rounds the first time and 1 the second.
+4. **The Beijing intranet PUT must be detached.** `setsid … &` inside the
+   command, then poll a status file: a foreground PUT outlives the invocation
+   too, and the object is still written correctly, but the tool call reports
+   failure and the retry risk doubles the upload.
+5. **`StartInstance` immediately after `ReplaceSystemDisk` is dropped** — the
+   instance stayed `Stopped` for two minutes until start was re-issued. Always
+   poll for `Running` rather than assuming the start stuck.
+6. **`python3` is not on this host**; mutation-testing a page guard needs node.
+
+### State left behind
+
+Prod `i-2ze1zdxis0hcsg91qbh5` (Running) on **`m-2ze907s3a43t8l3sdh9r`**, disk
+`d-2ze06rpqpzc6zztfu0fk`. Images/snapshots back to **5 / 5**: v225c (live),
+v223b (rollback), v222b, v221b, v220 — v218 and the uncorrected v225 were
+deleted with their snapshots. `relay188` **Stopped** (`StopCharging`).
+Staging objects `paypal-tdx-relay-1792227992/disk225.raw|disk226.raw` and
+`paypal-tdx-image-1792145409/paypal-auth-vm/disk225.raw|disk226.raw` remain.
+Local `/tmp/pav-userdata*.{b64,json}` (mode 600, live secrets) and the OSS
+presigner `/tmp/oss-sign.mjs` remain — delete before handing this box on.
+
+### Still manual
+
+**PayPal must register the auditor URL** as a Return URL for the app
+(`https://leonardopedro.github.io/verifiedUniqueAliases/verify.html`), or the
+checkbox path dies at the authorize screen. The enclave side is already live and
+allowlisted; see README → *Adding a sealed-redirect URI*.

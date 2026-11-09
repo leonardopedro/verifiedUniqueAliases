@@ -183,7 +183,7 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 299,638 bytes | `11435c5e28c7e22acac20c5d109ede8214a405ed404cac9e21f6d53b626eb9f1` |
+| `verify.html` | 301,312 bytes | `d37c59a9830acf2166eb2895c7e790592cf62bc5425e21e949428284003ac16b` |
 | `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
 | `zk-rsa.html` | 100,001 bytes | `a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40` |
 | `privacy.html` | 4,673 bytes | `e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8` |
@@ -191,7 +191,7 @@ the file it describes:
 
 ```bash
 sha256sum verify.html zk.html zk-rsa.html privacy.html terms.html
-# 11435c5e28c7e22acac20c5d109ede8214a405ed404cac9e21f6d53b626eb9f1  verify.html
+# d37c59a9830acf2166eb2895c7e790592cf62bc5425e21e949428284003ac16b  verify.html
 # 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
 # a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40  zk-rsa.html
 # e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8  privacy.html
@@ -327,6 +327,53 @@ on every spot recreate. The live config carries: the two PayPal client pairs,
 > A retired GCP version of `upload-secrets.sh` drove `gcloud secrets` and reset
 > `paypal-auth-vm-v60` in `europe-west4-a`. Nothing about it can take effect on
 > this stack; it was rewritten for Alibaba ECS user_data.
+
+### Adding a sealed-redirect URI (operator checklist)
+
+The v225 sealed redirect sends the PayPal `code` to a URL **the page owns**
+instead of the enclave's `/callback`, so the code arrives sealed by
+construction. Two independent registries must agree on that exact string, and
+the enclave refuses anything else. Register them in this order — the enclave
+always rejects first, so a wrong PayPal entry cannot cost you a redirect loop:
+
+1. **PayPal app.** Developer Dashboard → *Apps & Credentials* → the app whose
+   `paypal_client_id` the enclave signs → *App Settings* → **Return URL**
+   (`redirect_uris`). Add the page's absolute URL, e.g.
+   `https://leonardopedro.github.io/verifiedUniqueAliases/verify.html`.
+   Do it for **both** Live and Sandbox if you use both.
+2. **Enclave config.** Add the same string to `seal_redirect_uris` in the
+   `user_data` JSON:
+
+   ```json
+   "seal_redirect_uris": [
+     "https://login.airma.de/callback",
+     "https://leonardopedro.github.io/verifiedUniqueAliases/verify.html"
+   ]
+   ```
+
+   `https://<domain>/callback` is always accepted even when the key is absent,
+   so a config with no `seal_redirect_uris` still serves the manual seal card.
+   Aliases: `paypal_redirect_uris`, `redirect_uris`.
+3. **Push the config** with the documented order — `StopInstance` →
+   `ModifyInstanceAttribute --UserData` → `StartInstance`, then read it back
+   (`DescribeUserData | base64 -d | jq .seal_redirect_uris`).
+4. **Prove it.** On the page, tick *“Let this page receive the code and seal
+   it”*, log in, and confirm PayPal returns to that page and the tab jumps to
+   `/callback?code_enc=…` by itself — no copy/paste.
+
+The strings are compared **byte-for-byte** on both sides: no trailing-slash
+forgiveness, no case folding, no query string, no fragment, no userinfo. A
+missing `https://`, a trailing `/`, or a different path is refused by the
+enclave with HTTP 400 (`redirect_uri is not one of this enclave's allow-listed
+redirect URIs …`) and, if the enclave list is right but PayPal's is not, by
+PayPal at the authorize screen (`redirect_uri` mismatch). Both are pre-login failures — nothing is
+consumed and no session is half-created.
+
+> Off-allowlist URIs cannot be used to exfiltrate a code: the value the enclave
+> signs is the value it later repeats to the token exchange, and the page
+> hard-fails with **REDIRECT SUBSTITUTION** if the signed URI is not its own
+> URL. Treat the allowlist as "which redirect targets may ever receive a code",
+> not as a hint list.
 
 ### The procedure
 

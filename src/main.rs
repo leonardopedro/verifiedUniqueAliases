@@ -2707,13 +2707,17 @@ fn decrypt_sealed_code(state: &AppState, b64: &str) -> Result<String, String> {
         .read()
         .clone()
         .ok_or_else(|| "this boot has no TLS key yet".to_string())?;
-    rsa_oaep_open(&key, b64)
+    rsa_oaep_open(&key, b64, "code")
 }
 
 /// Open an RSA-OAEP/SHA-256 seal with the given key, bounded to one ciphertext.
+/// `what` names the slot in the failure reason: a nonce sealed to the code key
+/// (or the reverse) must say WHICH seal failed, or an operator chasing an
+/// interchange bug reads "TLS key" on a request that never touched the TLS key.
 fn rsa_oaep_open(
     key: &openssl::pkey::PKey<openssl::pkey::Private>,
     b64: &str,
+    what: &str,
 ) -> Result<String, String> {
     use base64::engine::general_purpose::STANDARD as B64STD;
     use base64::Engine as _;
@@ -2737,7 +2741,10 @@ fn rsa_oaep_open(
     let mut plaintext = vec![0u8; key.size() as usize];
     let len = ctx
         .decrypt(&ciphertext, Some(&mut plaintext))
-        .map_err(|_| "cannot open the sealed code with this boot's TLS key".to_string())?;
+        .map_err(|_| {
+            let key_name = if what == "code" { "TLS key" } else { "nonce key" };
+            format!("cannot open the sealed {what} with this boot's {key_name}")
+        })?;
     plaintext.truncate(len);
     String::from_utf8(plaintext)
         .map_err(|_| "the sealed code is not valid UTF-8".to_string())
@@ -3800,7 +3807,7 @@ async fn callback(
                     .into_response()
             }
         };
-        match rsa_oaep_open(&key, sealed) {
+        match rsa_oaep_open(&key, sealed, "nonce") {
             Ok(opened) => user_nonce_raw = opened,
             Err(reason) => {
                 return (StatusCode::BAD_REQUEST, format!("cannot open the sealed nonce: {reason}"))
@@ -5732,24 +5739,25 @@ mod security_tests {
 
         let sealed = seal(&pem, "A1b2C3-the-paypal-code");
         assert_eq!(
-            rsa_oaep_open(&key, &sealed).unwrap(),
+            rsa_oaep_open(&key, &sealed, "code").unwrap(),
             "A1b2C3-the-paypal-code"
         );
 
         // A different boot's key cannot open it — the whole point of sealing.
         let other = openssl::pkey::PKey::from_rsa(openssl::rsa::Rsa::generate(2048).unwrap()).unwrap();
-        assert!(rsa_oaep_open(&other, &sealed).is_err());
+        assert!(rsa_oaep_open(&other, &sealed, "code").is_err());
 
         // Junk, wrong-size, and tampered seals fail closed, never silently.
-        assert!(rsa_oaep_open(&key, "not base64!!").is_err());
-        assert!(rsa_oaep_open(&key, "AAAA").is_err());
+        assert!(rsa_oaep_open(&key, "not base64!!", "code").is_err());
+        assert!(rsa_oaep_open(&key, "AAAA", "code").is_err());
         let mut tampered = base64::engine::general_purpose::STANDARD
             .decode(&sealed)
             .unwrap();
         tampered[10] ^= 0x01;
         assert!(rsa_oaep_open(
             &key,
-            &base64::engine::general_purpose::STANDARD.encode(tampered)
+            &base64::engine::general_purpose::STANDARD.encode(tampered),
+            "code"
         )
         .is_err());
     }
@@ -5778,11 +5786,17 @@ mod security_tests {
         };
 
         // Each slot opens its own seal...
-        assert_eq!(rsa_oaep_open(&nonce_key, &seal_to(&nonce_key, "my-nonce-42")).unwrap(), "my-nonce-42");
-        assert_eq!(rsa_oaep_open(&code_key, &seal_to(&code_key, "A1b2C3")).unwrap(), "A1b2C3");
+        assert_eq!(rsa_oaep_open(&nonce_key, &seal_to(&nonce_key, "my-nonce-42"), "nonce").unwrap(), "my-nonce-42");
+        assert_eq!(rsa_oaep_open(&code_key, &seal_to(&code_key, "A1b2C3"), "code").unwrap(), "A1b2C3");
         // ...and refuses the other slot's, in both directions.
-        assert!(rsa_oaep_open(&code_key, &seal_to(&nonce_key, "my-nonce-42")).is_err());
-        assert!(rsa_oaep_open(&nonce_key, &seal_to(&code_key, "A1b2C3")).is_err());
+        assert!(rsa_oaep_open(&code_key, &seal_to(&nonce_key, "my-nonce-42"), "nonce").is_err());
+        assert!(rsa_oaep_open(&nonce_key, &seal_to(&code_key, "A1b2C3"), "code").is_err());
+        // The refusal names the slot it actually tried: an interchange bug must
+        // not read as "TLS key" on a request that never touched the TLS key.
+        let err = rsa_oaep_open(&code_key, &seal_to(&nonce_key, "x"), "nonce").unwrap_err();
+        assert!(err.contains("sealed nonce") && err.contains("nonce key"), "{err}");
+        let err = rsa_oaep_open(&nonce_key, &seal_to(&code_key, "x"), "code").unwrap_err();
+        assert!(err.contains("sealed code") && err.contains("TLS key"), "{err}");
 
         // The plaintext becomes a signed report field, so it is bounded and
         // canonicalised exactly like custom_info.
