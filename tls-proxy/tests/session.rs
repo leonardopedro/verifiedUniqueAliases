@@ -382,7 +382,46 @@ async fn attests_a_real_tls_session_end_to_end() -> Result<(), Box<dyn std::erro
                 .to_string();
             let (status, one) = http_get(api_port, &format!("/attestations/{id}")).await?;
             assert_eq!(status, 200);
-            attestation = Some(serde_json::from_str::<serde_json::Value>(&one)?);
+            // v221: the SERVED TEXT must carry the signed fields in the SIGNED
+            // order. The auditor page rebuilds the signed bytes from exactly
+            // this text, so a proxy that serves them re-serialised through
+            // `serde_json::Value` (alphabetical) makes every real attestation
+            // unverifiable — which is what shipped until this was fixed. This
+            // check deliberately reads bytes, not a parsed struct: parsing into
+            // the typed body restores the order and hides the defect.
+            const SIGNED_ORDER: [&str; 14] = [
+                "\"version\"", "\"session_id\"", "\"server_name\"", "\"notarized_at\"",
+                "\"sent_len\"", "\"received_len\"", "\"sent_sha256\"", "\"received_sha256\"",
+                "\"sent_b64\"", "\"received_b64\"", "\"truncated\"", "\"enclave_pubkey_pem\"",
+                "\"signature_alg\"", "\"signature_b64\"",
+            ];
+            let mut cursor = 0usize;
+            for field in SIGNED_ORDER {
+                let at = one[cursor..]
+                    .find(field)
+                    .map(|p| p + cursor)
+                    .unwrap_or_else(|| panic!("{field} missing from the served attestation"));
+                cursor = at + field.len();
+            }
+            // And the signature must verify over the byte range the page will
+            // cut out of that same text: the body, up to the envelope.
+            let envelope_at = one.find(",\"enclave_pubkey_pem\"").expect("flattened envelope");
+            let mut served_signed = one[..envelope_at].to_string();
+            served_signed.push('}');
+            let served: serde_json::Value = serde_json::from_str(&one)?;
+            let served_pubkey = openssl::pkey::PKey::public_key_from_pem(
+                served["enclave_pubkey_pem"].as_str().expect("pubkey").as_bytes(),
+            )?;
+            let mut served_verifier =
+                openssl::sign::Verifier::new(openssl::hash::MessageDigest::sha256(), &served_pubkey)?;
+            served_verifier.update(served_signed.as_bytes())?;
+            let served_sig = base64::engine::general_purpose::STANDARD
+                .decode(served["signature_b64"].as_str().expect("signature"))?;
+            assert!(
+                served_verifier.verify(&served_sig)?,
+                "the signature must verify over the bytes the API actually serves"
+            );
+            attestation = Some(served);
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

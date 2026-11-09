@@ -56,6 +56,7 @@ use std::{
 use axum::{
     extract::{Path as AxumPath, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -198,7 +199,19 @@ struct ProxyState {
     /// touched. The process keeps serving its record while draining.
     draining: AtomicBool,
     /// Newest last; bounded by MAX_STORED_ATTESTATIONS.
-    attestations: Mutex<VecDeque<(String, serde_json::Value)>>,
+    /// Stored as the exact JSON text that was signed plus its envelope, NOT as a
+    /// `serde_json::Value`.
+    ///
+    /// v221 (live auditor finding, 2026-11-09): `Value` round-trips through a
+    /// BTreeMap, so `Json(value)` served keys in ALPHABETICAL order while the
+    /// signature covers the struct's declaration order. The auditor page
+    /// reconstructs the signed bytes from the text it is given, so every real
+    /// attestation failed with "unexpected shape — top-level order:
+    /// enclave_pubkey_pem, notarized_at, …". The hermetic test missed it because
+    /// it re-parsed into a typed struct before verifying, which restores the
+    /// order the signature needs. Keeping the text is the only way what we serve
+    /// is what we signed.
+    attestations: Mutex<VecDeque<(String, String)>>,
     /// Newest last; bounded by MAX_STORED_REFUSALS.
     refusals: Mutex<VecDeque<RefusalRecord>>,
 }
@@ -210,12 +223,12 @@ impl ProxyState {
         }
     }
 
-    fn remember(&self, id: String, value: serde_json::Value) {
+    fn remember(&self, id: String, json: String) {
         let mut store = self.attestations.lock().unwrap();
         while store.len() >= MAX_STORED_ATTESTATIONS {
             store.pop_front();
         }
-        store.push_back((id, value));
+        store.push_back((id, json));
     }
 
     fn remember_refusal(&self, kind: &'static str, reason: String) {
@@ -459,7 +472,7 @@ fn record_attestation(st: &ProxyState, verified: Verified) -> Result<String, Box
         signature_b64,
     };
     let id = attestation.body.session_id.clone();
-    st.remember(id.clone(), serde_json::to_value(&attestation)?);
+    st.remember(id.clone(), serde_json::to_string(&attestation)?);
     Ok(id)
 }
 
@@ -506,11 +519,16 @@ async fn drain(State(st): State<Arc<ProxyState>>) -> Json<serde_json::Value> {
 ///
 /// The signed body is **flattened** into the envelope (`Attestation` carries
 /// `#[serde(flatten)] body`), so `server_name` and `notarized_at` live at the
-/// top level of the stored value — the same place `GET /attestations/{id}`
+/// top level of the document — the same place `GET /attestations/{id}`
 /// serves them from. Reading them under a `body` key instead lists every
 /// session with a null host, which is the one field an operator is looking
-/// for.
-fn summarize_session(id: &str, value: &serde_json::Value) -> serde_json::Value {
+/// for (v217).
+///
+/// The stored form is text (see `ProxyState::attestations`), so this parses a
+/// copy: reading fields for a listing does not need — and must not rewrite — the
+/// byte layout the signature covers.
+fn summarize_session(id: &str, json: &str) -> serde_json::Value {
+    let value: serde_json::Value = serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
     serde_json::json!({
         "session_id": id,
         "server_name": value.get("server_name"),
@@ -522,7 +540,7 @@ async fn list(State(st): State<Arc<ProxyState>>) -> Json<serde_json::Value> {
     let store = st.attestations.lock().unwrap();
     let sessions: Vec<serde_json::Value> = store
         .iter()
-        .map(|(id, v)| summarize_session(id, v))
+        .map(|(id, json)| summarize_session(id, json))
         .collect();
     Json(serde_json::json!({
         "count": sessions.len(),
@@ -541,13 +559,22 @@ async fn refusals(State(st): State<Arc<ProxyState>>) -> Json<serde_json::Value> 
     }))
 }
 
+/// Serve the attestation as **the text that was signed**, verbatim.
+///
+/// Not `Json(value)`: that would re-serialize through `serde_json::Value` and
+/// emit the signed fields in alphabetical order, which the auditor page cannot
+/// verify (v221). The bytes on the wire are the bytes the enclave hashed.
 async fn get_one(
     State(st): State<Arc<ProxyState>>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     let store = st.attestations.lock().unwrap();
     match store.iter().find(|(sid, _)| sid == &id) {
-        Some((_, value)) => Ok(Json(value.clone())),
+        Some((_, json)) => Ok((
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            json.clone(),
+        )
+            .into_response()),
         None => Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -694,23 +721,23 @@ mod tests {
 
     /// The envelope `record_attestation` stores and `GET /attestations/{id}`
     /// serves: signed fields flattened to the top level beside the signature.
-    fn stored_envelope(server_name: &str) -> serde_json::Value {
-        serde_json::json!({
-            "version": "tls-proxy/1",
-            "session_id": "aa",
-            "server_name": server_name,
-            "notarized_at": 1_790_000_000u64,
-            "sent_len": 107,
-            "received_len": 3429,
-            "sent_sha256": "00",
-            "received_sha256": "00",
-            "sent_b64": "",
-            "received_b64": "",
-            "truncated": false,
-            "enclave_pubkey_pem": "pem",
-            "signature_alg": "RSA-PKCS1-v1_5-SHA256",
-            "signature_b64": "sig",
-        })
+    ///
+    /// Returned as text, because the store holds text: `serde_json::json!`
+    /// builds a `Map` (a BTreeMap without `preserve_order`), which is precisely
+    /// the alphabetical re-ordering that made served attestations unverifiable
+    /// (v221). A fixture that sorted itself could never catch that.
+    fn stored_envelope(server_name: &str) -> String {
+        format!(
+            concat!(
+                "{{\"version\":\"tls-proxy/1\",\"session_id\":\"aa\",\"server_name\":\"{}\",",
+                "\"notarized_at\":{},\"sent_len\":107,\"received_len\":3429,",
+                "\"sent_sha256\":\"00\",\"received_sha256\":\"00\",\"sent_b64\":\"\",\"received_b64\":\"\",",
+                "\"truncated\":false,\"enclave_pubkey_pem\":\"pem\",",
+                "\"signature_alg\":\"RSA-PKCS1-v1_5-SHA256\",\"signature_b64\":\"sig\"}}"
+            ),
+            server_name,
+            1_790_000_000u64
+        )
     }
 
     #[test]
@@ -726,8 +753,7 @@ mod tests {
 
     #[test]
     fn list_projection_tolerates_a_record_without_a_host() {
-        let mut envelope = stored_envelope("");
-        envelope.as_object_mut().unwrap().remove("server_name");
+        let envelope = stored_envelope("").replace("\"server_name\":\"\",", "");
         let row = summarize_session("bb", &envelope);
         assert_eq!(row["session_id"], "bb");
         assert!(row["server_name"].is_null());

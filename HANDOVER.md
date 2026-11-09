@@ -1332,3 +1332,107 @@ not failed relays.
 Verification half re-run after the session: `node scripts/test-verify-proxy.mjs` → **44 passed,
 0 failed** (the real `verify-proxy.html` audit path against RSA-2048-signed attestations, including the
 "any field changed must fail" cases). Pins were untouched — this run changed no boot measurements.
+
+## 0.31 Five more sandbox relay runs: 6/6 first attempt today (2026-11-09)
+
+Same command as §0.30, five consecutive runs, no retry needed in any of them:
+
+| run | attempt used | commit accepted | 200 OK | prover finished | 
+|---|---|---|---|---|
+| 1 | 1/3 | 8.6 s | 10.6 s | **13.2 s** |
+| 2 | 1/3 | 6.1 s | 7.7 s | **11.8 s** |
+| 3 | 1/3 | 8.3 s | 10.5 s | **15.3 s** |
+| 4 | 1/3 | 7.1 s | 8.8 s | **11.4 s** |
+| 5 | 1/3 | 8.0 s | 9.8 s | **12.5 s** |
+
+Mean 12.9 s, min 11.4 s, max 15.3 s (the §0.30 run was 23.6 s — first run after a long idle,
+committed at 14.9 s, so the outlier is the cold path, not the page). All five: `sent 103 B`,
+`received 37993–37998 B`, `test result: ok`.
+
+**That contradicts the note in `tls-proxy/tests/live.rs`** ("measured at 2 of 3 runs" failing the
+relayed handshake). Today it is 6/6 first-attempt across two sessions of testing. Keep the retry
+machinery — a CDN edge closing mid-handshake is a real failure mode and one afternoon does not
+disprove the older measurement — but the comment now overstates the flakiness; treat the retry as
+insurance, not as the expected outcome.
+
+## 0.32 Auditing a LIVE attestation on the real page found a shipping defect (v221)
+
+The notary's signed attestation is served only on loopback (`:8081`), which is firewalled from the
+internet — so a deployed attestation cannot be pulled for audit from outside. To audit real bytes,
+run the same binary locally as the notary and relay a real sandbox session through it:
+
+```bash
+TLS_PROXY_LISTEN=127.0.0.1:8443 TLS_PROXY_HTTP_LISTEN=127.0.0.1:8081 \
+  TLS_PROXY_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt ./tls-proxy/target/debug/tls-proxy
+LIVE_NOTARY=127.0.0.1:8443 LIVE_SERVER=www.sandbox.paypal.com LIVE_PATH=/signin \
+  cargo test --test live -- --ignored --nocapture
+curl -s localhost:8081/attestations/<id> > /tmp/live-proxy-attestation.json
+```
+
+Feeding that file to `verify-proxy.html` (headless chromium, `#attestationFile`) **failed**:
+
+```
+NOT VERIFIED — do not rely on this attestation
+❌ Expected fields, in the signed order
+   unexpected shape — duplicate keys: none; top-level order:
+   enclave_pubkey_pem, notarized_at, received_b64, received_len, received_sha256,
+   sent_b64, sent_len, sent_sha256, server_name, session_id, signature_alg,
+   signature_b64, truncated, version
+```
+
+Alphabetical — and that is the bug. `ProxyState` stored the attestation as a `serde_json::Value`;
+`Value`'s object is a `BTreeMap` (no `preserve_order`), so `Json(value)` re-serialised the document
+sorted, while the signature covers the struct's declaration order. The page rebuilds the signed bytes
+from the text it is given (that is its whole design — it cuts the body out of your bytes), so **no
+attestation served by the live proxy could ever verify**. The hermetic test missed it because it
+re-parsed into a typed `SignedBody` before verifying, which silently restores the order.
+
+Fix (v221, `tls-proxy/src/main.rs`):
+- `ProxyState::attestations` stores the **exact signed text** (`String`), not a `Value`
+  (`serde_json::to_string(&Attestation)` — flattened body in declaration order, then the envelope).
+- `GET /attestations/{id}` returns that text verbatim as `application/json` (a `Response`, not
+  `Json`), so the bytes on the wire are the bytes that were hashed.
+- `list` parses a copy for its three-field projection; it never rewrites what it serves.
+- Regression test in `tests/session.rs`: asserts the served text carries the 14 keys in signed order
+  **and** that the signature verifies over the body slice cut out of that text — byte-level, the way
+  the page does it, so a re-sorting store fails the test instead of shipping.
+
+Proof after the fix, same live path (fresh notary, real sandbox transcript):
+
+```
+VERDICT: Signature and digests verified — this record is intact
+✅ Expected fields, in the signed order
+✅ Signed bytes reconstructed from your input   SHA-256 f5c16053…  · 51190 bytes
+✅ Enclave signature                            RSA PKCS#1 v1.5 · SHA-256 · key SHA-256 894b96af…
+✅ Request digest      103 bytes   SHA-256 c2d43008…
+✅ Response digest     37993 bytes SHA-256 3219b888…
+✅ Notarized server name  www.sandbox.paypal.com (port 443, resolved by the enclave)
+✅ Notarization time      2026-11-09T01:50:16Z
+⚠️ Key bound to the enclave hardware — not checked here (the page verifies the record, not who
+   holds the key; documented, expected for this page)
+```
+
+`cd tls-proxy && cargo test` → 2 unit + 7 session tests pass (including the new byte assertion); the
+live test stays `#[ignore]` as designed.
+
+**Not yet deployed.** The prod notary still runs the pre-v221 binary, so its attestations still come
+out sorted and still fail the page. Shipping this needs the normal image path (`--features oci`,
+pins/digest rotation, `ReplaceSystemDisk`) — treat §0.32 as fixed-in-source, unproven-on-prod until
+that image ships.
+
+## 0.33 `e2e-sandbox.mjs` now refuses a production-configured enclave (2026-11-09)
+
+The driver's name invites the §0.29 mistake, so it now checks the target before opening a browser:
+it POSTs a minimal `/attest/login-session` (fresh P-256 key, random nonce) and reads the **signed**
+`paypal_environment` / `authorize_base` — the only place the boot-time `staging` flag is observable,
+since no route exposes the config. `staging:false` ⇒ refuse, exit **2**, print why plus the notary
+test that *is* the sandbox coverage:
+
+```
+❌ REFUSING TO RUN — https://login.airma.de is configured for production, not sandbox.
+   authorize_base: https://www.paypal.com/signin/authorize
+```
+
+- `PAV_ENCLAVE_HOST` (new, shared with the flow script so both agree on the target)
+- `PAV_ALLOW_PRODUCTION=1` for a deliberate production run (needs a real account, not `sb-…`)
+- Unreachable host ⇒ preflight failure, exit 2, nothing launched (verified with `127.0.0.1:9`).

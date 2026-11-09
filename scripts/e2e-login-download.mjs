@@ -93,6 +93,9 @@ const PASSWORD = process.env.PPPASS || '4&itWr>M';
 const VERIFY_RAW = process.env.VERIFY_HTML
   || new URL('../verify.html', import.meta.url).pathname;
 const VERIFY = /^https?:\/\//.test(VERIFY_RAW) ? VERIFY_RAW : 'file://' + VERIFY_RAW;
+// The enclave the auditor page talks to. Shared with scripts/e2e-sandbox.mjs so
+// that its staging preflight inspects exactly the host this flow logs in against.
+const ENCLAVE_HOST = (process.env.PAV_ENCLAVE_HOST || 'https://login.airma.de').replace(/\/+$/, '');
 const log = (...a) => console.log(...a);
 
 const browser = await chromium.launch({
@@ -124,7 +127,7 @@ page.on('console', (m) => {
 
 try {
   await page.goto(VERIFY, { waitUntil: 'domcontentloaded' });
-  await page.fill('#localEnclaveHost', 'https://login.airma.de');
+  await page.fill('#localEnclaveHost', ENCLAVE_HOST);
   log('1. loaded', VERIFY, '(trusted copy)');
 
   // v197b — optional escrow-key override: seal to a key WE hold the private
