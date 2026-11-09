@@ -1248,3 +1248,41 @@ creation `Success`, five `delete refused (Running): … Initializing`, then `del
 **Trap:** on this platform `Status: Running` is not "ready" — `IncorrectInstanceStatus.Initializing`
 is the only signal that creation is still in progress, and it is an *error* from the mutating call,
 never a status you can poll for.
+
+## 0.29 The sandbox login e2e cannot pass against THIS deployment, by configuration (2026-11-09)
+
+`CHROMIUM_PATH=$(command -v chromium) node scripts/e2e-sandbox.mjs full` drives the real prod
+auditor with headless chromium. It gets all the way to PayPal and then stops:
+
+```
+1. loaded verify.html (trusted copy)               ✅
+2. step-1: Login session ready, escrow ON (183BA8C8…) ✅
+3. popup landed: https://www.paypal.com/signin/authorize?client_id=BAAKIQtHan_IwlC0KJeBICQ86HyaLghkcmyP9W42jfd2TjtugYHpYrfQFKp8
+   credentials submit #1..#3
+E2E FAILED: PayPal login did not navigate after 3 submit attempts
+```
+
+**The popup is production PayPal, and the account is a sandbox account.** Prod's config is
+`staging:false` (checked from the instance's user_data), so `authorize` is built against
+`www.paypal.com` with the production app; `api_base` likewise resolves to
+`api-m.paypal.com` (line `let api_base = if state.staging {…}`). A `sb-…@personal.example.com`
+account has no identity on the production host, so the form never navigates — "3 submit attempts"
+is the automation retrying a page that was always going to refuse.
+
+The credentials themselves are fine, proven separately: the same email/password on
+`https://www.sandbox.paypal.com/signin` goes `#email` → `#btnNext` → `#password` → `#btnLogin` →
+**`/myaccount/summary?intl=0`**, no alert.
+
+Why it cannot be fixed by editing the driver:
+- `staging` is **boot configuration only** — there is no per-session override; `attest_login_session`
+  takes `flow`, nothing else.
+- The repo carries **no staging config and no sandbox app client id/secret** (only the API base
+  constant `PAYPAL_SANDBOX_API`). Flipping prod to `staging:true` would send users to sandbox PayPal
+  with the *production* client id, which PayPal rejects — it would break the live login without making
+  the test pass.
+
+So the sandbox login e2e needs a **separate staging deployment**: same v220 image, `user_data` with
+`staging: true` plus sandbox app credentials. Prod stays production and untouched. What prod *has*
+proven this cycle: trusted-page load, login-session + escrow setup, authorize URL construction, and
+(the separate TLSNotary path) three notarised sandbox sessions — everything except the authentication
+step that a sandbox identity cannot perform on a production host.
