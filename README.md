@@ -375,6 +375,60 @@ consumed and no session is half-created.
 > URL. Treat the allowlist as "which redirect targets may ever receive a code",
 > not as a hint list.
 
+#### Hosting the page on a custom domain
+
+The Return URL must be https and must actually serve the auditor, so the
+hostname needs TLS termination in front of the GitHub content. Two ways, and
+one that looks right but is not:
+
+- **Plain DNS CNAME to `raw.githubusercontent.com` fails.** The visitor's
+  browser validates the certificate against *their* hostname and raw's
+  certificate only covers `*.githubusercontent.com`:
+
+  ```text
+  $ curl --resolve audit.example.org:443:185.199.108.133 \
+      https://audit.example.org/owner/repo/main/verify.html
+  curl: (60) SSL: no alternative certificate subject name matches target hostname
+  ```
+
+  PayPal requires an `https` Return URL, so the flow dies at the authorize
+  screen before any code is issued.
+- **Proxied CNAME through Cloudflare** (this is what `airma.de` already uses —
+  its nameservers are Cloudflare's). Cloudflare terminates TLS with a
+  certificate for the custom hostname and pulls the path from raw with the
+  correct SNI. Create:
+
+  ```text
+  Type   Name    Target                      Proxy
+  CNAME  audit   raw.githubusercontent.com   Proxied (orange cloud)
+  ```
+
+  The page then lives at
+  `https://audit.airma.de/leonardopedro/verifiedUniqueAliases/main/verify.html`
+  — the origin pull returns the committed bytes
+  (sha256 `d37c59a9…` matches `verify.html` in the repo and inside the
+  measured ESP). Allowlist that exact string:
+
+  ```json
+  "seal_redirect_uris": [
+    "https://login.airma.de/callback",
+    "https://audit.airma.de/leonardopedro/verifiedUniqueAliases/main/verify.html"
+  ]
+  ```
+
+- **A host you control** (Cloudflare Worker, Netlify, nginx `proxy_pass` to
+  raw, or GitHub Pages with its own CNAME) works the same way: the ARK of the
+  requirement is that the certificate matches the hostname, not which vendor
+  serves it.
+
+> `@main` is a mutable ref: a push changes the page behind a Return URL that is
+> registered permanently in PayPal. Pin `@<commit>` instead when you want the
+> served page frozen per release — at the cost of re-registering the Return URL
+> each rotation. Either way the signed report carries
+> `boot_measurements.disk_manifest.verify.html` (the digest of the copy inside
+> the measured ESP), so an auditor can tell a stale or swapped page from the
+> shipped one.
+
 ### The procedure
 
 ```bash
