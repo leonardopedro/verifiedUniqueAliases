@@ -2281,3 +2281,96 @@ snapshot deleted; relay stopped again; `/tmp` config and report captures removed
    nothing to add, and do **not** add the Pages URL.
 2. **Browser E2E**: PayPal answers 403 to this host, so the real login round trip
    still needs a human with an account.
+
+---
+
+## 0.44 — v228: the certificate download is provable before login (2026-11-09)
+
+### What the check found
+
+v227 made `/tls-cert.pem` the visitor's proof of the channel, but nothing tied
+that download to the attestation. Writing the binding check exposed two gaps on
+the live service, both fixed here:
+
+1. **`/debug/envelope` carried no `tls_certificate_pem` at all.** The pre-login
+   report named the TLS *key* (v223) but not the certificate, so an auditor could
+   only check the download against a report after completing a PayPal login.
+   The envelope now carries the same PEM the callback report does — public
+   handshake bytes, no new exposure.
+2. **`/tls-cert.pem` serves the full chain** (leaf + 2 intermediates, 3 PEM
+   blocks at 6,870 B), not a single certificate. That is the right thing to
+   serve (`openssl verify -CAfile` then works), so the check compares the leaf
+   and reports the chain length rather than demanding one block.
+
+The download is also confirmed to be the *live handshake leaf*, which is the
+claim the landing actually makes ("match it against your padlock"): pass 1 saw
+`7923cb77…`, pass 2 `9a5949a9…` — the certificate rotates per boot with ACME,
+which is precisely why the report has to name it.
+
+### The check
+
+`scripts/check-live-tls-cert.mjs` fetches the landing, the PEM, the envelope and
+the real TLS handshake, then compares DER (leaf) — plus `--report <file>` for an
+archived report. It fails if the landing stops linking `/tls-cert.pem`, stops
+naming `login.airma.de/callback`, links a third-party auditor again, serves a
+non-PEM body or the wrong content-type, or if any of the three certificates
+disagree.
+
+Wired in twice:
+- **Every rotation**, as the last gate of phase 6 (`rotate-alibaba.sh`) — a TLS
+  proxy in front of the enclave, or a report built before the certificate was
+  loaded, cannot ship silently.
+- **Daily in CI** (`.github/workflows/live-cert-check.yml`, `17 5 * * *`, plus
+  manual dispatch with a URL input), because this is a property of the deployed
+  service that no build-time test can observe.
+
+### Pages is no longer a trusted auditor, anywhere
+
+`trustedAuditorContext()` is now `file://` only. The Pages mirror was still
+whitelisted as a key-generating origin — the leftover of the v226 design — and
+it is an origin its owner can republish, so it grants nothing. The banner and
+`untrustedOriginError()` say "served over the network", not "served by the
+enclave", since both cases are the same threat. Legal-document links and the
+Pages *reading* mirror are untouched; `zk.html` keeps its own copy of the gate
+for its own origin and was deliberately not changed.
+
+**Harness bug fixed while doing this:** the offline suite evals `verify.html`,
+then `zk.html`, which re-declares `trustedAuditorContext`. Every isolation test
+was therefore exercising **zk.html's** rule, not the auditor's — the Pages entry
+could have stayed here indefinitely with the suite green. The suite now captures
+the auditor's function before zk.html is evaluated.
+
+### Two passes
+
+| | image | disk sha256 | binary | RTMR2 |
+|---|---|---|---|---|
+| v228 | `m-2ze2z2xb3t87rovbbm8t` (superseded) | `335af4bf…` | `406cdcb3…` | `a2b7baf1…` |
+| **v228b (live)** | **`m-2ze907s3a43tcv075rd2`** | **`4aad2dd9…`** | `406cdcb3…` (identical) | `a2b7baf1…` (held) |
+
+RTMR2 rotated `faba03c0… → a2b7baf1…` (MRTD `e0199499…`, RTMR0 `06a32a2f…`,
+RTMR1 `6fa035…`, RTMR3 held) because the envelope field lives in the binary;
+pins were rotated against the live quote, and pass 2 shipped the rotated page
+with the binary byte-identical.
+
+Live after the swap: envelope `binary_sha256 = 406cdcb3…` == pin; live RTMR2
+`a2b7baf1…` == `EXPECTED_RTMR2`; envelope `disk_manifest.verify.html =
+71e71f9f…` (303,074 B) == repo == Pages; `certificate download == live handshake
+== report` at phase 6 on both passes; `PARITY OK`; security **496/0**, proxy
+**44/0**, seal `card` and `sealed-return` green.
+
+### The login round trip could not be run here
+
+No Chromium or Playwright in this environment, and the live enclave is
+production-configured — `scripts/e2e-sandbox.mjs` refuses to drive it by design
+(a sandbox identity cannot complete a production login). PayPal also answers 403
+to this host. What *was* verified about the leg without a PayPal session:
+`GET /callback` with no session returns **403 "Invalid or expired session"** —
+the route exists, is sealed to a live session and refuses bare input. The real
+round trip still needs a human with a PayPal account in a browser.
+
+### State
+
+Live `i-2ze1zdxis0hcsg91qbh5`, image `m-2ze907s3a43tcv075rd2`; rollback
+`m-2zej7uzl9mr49avdfwyj` (v227c — its RTMR2 was `a2b7baf1…`? no: `faba03c0…`,
+so rolling back also needs the pins of that era). Superseded v228 image and its
+snapshot deleted; relay stopped; `/tmp` config and report captures removed.
