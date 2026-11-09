@@ -2454,5 +2454,5 @@ text), but nobody has watched a real `code` come back and seal correctly yet.
 
 Live `i-2ze1zdxis0hcsg91qbh5`, image `m-2zefbu7nyrwv18mu8o31`; rollback
 `m-2ze907s3a43tcv075rd2` (v228b, same binary and RTMR2 — pins still apply).
-Superseded v228b image and its snapshot to be deleted after this note; relay
+Superseded v228b image and its snapshot deleted; relay
 stopped; `/tmp` config and report captures removed.
