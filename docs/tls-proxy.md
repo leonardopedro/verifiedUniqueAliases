@@ -136,6 +136,7 @@ nothing, and stops demanding PayPal app credentials only for the proxy-only case
 | `GET https://<domain>/proxy/health` | same liveness answer on the public origin |
 | `GET https://<domain>/proxy/refusals` | the refusal ring on the public origin, hostnames fingerprinted |
 | `GET https://<domain>/proxy/attestations` | the recorded sessions on the public origin: id, host fingerprint, time |
+| `GET https://<domain>/proxy/attestations/{id}?sent_sha256=&received_sha256=` | **your own** signed record, from anywhere: served only when both digests match |
 
 `/refusals` answers the operator's question "why was that session rejected?"
 without a shell: each entry is `{at, kind, reason}`, where `kind` is `rejected`
@@ -171,11 +172,37 @@ ids, fingerprints, timestamps. The transcript bytes and the signature stay on th
 loopback API (`GET :8081/attestations/{id}`), because serving them on a shared
 origin would hand every visitor everyone else's transcripts.
 
+### Who may download a transcript
+
+A prover who is not sitting on the VM still needs the signed record — that is
+their evidence. `GET /proxy/attestations/{id}` serves it to a caller that
+presents `sent_sha256` **and** `received_sha256`, the pair the record itself
+signs over. That pair is a capability, not a password:
+
+* a prover computes both digests from the bytes their own proof reveals (TLSNotary
+  hands the revealed transcript to the prover, and to nobody else);
+* the public list never carries either digest, so reading it is not enough;
+* a wrong pair, an unknown id, a malformed digest and a missing parameter all
+  answer the same `404 {"error":"no such attestation in this boot"}`, so the
+  route cannot be used to test guesses about other people's sessions;
+* the bytes are relayed as text, never re-serialised — the signature covers the
+  field order the proxy stored (v221), so a JSON round-trip here would hand the
+  prover a record that cannot verify.
+
+There is no stronger capability to bind: the TLSNotary session carries no
+prover-chosen nonce this notary could key a token to, and any server-generated
+token would have no way to reach the prover, since the notary never speaks after
+the session ends. The transcript is the only secret both sides already hold.
+
+Loopback reads stay queryless: `GET :8081/attestations/{id}` with no parameters
+still serves the record to whoever has a shell on the VM.
+
 The attestation API binds loopback on purpose: the bytes are read by whoever
-already has a shell on the VM (or a future in-guest collector), and the two
-public routes relay nothing but the refusal ring and the session list. Session
-traffic never passes through the HTTPS listener either, so the PayPal TLS
-certificate is not involved in a proof.
+already has a shell on the VM (or a future in-guest collector). The public routes
+relay the refusal ring, the session list, and — only to a caller that presents
+the transcript digests — that caller's own record. Session traffic never passes
+through the HTTPS listener either, so the PayPal TLS certificate is not involved
+in a proof.
 
 ## The attestation
 

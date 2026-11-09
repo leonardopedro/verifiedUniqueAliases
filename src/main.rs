@@ -1171,7 +1171,7 @@ pub fn cmd_output_timeout(
 }
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
@@ -4108,12 +4108,138 @@ async fn proxy_attestations() -> axum::response::Response {
         map.insert(
             "redaction".into(),
             serde_json::json!(
-                "`server_name` is replaced by host:<sha256 prefix>; the committed name \
-                 and the transcript are served by the loopback API (GET :8081/attestations/<id>)"
+                "`server_name` is replaced by host:<sha256 prefix>; a prover fetches their own \
+                 signed record from GET /proxy/attestations/<id>?sent_sha256=<…>&received_sha256=<…> \
+                 (the digests of the bytes their own proof reveals), and the unfiltered record is \
+                 also on the loopback API (GET :8081/attestations/<id>)"
             ),
         );
     }
     axum::Json(parsed).into_response()
+}
+
+/// What a prover may present instead of being on the box.
+#[derive(serde::Deserialize)]
+struct AttestationDownloadQuery {
+    sent_sha256: Option<String>,
+    received_sha256: Option<String>,
+}
+
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_hex32(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// One answer for every "not yours": an id this boot never recorded, a digest
+/// pair that does not match, a malformed request. Distinguishing them would turn
+/// the route into an oracle for which sessions exist.
+fn attestation_absent(id: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({
+            "error": "no such attestation in this boot",
+            "session_id": id,
+        })),
+    )
+        .into_response()
+}
+
+/// `/proxy/attestations/{id}` — the prover's own signed record, from anywhere.
+///
+/// The list publishes ids but never transcripts, and the transcript is exactly
+/// what a prover already holds: TLSNotary reveals it to build the proof. So the
+/// capability is that knowledge — `sent_sha256` and `received_sha256`, the pair
+/// the record itself signs over. Whoever ran the session can compute both; an
+/// onlooker who only read the public list cannot, and the record never becomes
+/// reachable by enumerating ids.
+///
+/// The bytes are relayed as text, never re-serialised: the signature covers the
+/// field order of what the proxy stored (v221), so parsing and re-encoding here
+/// would break the very thing the prover came to download.
+async fn proxy_attestation_download(
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<AttestationDownloadQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let Some(sup) = PROXY_SUPERVISOR.get() else {
+        return attestation_absent(&id);
+    };
+    if !sup.alive.load(Ordering::Relaxed) {
+        return proxy_unavailable(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!(sup.last.read().clone()),
+        );
+    }
+
+    let (Some(sent), Some(received)) = (q.sent_sha256, q.received_sha256) else {
+        return attestation_absent(&id);
+    };
+    if !is_hex32(&id) || !is_hex64(&sent) || !is_hex64(&received) {
+        return attestation_absent(&id);
+    }
+
+    let path = format!("/attestations/{id}?sent_sha256={sent}&received_sha256={received}");
+    match proxy_loopback_text("attestations", sup.api_port, &path).await {
+        Ok((200, text)) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            text,
+        )
+            .into_response(),
+        Ok((404, _)) => attestation_absent(&id),
+        Ok((code, detail)) => {
+            warn!("proxy attestations: loopback answered {code} for a download");
+            proxy_unavailable(
+                axum::http::StatusCode::BAD_GATEWAY,
+                serde_json::json!(format!("loopback API answered {code}: {detail}")),
+            )
+        }
+        Err((code, detail)) => proxy_unavailable(code, serde_json::json!(detail)),
+    }
+}
+
+/// Read the child's loopback API **without parsing it**.
+///
+/// The attestation download must hand the prover the bytes the enclave signed,
+/// so the status and the text are relayed untouched. `proxy_loopback_json` is
+/// right for the list and the refusal ring (fields are read, never served) and
+/// wrong here.
+async fn proxy_loopback_text(
+    what: &str,
+    api_port: u16,
+    path: &str,
+) -> Result<(u16, String), (axum::http::StatusCode, String)> {
+    let url = format!("http://127.0.0.1:{api_port}{path}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .map_err(|e| {
+            error!("proxy {what}: cannot build the loopback client: {e}");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot build the loopback client: {e}"),
+            )
+        })?;
+    let resp = client.get(&url).send().await.map_err(|e| {
+        warn!("proxy {what}: loopback API unreachable: {e}");
+        (
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("loopback API unreachable: {e}"),
+        )
+    })?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.map_err(|e| {
+        warn!("proxy {what}: cannot read the loopback answer: {e}");
+        (
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("cannot read the loopback answer: {e}"),
+        )
+    })?;
+    Ok((status, text))
 }
 
 /// The 503/502 shape both proxy relays answer with when the child cannot be
@@ -4592,6 +4718,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // because the attestation list lives on the loopback API. Hosts are
             // fingerprinted; transcript bytes stay on loopback.
             .route("/proxy/attestations", get(proxy_attestations))
+            // v222: the prover's own record, fetched from anywhere with the
+            // digest pair their proof reveals — the list above publishes ids,
+            // never transcripts, so this is the only way back to a session
+            // from a machine that is not the VM.
+            .route(
+                "/proxy/attestations/{id}",
+                get(proxy_attestation_download),
+            )
             // v189 (user request): the enclave's own TLS chain as a PEM file,
             // offered by verify.html BEFORE the PayPal login (see handler).
             .route("/tls-cert.pem", get(serve_tls_cert))
@@ -5193,6 +5327,115 @@ mod security_tests {
         );
         assert!(!refused.to_string().contains(host));
         assert!(!attested.to_string().contains(host));
+    }
+
+    /// The download route's two guards, pinned directly: a digest that is not
+    /// 32 bytes of hex is not a digest, and an id that is not the notary's
+    /// 16-byte hex session id is not an id. Both are refused before any child
+    /// call, so a malformed request cannot even probe which sessions exist.
+    #[test]
+    fn download_guards_are_width_and_hex_only() {
+        assert!(is_hex64(&"a".repeat(64)));
+        assert!(is_hex64(&"0123456789abcdef".repeat(4)));
+        assert!(!is_hex64(&"a".repeat(63)));
+        assert!(!is_hex64(&"a".repeat(65)));
+        assert!(!is_hex64(&"g".repeat(64)));
+        assert!(!is_hex64(""));
+        assert!(is_hex32("40fdf777e52ecea2bc5e13f74de30bb3"));
+        assert!(!is_hex32("../../etc/passwd"));
+        assert!(!is_hex32(&"a".repeat(64)));
+    }
+
+    /// The public download relays the child's bytes **verbatim**. This is the
+    /// v221 failure mode one layer up: a JSON round-trip here would re-order
+    /// the signed fields and hand the prover a record that cannot verify.
+    #[test]
+    fn download_relay_does_not_reorder_signed_bytes() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+
+        // Deliberately not alphabetical: `version` first is the signed order.
+        let signed = concat!(
+            r#"{"version":"tls-proxy/1","session_id":"aa","server_name":"example.com","#,
+            r#""notarized_at":1,"sent_len":3,"received_len":4,"#,
+            r#""sent_sha256":"00","received_sha256":"00","#,
+            r#""sent_b64":"R0VU","received_b64":"T0s=","truncated":false,"#,
+            r#""enclave_pubkey_pem":"pem","signature_alg":"RSA-PKCS1-v1_5-SHA256","#,
+            r#""signature_b64":"sig"}"#
+        );
+
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let body = signed.to_string();
+            let app = axum::Router::new().route(
+                "/attestations/{id}",
+                axum::routing::get(move |axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| {
+                    let body = body.clone();
+                    async move {
+                        // Mirrors the child: a matching pair is served, anything
+                        // else is the same 404 the prover must not be able to
+                        // use as an oracle.
+                        if q.get("sent_sha256").map(String::as_str) == Some(&"a".repeat(64))
+                            && q.get("received_sha256").map(String::as_str) == Some(&"b".repeat(64))
+                        {
+                            (axum::http::StatusCode::OK, body)
+                        } else {
+                            (
+                                axum::http::StatusCode::NOT_FOUND,
+                                "{\"error\":\"no such attestation in this boot\"}".to_string(),
+                            )
+                        }
+                    }
+                }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let ok = format!(
+                "/attestations/aa?sent_sha256={}&received_sha256={}",
+                "a".repeat(64),
+                "b".repeat(64)
+            );
+            let (status, text) = proxy_loopback_text("attestations", port, &ok)
+                .await
+                .expect("loopback");
+            assert_eq!(status, 200);
+            assert_eq!(text, signed, "the relay must not parse or re-encode");
+            assert!(text.starts_with("{\"version\""), "signed order, not alphabetical");
+
+            let (status, _) = proxy_loopback_text("attestations", port, "/attestations/aa?sent_sha256=0&received_sha256=0")
+                .await
+                .expect("loopback");
+            assert_eq!(status, 404, "a mismatch is relayed as a 404, not a body");
+
+            server.abort();
+        });
+    }
+
+    /// Without a proxy on this boot the download route is a 404 with the child's
+    /// own absence envelope — not a 500 and not a leaked path.
+    #[test]
+    fn download_answers_404_when_no_proxy_is_configured() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let resp = rt.block_on(proxy_attestation_download(
+            AxumPath("40fdf777e52ecea2bc5e13f74de30bb3".to_string()),
+            Query(AttestationDownloadQuery {
+                sent_sha256: Some("a".repeat(64)),
+                received_sha256: Some("b".repeat(64)),
+            }),
+        ));
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let body = rt
+            .block_on(axum::body::to_bytes(resp.into_body(), 1 << 20))
+            .expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["error"], "no such attestation in this boot");
+        assert_eq!(parsed["session_id"], "40fdf777e52ecea2bc5e13f74de30bb3");
     }
 
     /// A record with no host (or a shape the child changed) must not panic the

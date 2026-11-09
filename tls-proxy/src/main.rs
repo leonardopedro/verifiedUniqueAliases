@@ -30,6 +30,11 @@
 //!        POST /drain             stop accepting sessions; let running ones finish
 //!        GET /attestations       ids, server names, timestamps
 //!        GET /attestations/{id}  the signed attestation
+//!             ?sent_sha256=&received_sha256=  same, for someone who is not on
+//!                                this box: served only when both digests match
+//!                                the stored record, i.e. when the caller holds
+//!                                the revealed transcript (see docs §"Who may
+//!                                download a transcript")
 //!        GET /refusals           why recent sessions were refused (bounded)
 //!
 //! Environment
@@ -54,7 +59,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -62,7 +67,7 @@ use axum::{
 };
 use base64::Engine as _;
 use openssl::{hash::MessageDigest, pkey::PKey, rsa::Rsa, sign::Signer, x509::X509};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -559,30 +564,96 @@ async fn refusals(State(st): State<Arc<ProxyState>>) -> Json<serde_json::Value> 
     }))
 }
 
+/// A caller may prove it is the prover instead of being on this machine: the
+/// digest pair the record signs over.
+#[derive(Debug, Deserialize)]
+struct DownloadProof {
+    sent_sha256: Option<String>,
+    received_sha256: Option<String>,
+}
+
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// True when the caller holds the revealed transcript.
+///
+/// TLSNotary gives the prover no nonce of its own to carry a capability (the
+/// protocol's only prover-chosen values are the committed transcript digests),
+/// so the capability is the transcript itself: a caller that presents both
+/// digests the record signs over has the bytes, because those bytes are what a
+/// proof reveals. A caller that has neither has nothing to fetch.
+fn digests_authorize(stored: &serde_json::Value, claimed: (&str, &str)) -> bool {
+    let (sent, received) = claimed;
+    if !is_hex64(sent) || !is_hex64(received) {
+        return false;
+    }
+    let matches = |field: &str, claimed: &str| {
+        stored
+            .get(field)
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v.eq_ignore_ascii_case(claimed))
+    };
+    matches("sent_sha256", sent) && matches("received_sha256", received)
+}
+
+/// One answer for "not yours": an unknown id and a wrong digest must be
+/// indistinguishable, or the endpoint becomes a way to test guesses about other
+/// people's transcripts.
+fn no_such_attestation(id: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "no such attestation in this boot",
+            "session_id": id,
+        })),
+    )
+}
+
 /// Serve the attestation as **the text that was signed**, verbatim.
 ///
 /// Not `Json(value)`: that would re-serialize through `serde_json::Value` and
 /// emit the signed fields in alphabetical order, which the auditor page cannot
 /// verify (v221). The bytes on the wire are the bytes the enclave hashed.
+///
+/// Two ways in: loopback with no query (the operator reading their own VM), or
+/// anywhere with `?sent_sha256=&received_sha256=` matching the record — the
+/// prover who ran the session knows both digests, and nobody else does.
 async fn get_one(
     State(st): State<Arc<ProxyState>>,
     AxumPath(id): AxumPath<String>,
+    Query(proof): Query<DownloadProof>,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     let store = st.attestations.lock().unwrap();
-    match store.iter().find(|(sid, _)| sid == &id) {
-        Some((_, json)) => Ok((
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            json.clone(),
-        )
-            .into_response()),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "no such attestation in this boot",
-                "session_id": id,
-            })),
-        )),
+    let Some((_, json)) = store.iter().find(|(sid, _)| sid == &id) else {
+        return Err(no_such_attestation(&id));
+    };
+    match (proof.sent_sha256.as_deref(), proof.received_sha256.as_deref()) {
+        // The API binds loopback: this is the read the boot log's
+        // "attestation <id>" line points at, and it stays queryless.
+        (None, None) => {}
+        (Some(sent), Some(received)) => {
+            let stored: serde_json::Value =
+                serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
+            if !digests_authorize(&stored, (sent, received)) {
+                return Err(no_such_attestation(&id));
+            }
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "sent_sha256 and received_sha256 go together",
+                    "session_id": id,
+                })),
+            ))
+        }
     }
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        json.clone(),
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -758,5 +829,47 @@ mod tests {
         assert_eq!(row["session_id"], "bb");
         assert!(row["server_name"].is_null());
         assert_eq!(row["notarized_at"], 1_790_000_000u64);
+    }
+
+    const SENT: &str = "c2d43008022cb6af4267c4eb68a28f9d442f674a9f912e16225f097a9d35e756";
+    const RECEIVED: &str = "16c4a1842ee93605a563e3c866dd2481521a836aee08a9281f1b19b3f2eba694";
+
+    fn stored_with(digests: &str) -> serde_json::Value {
+        serde_json::from_str(&stored_envelope("www.sandbox.paypal.com").replace(
+            "\"sent_sha256\":\"00\",\"received_sha256\":\"00\"",
+            digests,
+        ))
+        .expect("fixture parses")
+    }
+
+    /// The capability is the transcript: both digests of the record, nothing
+    /// less. Pinned here because the failure mode is silent — a matcher that
+    /// accepts a prefix or one field would serve transcripts to anyone who read
+    /// the public list.
+    #[test]
+    fn digests_authorize_only_the_complete_pair() {
+        let stored = stored_with(&format!(
+            "\"sent_sha256\":\"{SENT}\",\"received_sha256\":\"{RECEIVED}\""
+        ));
+        assert!(digests_authorize(&stored, (SENT, RECEIVED)));
+        // Case is not a capability: the digests are the same value.
+        assert!(digests_authorize(
+            &stored,
+            (&SENT.to_uppercase(), &RECEIVED.to_uppercase())
+        ));
+
+        // One right, one wrong; both wrong; a prefix; a non-hex string.
+        assert!(!digests_authorize(&stored, (SENT, &"0".repeat(64))));
+        assert!(!digests_authorize(&stored, (&"0".repeat(64), RECEIVED)));
+        assert!(!digests_authorize(&stored, (&SENT[..32], RECEIVED)));
+        assert!(!digests_authorize(&stored, ("deadbeef", RECEIVED)));
+        // Empty digests are legitimate for a fully redacted transcript, and
+        // they must still be the pair the record signed over — not a bypass.
+        let empty = stored_with("\"sent_sha256\":\"\",\"received_sha256\":\"\"");
+        assert!(!digests_authorize(&empty, ("", "")));
+
+        // A record that lost its digests authorizes nobody.
+        let broken = stored_with("\"sent_sha256\":null,\"received_sha256\":null");
+        assert!(!digests_authorize(&broken, (SENT, RECEIVED)));
     }
 }

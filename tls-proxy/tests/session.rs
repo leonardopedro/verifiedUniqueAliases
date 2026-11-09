@@ -721,6 +721,57 @@ async fn list_over_http_names_the_host_of_a_recorded_session(
     let detail: serde_json::Value = serde_json::from_str(&one)?;
     assert_eq!(detail["server_name"], row["server_name"], "{detail}");
     assert_eq!(detail["session_id"], id);
+
+    // The prover's way back in from a machine that is not this VM: the record
+    // signs over a digest pair, and presenting that pair is the capability.
+    // Asserted against a session recorded by the real binary, because the
+    // matcher compares text the store actually holds.
+    let sent = detail["sent_sha256"].as_str().expect("sent digest");
+    let received = detail["received_sha256"].as_str().expect("received digest");
+    let gated = format!("/attestations/{id}?sent_sha256={sent}&received_sha256={received}");
+    let (status, same) = http_get(proxy.api_port, &gated).await?;
+    assert_eq!(status, 200, "{same}");
+    assert_eq!(
+        same, one,
+        "the gated read must serve the signed bytes verbatim, not a re-encoding"
+    );
+
+    // A wrong digest must be indistinguishable from an unknown id: otherwise
+    // the endpoint answers "this transcript exists" to anyone guessing.
+    let wrong = format!(
+        "/attestations/{id}?sent_sha256={sent}&received_sha256={}",
+        "0".repeat(64)
+    );
+    let (status, body) = http_get(proxy.api_port, &wrong).await?;
+    assert_eq!(status, 404, "{body}");
+    let (status_missing, missing) = http_get(proxy.api_port, "/attestations/does-not-exist").await?;
+    assert_eq!(status_missing, status);
+    // Same error, same fields: only the id the caller itself supplied differs,
+    // so a wrong guess learns nothing it did not already know.
+    let guessed: serde_json::Value = serde_json::from_str(&body)?;
+    let absent: serde_json::Value = serde_json::from_str(&missing)?;
+    assert_eq!(guessed["error"], absent["error"], "{guessed} vs {absent}");
+    let keys = |v: &serde_json::Value| {
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort_unstable();
+        k
+    };
+    assert_eq!(keys(&guessed), keys(&absent), "the answers must have one shape");
+    assert_eq!(guessed["session_id"], id);
+
+    // Half a pair is a client bug, not a capability, and junk is not a digest.
+    let (status, body) = http_get(
+        proxy.api_port,
+        &format!("/attestations/{id}?sent_sha256={sent}"),
+    )
+    .await?;
+    assert_eq!(status, 400, "{body}");
+    let (status, _) = http_get(
+        proxy.api_port,
+        &format!("/attestations/{id}?sent_sha256=zz&received_sha256=zz"),
+    )
+    .await?;
+    assert_eq!(status, 404, "junk must not be treated as a matching digest");
     Ok(())
 }
 

@@ -21,6 +21,12 @@
 //! 11.4–15.3 s; HANDOVER §0.31), so a retry here means something changed at
 //! the edge — read the reported attempt number rather than assuming flakiness.
 //!
+//! On success the harness prints the digest pair the record signs over
+//! (`sent_sha256`, `received_sha256`) — that pair is the capability a prover
+//! presents to `GET https://<domain>/proxy/attestations/<id>?sent_sha256=…&\
+//! received_sha256=…` to fetch their own attestation from a machine that is not
+//! the VM (v222). The notary itself only ever sees the digests.
+//!
 //! The prover is the same shape as `tests/session.rs`, minus the fixture: the
 //! root store comes from the host bundle, so the relayed certificate has to
 //! chain to a real public CA exactly as a browser's would.
@@ -129,8 +135,10 @@ async fn one_session(
     lap(&format!("relayed response status: {}", response.status()));
 
     let mut prover = prover_task.await??;
-    let sent = prover.transcript().sent().len();
-    let received = prover.transcript().received().len();
+    let sent_bytes = prover.transcript().sent().to_vec();
+    let received_bytes = prover.transcript().received().to_vec();
+    let sent = sent_bytes.len();
+    let received = received_bytes.len();
     lap(&format!("transcript: sent {sent} B, received {received} B"));
     let head = prover.transcript().received();
     eprintln!(
@@ -147,6 +155,20 @@ async fn one_session(
     prover.close().await?;
     handle.close();
     driver_task.await??;
+
+    // The record is fetched from outside the box by whoever holds the revealed
+    // transcript; these are the two digests it signs over, so print them here —
+    // the prover is the only party that can compute them, and this harness just
+    // proved it is one.
+    {
+        use sha2::{Digest, Sha256};
+        let hex = |bytes: &[u8]| hex::encode(Sha256::digest(bytes));
+        eprintln!(
+            "    capability: sent_sha256={} received_sha256={}",
+            hex(&sent_bytes),
+            hex(&received_bytes)
+        );
+    }
     lap("prover finished: presentation complete");
     Ok(())
 }

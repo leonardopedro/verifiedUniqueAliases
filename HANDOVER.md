@@ -1537,3 +1537,115 @@ Prod `i-2ze1zdxis0hcsg91qbh5`, Running, image `m-2zeg00pu0glst9auyfs3`, disk `d-
 (1 GiB `cloud_auto`), EIP `101.200.178.251`, `user_data` `4fda21a7…`; images `v221b` (live), `v221a`
 (rotation probe — delete once reviewed), `v220` (rollback), `v218`, `v217b`, `v216b`, `v216a`;
 `relay188` stopped in economy mode. Local released-binary notary stopped; repo tree clean.
+
+## 0.36 v222 — a prover can fetch their own transcript from anywhere (2026-11-09)
+
+The notary attests a session and parks the record in guest RAM. Until now the only
+way to that record was a shell on the VM (`GET :8081/attestations/<id>`) or the
+public list, which deliberately withholds transcripts. A prover on a managed
+importer therefore could not get the evidence they had just produced. v222 adds
+the missing path:
+
+```
+GET https://<domain>/proxy/attestations/{id}?sent_sha256=<64hex>&received_sha256=<64hex>
+```
+
+### Why the capability is the transcript
+
+TLSNotary gives this notary nothing to hand a prover after the session: the
+protocol carries no prover-chosen nonce (checked in
+`crates/core/src/lib.rs` — `VerifierOutput` is server name, transcript and
+commitments), and the notary never speaks after `proof` finishes, so a
+server-generated token could not reach the prover at all. What both sides
+already hold is the revealed transcript: the prover built it, and the record
+signs over `SHA-256` of its two halves.
+
+So presenting **both digests** is the capability — a knowledge proof, not a
+password. The public list never carries them, a wrong pair is answered exactly
+like an unknown id (same status, same body minus the id the caller supplied), and
+the rendered record is relayed as **text**, never re-serialised, because the
+signature covers the stored field order (v221).
+
+| Call | Answer |
+|---|---|
+| both digests match | `200` the signed record, byte-for-byte |
+| one digest, or a malformed one | `404 {"error":"no such attestation in this boot"}` |
+| unknown id | same `404` |
+| loopback `:8081/attestations/{id}`, no query | unchanged: served, operator access |
+| `:8081` half pair | `400 sent_sha256 and received_sha256 go together` (client bug, not an oracle) |
+
+`tls-proxy/tests/live.rs` now prints the pair on success — the prover harness is
+the only party that can compute it, which is the point.
+
+### Build and pins
+
+| | Cycle A (rotation source) | Cycle B (shipped) |
+|---|---|---|
+| Image | `m-2zeexizgfuirnhijit17` (`…v222a-202611090942`) | **`m-2ze484qn2p2c3udbhxhb`** (`…v222b-202611090952`) |
+| Disk | sha256 `dd66129e…`, md5 `38980bdb…` | sha256 **`cd89b087…`**, md5 `536544d5…` |
+| initrd | `3c883019…` | **`3c883019…`** (identical) |
+| Enclave `/init` | `0616aed1…` (changed: new route + relay) | `0616aed1…` |
+| tls-proxy | `a13eabe7…` (changed: gated get) | `a13eabe7…` |
+
+Both components moved this time, so **two** pins rotated, not one: `EXPECTED_RTMR2`
+`7badda87… → 4de4917a…` and `EXPECTED_ENCLAVE_SHA256` `a729c827… → 0616aed1…`
+(`index.html` is a byte-copy of `verify.html`; both were updated, then re-checked
+identical). MRTD / RTMR0 / RTMR1 / RTMR3 held. `verify.html` is now
+**265,825 bytes / `43de8479…`** (README row updated). Live envelope after the B
+swap matched every pin, `/proxy/health` 200 at **t+60 s**.
+
+Promotion took the documented two cycles: import A → swap prod → capture
+`/debug/envelope` → rotate → rebuild B → relay → import → swap again. Disk
+`d-2ze024y1756n7282gb2y`, `user_data` re-pushed (`5972` b64, sha `4fda21a7…`).
+
+### Proof on the shipped image
+
+| Check | Result |
+|---|---|
+| `www.sandbox.paypal.com/signin` via `101.200.178.251:8443` | attempt 1/3, 16.5 s, 200 OK, 103 B → 37,998 B |
+| `www.sandbox.paypal.com/checkoutnow` (on B) | attempt 1/3, 25.3 s, 302, 108 B → 3,931 B |
+| public list | `host:0a191a6a`, ids `96cb9cc6…` (A) and `41a1f827…` (B) |
+| gated download (A record) | `200`, 52,081 B; audit page: **"Signature and digests verified"** (digests `c2d43008…` / `205a6e96…`) |
+| gated download (B record) | `200`, 6,664 B; audit page: **"Signature and digests verified"** (digests `dcbe9990…` / `a66ec0e7…`) |
+| no digests / wrong digest | `404` both, same shape |
+
+The two live records were fetched over the public origin from this machine —
+no shell on the VM, no loopback hop.
+
+Local pre-deploy smoke on the debug build pinned the same behaviour end to end:
+gated read byte-identical to the ungated one, wrong digest `404`, half pair
+`400`, another session's id with this pair `404`.
+
+Tests: `tls-proxy` 3 unit (incl. the digest matcher and the "one right, one
+wrong / prefix / junk / empty-pair" cases) + 7 integration (the gated read is
+asserted against a session the real binary recorded); enclave
+`download_guards_are_width_and_hex_only`,
+`download_relay_does_not_reorder_signed_bytes`,
+`download_answers_404_when_no_proxy_is_configured`.
+
+### Traps re-hit (all cost a round trip)
+
+1. **OSS V1 signature covers Content-Type.** A presigned PUT signed with an
+   empty content type and sent with `application/octet-stream` answers
+   `SignatureDoesNotMatch`; send no `Content-Type` at all.
+2. **A Hong Kong bucket's `-internal` endpoint is unreachable from a Beijing
+   relay** (curl `http_code=000` after 20 s). Use the HK **public** endpoint for
+   that leg; only the Beijing leg is intranet.
+3. **The importer looks under `paypal-auth-vm/`** — a correctly uploaded object
+   at the bucket root still fails `InvalidOSSObject.NotFound`. The relay PUT
+   must use the prefixed key.
+4. **`DescribeInstanceAttribute` does not return `UserData`** (empty on this
+   account); `DescribeUserData` does. Capture before the swap, re-push after.
+5. Artifacts stay inside the built image: `podman cp` them out, or the output
+   directory silently keeps the previous cycle's files (their hashes look fine).
+
+### State left behind
+
+Prod `i-2ze1zdxis0hcsg91qbh5`, Running, image `m-2ze484qn2p2c3udbhxhb`, disk
+`d-2ze024y1756n7282gb2y`, EIP `101.200.178.251`. Watchdog `dist/config.json` and
+all three OOS templates now name v222b; a real reconcile answered
+`Success {"instanceId":"i-2ze1zdxis0hcsg91qbh5","eipStatus":"InUse"}` (created
+nothing). Images kept: v222b (live), v222a (rotation probe), v221b, v220
+(rollback), v218, v217b, v216b, v216a. `relay188` running for the transfer;
+stop it economically when done. Probe-image cleanup is the operator's call — same
+as v221a, which was deleted with its snapshot on request.
