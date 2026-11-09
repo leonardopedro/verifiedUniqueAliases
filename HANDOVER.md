@@ -2053,25 +2053,37 @@ $ curl --resolve audit.airma.de:443:185.199.108.133 \
 curl: (60) SSL: no alternative certificate subject name matches target hostname 'audit.airma.de'
 ```
 
-`airma.de` is on Cloudflare (`vick/teagan.ns.cloudflare.com`), so the working
-shape is a **proxied** CNAME (`audit` → `raw.githubusercontent.com`, orange
-cloud): Cloudflare terminates TLS for the custom hostname and pulls the path
-from raw with the right SNI. Origin pull verified — raw and jsDelivr both
-return the committed page, sha256 `d37c59a9…`, identical to the copy inside the
+A proxied CNAME (`airma.de` is on Cloudflare — `vick/teagan.ns.cloudflare.com`)
+fixes only the certificate. It still **relays the origin's content type**, and
+raw sends:
+
+```
+content-type: text/plain; charset=utf-8
+x-content-type-options: nosniff
+content-length: 301312          ← the right bytes, the wrong type
+```
+
+With `nosniff` the browser refuses to execute it: the visitor sees the HTML
+source and no seal flow runs. jsDelivr's `/gh/` path answers the same way. So a
+custom domain needs a front that emits `text/html` — a ~20-line Cloudflare
+Worker (snippet in README → *Hosting the page on a custom domain*), Netlify,
+nginx, or GitHub Pages' own CNAME. Verified for all candidates: the bytes are
+the committed page, sha256 `d37c59a9…`, identical to the copy inside the
 measured ESP.
 
-**Not done, because it needs the DNS owner:** the record itself. And a
-config-only rotation (no rebuild) is waiting on it:
+**Not done, because it needs the account owner:** the Worker + record, then the
+config-only rotation (no rebuild):
 
-1. create `CNAME audit → raw.githubusercontent.com`, proxied;
+1. deploy the Worker on `audit.airma.de/*`, serving `text/html`;
 2. add `https://audit.airma.de/leonardopedro/verifiedUniqueAliases/main/verify.html`
    to `seal_redirect_uris` (Stop → `ModifyInstanceAttribute --UserData` → Start);
 3. register the same string as the PayPal app's Return URL.
 
-Then verify: page digest == `d37c59a9…`, `/attest/login-session` returns it
-signed, and a real login lands back on that page and jumps to `/callback?code_enc=…`.
-Note `@main` is mutable behind a permanently registered Return URL — pin
-`@<commit>` if the page must be frozen per release.
+Then verify: `curl -I` shows `text/html`, page digest == `d37c59a9…`,
+`/attest/login-session` returns it signed, and a real login lands back on that
+page and jumps to `/callback?code_enc=…`. Note `@main` is mutable behind a
+permanently registered Return URL — pin `@<commit>` if the page must be frozen
+per release.
 
 ### Browser E2E for the sealed redirect: blocked, precisely
 

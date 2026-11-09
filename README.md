@@ -377,9 +377,17 @@ consumed and no session is half-created.
 
 #### Hosting the page on a custom domain
 
-The Return URL must be https and must actually serve the auditor, so the
-hostname needs TLS termination in front of the GitHub content. Two ways, and
-one that looks right but is not:
+The Return URL must serve the auditor **as an executable page**: https, a
+certificate matching the hostname, and `Content-Type: text/html`. A URL built
+directly on `raw.githubusercontent.com` fails the last two, so the hostname
+needs a front that terminates TLS for it and rewrites the content type.
+
+`raw.githubusercontent.com` sends `content-type: text/plain; charset=utf-8`
+together with `x-content-type-options: nosniff` (301,312 bytes, the right
+bytes, the wrong type). With `nosniff` the browser refuses to execute it, so
+the visitor sees the HTML source and the seal flow never runs. jsDelivr's
+`/gh/` path behaves the same way. Only a front that emits `text/html` — GitHub
+Pages, a Cloudflare Worker, Netlify, or nginx — can host the auditor.
 
 - **Plain DNS CNAME to `raw.githubusercontent.com` fails.** The visitor's
   browser validates the certificate against *their* hostname and raw's
@@ -393,21 +401,37 @@ one that looks right but is not:
 
   PayPal requires an `https` Return URL, so the flow dies at the authorize
   screen before any code is issued.
-- **Proxied CNAME through Cloudflare** (this is what `airma.de` already uses —
-  its nameservers are Cloudflare's). Cloudflare terminates TLS with a
-  certificate for the custom hostname and pulls the path from raw with the
-  correct SNI. Create:
+- **A Cloudflare Worker in front of raw** (`airma.de` already uses
+  Cloudflare's nameservers — `vick.ns.cloudflare.com`). A proxied CNAME alone
+  fixes the certificate but still relays `text/plain`; the Worker fixes both:
 
-  ```text
-  Type   Name    Target                      Proxy
-  CNAME  audit   raw.githubusercontent.com   Proxied (orange cloud)
+  ```js
+  export default {
+    async fetch(req) {
+      const url = new URL(req.url);
+      const origin = await fetch('https://raw.githubusercontent.com' + url.pathname, {
+        cf: { cacheTtl: 300 },
+      });
+      if (!origin.ok) return new Response('not found', { status: 404 });
+      const body = await origin.arrayBuffer();
+      return new Response(body, {
+        status: 200,
+        headers: {
+          'content-type': 'text/html; charset=utf-8',
+          'x-content-type-options': 'nosniff',
+          'cache-control': 'public, max-age=300',
+        },
+      });
+    },
+  };
   ```
 
-  The page then lives at
-  `https://audit.airma.de/leonardopedro/verifiedUniqueAliases/main/verify.html`
-  — the origin pull returns the committed bytes
-  (sha256 `d37c59a9…` matches `verify.html` in the repo and inside the
-  measured ESP). Allowlist that exact string:
+  Route `audit.airma.de/*` to it (Workers route or a proxied CNAME to the
+  Worker's hostname). Both origins return the committed bytes — sha256
+  `d37c59a9…`, identical to `verify.html` in the repo and inside the measured
+  ESP. The page then lives at
+  `https://audit.airma.de/leonardopedro/verifiedUniqueAliases/main/verify.html`;
+  allowlist that exact string:
 
   ```json
   "seal_redirect_uris": [
@@ -416,10 +440,10 @@ one that looks right but is not:
   ]
   ```
 
-- **A host you control** (Cloudflare Worker, Netlify, nginx `proxy_pass` to
-  raw, or GitHub Pages with its own CNAME) works the same way: the ARK of the
-  requirement is that the certificate matches the hostname, not which vendor
-  serves it.
+- **GitHub Pages with its own CNAME** is the zero-extra-account route: Pages
+  serves `text/html` and provisions the certificate. Any host you control works
+  the same way — the requirement is certificate **and** content type, not which
+  vendor serves it.
 
 > `@main` is a mutable ref: a push changes the page behind a Return URL that is
 > registered permanently in PayPal. Pin `@<commit>` instead when you want the
