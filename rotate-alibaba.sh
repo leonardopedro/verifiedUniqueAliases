@@ -113,6 +113,26 @@ relay_start() { # SCRIPT
         --Type RunShellScript --ContentEncoding Base64 \
         --CommandContent "$b64" --Timeout 3600 >/dev/null
 }
+relay_ensure_running() { # the relay is stopped between rotations (StopCharging)
+    local st
+    st=$(aliyun ecs DescribeInstances --RegionId "$REGION" --InstanceIds "[\"$RELAY_INSTANCE_ID\"]" 2>/dev/null \
+        | jq -r '.Instances.Instance[0].Status // empty')
+    if [[ "$st" != "Running" ]]; then
+        say "   relay $RELAY_INSTANCE_ID is ${st:-unknown} — starting it"
+        aliyun ecs StartInstance --RegionId "$REGION" --InstanceId "$RELAY_INSTANCE_ID" >/dev/null 2>&1 || true
+        for _ in $(seq 1 48); do
+            st=$(aliyun ecs DescribeInstances --RegionId "$REGION" --InstanceIds "[\"$RELAY_INSTANCE_ID\"]" 2>/dev/null \
+                | jq -r '.Instances.Instance[0].Status // empty')
+            [[ "$st" == "Running" ]] && break
+            sleep 5
+        done
+        [[ "$st" == "Running" ]] || die "relay $RELAY_INSTANCE_ID did not reach Running (status: ${st:-unknown})"
+        # RunCommand can land before the cloud agent is listening on a fresh boot.
+        sleep 15
+    fi
+    ok "relay $RELAY_INSTANCE_ID is Running"
+}
+
 relay_poll() { # STATUSFILE TIMEOUT_S -> prints file content
     local f="$1" limit="${2:-1800}" b64
     b64=$(printf 'cat %s 2>/dev/null || echo PENDING' "$f" | base64 -w0)
@@ -260,6 +280,7 @@ phase_stage() {
     [[ "$hk_etag" == "$DISK_MD5" ]] || die "HK object etag $hk_etag != local md5 $DISK_MD5"
     ok "leg 1 verified ($hk_size B, etag $hk_etag)"
 
+    relay_ensure_running
     say "   leg 2: relay $RELAY_INSTANCE_ID -> Beijing bucket (detached)"
     local get_url bj_put_url
     get_url=$(presign GET "$STAGE_BUCKET" "$object" "$stage_host")
