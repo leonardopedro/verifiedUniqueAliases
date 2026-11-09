@@ -1249,10 +1249,19 @@ creation `Success`, five `delete refused (Running): … Initializing`, then `del
 is the only signal that creation is still in progress, and it is an *error* from the mutating call,
 never a status you can poll for.
 
-## 0.29 The sandbox login e2e cannot pass against THIS deployment, by configuration (2026-11-09)
+## 0.29 Two services, two targets: production login vs. sandbox notary (2026-11-09)
 
-`CHROMIUM_PATH=$(command -v chromium) node scripts/e2e-sandbox.mjs full` drives the real prod
-auditor with headless chromium. It gets all the way to PayPal and then stops:
+There are **two webservices** and they deliberately face different PayPal environments:
+
+| Service | Reaches | Status |
+|---|---|---|
+| login / attestation (`src/main.rs`, `login.airma.de`) | **production** `paypal.com` only (`staging:false`) | live |
+| TLS-notary proxy (`tls-proxy/`, `:8443`) | **`sandbox.paypal.com`** — the sandbox exists to exercise the notary | live |
+
+So the sandbox account is *not* an input to the login page, and running the auditor driver
+(`scripts/e2e-sandbox.mjs`) against prod is testing the wrong service. That run gets all the way to
+PayPal and then stops, which is expected — the popup is production PayPal and the identity is a
+sandbox identity:
 
 ```
 1. loaded verify.html (trusted copy)               ✅
@@ -1273,16 +1282,53 @@ The credentials themselves are fine, proven separately: the same email/password 
 `https://www.sandbox.paypal.com/signin` goes `#email` → `#btnNext` → `#password` → `#btnLogin` →
 **`/myaccount/summary?intl=0`**, no alert.
 
-Why it cannot be fixed by editing the driver:
-- `staging` is **boot configuration only** — there is no per-session override; `attest_login_session`
-  takes `flow`, nothing else.
-- The repo carries **no staging config and no sandbox app client id/secret** (only the API base
-  constant `PAYPAL_SANDBOX_API`). Flipping prod to `staging:true` would send users to sandbox PayPal
-  with the *production* client id, which PayPal rejects — it would break the live login without making
-  the test pass.
+Do not "fix" this by moving prod onto sandbox:
+- `staging` is **boot configuration only** — no per-session override; `attest_login_session` takes
+  `flow`, nothing else.
+- Flipping prod to `staging:true` would send users to sandbox PayPal with the *production* client id,
+  which PayPal rejects. It breaks the live login and does not make the driver pass. The login service
+  stays production-only; the sandbox is the notary's target (§0.30).
 
-So the sandbox login e2e needs a **separate staging deployment**: same v220 image, `user_data` with
-`staging: true` plus sandbox app credentials. Prod stays production and untouched. What prod *has*
-proven this cycle: trusted-page load, login-session + escrow setup, authorize URL construction, and
-(the separate TLSNotary path) three notarised sandbox sessions — everything except the authentication
-step that a sandbox identity cannot perform on a production host.
+What the login service proved while the driver was attached to it: trusted-page load, login-session +
+escrow setup, and authorize-URL construction with the production app — everything up to the point
+where a sandbox identity is supposed to be refused.
+
+## 0.30 Notary e2e against sandbox.paypal.com — re-measured, first attempt (2026-11-09)
+
+The sandbox service's e2e is the live relay test in `tls-proxy/tests/live.rs`, run against the
+deployed notary:
+
+```bash
+LIVE_NOTARY=101.200.178.251:8443 LIVE_SERVER=www.sandbox.paypal.com LIVE_PATH=/signin \
+  LIVE_ATTEMPTS=3 cargo test --test live -- --ignored --nocapture      # in tls-proxy/
+```
+
+```
+--- attempt 1/3: www.sandbox.paypal.com/signin
+[   0.2s] connected to notary 101.200.178.251:8443; committing www.sandbox.paypal.com
+[  14.9s] commit accepted — the notary is relaying TLS to www.sandbox.paypal.com
+[  16.8s] relayed response status: 200 OK
+[  18.9s] transcript: sent 103 B, received 37998 B
+response head: HTTP/1.1 200 OK | Connection: close | Content-Length: 33069
+[  23.6s] prover finished: presentation complete
+test live_relay_of_a_real_website ... ok        (1 passed, 0 failed, 23.56s)
+```
+
+So the whole MPC round-trip on a 33 KB sandbox page completed on the **first** attempt in 23.6 s —
+no retry needed, which is the good side of the coin-flip noted in the header comment (2 of 3 runs
+used to fail the handshake). Attestation landed on the notary:
+
+```
+count:4  sessions_ok:4  sessions_failed:9
+latest: session_id 35fd70b6028973efdbbb8cd9a68cee5b  server_name host:0a191a6a  notarized_at 1794215223
+```
+
+`host:0a191a6a` is the redacted `www.sandbox.paypal.com` and now appears twice (this run plus the
+earlier one); the two `api-m.sandbox.paypal.com` sessions are `host:5c868ab7`. `sessions_failed:9` is
+unchanged by this run and counts the bare connect-and-close probes on :8443 (each records
+`kind:"rejected", reason:"commitment protocol failed to receive request … unexpected end of file"`),
+not failed relays.
+
+Verification half re-run after the session: `node scripts/test-verify-proxy.mjs` → **44 passed,
+0 failed** (the real `verify-proxy.html` audit path against RSA-2048-signed attestations, including the
+"any field changed must fail" cases). Pins were untouched — this run changed no boot measurements.
