@@ -952,7 +952,7 @@ Wmw2oAio9A==
         return TRUSTED_AUDITOR_HOSTS.indexOf(location.host) !== -1;
     }
     function untrustedOriginError() {
-        return new Error('UNTRUSTED AUDITOR ORIGIN: this page is served by the enclave\'s own webserver — its owner can rewrite this script at will, so keys generated here would be exposed (Web Auditor Tampering defense). Key generation and logins are REFUSED here. Download verify.html from the project GitHub (or use the GitHub Pages copy) and open it as a local file (file://) to run the secure login — the yellow card at the top of this page has the save button and the exact keystrokes. Paste-report auditing on this copy is still safe.');
+        return new Error('UNTRUSTED AUDITOR ORIGIN: this page is served by the enclave\'s own webserver — its owner can rewrite this script at will, so keys generated here would be exposed (Web Auditor Tampering defense). Key generation and logins are REFUSED here. Download verify.html from the project GitHub and open it as a local file (file://) to run the secure login — the yellow card at the top of this page has the save button and the exact keystrokes. Paste-report auditing on this copy is still safe.');
     }
 
     // ========================================================================
@@ -2453,9 +2453,9 @@ Wmw2oAio9A==
                 let postLogin = false;
                 try { postLogin = !!sessionStorage.getItem('pav_e2ee_blob') || location.search.indexOf('afterlogin=1') !== -1; } catch (e) {}
                 if (postLogin) {
-                    say('✅ Your PayPal login COMPLETED — the encrypted attestation was downloaded automatically by the callback page. Load that file (encrypted-attestation-report.json) into the “Attestation JSON report” box of a TRUSTED auditor (GitHub Pages copy or your saved file:// verify.html) and run the audit there — decryption only ever happens in the copy that generated the key, never on this owner-controlled origin (Web Auditor Tampering defense).');
+                    say('✅ Your PayPal login COMPLETED — the encrypted attestation was downloaded automatically by the callback page. Load that file (encrypted-attestation-report.json) into the “Attestation JSON report” box of a TRUSTED auditor (your saved file:// verify.html, downloaded from raw.githubusercontent.com) and run the audit there — decryption only ever happens in the copy that generated the key, never on this owner-controlled origin (Web Auditor Tampering defense).');
                 } else {
-                    say('⚠️ UNTRUSTED AUDITOR COPY — this page is served by the enclave\'s own webserver, which its owner controls. The secure login and key generation are DISABLED here (Web Auditor Tampering defense). Save this file from the project GitHub and open it locally (file://) — or use the GitHub Pages copy — to log in. Paste-report auditing below still works on this copy.');
+                    say('⚠️ UNTRUSTED AUDITOR COPY — this page is served by the enclave\'s own webserver, which its owner controls. The secure login and key generation are DISABLED here (Web Auditor Tampering defense). Save this file from the project GitHub and open it locally (file://) to log in. Paste-report auditing below still works on this copy.');
                 }
             }
         } catch (e) { /* no location (harness) — skip */ }
@@ -4296,7 +4296,7 @@ Wmw2oAio9A==
     // else, and so does the enclave's allowlist.
     function pageRedirectUri() {
         if (typeof location === 'undefined' || !/^https:$/.test(location.protocol)) {
-            throw new Error('the sealed redirect needs this page served over https:// (file:// copies cannot receive a PayPal redirect) — use the GitHub Pages copy.');
+            throw new Error('the sealed redirect needs this page served over https:// from an origin the enclave allow-lists — a file:// copy cannot receive a PayPal redirect. Leave this box unticked: PayPal then returns to the enclave\u2019s own https://login.airma.de/callback, over the certificate you can download from it.');
         }
         return location.origin + location.pathname;
     }

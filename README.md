@@ -183,7 +183,7 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 301,928 bytes | `b9cce40b33a4d058898996ab3751234b67b1a8fcc8b2730150b637ae8ffd1c57` |
+| `verify.html` | 302,044 bytes | `d71d96dcfb6ea3bf9ad89847056df5bcc7d6fc96d1f6d457ac44caf9ea19738d` |
 | `zk.html` | 111,684 bytes | `1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0` |
 | `zk-rsa.html` | 100,001 bytes | `a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40` |
 | `privacy.html` | 4,673 bytes | `e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8` |
@@ -191,7 +191,7 @@ the file it describes:
 
 ```bash
 sha256sum verify.html zk.html zk-rsa.html privacy.html terms.html
-# b9cce40b33a4d058898996ab3751234b67b1a8fcc8b2730150b637ae8ffd1c57  verify.html
+# d71d96dcfb6ea3bf9ad89847056df5bcc7d6fc96d1f6d457ac44caf9ea19738d  verify.html
 # 1beb6b788aaf1247de6cb8951acd84b28f30fbba45fa26bc7c38de9bd457afa0  zk.html
 # a6ef449546d42f24dfe0359411a647bf650fdff7f372cd828387f617ae0b2d40  zk-rsa.html
 # e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8  privacy.html
@@ -328,45 +328,54 @@ on every spot recreate. The live config carries: the two PayPal client pairs,
 > `paypal-auth-vm-v60` in `europe-west4-a`. Nothing about it can take effect on
 > this stack; it was rewritten for Alibaba ECS user_data.
 
-### Adding a sealed-redirect URI (operator checklist)
+### Redirect URIs: the enclave owns the return leg
 
-The v225 sealed redirect sends the PayPal `code` to a URL **the page owns**
-instead of the enclave's `/callback`, so the code arrives sealed by
-construction. Two independent registries must agree on that exact string, and
-the enclave refuses anything else. Register them in this order — the enclave
-always rejects first, so a wrong PayPal entry cannot cost you a redirect loop:
+The PayPal app's **Return URL is `https://login.airma.de/callback`** and stays
+there. That is deliberate: PayPal hands the `code` straight back to the attested
+process over TLS, so nothing sits between PayPal and the exchange, and the user
+can download the exact certificate that connection used
+(`https://login.airma.de/tls-cert.pem`) and match its fingerprint against the
+padlock in their own browser. The report repeats the same PEM as
+`session_context.tls_certificate_pem`, so the key a sealed `code_enc` must name
+is the key of a certificate the user has held in their hand — not one a host
+told them about.
 
-1. **PayPal app.** Developer Dashboard → *Apps & Credentials* → the app whose
-   `paypal_client_id` the enclave signs → *App Settings* → **Return URL**
-   (`redirect_uris`). Add the page's absolute URL, e.g.
-   `https://leonardopedro.github.io/verifiedUniqueAliases/verify.html`.
-   Do it for **both** Live and Sandbox if you use both.
-2. **Enclave config.** Add the same string to `seal_redirect_uris` in the
-   `user_data` JSON:
+The auditor is distributed from **`raw.githubusercontent.com` only**, as a
+download. raw sends `content-type: text/plain; charset=utf-8` with
+`x-content-type-options: nosniff`, so the browser shows source and never runs
+it; a plain CNAME to raw cannot even complete the handshake
+(`SSL: no alternative certificate subject name matches target hostname` — its
+certificate only covers `*.githubusercontent.com`). That is the point: the bytes
+are checked against `boot_measurements.disk_manifest.verify.html` in the signed
+report, so the host serving them cannot quietly substitute a page.
 
-   ```json
-   "seal_redirect_uris": [
-     "https://login.airma.de/callback",
-     "https://leonardopedro.github.io/verifiedUniqueAliases/verify.html"
-   ]
-   ```
+GitHub Pages still serves a **mirror of the file for reading** and the legal
+documents (the tests enforce that Pages is linked only for the legal documents).
+It is **not** a redirect target and not trusted as one: an origin outside the
+measured image can change under a Return URL that PayPal keeps forever, which is
+exactly the false assurance a "stable URL" gives.
 
-   `https://<domain>/callback` is always accepted even when the key is absent,
-   so a config with no `seal_redirect_uris` still serves the manual seal card.
-   Aliases: `paypal_redirect_uris`, `redirect_uris`.
-3. **Push the config** with the documented order — `StopInstance` →
-   `ModifyInstanceAttribute --UserData` → `StartInstance`, then read it back
-   (`DescribeUserData | base64 -d | jq .seal_redirect_uris`).
-4. **Prove it.** On the page, tick *“Let this page receive the code and seal
-   it”*, log in, and confirm PayPal returns to that page and the tab jumps to
-   `/callback?code_enc=…` by itself — no copy/paste.
+#### Page-owned redirects (optional, self-hosted)
 
-The strings are compared **byte-for-byte** on both sides: no trailing-slash
-forgiveness, no case folding, no query string, no fragment, no userinfo. A
-missing `https://`, a trailing `/`, or a different path is refused by the
-enclave with HTTP 400 (`redirect_uri is not one of this enclave's allow-listed
-redirect URIs …`) and, if the enclave list is right but PayPal's is not, by
-PayPal at the authorize screen (`redirect_uri` mismatch). Both are pre-login failures — nothing is
+`seal_redirect_uris` remains an allowlist for an operator who runs the page
+themselves on an `https` origin they control. The tab then seals the code to the
+attested TLS key and hands `/callback?code_enc=…` to the enclave — same
+exchange, same report, but the code is encrypted before it leaves the tab.
+
+```json
+"seal_redirect_uris": ["https://login.airma.de/callback"]
+```
+
+`https://<domain>/callback` is always accepted even when the key is absent, so a
+config with no `seal_redirect_uris` still serves the manual seal card. Aliases:
+`paypal_redirect_uris`, `redirect_uris`.
+
+The values are compared **byte-for-byte**: no trailing-slash forgiveness, no
+case folding, no query string, no fragment, no userinfo. A missing `https://`, a
+trailing `/`, or a different path is refused by the enclave with HTTP 400
+(`redirect_uri is not one of this enclave's allow-listed redirect URIs …`) and,
+if the enclave list is right but PayPal's is not, by PayPal at the authorize
+screen (`redirect_uri` mismatch). Both are pre-login failures — nothing is
 consumed and no session is half-created.
 
 > Off-allowlist URIs cannot be used to exfiltrate a code: the value the enclave
@@ -375,83 +384,16 @@ consumed and no session is half-created.
 > URL. Treat the allowlist as "which redirect targets may ever receive a code",
 > not as a hint list.
 
-#### Hosting the page on a custom domain
-
-The Return URL must serve the auditor **as an executable page**: https, a
-certificate matching the hostname, and `Content-Type: text/html`. A URL built
-directly on `raw.githubusercontent.com` fails the last two, so the hostname
-needs a front that terminates TLS for it and rewrites the content type.
-
-`raw.githubusercontent.com` sends `content-type: text/plain; charset=utf-8`
-together with `x-content-type-options: nosniff` (301,928 bytes, the right
-bytes, the wrong type). With `nosniff` the browser refuses to execute it, so
-the visitor sees the HTML source and the seal flow never runs. jsDelivr's
-`/gh/` path behaves the same way. Only a front that emits `text/html` — GitHub
-Pages, a Cloudflare Worker, Netlify, or nginx — can host the auditor.
-
-- **Plain DNS CNAME to `raw.githubusercontent.com` fails.** The visitor's
-  browser validates the certificate against *their* hostname and raw's
-  certificate only covers `*.githubusercontent.com`:
-
-  ```text
-  $ curl --resolve audit.example.org:443:185.199.108.133 \
-      https://audit.example.org/owner/repo/main/verify.html
-  curl: (60) SSL: no alternative certificate subject name matches target hostname
-  ```
-
-  PayPal requires an `https` Return URL, so the flow dies at the authorize
-  screen before any code is issued.
-- **A Cloudflare Worker in front of raw** (`airma.de` already uses
-  Cloudflare's nameservers — `vick.ns.cloudflare.com`). A proxied CNAME alone
-  fixes the certificate but still relays `text/plain`; the Worker fixes both:
-
-  ```js
-  export default {
-    async fetch(req) {
-      const url = new URL(req.url);
-      const origin = await fetch('https://raw.githubusercontent.com' + url.pathname, {
-        cf: { cacheTtl: 300 },
-      });
-      if (!origin.ok) return new Response('not found', { status: 404 });
-      const body = await origin.arrayBuffer();
-      return new Response(body, {
-        status: 200,
-        headers: {
-          'content-type': 'text/html; charset=utf-8',
-          'x-content-type-options': 'nosniff',
-          'cache-control': 'public, max-age=300',
-        },
-      });
-    },
-  };
-  ```
-
-  Route `audit.airma.de/*` to it (Workers route or a proxied CNAME to the
-  Worker's hostname). Both origins return the committed bytes — sha256
-  `b9cce40b…`, identical to `verify.html` in the repo and inside the measured
-  ESP. The page then lives at
-  `https://audit.airma.de/leonardopedro/verifiedUniqueAliases/main/verify.html`;
-  allowlist that exact string:
-
-  ```json
-  "seal_redirect_uris": [
-    "https://login.airma.de/callback",
-    "https://audit.airma.de/leonardopedro/verifiedUniqueAliases/main/verify.html"
-  ]
-  ```
-
-- **GitHub Pages with its own CNAME** is the zero-extra-account route: Pages
-  serves `text/html` and provisions the certificate. Any host you control works
-  the same way — the requirement is certificate **and** content type, not which
-  vendor serves it.
+To add a page-owned target: register the same absolute URL on the PayPal app
+(Live *and* Sandbox if both are used), add it to `seal_redirect_uris`, push the
+config (`StopInstance` → `ModifyInstanceAttribute --UserData` →
+`StartInstance`), read it back (`DescribeUserData | base64 -d | jq
+.seal_redirect_uris`), then tick *"Seal the code in this page"* and confirm the
+tab lands on `/callback?code_enc=…` by itself.
 
 > `@main` is a mutable ref: a push changes the page behind a Return URL that is
-> registered permanently in PayPal. Pin `@<commit>` instead when you want the
-> served page frozen per release — at the cost of re-registering the Return URL
-> each rotation. Either way the signed report carries
-> `boot_measurements.disk_manifest.verify.html` (the digest of the copy inside
-> the measured ESP), so an auditor can tell a stale or swapped page from the
-> shipped one.
+> registered permanently in PayPal. That is one more reason the default return
+> leg is the enclave's `/callback` rather than a hosted page.
 
 ### The procedure
 

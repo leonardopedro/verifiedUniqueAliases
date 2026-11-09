@@ -2477,6 +2477,19 @@ console.log('\nTest 51: local-copy rescue card — non-file:// origins get save 
     check('the landing tells the visitor what to do next',
       landing.includes('file:///') && landing.includes('Log in with PayPal'),
       'next-step instructions missing');
+    // v227 (user directive): GitHub Pages is NOT a redirect target and not a
+    // trusted origin. The auditor comes from raw as a download; PayPal returns
+    // to the enclave's own /callback, whose certificate the visitor can save.
+    check('the landing never links a Pages copy of the auditor',
+      !/github\.io\/verifiedUniqueAliases\/verify\.html/.test(landing),
+      'landing still offers the Pages auditor');
+    check('the landing offers the connection certificate the code is sealed to',
+      /href="\/tls-cert\.pem"/.test(landing) && /login\.airma\.de\/callback/.test(landing),
+      'landing is missing the /tls-cert.pem download or the callback return leg');
+    check('the sealed-redirect error no longer sends users to a Pages copy',
+      html.includes('function pageRedirectUri')
+        && !/use the GitHub Pages copy/.test(html),
+      'pageRedirectUri still recommends Pages');
     check('the landing carries NO auditor code (no keys, no pins, no crypto)',
       landing.length > 0
         && !/generateKey|subtle\.|EXPECTED_ENCLAVE_SHA256|EXPECTED_RTMR|EXPECTED_MRTD/.test(landing),

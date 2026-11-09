@@ -3258,15 +3258,15 @@ const LANDING_HTML: &str = r#"<!DOCTYPE html>
 
   <a class="dl" id="dl" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html" download="verify.html">&#128190; Download verify.html</a>
   <span class="hint" id="hint"></span>
-  <a class="dl alt" id="run" href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">&#127760; Open verify.html in this browser</a>
-  <span class="hint">No download: GitHub serves that copy as a page, so PayPal can hand it the code already sealed to this boot.</span>
+  <a class="dl alt" id="cert" href="/tls-cert.pem" download="enclave-tls-certificate.pem">&#128274; Download this connection&rsquo;s TLS certificate</a>
+  <span class="hint">Your browser&rsquo;s padlock shows the same certificate &mdash; compare the fingerprints. PayPal returns to <code>https://login.airma.de/callback</code> on this server, so this is the key a sealed code must name.</span>
 
   <h2>What to do next</h2>
   <ol>
     <li>Open the downloaded file by double-clicking it (or with <b>Ctrl+O</b> / <b>&#8984;O</b>). The address bar must read <code>file:///&hellip;/verify.html</code> &mdash; the offline audit only runs from that local copy.</li>
     <li>In it, keep <code>https://login.airma.de</code> as the enclave address and press <b>Log in with PayPal</b>. Your keypair is created by that file in your browser and never leaves it.</li>
+    <li>PayPal returns the code to <code>https://login.airma.de/callback</code> &mdash; this server, over the certificate above &mdash; so no page sits between PayPal and the exchange, and there is no redirect to race.</li>
     <li>After PayPal returns, the encrypted attestation downloads by itself &mdash; load it back into the same file. It is decrypted and audited there; this server never sees the plaintext.</li>
-    <li>Or use the blue button instead: in the browser copy, tick <b>Let this page receive the code and seal it</b> before logging in. PayPal returns to that page, which seals your code to this boot's key and forwards it to the enclave &mdash; nothing to copy, and the enclave never sees the plaintext either.</li>
   </ol>
 </div>
 <script>
