@@ -2374,3 +2374,85 @@ Live `i-2ze1zdxis0hcsg91qbh5`, image `m-2ze907s3a43tcv075rd2`; rollback
 `m-2zej7uzl9mr49avdfwyj` (v227c, RTMR2 `faba03c0…` / binary `f2c29e9d…` —
 rolling back also means restoring that era's pins). Superseded v228 image and
 its snapshot deleted; relay stopped; `/tmp` config and report captures removed.
+
+---
+
+## 0.45 — v229: the ZK handoff is files, and /callback is probed live (2026-11-09)
+
+### The last Pages dependency in the trust path
+
+`zk.html` still trusted `leonardopedro.github.io` as a key-generating origin and
+accepted the audited identity over a `postMessage` **pinned to that origin** — so
+after v227/v228 removed Pages from the auditor, the prover still ran on an origin
+its owner can republish. Both halves are gone:
+
+- **zk.html**: the gate is `file://` only (`TRUSTED_AUDITOR_HOSTS` deleted), the
+  message listener and its origin allowlist (`ZK_HANDOFF_ORIGINS`) are removed,
+  and the handoff arrives as a **bundle file** loaded through
+  `#zkHandoffBundleFile` → `zkHandoffFromBundleFile()`. It runs the same
+  fail-closed path as the paste box (`zkIdentityFromReportText` →
+  `zkStashIdentity`: band, hash re-derivation, SIGNED raw-hash cross-check), so
+  the bundle is re-verified regardless of who produced it. A file that is not a
+  handoff is refused by name.
+- **verify.html**: `openZkProver()` and the 250 ms postMessage retry loop are
+  replaced by two explicit artifacts — ① **Save zk.html** from
+  `raw.githubusercontent.com`, ② **Download the audited identity bundle**
+  (`zk-handoff.json`, carrying the canonical report text + the audited hash,
+  i.e. exactly the old payload). `ZK_PROVER_URL` now points at raw, and no
+  origin is posted to at all.
+
+The offline suite drives the new path rather than just grepping for it: it
+captures the bundle via a stubbed `Blob`, feeds it to zk.html's own loader with
+a stubbed `FileReader`, and asserts the re-derived identity and hash match — plus
+a negative case (a non-bundle file is refused). Security suite: **501 passed,
+0 failed** (five new checks).
+
+**Known limitation, unchanged by this release:** `zk.html` and `zk-rsa.html` are
+not on the ESP, so they have no `disk_manifest` row — `build-alibaba-image.sh`
+ships only `verify.html` (v167/v205 rationale: the enclave no longer serves the
+page). The prover's integrity anchor is therefore the repository digest
+published in README (`zk.html` = `06d0fe31…`, 111,997 B), which is what a user
+compares their saved copy against. Putting it in the manifest would mean
+measuring a file the enclave never serves.
+
+### A live check for the return leg
+
+`scripts/check-live-callback.mjs` probes the only PayPal Return URL there is:
+`/callback` bare and with `?code=bogus&state=bogus` must both answer **403** with
+the *same* sealed plain-text line naming where to restart, and
+`?error=access_denied` must answer **400** saying no code was exchanged. It also
+rejects an HTML body, a `text/html` content-type, a body over 300 chars, and any
+leak of `panic`/stack/`axum`/`hyper` markers or a code/credential echo.
+
+Runs in the rotation's phase 6 (after the certificate check) and daily in the
+same workflow. First live run: 403 / 403 / 400, identical refusals — OK.
+
+### Release
+
+Single pass this time: the binary did not change (`406cdcb3…`, RTMR2 `a2b7baf1…`
+held, MRTD/RTMR0/1/3 unchanged), so **no pin rotation** — only the disk moved.
+
+| | image | disk sha256 | binary | RTMR2 |
+|---|---|---|---|---|
+| **v229 (live)** | **`m-2zefbu7nyrwv18mu8o31`** | **`d834fb3a…`** | `406cdcb3…` (unchanged) | `a2b7baf1…` (held) |
+
+Live after the swap: envelope `disk_manifest.verify.html = c36666d5…`
+(302,273 B) == repo == Pages; certificate download == handshake == report
+(`a727745d…`); callback refusals sealed; `PARITY OK`; security **501/0**, proxy
+**44/0**, seal `card` and `sealed-return` green.
+
+### Still needs the operator
+
+The real PayPal login round trip cannot run from this environment: no Chromium or
+Playwright is installed, the enclave is production-configured (so
+`e2e-sandbox.mjs` refuses it by design — a sandbox identity cannot complete a
+production login), and PayPal answers 403 to this host. The callback leg is
+verified structurally (bare/forged/denied input all refused in sealed plain
+text), but nobody has watched a real `code` come back and seal correctly yet.
+
+### State
+
+Live `i-2ze1zdxis0hcsg91qbh5`, image `m-2zefbu7nyrwv18mu8o31`; rollback
+`m-2ze907s3a43tcv075rd2` (v228b, same binary and RTMR2 — pins still apply).
+Superseded v228b image and its snapshot to be deleted after this note; relay
+stopped; `/tmp` config and report captures removed.
