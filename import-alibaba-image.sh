@@ -46,7 +46,9 @@ if [[ ! -f "$DISK_FILE" ]]; then
 fi
 
 OSS_OBJECT="paypal-auth-vm/$(basename "$DISK_FILE")"
-IMAGE_NAME="paypal-tdx-esp-$(date +%Y%m%d%H%M)"
+# Overridable so rotate-alibaba.sh can name the image for the release it ships;
+# the default keeps the timestamp form for ad-hoc imports.
+IMAGE_NAME="${ALI_IMAGE_NAME:-paypal-tdx-esp-$(date +%Y%m%d%H%M)}"
 DISK_SHA=$(sha256sum "$DISK_FILE" | cut -d' ' -f1)
 
 echo "============================================================"

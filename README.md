@@ -520,6 +520,7 @@ CHROMIUM_PATH=$(command -v chromium) node scripts/e2e-login-download.mjs
 | `build-initramfs-tools.sh` | Initramfs construction with kernel module selection |
 | `build-alibaba-disk.sh` | **Retired (hard-fail stub)** — legacy non-bootable artifact; use `build-alibaba-docker.sh` |
 | `import-alibaba-image.sh` / `deploy-alibaba.sh` | Image import and instance deployment (cn-beijing) |
+| `rotate-alibaba.sh` | One-pass rotation with a digest gate per hop: build → OSS relay → import → in-place disk swap — refuses to continue when any hop's sha256/md5/ETag disagrees |
 | `.github/workflows/build-attest.yml` | Sigstore provenance + independent MRTD/RTMR golden pins |
 | `scripts/` | Security harness (`test-verify-security.mjs`), E2E flows, golden-RTMR tooling |
 | `AGENTS.md` · `audit.md` · `plan.md` · `HANDOVER.md` | Security architecture, audit trail, handover notes |
