@@ -13,12 +13,13 @@
 //! rather than the sandbox's bare origin.
 //!
 //! `LIVE_ATTEMPTS` (default 3) retries a session that ends before a verdict.
-//! That is not papering over a defect: a real site's edge will sometimes close
-//! while the relayed TLS handshake is still in flight, because every MPC round
-//! costs a prover↔notary round trip. It is the ordinary way this service fails
-//! on a page it usually serves — measured at 2 of 3 runs on a 33 KB
-//! `www.sandbox.paypal.com/signin` — so the test retries and reports which
-//! attempt passed, rather than turning a coin flip into a red build.
+//! That is insurance, not the expected path: a real site's edge will sometimes
+//! close while the relayed TLS handshake is still in flight, because every MPC
+//! round costs a prover↔notary round trip. The 33 KB
+//! `www.sandbox.paypal.com/signin` page was once measured at 2 failures in 3
+//! runs, but the current figure is **6 of 6 first-attempt passes** (2026-11-09,
+//! 11.4–15.3 s; HANDOVER §0.31), so a retry here means something changed at
+//! the edge — read the reported attempt number rather than assuming flakiness.
 //!
 //! The prover is the same shape as `tests/session.rs`, minus the fixture: the
 //! root store comes from the host bundle, so the relayed certificate has to

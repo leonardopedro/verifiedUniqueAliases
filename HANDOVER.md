@@ -1436,3 +1436,104 @@ test that *is* the sandbox coverage:
 - `PAV_ENCLAVE_HOST` (new, shared with the flow script so both agree on the target)
 - `PAV_ALLOW_PRODUCTION=1` for a deliberate production run (needs a real account, not `sb-…`)
 - Unreachable host ⇒ preflight failure, exit 2, nothing launched (verified with `127.0.0.1:9`).
+
+## 0.34 v221 — the notary now serves what it signed, and prod runs it (2026-11-09)
+
+The signed-text fix from §0.32 is on the wire. Prod `i-2ze1zdxis0hcsg91qbh5` runs image
+**`m-2zeg00pu0glst9auyfs3`** (`paypal-tdx-esp-v221b-202611090830`), and its envelopes still match the
+pins — with RTMR2 rotated because the proxy binary inside the initramfs changed.
+
+### Two cycles, same discipline as §0.26/§0.27
+
+| | Cycle A (rotation source) | Cycle B (shipped) |
+|---|---|---|
+| Image | `m-2ze9lskiq4fq01u57kzk` (`…v221a-202611090818`) | **`m-2zeg00pu0glst9auyfs3`** (`…v221b-202611090830`) |
+| Disk | sha256 `230ecd09…`, md5 `19ce6eeb…` | sha256 **`92062f78…`**, md5 `a8cb1af4…` |
+| initrd | `a3cabed7…` | **`a3cabed7…`** (identical — reproducibility held) |
+| Enclave `/init` | `a729c827…` (unchanged from v220) | `a729c827…` |
+| tls-proxy bin | `4ea7d2e5…` (first build carrying v221) | **`4ea7d2e5…`** |
+
+Cycle A captured `/debug/envelope` from prod after its own swap; `node scripts/calculate-golden-rtmr.mjs
+--report envelope.json --update` rotated **`EXPECTED_RTMR2` `44cfbca3… → 7badda87c1706377…`** in
+`verify.html` **and** `index.html` (both carry a copy; rotating one is a silent audit failure on the
+other page). MRTD / RTMR0 / RTMR1 / RTMR3 byte-held, `EXPECTED_ENCLAVE_SHA256` unchanged (the enclave
+binary did not move). README's `verify.html` row now reads **265,825 bytes / `c4c7beb6…`**.
+
+Cycle B rebuilt the same binary/initrd onto an ESP carrying the rotated auditor; the live envelope
+then byte-matched the new pin:
+
+```
+MRTD   e0199499…   RTMR0 06a32a2f…   RTMR1 6fa03523…
+RTMR2  7badda87…   RTMR3 0000…       binary_sha256 a729c827…   initrd a3cabed7…
+```
+
+Prod swap: `StopInstance --ForceStop true` (Stopped in 10 s) → flat-RPC `ReplaceSystemDisk`
+`--SystemDisk.Size 1` (new disk **`d-2zec5a2xwy7qjxo41r3o`**) → `ModifyInstanceAttribute --UserData`
+with the **live** blob captured before the swap (`5972` b64 chars, decoded sha `4fda21a7…`, readback
+byte-identical) → `StartInstance` → **`/proxy/health` 200 at t+60 s**. All five routes 200 with
+`ssl_verify_result=0`.
+
+### Live proof on the shipped image
+
+| Check | Result |
+|---|---|
+| `www.sandbox.paypal.com/signin` via `101.200.178.251:8443` | **attempt 1/3**, 16.1 s, `200 OK`, 103 B → 38,004 B |
+| `www.sandbox.paypal.com/checkoutnow` | **passed on attempt 3/3**, 302, 108 B → 3,931 B; attempts 1–2 aborted socket (they are the `sessions_failed:2` seen below) |
+| `/proxy/attestations` | `count:2`, both `host:0a191a6a`, ids `ecee7ce6…`, `46fa87d8…` |
+| `/proxy/health` | `sessions_ok:2 sessions_failed:2 running:true` |
+
+The `checkoutnow` retries are the §0.31 caveat in the flesh: a small 302 transcript is not automatically
+the easy case, and the retry machinery earns its keep. `live.rs`'s header was corrected in this commit —
+it claimed 2 of 3 runs failed; the measured figure is 6/6 first attempt on `/signin` today, so read the
+attempt number instead of assuming flakiness.
+
+### The attestation audit, on the released bytes
+
+`GET :8081/attestations/<id>` is loopback-only by design (the public origin serves the list and
+fingerprints hosts, never transcript bytes; `/proxy/attestations/<id>` answers **404**), so a deployed
+attestation cannot be pulled for audit from the internet. The proof therefore runs the **exact released
+binary** — `tmp-tls-proxy-bin`, sha256 `4ea7d2e5…`, the same bytes inside the deployed initramfs — as a
+local notary, relays a real sandbox session (4.7 s, 103 B → 37,992 B, attestation `745a8545…`), and
+feeds that URL's response to `verify-proxy.html`:
+
+```
+VERDICT: Signature and digests verified — this record is intact
+✅ 11 signed fields first, in order, then the key and signature
+✅ Signed bytes SHA-256 40fdd1f046764b8d… · 51186 bytes
+✅ Enclave signature  RSA PKCS#1 v1.5 · SHA-256 · key SHA-256 84f43322…
+✅ request  103 bytes   SHA-256 c2d43008…
+✅ response 37992 bytes SHA-256 16c4a184…
+```
+
+Same page, same record type, the binary that is actually deployed. `cargo test` in `tls-proxy` (2 unit +
+7 session incl. the byte-order assertion) and the auditor suites (`calculate-golden-rtmr --selftest`,
+`test-verify-proxy.mjs` 44/44) stay green.
+
+### Self-heal was pointing at v220
+
+`watchdog/dist/config.json` still said `spec.imageId = m-2ze7c8jev53ikz43ybj8`. Left alone, a spot
+preemption would have rebuilt prod **on the pre-v221 notary** — the fix would vanish exactly when the
+operator is least likely to look. Refreshed to `m-2zeg00pu0glst9auyfs3` (same live `userDataB64`), then
+`bash watchdog/deploy-oos-watchdog.sh deploy` (templates + heartbeat chain `exec-ee4e1aac…`),
+`deploy-spot-notice.sh deploy`, and a real reconcile: `Success {"instanceId":"i-2ze1zdxis0hcsg91qbh5",
+"eipStatus":"InUse"}` — found prod, bound nothing, created nothing.
+
+### Relay traps (re-hit and now written down)
+
+1. **Presigned PUT must use the virtual-host form** — `bucket.oss-cn-…aliyuncs.com`. The path form
+   answers `SecondLevelDomainForbidden` (or, for the same URL, a 403 at 64 KiB in).
+2. **GET needs a GET-verb signature.** Reusing the PUT-presigned URL for a download returns a ~3.8 KB
+   XML error body, which `curl -o` happily saves: the relay then "downloads" an error page. Sign the
+   verb you will actually use.
+3. **The Beijing image bucket is `paypal-tdx-image-1792145409`**, not `paypal-auth-vm` (that name is
+   the *prefix* inside it). Both Beijing buckets refuse the public endpoint entirely
+   (`PublicEndpointForbidden`), so the relay hop is mandatory; `aliyun oss cp` cannot be used from here.
+4. Relay legs were green in seconds: `get 55,574,528 B md5 19ce6eeb…` → `put-http=200` →
+   `readback` byte-identical (`READBACK-OK`), same for `a8cb1af4…`.
+
+### State left behind
+
+Prod `i-2ze1zdxis0hcsg91qbh5`, Running, image `m-2zeg00pu0glst9auyfs3`, disk `d-2zec5a2xwy7qjxo41r3o`
+(1 GiB `cloud_auto`), EIP `101.200.178.251`, `user_data` `4fda21a7…`; images `v221b` (live), `v221a`
+(rotation probe — delete once reviewed), `v220` (rollback), `v218`, `v217b`, `v216b`, `v216a`;
+`relay188` stopped in economy mode. Local released-binary notary stopped; repo tree clean.
