@@ -2371,6 +2371,6 @@ round trip still needs a human with a PayPal account in a browser.
 ### State
 
 Live `i-2ze1zdxis0hcsg91qbh5`, image `m-2ze907s3a43tcv075rd2`; rollback
-`m-2zej7uzl9mr49avdfwyj` (v227c — its RTMR2 was `a2b7baf1…`? no: `faba03c0…`,
-so rolling back also needs the pins of that era). Superseded v228 image and its
-snapshot deleted; relay stopped; `/tmp` config and report captures removed.
+`m-2zej7uzl9mr49avdfwyj` (v227c, RTMR2 `faba03c0…` / binary `f2c29e9d…` —
+rolling back also means restoring that era's pins). Superseded v228 image and
+its snapshot deleted; relay stopped; `/tmp` config and report captures removed.
