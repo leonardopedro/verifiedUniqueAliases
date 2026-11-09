@@ -3245,8 +3245,9 @@ const LANDING_HTML: &str = r#"<!DOCTYPE html>
   ol { margin:0; padding-left:20px; color:var(--dim); line-height:1.6; }
   ol li { margin-bottom:8px; }
   .legal { font-size:.82rem; margin:0 0 22px; }
-  .dl { display:inline-block; margin:2px 0 8px; padding:13px 20px; background:#238636; color:#fff; border-radius:8px; font-weight:600; font-size:.95rem; text-decoration:none; }
-  .hint { display:block; font-size:.82rem; color:var(--dim); min-height:1.2em; }
+  .dl { display:inline-block; margin:2px 0 6px; padding:13px 20px; background:#238636; color:#fff; border-radius:8px; font-weight:600; font-size:.95rem; text-decoration:none; }
+  .dl.alt { background:#1f6feb; }
+  .hint { display:block; font-size:.82rem; color:var(--dim); min-height:1.2em; margin-bottom:14px; }
 </style>
 </head>
 <body>
@@ -3257,12 +3258,15 @@ const LANDING_HTML: &str = r#"<!DOCTYPE html>
 
   <a class="dl" id="dl" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html" download="verify.html">&#128190; Download verify.html</a>
   <span class="hint" id="hint"></span>
+  <a class="dl alt" id="run" href="https://leonardopedro.github.io/verifiedUniqueAliases/verify.html">&#127760; Open verify.html in this browser</a>
+  <span class="hint">No download: GitHub serves that copy as a page, so PayPal can hand it the code already sealed to this boot.</span>
 
   <h2>What to do next</h2>
   <ol>
-    <li>Open the downloaded file by double-clicking it (or with <b>Ctrl+O</b> / <b>&#8984;O</b>). The address bar must read <code>file:///&hellip;/verify.html</code> &mdash; the audit only runs from that local copy.</li>
+    <li>Open the downloaded file by double-clicking it (or with <b>Ctrl+O</b> / <b>&#8984;O</b>). The address bar must read <code>file:///&hellip;/verify.html</code> &mdash; the offline audit only runs from that local copy.</li>
     <li>In it, keep <code>https://login.airma.de</code> as the enclave address and press <b>Log in with PayPal</b>. Your keypair is created by that file in your browser and never leaves it.</li>
     <li>After PayPal returns, the encrypted attestation downloads by itself &mdash; load it back into the same file. It is decrypted and audited there; this server never sees the plaintext.</li>
+    <li>Or use the blue button instead: in the browser copy, tick <b>Let this page receive the code and seal it</b> before logging in. PayPal returns to that page, which seals your code to this boot's key and forwards it to the enclave &mdash; nothing to copy, and the enclave never sees the plaintext either.</li>
   </ol>
 </div>
 <script>
