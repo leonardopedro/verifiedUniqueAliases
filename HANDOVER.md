@@ -2100,3 +2100,89 @@ registered.
 secrets). Staging OSS objects (`disk225.raw|disk226.raw` in both buckets) remain
 — deleting them needs the relay started, which costs more than they do.
 `/tmp/pav-userdata.json` (30 Oct, superseded) remains.
+
+---
+
+## 0.42 — v226: the landing page links the page that can actually seal (2026-11-09)
+
+### What shipped
+
+The enclave landing (`https://login.airma.de/`) had one button: *Download
+verify.html* from `raw.githubusercontent.com`, which lands as `file://` — a copy
+that can **never** receive a PayPal code, so the sealed redirect was unreachable
+for anyone who followed the page they arrived on. It now has a second, blue
+button — *Open verify.html in this browser* →
+`https://leonardopedro.github.io/verifiedUniqueAliases/verify.html` — and a
+fourth step telling the user to tick **Let this page receive the code and seal
+it** before logging in. The GitHub-served copy is `text/html`, so it executes
+and can be the Return URL.
+
+The custom-domain idea was dropped after measurement: a plain CNAME to raw
+fails certificate validation, and a **proxied** CNAME fixes only TLS — raw (and
+jsDelivr) send `text/plain` + `nosniff`, so the browser renders source and runs
+nothing. README → *Hosting the page on a custom domain* now states the real
+requirement (`text/html`) and carries a ~20-line Worker for an operator who
+wants a custom hostname.
+
+### Two rotations, both driven by `rotate-alibaba.sh`
+
+| | image | disk sha256 | binary | RTMR2 |
+|---|---|---|---|---|
+| v226 | `m-2ze3vnn8vo8p7rpaunsi` (deleted) | `08e1c9bc…` | `04cdf40c…` | `3ca54e8d…` |
+| **v226b (live)** | **`m-2ze4m8a0ea3g4p7s5eqy`** | **`19e1a0d0…`** | `04cdf40c…` (identical) | `3ca54e8d…` (held) |
+
+1. **v226** carried the landing change. Binary → initrd → **RTMR2 rotated
+   `068f0efc…` → `3ca54e8d…`** (MRTD/RTMR0/1/3 held), so the pins in
+   `verify.html`/`index.html` were stale and every user would have been shown
+   the *"this auditor copy is stale"* warning.
+2. Pins rotated with the documented procedure (`calculate-golden-rtmr.mjs
+   --report … --update`: `EXPECTED_RTMR2` and the informational
+   `EXPECTED_ENCLAVE_SHA256` → `04cdf40c…`), page mirrored to `index.html`,
+   `README` digest rows moved to `b9cce40b…` / 301,928 B, pushed so Pages
+   rebuilds.
+3. **v226b** rebuilt the ESP with the rotated page only: binary came out
+   **byte-identical** and RTMR2 stayed `3ca54e8d…` — the reproducibility claim
+   holding across a page-only release, which is what lets the pin be rotated
+   before the final deploy.
+
+Prod: `i-2ze1zdxis0hcsg91qbh5`, disk **`d-2zebrw0u4iota2v51ovo`**, user_data
+pushed and read back byte-identical (6,160 B b64, sha256 `946cfb4d…`).
+
+### Live proofs
+
+- landing serves **both** buttons (`Download verify.html` + `Open verify.html in
+  this browser` → the Pages URL);
+- envelope `boot_measurements.binary_sha256 = 04cdf40c…` == `EXPECTED_ENCLAVE_SHA256`;
+- live RTMR2 `3ca54e8d…` == `EXPECTED_RTMR2` (parsed from the quote by
+  `calculate-golden-rtmr.mjs --report`, not taken from the envelope's word);
+- envelope `disk_manifest.verify.html = b9cce40b…` == repo page == what Pages
+  serves;
+- `check-manifest-parity.mjs` → **PARITY OK** (6 same, `NvVars` excluded);
+- suites: security **500/500**, proxy **44/44**, seal-page `card` and
+  `sealed-return` both green.
+
+### Trap found (now fixed in the script)
+
+The first `stage` run died on the HK presigned PUT with
+`InvalidAccessKeyId`. The profile is an **OAuth-mode** login: only an `aliyun`
+CLI call refreshes the STS token in `~/.aliyun/config.json`, and the build had
+outlived the token. `rotate-alibaba.sh` now pokes `aliyun sts GetCallerIdentity`
+before presigning. (The relay legs themselves worked first try: HK PUT → relay
+intranet PUT → HEAD on the Beijing object, all `ETag == md5`.)
+
+### State left behind
+
+Live image `m-2ze4m8a0ea3g4p7s5eqy` (v226b), rollback `m-2ze907s3a43t8l3sdh9r`
+(v225c); 6 images / 6 snapshots after deleting v226 and its snapshot.
+`relay188` **Stopped** (`StopCharging`). `/tmp/pav-prod-*.{b64,json}` and the
+report captures deleted. Staging objects `disk225.raw|disk226.raw` still sit in
+both buckets (deleting them needs the relay started).
+
+### Still manual
+
+1. **PayPal Return URL** for `https://leonardopedro.github.io/verifiedUniqueAliases/verify.html`
+   — without it the sealed path dies at the authorize screen.
+2. A **custom hostname**, if wanted: needs a Worker/Pages CNAME (README), then a
+   config-only allowlist push — no rebuild.
+3. The **browser E2E** for the sealed redirect: PayPal answers 403 to this
+   host and there is no account or browser here.
