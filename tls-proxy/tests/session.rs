@@ -167,6 +167,28 @@ async fn start_fixture() -> u16 {
     port
 }
 
+/// Commits to a proxy session and then says nothing at all — the shape of a
+/// prover that dies in tlsn's preprocessing after a successful commit.
+async fn silent_after_commit(socket: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    let session = Session::new(socket.compat());
+    let (driver, mut handle) = session.split();
+    let driver_task = tokio::spawn(driver);
+    let prover = handle.new_prover(ProverConfig::builder().build()?)?;
+    prover
+        .commit(
+            ProxyTlsConfig::builder()
+                .server_name(DnsName::try_from(SERVER_DOMAIN)?)
+                .build()?,
+        )
+        .await?;
+    // Never call `connect`: the notary has dialled the target and is waiting for
+    // the handshake this prover will never start.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    handle.close();
+    let _ = tokio::time::timeout(Duration::from_secs(5), driver_task).await;
+    Ok(())
+}
+
 /// A proxy started exactly as PID 1 starts it, with stderr captured so a test
 /// can assert *why* a session was refused and not merely that it was. Killed and
 /// cleaned up on drop.
@@ -1068,11 +1090,55 @@ async fn refuses_a_relayed_session_that_never_answers(
         reason.contains("retry"),
         "the reason must tell the prover to retry: {reason}"
     );
+    // Which of the pre-transcript phases it names depends on where the relay
+    // was (the notary may still be handing the session over, or already
+    // relaying); what must never be missing is WHERE it was pointing.
     assert!(
-        reason.contains("last progress: relayed TLS handshake"),
+        reason.contains("last progress: relay"),
         "the reason must say which phase stalled: {reason}"
     );
     held.abort();
+    Ok(())
+}
+
+/// A prover that commits and then vanishes must not hold the session until the
+/// 120 s session timeout: the target connection is up, so the notary knows the
+/// prover is gone, and it says so — live, a v238 wave lost exactly this session
+/// for 120 s (the prover had died in tlsn's preprocessing).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refuses_a_prover_that_commits_then_vanishes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _serial = SERIAL.lock().await;
+    let fixture_port = start_fixture().await;
+    let target = format!("127.0.0.1:{fixture_port}");
+    let proxy = Proxy::start(&[
+        ("TLS_PROXY_TARGET_ADDR", target.as_str()),
+        ("TLS_PROXY_STALL_TIMEOUT", "2"),
+    ])
+    .await;
+
+    let socket = TcpStream::connect(("127.0.0.1", proxy.session_port)).await?;
+    let started = Instant::now();
+    let task = tokio::spawn(async move {
+        silent_after_commit(socket).await.map_err(|e| e.to_string())
+    });
+    let health = proxy.wait_for_failed(1).await;
+    let elapsed = started.elapsed();
+    let _ = task.await;
+
+    assert_eq!(health["sessions_ok"].as_u64(), Some(0), "{health}");
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "a prover that vanished must be refused near the 2 s bound, took {elapsed:?}"
+    );
+    let refusals = proxy.refusals().await;
+    assert_eq!(refusals["refusals"][0]["kind"], "stalled", "{refusals}");
+    let reason = refusals["refusals"][0]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("last progress: relaying TLS to"),
+        "the stall must be reported where it happened (the target is up, the \
+         prover is missing): {reason}"
+    );
     Ok(())
 }
 

@@ -711,17 +711,31 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
         info!("session from {peer}: relaying TLS to {server_name} ({addr})");
         *phase.lock().unwrap() = format!("relaying TLS to {server_name} ({addr})");
 
-        let verifier = verifier.accept().await?;
-
-        // Watch the relayed connection for silence. The stall this catches is a
-        // real, measured failure mode: the edge accepts the TCP connection, the
-        // ClientHello goes out, and no ServerHello ever comes back — the session
-        // then sits until the 120 s session timeout, holding its slot and
-        // telling the prover only "connection closed". 20 s of silence (no byte
-        // in either direction) is the verdict instead; every measured healthy
-        // session to these targets finishes the relayed phase in <2 s.
+        // Watch the relayed connection for silence, from the moment the target
+        // connection exists. Two measured shapes end here, and both used to hold
+        // the session until the 120 s session timeout:
+        //   * the edge accepts the TCP connection, the ClientHello goes out and
+        //     no ServerHello ever comes back (measured: 5 of 8 simultaneous
+        //     sessions against `api-m.paypal.com`'s edge, HANDOVER §0.55);
+        //   * the prover dies in tlsn's preprocessing and never sends the
+        //     session it committed to (`preprocessing proxy-tls failed …
+        //     connection is closed`), which leaves the notary waiting in
+        //     `accept()` forever — observed live in a v238 wave.
+        // Every measured healthy session moves bytes within 2 s of the dial, so
+        // `stall_timeout` of silence is a verdict, not slowness.
         let activity = RelayActivity::new(st.stall_timeout);
         activity.arm();
+        let verifier = tokio::select! {
+            accepted = verifier.accept() => accepted?,
+            _ = activity.clone().stalled() => {
+                stalled.store(true, Ordering::SeqCst);
+                return Err(format!(
+                    "the prover sent nothing for {:?} after the target connection to {server_name} ({addr}) was established",
+                    st.stall_timeout
+                )
+                .into());
+            }
+        };
         let relayed = Stamped::new(client, activity.clone());
         *phase.lock().unwrap() = format!("relayed TLS handshake to {server_name} ({addr})");
         let verifier = tokio::select! {
