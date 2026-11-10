@@ -2870,11 +2870,11 @@ the user agreement. v234 draws the boundary instead of dropping the origin:
   and are pinned by SHA-256 inside those pages. Test 46 now asserts BOTH halves:
   every `github.io` link in a shipped page must be `/privacy.html` or
   `/terms.html`, and the prover/artifact base must stay on raw.
-- `PRIVACY.md`/`TERMS.md` stay in the repository as *compatibility copies*:
-  the **deployed** v233b landing still links `github.com/…/blob/main/PRIVACY.md`,
-  so deleting them 404'd the user-visible legal links the moment v234 was pushed
-  (checked live). Delete them only after a release whose landing points at
-  Pages.
+- `PRIVACY.md`/`TERMS.md` were deleted once, and that broke the deployed v233b
+  landing, which still links `github.com/…/blob/main/PRIVACY.md` — the links
+  404'd the moment v234 was pushed (checked live). They were restored as
+  compatibility copies and **removed again in §0.51**, after pass 5 shipped a
+  landing that links the hosted pages.
 
 ### Why the Pages build had been failing (root cause, not a guess)
 
@@ -2931,3 +2931,55 @@ key fails the release instead of an auditor's binding check later.
 
 Checks this pass: `node --check` on the changed scripts, `bash -n` on the
 rotation, `test-verify-security` re-run after the link/pin change.
+
+---
+
+## 0.51 — v234 pass 5: the landing links Pages, so the Markdown copies go (2026-11-10)
+
+### Release
+
+| pass | image | disk sha256 | note |
+|---|---|---|---|
+| 5 (live) | `m-2zeggtx23lhbjgtv2pj6` (`paypal-tdx-esp-202611101011`) | `f59c65bd…` | landing links Pages; ZK pin gate in preflight |
+
+Deployed binary `cfafb15d…` == the locally built `paypal-auth-vm`
+(`/debug/envelope` → `boot_measurements.binary_sha256`), `check-manifest-parity`
+**PARITY OK**, `HTTPS 200`, cert == handshake == report (`51325411…`), sealed
+`/callback` refusals (403/400, identical bodies for missing vs forged input),
+notary named and serving, and the **new `check-live-proxy-restart.mjs` step ran
+inside the rotation** — `✅ envelope cache re-mints with the new notary key
+across a live restart`. Rotation exit 0.
+
+### A release gate for the ZK pins (`scripts/check-zk-pins.mjs`)
+
+`zk.html` refuses to prove unless the bytes it downloads hash to the constants
+baked into the page, but nothing compared those constants with the *committed*
+artifacts — a rotated wasm/zkey or a rotated pin that forgot the other half
+would build, pass every other check, and fail only in a user's browser. The new
+script hashes `zk/identity_escrow.wasm` and the concatenation of
+`ZK_ZKEY_PARTS` in fetch order (the pin covers the assembled key), asserts the
+parts are under GitHub's 100 MB limit and **tracked by git** (an ignored part
+never reaches raw, however right the digest is), and that `ZK_BASE` is raw.
+It runs in `rotate-alibaba.sh` phase 1 and fails as a negative test when either
+pin is off by one byte. Rotation preflight refuses to start on a mismatch.
+
+### `PRIVACY.md` / `TERMS.md` removed
+
+The deployed landing links
+`https://leonardopedro.github.io/verifiedUniqueAliases/{privacy,terms}.html`
+directly — live-checked against the running instance: those two `href`s are the
+only legal links on the page, so the Markdown copies have no consumer left.
+Removed: the README digest rows and `sha256sum` lines go with them. The legal
+text now exists once, as the hosted HTML pages.
+
+### Pages, after the `_config.yml` fix
+
+Run `42784643688` (sha `8f443f6`) and `42785339581` (sha `bcd5d18`): **all
+green** — `Build with Jekyll` success, `Upload artifact` success, `deploy`
+success. Live:
+
+```
+/ (verify.html)  200  303,002 B  f50d441f…   == repo
+/privacy.html    200    4,673 B  e570784f…   == repo
+/terms.html      200    3,663 B  9e8daa06…   == repo
+```

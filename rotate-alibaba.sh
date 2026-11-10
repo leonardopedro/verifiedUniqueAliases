@@ -30,7 +30,9 @@
 #                byte-identical) -> StartInstance. Order matters: a user_data
 #                push BEFORE the swap is discarded.
 #   6 verify     HTTPS 200, /debug/envelope binary_sha256 == the binary just
-#                built, check-manifest-parity.mjs -> PARITY OK against the
+#                built, live TDX RTMR2 + EXPECTED_ENCLAVE_SHA256 == the pins in
+#                verify.html (a stale pin fails every audit),
+#                check-manifest-parity.mjs -> PARITY OK against the
 #                local disk (proves the deployed ESP is this file), then the
 #                three live behaviour checks: TLS certificate binding, sealed
 #                callback refusals, the notary answering — plus (v234) a real
@@ -476,6 +478,26 @@ phase_verify() {
     [[ -n "$live_bin" ]] || die "envelope carried no binary_sha256 — cannot prove which binary is running"
     [[ "$live_bin" == "$BIN_SHA" ]] || die "running binary $live_bin != built $BIN_SHA"
     ok "running binary matches the build ($live_bin)"
+
+    # The auditor's silicon gate is a HARD fail: verify.html pins EXPECTED_RTMR2,
+    # and a release that ships a different binary/initrd rotates RTMR2. Ship the
+    # page without rotating the pin and every audit dies on the RTMR row — the
+    # one row that proves WHICH code is running — while the service itself looks
+    # perfectly healthy. v234 pass 5 did exactly that; the two-cycle procedure
+    # exists for it, so compare the live quote with the committed page here.
+    local envfile rtmr2 pin_rtmr2 pin_bin
+    envfile=$(mktemp)
+    curl -fsS --max-time 20 "$PROD_URL/debug/envelope" >"$envfile"
+    rtmr2=$(node scripts/calculate-golden-rtmr.mjs --report "$envfile" 2>/dev/null | sed -n 's/^RTMR2 = //p')
+    rm -f "$envfile"
+    pin_rtmr2=$(sed -n "s/.*EXPECTED_RTMR2 = '\([0-9a-f]\{192\}\)'.*/\1/p" verify.html | head -1)
+    pin_bin=$(sed -n "s/.*EXPECTED_ENCLAVE_SHA256 = '\([0-9a-f]\{64\}\)'.*/\1/p" verify.html | head -1)
+    [[ -n "$rtmr2" ]] || die "could not read RTMR2 from the live TD quote"
+    if [[ "$rtmr2" != "$pin_rtmr2" ]]; then
+        die "live RTMR2 ${rtmr2:0:16}… != verify.html pin ${pin_rtmr2:0:16}… — every audit would fail the silicon gate. Rotate the pins (node scripts/calculate-golden-rtmr.mjs --report <envelope> --update, mirror verify.html to index.html, README digest), rebuild and swap again"
+    fi
+    [[ "$pin_bin" == "$BIN_SHA" ]] || die "verify.html EXPECTED_ENCLAVE_SHA256 ${pin_bin:0:16}… != built ${BIN_SHA:0:16}… — rotate the display pin in the same commit"
+    ok "auditor pins match the live quote (RTMR2 ${rtmr2:0:16}…, binary ${pin_bin:0:16}…)"
 
     local parity
     parity=$(node scripts/check-manifest-parity.mjs "$PROD_URL" "$DISK_FILE" 2>&1) || {
