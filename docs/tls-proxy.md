@@ -43,7 +43,9 @@ existed before this feature.
     "enabled": true,
     "session_port": 8443,        // inbound TLSNotary sessions
     "api_port": 8081,            // loopback-only attestation API
-    "session_timeout_secs": 120,
+    "session_timeout_secs": 120,   // hard ceiling for one session
+    "stall_timeout_secs": 20,       // silence on the relayed connection = stall
+    "dial_spacing_ms": 1500,        // spacing between dials to ONE target address
     "signing_key_pem": null,     // null/absent = fresh per-boot RSA-2048 key
     "restart_token": null,       // v233: operator token for POST /proxy/restart
     "relay_targets": [           // hosts a prover may commit to
@@ -181,9 +183,11 @@ file`, and the explanation existed only in the operator's refusal ring.
 `/refusals` answers the operator's question "why was that session rejected?"
 without a shell: each entry is `{at, kind, reason}`, where `kind` is `rejected`
 (a verdict was reached and refused — MPC mode, no revealed server identity, a
-mismatched name, a transcript over the bound) or `timeout` (no verdict in
-`session_timeout_secs`, with the last thing the session did before it ran out
-— normally the address it was relaying to). Every refusal names its own cause,
+mismatched name, a transcript over the bound), `stalled` (the relayed
+connection moved no byte for `stall_timeout_secs` — the target's edge accepted
+the TCP connection and then said nothing; retryable, see "Bursts and stalls"
+below) or `timeout` (no verdict in `session_timeout_secs`, with the last thing
+the session did before it ran out — normally the address it was relaying to). Every refusal names its own cause,
 so a prover who got no answer at all has to be told what went wrong rather than
 being left with a bare disconnect. The reason quotes the prover's own commit, so it is
 capped at 400 characters; these records are diagnostics, never evidence, and
@@ -475,6 +479,48 @@ with `OPENSSL_INCLUDE_DIR=…-openssl-3.6.5-dev/include`. Other `openssl-3.6.5`
 outputs in the store are 32-bit and fail with `incompatible with
 elf64-x86-64`.
 
+## Bursts and stalls
+
+`api-m.paypal.com` sits behind Cloudflare (`104.16.124.74`), and that edge
+tolerates only a few relayed TLS handshakes arriving from one source address at
+the same instant. Beyond that it accepts the TCP connection and then never sends
+a ServerHello — nothing moves again. Measured on the deployed notary (2026-11-10,
+one boot, 2 vCPU, one EIP):
+
+| wave (all `api-m.paypal.com`) | result |
+|---|---|
+| sequential | 10/10 |
+| 4 simultaneous (3 waves) | 12/12 |
+| 6 simultaneous | 5/6 |
+| 8 simultaneous | 3/8, 5/8 |
+| 8 simultaneous, 0.4 s apart | 3/8 |
+| 8 simultaneous, 1.5 s apart | 8/8 |
+| 8 simultaneous to `api-m.sandbox.paypal.com` (Fastly `146.75.123.1`) | 8/8 |
+| 8 raw TLS handshakes from another host to `104.16.124.74` | 8/8 in 71 ms |
+
+The notary is not the limit: it serves eight simultaneous sessions to a
+different edge from the same process, and its transcript bytes are tiny (85 B
+sent, 5.7 KB received per session), so neither the 2 vCPU nor the 5 Mbps EIP is
+involved. What breaks is the timing of handshakes into Cloudflare from one
+address.
+
+Two mechanisms answer that, both fail-soft:
+
+- **Dial spacing** (`dial_spacing_ms`, default 1500): the notary spaces its own
+  outbound dials per target ADDRESS, so a burst of provers arrives at the edge
+  spaced out. A session that waits is logged and reported as `queued N.Ns for a
+dial slot to <host> (<addr>)`, which is a queue, not a stall. Eight sessions cost
+  at most `7 × spacing` of extra wait for the last one.
+- **Stall verdict** (`stall_timeout_secs`, default 20): a relayed connection that
+  moves no byte for this long is refused as `stalled`, naming the phase and
+  telling the prover to retry. Before this, such a session sat until the 120 s
+  `session_timeout_secs`, holding its slot for 100 s of nothing.
+
+A prover should therefore retry once when an attempt ends before its verdict
+(the bundled harness does): with spacing in place a retry lands on a healthy
+handshake. `tls-proxy/tests/live.rs` defaults to `LIVE_ATTEMPTS=2` for exactly
+that reason.
+
 ## Limits worth knowing
 
 - Transcripts over 8 MiB are refused rather than stored: the whole transcript
@@ -489,6 +535,10 @@ elf64-x86-64`.
   the verdict. The refusal says where it had got to (`last progress: relaying
   TLS to <host> (<address>)`): the address comes from the boot-time pin and
   cannot be re-derived afterwards, so a stall with no address in it is
-  unactionable for an operator.
+  unactionable for an operator. A relayed connection that goes silent is cut at
+  `stall_timeout_secs` instead, so a stalled session frees its slot in 20 s.
+- Concurrent sessions are bounded by the target edge, not by the guest: 1–2 at a
+  time is unconditionally safe, 4 works against both measured edges, and the
+  notary itself serves 8 (see "Bursts and stalls").
 - `tlsn` is alpha software; the pinned revision is the one this crate was written
   against, not an audited one.

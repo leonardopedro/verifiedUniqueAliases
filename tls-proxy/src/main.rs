@@ -42,6 +42,10 @@
 //!
 //! Environment
 //!   TLS_PROXY_LISTEN, TLS_PROXY_HTTP_LISTEN, TLS_PROXY_SESSION_TIMEOUT (secs),
+//!   TLS_PROXY_STALL_TIMEOUT (secs, default 20: a relayed session that moves no
+//!   byte for this long is refused instead of sitting until the session
+//!   timeout), TLS_PROXY_DIAL_SPACING_MS (default 1500: minimum spacing between
+//!   outbound dials to ONE target address — see `DialPacer`),
 //!   TLS_PROXY_CA_BUNDLE (default /etc/ssl/certs/ca-certificates.crt),
 //!   TLS_PROXY_SIGNING_KEY_PEM (absent = fresh per-boot RSA-2048 key),
 //!   TLS_PROXY_MAX_TRANSCRIPT_BYTES (default 8 MiB; the refusal bound),
@@ -52,13 +56,15 @@
 //! such as a missing CA bundle or an unusable key, or a listener failure).
 
 use std::{
-    collections::VecDeque,
-    net::SocketAddr,
+    collections::{HashMap, VecDeque},
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    task::{Context, Poll},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -72,6 +78,7 @@ use base64::Engine as _;
 use openssl::{hash::MessageDigest, pkey::PKey, rsa::Rsa, sign::Signer, x509::X509};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{error, info, warn};
@@ -113,6 +120,46 @@ const TARGET_PORT: u16 = 443;
 /// refused while the prover is still watching (before v236 the session simply
 /// sat until the 120 s session timeout).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Minimum spacing between the notary's outbound DIALS to one target address.
+///
+/// Measured on the deployed notary (2026-11-10, one boot, same 2 vCPU, same
+/// EIP), all against `api-m.paypal.com` = Cloudflare `104.16.124.74`:
+///
+/// | wave                                  | result |
+/// |---------------------------------------|--------|
+/// | 4 simultaneous (3 waves)              | 12/12  |
+/// | 6 simultaneous                        | 5/6    |
+/// | 8 simultaneous                        | 3/8, 5/8 |
+/// | 8 simultaneous, 0.4 s apart           | 3/8    |
+/// | 8 simultaneous, 1.5 s apart           | 8/8    |
+/// | 8 simultaneous to Fastly (`api-m.sandbox`, 146.75.123.1) | 8/8 |
+/// | 8 simultaneous to `104.16.124.74` spread over 3 edges | 6/8, all failures on Cloudflare |
+///
+/// The failing sessions are indistinguishable from healthy ones up to the
+/// relayed handshake: TCP connects, then the edge never sends a ServerHello and
+/// nothing moves again until the session timeout. Sequential sessions on the
+/// same address never fail, and the notary serves eight simultaneous sessions
+/// to a different edge, so this is the edge's tolerance for near-simultaneous
+/// TLS handshakes from one source address — not CPU, not the 5 Mbps line, and
+/// not the transcript size.
+///
+/// The fix that stays inside the design is to space the dials: the notary's
+/// ClientHellos then reach the edge spaced instead of together. A session that
+/// waits here is waiting before its handshake starts, which is the state the
+/// prover is already in during the commit.
+const DEFAULT_DIAL_SPACING_MS: u64 = 1_500;
+
+/// How long a relayed session may move NO byte before it is refused.
+///
+/// A stalled handshake (the edge accepting and then withholding its ServerHello)
+/// never recovers: the 120 s session timeout was the only thing that ended it,
+/// and that is 100 s of a slot held for nothing. Every real session to this
+/// notary's targets moves bytes within seconds — the measured passing sessions
+/// finish the whole relayed phase in 1.4–1.6 s — so silence for 20 s is a stall,
+/// not slowness. Bounded below the session timeout on purpose, and settable so a
+/// genuinely slow target can be given more.
+const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ---------------------------------------------------------------------------
 // Signed statement
@@ -196,6 +243,196 @@ impl SigningKey {
 }
 
 // ---------------------------------------------------------------------------
+// Outbound dial pacing, and stall detection on the relayed connection
+// ---------------------------------------------------------------------------
+
+/// Spaces the notary's outbound dials per target address (see
+/// [`DEFAULT_DIAL_SPACING_MS`] for the measurement this is based on).
+///
+/// Keyed by ADDRESS, not by host name: the edge's tolerance is about how many
+/// handshakes arrive from one source address at the same target address at once,
+/// and two names that resolve to the same address share it.
+struct DialPacer {
+    spacing: Duration,
+    /// When the next dial to this address may leave. Only ever written by the
+    /// task that claimed the slot, so a claim is a reservation, not a race.
+    next_free: Mutex<HashMap<IpAddr, Instant>>,
+}
+
+impl DialPacer {
+    fn new(spacing: Duration) -> Self {
+        Self {
+            spacing,
+            next_free: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Waits for this address's slot and claims it, returning how long the wait
+    /// was so the log and the progress text can say the session was queued
+    /// rather than stalled.
+    async fn claim(&self, addr: IpAddr) -> Duration {
+        if self.spacing.is_zero() {
+            return Duration::ZERO;
+        }
+        let start = Instant::now();
+        loop {
+            // The guard is dropped before the sleep: holding a std mutex across
+            // an await would stall every other session's dial.
+            let wait = {
+                let mut map = self.next_free.lock().unwrap();
+                let now = Instant::now();
+                let slot = map.entry(addr).or_insert(now);
+                if *slot <= now {
+                    *slot = now + self.spacing;
+                    return start.elapsed();
+                }
+                *slot - now
+            };
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
+
+/// Byte activity of the relayed connection, so "no verdict yet" can be told
+/// apart from "the edge accepted the TCP connection and then said nothing".
+///
+/// Armed once the target connection is established (before that there is no
+/// relayed stream to watch), stamped by every byte the relayed stream carries in
+/// either direction, and polled by [`RelayActivity::stalled`].
+struct RelayActivity {
+    origin: Instant,
+    /// Milliseconds since `origin` of the last byte; 0 while unarmed.
+    last_millis: AtomicU64,
+    armed: AtomicBool,
+    stall: Duration,
+}
+
+impl RelayActivity {
+    fn new(stall: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            origin: Instant::now(),
+            last_millis: AtomicU64::new(0),
+            armed: AtomicBool::new(false),
+            stall,
+        })
+    }
+
+    fn arm(&self) {
+        self.stamp();
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn stamp(&self) {
+        self.last_millis
+            .store(self.origin.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// How long the relayed connection has been silent, or `None` when it has
+    /// not started yet.
+    fn idle(&self) -> Option<Duration> {
+        if !self.armed.load(Ordering::SeqCst) {
+            return None;
+        }
+        let last = self.last_millis.load(Ordering::Relaxed);
+        Some(self.origin.elapsed().saturating_sub(Duration::from_millis(last)))
+    }
+
+    /// Resolves once the relayed connection has been silent for `stall`.
+    /// Never resolves when the stall bound is disabled (0).
+    async fn stalled(self: Arc<Self>) {
+        if self.stall.is_zero() {
+            std::future::pending::<()>().await;
+        }
+        loop {
+            match self.idle() {
+                Some(idle) if idle >= self.stall => return,
+                Some(idle) => {
+                    let rest = self.stall - idle;
+                    tokio::time::sleep(rest.min(Duration::from_millis(200))).await;
+                }
+                // Not armed yet: the target connection is still being made, and
+                // `CONNECT_TIMEOUT` is what bounds that.
+                None => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    }
+}
+
+/// The relayed target connection, stamped on every byte it carries.
+struct Stamped<S> {
+    inner: S,
+    activity: Arc<RelayActivity>,
+}
+
+impl<S> Stamped<S> {
+    fn new(inner: S, activity: Arc<RelayActivity>) -> Self {
+        Self { inner, activity }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Stamped<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        let filled_before = buf.filled().len();
+        let poll = Pin::new(&mut me.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            if buf.filled().len() > filled_before {
+                me.activity.stamp();
+            }
+        }
+        poll
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Stamped<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let me = self.get_mut();
+        let poll = Pin::new(&mut me.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            if *n > 0 {
+                me.activity.stamp();
+            }
+        }
+        poll
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let me = self.get_mut();
+        let poll = Pin::new(&mut me.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = &poll {
+            if *n > 0 {
+                me.activity.stamp();
+            }
+        }
+        poll
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Service state
 // ---------------------------------------------------------------------------
 
@@ -205,6 +442,10 @@ struct ProxyState {
     /// session builds its own `RootCertStore` without cloning a tlsn type.
     roots: Vec<Vec<u8>>,
     session_timeout: Duration,
+    /// Silence bound on a relayed connection; see [`DEFAULT_STALL_TIMEOUT`].
+    stall_timeout: Duration,
+    /// Spaces outbound dials per target address; see [`DEFAULT_DIAL_SPACING_MS`].
+    pacer: DialPacer,
     /// Refusal bound for `sent + received`; see [`MAX_TRANSCRIPT_BYTES`].
     max_transcript_bytes: usize,
     started_at: u64,
@@ -309,6 +550,12 @@ enum SessionOutcome {
     /// The session hit `session_timeout`; the string is where it had got to,
     /// so the verdict says whether the relayed connection or the prover stalled.
     TimedOut(String),
+    /// The relayed connection went silent for `stall_timeout` — the edge
+    /// accepted the TCP connection and then moved no byte. Distinct from a
+    /// timeout because it is not a slow prover and not a slow answer: nothing at
+    /// all is happening, and it will not resolve itself (measured: 120 s of
+    /// silence, then the session timeout).
+    Stalled(String),
 }
 
 async fn handle_session(stream: TcpStream, peer: SocketAddr, st: Arc<ProxyState>) {
@@ -340,6 +587,15 @@ async fn handle_session(stream: TcpStream, peer: SocketAddr, st: Arc<ProxyState>
             st.sessions_failed.fetch_add(1, Ordering::Relaxed);
             warn!("session from {peer}: {reason} — closed");
         }
+        SessionOutcome::Stalled(where_at) => {
+            let reason = format!(
+                "relayed session moved no byte for {:?} — last progress: {where_at}; retry this session (a burst of sessions from one address can be stalled by the target's edge before its handshake starts)",
+                st.stall_timeout
+            );
+            st.remember_refusal("stalled", reason.clone());
+            st.sessions_failed.fetch_add(1, Ordering::Relaxed);
+            warn!("session from {peer}: {reason} — closed");
+        }
     }
 }
 
@@ -354,6 +610,8 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
         "before the commitment handshake",
     )));
     let phase = progress.clone();
+    // Set when the stall watchdog — not the protocol — ended the session.
+    let stalled = Arc::new(AtomicBool::new(false));
 
     let session = Session::new(stream.compat());
     let (driver, mut handle) = session.split();
@@ -408,6 +666,24 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
             }
         };
 
+        // Space this dial from the previous one to the SAME address: a burst of
+        // simultaneous sessions makes the edge in front of `api-m.paypal.com`
+        // accept the TCP connections and then withhold every ServerHello from
+        // the fifth one on (see [`DEFAULT_DIAL_SPACING_MS`]). Paced here, the
+        // handshakes reach the edge spaced instead of together, which is the
+        // difference between 3/8 and 8/8 on the deployed notary.
+        let waited = st.pacer.claim(addr.ip()).await;
+        if waited >= Duration::from_millis(100) {
+            info!(
+                "session from {peer}: queued {:.1}s for a dial slot to {server_name} ({addr})",
+                waited.as_secs_f64()
+            );
+            *phase.lock().unwrap() = format!(
+                "queued {:.1}s for a dial slot to {server_name} ({addr})",
+                waited.as_secs_f64()
+            );
+        }
+
         // v236: a target whose pinned address blackholes (a stale CDN address
         // after the boot-time resolution) used to hold the session until the
         // whole session timeout — 120 s of nothing, then a prover-side
@@ -436,7 +712,33 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
         *phase.lock().unwrap() = format!("relaying TLS to {server_name} ({addr})");
 
         let verifier = verifier.accept().await?;
-        let verifier = verifier.run(client.compat()).await?;
+
+        // Watch the relayed connection for silence. The stall this catches is a
+        // real, measured failure mode: the edge accepts the TCP connection, the
+        // ClientHello goes out, and no ServerHello ever comes back — the session
+        // then sits until the 120 s session timeout, holding its slot and
+        // telling the prover only "connection closed". 20 s of silence (no byte
+        // in either direction) is the verdict instead; every measured healthy
+        // session to these targets finishes the relayed phase in <2 s.
+        let activity = RelayActivity::new(st.stall_timeout);
+        activity.arm();
+        let relayed = Stamped::new(client, activity.clone());
+        *phase.lock().unwrap() = format!("relayed TLS handshake to {server_name} ({addr})");
+        let verifier = tokio::select! {
+            outcome = verifier.run(relayed.compat()) => outcome?,
+            _ = activity.clone().stalled() => {
+                // Recorded rather than typed into an error: the outcome has to
+                // say "stalled" ("retry this"), not "refused" ("don't bother"),
+                // and the flag outlives this block's error.
+                stalled.store(true, Ordering::SeqCst);
+                return Err(format!(
+                    "the relayed connection to {server_name} ({addr}) moved no byte for {:?}",
+                    st.stall_timeout
+                )
+                .into());
+            }
+        };
+        *phase.lock().unwrap() = format!("proof exchange after relaying to {server_name} ({addr})");
         let verifier = verifier.verify().await?;
 
         // Without the server identity the attestation would not say which site
@@ -496,7 +798,15 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
     };
     let outcome = match tokio::time::timeout(st.session_timeout, protocol).await {
         Ok(Ok(verified)) => SessionOutcome::Verified(verified),
-        Ok(Err(e)) => SessionOutcome::Rejected(e),
+        // A stall is its own verdict, not a refusal: the presentation was never
+        // judged, and the same commit would very likely pass on a retry.
+        Ok(Err(e)) => {
+            if stalled.load(Ordering::SeqCst) {
+                SessionOutcome::Stalled(progress.lock().unwrap().clone())
+            } else {
+                SessionOutcome::Rejected(e)
+            }
+        }
         Err(_) => SessionOutcome::TimedOut(progress.lock().unwrap().clone()),
     };
 
@@ -789,6 +1099,18 @@ async fn main() -> Result<(), BoxError> {
     let session_timeout_secs: u64 = env_or("TLS_PROXY_SESSION_TIMEOUT", "120")
         .parse()
         .map_err(|e| format!("TLS_PROXY_SESSION_TIMEOUT is not a number of seconds: {e}"))?;
+    let stall_timeout_secs: u64 = env_or(
+        "TLS_PROXY_STALL_TIMEOUT",
+        &DEFAULT_STALL_TIMEOUT.as_secs().to_string(),
+    )
+    .parse()
+    .map_err(|e| format!("TLS_PROXY_STALL_TIMEOUT is not a number of seconds: {e}"))?;
+    let dial_spacing_ms: u64 = env_or(
+        "TLS_PROXY_DIAL_SPACING_MS",
+        &DEFAULT_DIAL_SPACING_MS.to_string(),
+    )
+    .parse()
+    .map_err(|e| format!("TLS_PROXY_DIAL_SPACING_MS is not a number of milliseconds: {e}"))?;
     let ca_bundle = env_or("TLS_PROXY_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt");
     let max_transcript_bytes: usize =
         env_or("TLS_PROXY_MAX_TRANSCRIPT_BYTES", &MAX_TRANSCRIPT_BYTES.to_string())
@@ -822,6 +1144,8 @@ async fn main() -> Result<(), BoxError> {
         signer,
         roots,
         session_timeout: Duration::from_secs(session_timeout_secs),
+        stall_timeout: Duration::from_secs(stall_timeout_secs),
+        pacer: DialPacer::new(Duration::from_millis(dial_spacing_ms)),
         max_transcript_bytes,
         started_at: now_unix(),
         sessions_total: AtomicU64::new(0),
@@ -856,7 +1180,8 @@ async fn main() -> Result<(), BoxError> {
         .map_err(|e| format!("cannot bind sessions on {session_addr}: {e}"))?;
     info!(
         "tls-proxy ready: TLSNotary sessions on {session_addr}, attestation API on {http_addr} \
-         (roots: {}, timeout: {session_timeout_secs}s)",
+         (roots: {}, timeout: {session_timeout_secs}s, stall: {stall_timeout_secs}s, \
+         dial spacing: {dial_spacing_ms}ms per target address)",
         certs.len()
     );
 
@@ -899,6 +1224,94 @@ async fn main() -> Result<(), BoxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pacing is per ADDRESS: two sessions to one target are spaced, sessions to
+    /// different targets are not delayed at all. The failure this exists for is
+    /// bursts to a single edge, so a pacer that simply serialised everything
+    /// would cost latency for nothing.
+    #[tokio::test]
+    async fn dial_pacer_spaces_one_address_only() {
+        let pacer = DialPacer::new(Duration::from_millis(120));
+        let a: IpAddr = "203.0.113.10".parse().unwrap();
+        let b: IpAddr = "203.0.113.11".parse().unwrap();
+
+        let first = pacer.claim(a).await;
+        assert!(
+            first < Duration::from_millis(5),
+            "the first dial to an address goes at once, waited {first:?}"
+        );
+        // A different address is not waiting on the first one's slot.
+        let other = pacer.claim(b).await;
+        assert!(other < Duration::from_millis(20), "a distinct target waited {other:?}");
+
+        let waited = pacer.claim(a).await;
+        assert!(
+            waited >= Duration::from_millis(100),
+            "the second dial to the same address waited only {waited:?}"
+        );
+
+        // Consecutive claims reserve distinct slots: the second one waits a
+        // whole spacing after the first, so a queued burst cannot collapse into
+        // one dial.
+        let starts = Instant::now();
+        pacer.claim(b).await;
+        pacer.claim(b).await;
+        let both = starts.elapsed();
+        assert!(
+            both >= Duration::from_millis(100),
+            "two consecutive dials to one address took {both:?}, not one spacing apart"
+        );
+
+        // And the shipped configuration is a no-op when the spacing is 0.
+        let disabled = DialPacer::new(Duration::ZERO);
+        assert_eq!(disabled.claim(a).await, Duration::ZERO);
+        assert_eq!(disabled.claim(a).await, Duration::ZERO);
+    }
+
+    /// A relayed connection is not "stalled" before it is armed, is stale the
+    /// moment it is armed, and any byte in either direction postpones the
+    /// verdict. The live failure this models: TCP up, no ServerHello, ever.
+    #[tokio::test]
+    async fn relay_activity_arms_and_restamps() {
+        let activity = RelayActivity::new(Duration::from_millis(120));
+        assert!(activity.idle().is_none(), "unarmed is not idle");
+
+        activity.arm();
+        assert!(activity.idle().unwrap() < Duration::from_millis(50));
+
+        // Bytes keep the session alive past the bound.
+        let ok = tokio::time::timeout(Duration::from_millis(400), async {
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                activity.stamp();
+            }
+        })
+        .await;
+        assert!(ok.is_ok());
+
+        // Then silence is a verdict, within the bound rather than the 120 s
+        // session timeout.
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(2), activity.clone().stalled())
+            .await
+            .expect("the stall watchdog never fired");
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(110) && took < Duration::from_secs(1),
+            "the watchdog fired after {took:?}, not around the 120 ms bound"
+        );
+
+        // 0 disables it: a session may be silent forever and no verdict is
+        // invented for it (the session timeout still applies).
+        let off = RelayActivity::new(Duration::ZERO);
+        off.arm();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), off.stalled())
+                .await
+                .is_err(),
+            "a disabled stall bound must never fire"
+        );
+    }
 
     /// The envelope `record_attestation` stores and `GET /attestations/{id}`
     /// serves: signed fields flattened to the top level beside the signature.

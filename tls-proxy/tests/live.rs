@@ -17,14 +17,19 @@
 //! the full download URL — no hand-built query string, and no need to compute the
 //! digests yourself.
 //!
-//! `LIVE_ATTEMPTS` (default 3) retries a session that ends before a verdict.
-//! That is insurance, not the expected path: a real site's edge will sometimes
-//! close while the relayed TLS handshake is still in flight, because every MPC
-//! round costs a prover↔notary round trip. The 33 KB
-//! `www.sandbox.paypal.com/signin` page was once measured at 2 failures in 3
-//! runs, but the current figure is **6 of 6 first-attempt passes** (2026-11-09,
-//! 11.4–15.3 s; HANDOVER §0.31), so a retry here means something changed at
-//! the edge — read the reported attempt number rather than assuming flakiness.
+//! `LIVE_ATTEMPTS` (default 2 — i.e. ONE automatic retry) retries a session that
+//! ends before a verdict. The retry is a designed part of the prover path, not
+//! flakiness cover: `api-m.paypal.com` is served by an edge that accepts a burst
+//! of relayed TLS handshakes from one address and then withholds every
+//! ServerHello after about the fourth (measured 2026-11-10: 4 simultaneous
+//! 12/12, 6 simultaneous 5/6, 8 simultaneous 3/8 and 5/8, 8 spaced 1.5 s apart
+//! 8/8, and the same eight against Fastly's `api-m.sandbox.paypal.com` 8/8 —
+//! HANDOVER §0.55). The notary now spaces its own dials
+//! (`TLS_PROXY_DIAL_SPACING_MS`) and refuses a silent relay within ~20 s instead
+//! of holding the slot for 120 s, so a stalled attempt costs seconds and the
+//! retry normally lands on a healthy handshake. A retry therefore means "the
+//! edge stalled this attempt": read the reported attempt number rather than
+//! assuming the notary is at fault.
 //!
 //! On success the harness prints the digest pair the record signs over
 //! (`sent_sha256`, `received_sha256`) — that pair is the capability a prover
@@ -245,11 +250,13 @@ async fn live_relay_of_a_real_website() -> Result<(), Box<dyn std::error::Error>
     // A host is what the notary authorises; the page is the prover's choice.
     let path = std::env::var("LIVE_PATH").unwrap_or_else(|_| "/".into());
     let path = if path.starts_with('/') { path } else { format!("/{path}") };
+    // One retry by default: a burst stall is an expected single failure and the
+    // next attempt is the cheap answer to it (see the header).
     let attempts: u32 = std::env::var("LIVE_ATTEMPTS")
         .ok()
         .and_then(|n| n.parse().ok())
         .filter(|n: &u32| *n > 0)
-        .unwrap_or(3);
+        .unwrap_or(2);
 
     let roots = roots_from_bundle(&ca_bundle)?;
     assert!(!roots.is_empty(), "{ca_bundle} had no certificates");
@@ -275,12 +282,16 @@ async fn live_relay_of_a_real_website() -> Result<(), Box<dyn std::error::Error>
                 return Ok(());
             }
             Err(e) => {
-                // The expected shape: the site's edge closes mid-handshake or
-                // mid-response, and the notary logs "failed to receive proxy
-                // finished message". A refusal of OURS (an over-8-MiB
+                // Two shapes: the site's edge stalls the relayed handshake (the
+                // notary now says so in its `/refusals` ring within ~20 s), or
+                // it closes mid-response and the notary logs "failed to receive
+                // proxy finished message". A refusal of OURS (an over-8-MiB
                 // transcript, a non-proxy commit) fails the same way, so the
                 // message is kept verbatim in the report.
                 eprintln!("--- attempt {attempt}/{attempts} failed: {e}");
+                if attempt < attempts {
+                    eprintln!("--- retrying once: a stalled relayed handshake is retryable");
+                }
                 if attempt == attempts {
                     return Err(format!(
                         "no verdict in {attempts} attempt(s); last error: {e}"

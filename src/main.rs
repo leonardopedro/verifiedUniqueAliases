@@ -2530,6 +2530,20 @@ struct TlsProxyConfig {
     /// Idle budget for one prover session, seconds.
     #[serde(default = "proxy_default_timeout")]
     session_timeout_secs: u64,
+    /// v238: how long a RELAYED connection may move no byte before the child
+    /// calls it a stall (`stalled`, retryable) instead of letting it sit until
+    /// `session_timeout_secs`. 0 disables the verdict. See docs/tls-proxy.md
+    /// "Bursts and stalls" for the measurement behind the default.
+    #[serde(default = "proxy_default_stall_timeout")]
+    stall_timeout_secs: u64,
+    /// v238: minimum spacing between the child's outbound dials to one target
+    /// ADDRESS, milliseconds; 0 disables pacing. The edge in front of
+    /// `api-m.paypal.com` stalls relayed handshakes that arrive together from one
+    /// address (4 simultaneous 12/12, 8 simultaneous 3/8, 8 spaced 1.5 s apart
+    /// 8/8 — HANDOVER §0.55), so the child's dials are spaced rather than
+    /// batched.
+    #[serde(default = "proxy_default_dial_spacing_ms")]
+    dial_spacing_ms: u64,
     /// PEM key that signs attestations. Absent = a fresh per-boot key, so
     /// nothing long-lived is written anywhere (same model as the PayPal
     /// attestation key).
@@ -2579,6 +2593,18 @@ fn proxy_default_api_port() -> u16 {
 }
 fn proxy_default_timeout() -> u64 {
     120
+}
+
+/// v238 defaults, kept in step with `DEFAULT_STALL_TIMEOUT` /
+/// `DEFAULT_DIAL_SPACING_MS` in tls-proxy/src/main.rs: the child applies its own
+/// default when the variable is absent, and the enclave always passes the
+/// configured value, so these are only what an unconfigured deployment gets.
+fn proxy_default_stall_timeout() -> u64 {
+    20
+}
+
+fn proxy_default_dial_spacing_ms() -> u64 {
+    1500
 }
 
 #[derive(Clone)]
@@ -4480,6 +4506,11 @@ fn spawn_tls_proxy(cfg: &TlsProxyConfig) -> Arc<ProxySupervisor> {
                     "TLS_PROXY_SESSION_TIMEOUT",
                     cfg.session_timeout_secs.to_string(),
                 )
+                .env(
+                    "TLS_PROXY_STALL_TIMEOUT",
+                    cfg.stall_timeout_secs.to_string(),
+                )
+                .env("TLS_PROXY_DIAL_SPACING_MS", cfg.dial_spacing_ms.to_string())
                 .env("TLS_PROXY_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
@@ -6441,6 +6472,8 @@ mod security_tests {
                     session_port: 8443,
                     api_port: 8081,
                     session_timeout_secs: 120,
+                    stall_timeout_secs: proxy_default_stall_timeout(),
+                    dial_spacing_ms: proxy_default_dial_spacing_ms(),
                     signing_key_pem: None,
                     relay_targets: proxy_default_relay_targets(),
                     restart_token: None,

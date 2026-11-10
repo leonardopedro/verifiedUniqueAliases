@@ -202,6 +202,10 @@ impl Proxy {
             .env("TLS_PROXY_HTTP_LISTEN", format!("127.0.0.1:{api_port}"))
             .env("TLS_PROXY_CA_BUNDLE", &ca_path)
             .env("TLS_PROXY_SESSION_TIMEOUT", "60")
+            // Dial pacing is a property of one edge's burst tolerance and is
+            // measured against the live notary; tests would only pay its
+            // latency. The tests that are ABOUT pacing set it explicitly.
+            .env("TLS_PROXY_DIAL_SPACING_MS", "0")
             .env("RUST_LOG", "info")
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_copy));
@@ -927,6 +931,148 @@ async fn list_over_http_names_the_host_of_a_recorded_session(
     )
     .await?;
     assert_eq!(status, 404, "junk must not be treated as a matching digest");
+    Ok(())
+}
+
+/// Eight sessions at once must all be served: the notary's own concurrency is
+/// not the limit, and the live burst failures are the target edge's (see
+/// `DEFAULT_DIAL_SPACING_MS`). Pinned locally so a future change that serialises
+/// sessions — a shared lock, a single-threaded relay, a global mutex across an
+/// await — fails here instead of only on the deployed notary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serves_eight_simultaneous_sessions() -> Result<(), Box<dyn std::error::Error>> {
+    let _serial = SERIAL.lock().await;
+    let fixture_port = start_fixture().await;
+    let target = format!("127.0.0.1:{fixture_port}");
+    let proxy = Proxy::start(&[("TLS_PROXY_TARGET_ADDR", target.as_str())]).await;
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let socket = TcpStream::connect(("127.0.0.1", proxy.session_port)).await?;
+        // The error type is not `Send`; a spawned task only needs the verdict.
+        tasks.push(tokio::spawn(async move {
+            prover(socket).await.map_err(|e| e.to_string())
+        }));
+    }
+    for (i, task) in tasks.into_iter().enumerate() {
+        task.await?
+            .map_err(|e| format!("session {i} of 8 failed: {e}"))?;
+    }
+
+    let health = proxy.health().await;
+    assert_eq!(health["sessions_ok"].as_u64(), Some(8), "{health}");
+    assert_eq!(health["sessions_failed"].as_u64(), Some(0), "{health}");
+    assert_eq!(health["attestations"].as_u64(), Some(8), "{health}");
+    assert_eq!(health["active_sessions"].as_u64(), Some(0), "{health}");
+    Ok(())
+}
+
+/// Dial pacing must not delay a target other than the one that was just dialled,
+/// and must space two sessions to the same address — asserted on the real binary
+/// (its log carries the queueing) rather than only on the arithmetic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paces_repeated_dials_to_the_same_target(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _serial = SERIAL.lock().await;
+    let fixture_port = start_fixture().await;
+    let target = format!("127.0.0.1:{fixture_port}");
+    let proxy = Proxy::start(&[
+        ("TLS_PROXY_TARGET_ADDR", target.as_str()),
+        ("TLS_PROXY_DIAL_SPACING_MS", "700"),
+    ])
+    .await;
+
+    // Started together, so the second dial falls inside the first one's
+    // spacing window. Run one after the other and the slot is already free —
+    // which would make this test pass on a pacer that does nothing.
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let socket = TcpStream::connect(("127.0.0.1", proxy.session_port)).await?;
+        tasks.push(tokio::spawn(async move {
+            prover(socket).await.map_err(|e| e.to_string())
+        }));
+    }
+    for task in tasks {
+        task.await??;
+    }
+
+    let logs = proxy.logs();
+    assert!(
+        logs.contains("queued ") && logs.contains("for a dial slot to"),
+        "the second simultaneous dial to one address must be logged as queued, got: {logs}"
+    );
+    let health = proxy.health().await;
+    assert_eq!(health["sessions_ok"].as_u64(), Some(2), "{health}");
+    Ok(())
+}
+
+/// A target that accepts the TCP connection and then never answers is the live
+/// stall shape (the edge in front of `api-m.paypal.com` does exactly this to a
+/// burst from one address). Before the stall bound the session sat until the
+/// 120 s session timeout, holding its slot; now it is refused in about the
+/// bound, and the record says to retry rather than that the presenting party did
+/// anything wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refuses_a_relayed_session_that_never_answers(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _serial = SERIAL.lock().await;
+    // Accepts, reads nothing, answers nothing — and holds the socket open.
+    let blackhole = TcpListener::bind("127.0.0.1:0").await?;
+    let blackhole_port = blackhole.local_addr()?.port();
+    let held = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        while let Ok((stream, _)) = blackhole.accept().await {
+            sockets.push(stream);
+        }
+    });
+
+    let target = format!("127.0.0.1:{blackhole_port}");
+    let proxy = Proxy::start(&[
+        ("TLS_PROXY_TARGET_ADDR", target.as_str()),
+        ("TLS_PROXY_STALL_TIMEOUT", "2"),
+    ])
+    .await;
+
+    let socket = TcpStream::connect(("127.0.0.1", proxy.session_port)).await?;
+    let started = Instant::now();
+    let prover_task = tokio::spawn(async move {
+        prover(socket).await.map_err(|e| e.to_string())
+    });
+    let health = proxy.wait_for_failed(1).await;
+    let elapsed = started.elapsed();
+    let _ = prover_task.await;
+
+    assert_eq!(health["sessions_ok"].as_u64(), Some(0), "{health}");
+    assert_eq!(health["attestations"].as_u64(), Some(0), "{health}");
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "a silent target must be refused near the 2 s bound, took {elapsed:?}"
+    );
+
+    let refusals = proxy.refusals().await;
+    let last = refusals["refusals"]
+        .as_array()
+        .and_then(|r| r.last())
+        .cloned()
+        .expect("a refusal should be recorded");
+    assert_eq!(
+        last["kind"], "stalled",
+        "a silent relay is a stall, not a timeout or a refusal of the prover: {refusals}"
+    );
+    let reason = last["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("moved no byte for 2s"),
+        "the reason must name the silence: {reason}"
+    );
+    assert!(
+        reason.contains("retry"),
+        "the reason must tell the prover to retry: {reason}"
+    );
+    assert!(
+        reason.contains("last progress: relayed TLS handshake"),
+        "the reason must say which phase stalled: {reason}"
+    );
+    held.abort();
     Ok(())
 }
 
