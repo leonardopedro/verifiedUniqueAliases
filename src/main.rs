@@ -2628,7 +2628,42 @@ struct AppState {
     // standalone auditor envelope is minted ONCE per cache window and served
     // from this cache, so no request path can trigger quote generation at
     // line rate (each quote costs a full TDG.MR.REPORT + QGS round-trip).
-    boot_envelope: Arc<RwLock<Option<(Instant, serde_json::Value)>>>,
+    boot_envelope: Arc<RwLock<Option<CachedEnvelope>>>,
+}
+
+/// A cached `/debug/envelope` body, plus the one fact that can invalidate it
+/// before its 15-minute window is up: which notary key it names.
+///
+/// The window exists to keep quote generation off the request path, not to
+/// promise the body stays true. A restarted notary mints a fresh signing key,
+/// and the cached body would then name the dead one — the auditor page fails
+/// the binding check, correctly but pointlessly, until the window expires. So
+/// the cache remembers the fingerprint it published and is re-minted the moment
+/// the live notary reports a different one.
+#[derive(Clone)]
+struct CachedEnvelope {
+    at: Instant,
+    /// SHA-256(SPKI DER) the body names, or "" when the body names no key.
+    proxy_key_sha256: String,
+    body: serde_json::Value,
+}
+
+/// May the cached envelope be served as-is?
+///
+/// `live_key` is the fingerprint the running notary reports NOW, or `None` when
+/// it could not be asked (service disabled, process restarting, loopback
+/// hiccup). A silent notary does NOT invalidate the cache: re-minting would buy
+/// nothing — a process that cannot answer has not published a new key — and
+/// doing it per request would turn a crashed notary into a quote generator.
+fn envelope_cache_fresh(cached_at: Instant, cached_key: &str, live_key: Option<&str>) -> bool {
+    const ENVELOPE_CACHE_SECS: u64 = 900;
+    if cached_at.elapsed().as_secs() >= ENVELOPE_CACHE_SECS {
+        return false;
+    }
+    match live_key {
+        Some(live) => live == cached_key,
+        None => true,
+    }
 }
 
 impl AppState {
@@ -3120,14 +3155,17 @@ impl InRamAcmeManager {
         }
     }
 
-    /// Obtains an ACME certificate in RAM without saving private keys to disk
-    async fn obtain_certificate_in_ram(
+    /// Opens (registers) the ACME account ONCE per boot.
+    ///
+    /// Separate from the order flow on purpose: every registration is a new
+    /// account at the CA, and the old loop re-registered on every retry — so a
+    /// boot that hit a refusal dug itself deeper into the CA's per-account and
+    /// per-IP limits while it backed off. One account per boot, retried orders.
+    async fn open_account(
         &self,
-        ephemeral_tls_key: &openssl::pkey::PKey<openssl::pkey::Private>,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        use acme2_eab::{AccountBuilder, AuthorizationStatus, Csr, DirectoryBuilder, OrderBuilder};
+    ) -> Result<std::sync::Arc<acme2_eab::Account>, Box<dyn std::error::Error + Send + Sync>> {
+        use acme2_eab::{AccountBuilder, DirectoryBuilder};
         use base64::Engine as _;
-        use sha2::Digest as _;
 
         let acme_url = if self.eab_key_id.is_some() && self.eab_hmac_key.is_some() {
             ZEROSSL_CA_DIRECTORY
@@ -3146,7 +3184,20 @@ impl InRamAcmeManager {
             builder.external_account_binding(kid.clone(), openssl::pkey::PKey::hmac(&hmac_bytes)?);
         }
 
-        let account = builder.build().await?;
+        Ok(builder.build().await?)
+    }
+
+    /// Obtains an ACME certificate in RAM without saving private keys to disk.
+    /// The account is supplied by the caller so a retry reuses it.
+    async fn obtain_certificate_in_ram(
+        &self,
+        ephemeral_tls_key: &openssl::pkey::PKey<openssl::pkey::Private>,
+        account: &std::sync::Arc<acme2_eab::Account>,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        use acme2_eab::{AuthorizationStatus, Csr, OrderBuilder};
+        use base64::Engine as _;
+        use sha2::Digest as _;
+
         let mut order_builder = OrderBuilder::new(account.clone());
         order_builder.add_dns_identifier(self.domain.clone());
         let mut order = order_builder.build().await?;
@@ -3179,6 +3230,40 @@ impl InRamAcmeManager {
         }
         Ok(chain_pem)
     }
+}
+
+/// How long to wait before the next ACME attempt.
+///
+/// The old policy was a flat 15 s doubling to a 300 s cap, whatever went wrong.
+/// That is both too eager and too blind: a CA refusal (rate limit, duplicate
+/// certificate, pending order for the same identifiers) does not improve
+/// because we ask again 15 s later, and meanwhile the box serves NOTHING —
+/// there is no self-signed fallback, so every second of backoff is a second of
+/// "Running + dark".
+///
+/// So the delay now depends on WHY:
+///   * a refusal the CA asked us to wait out gets a long, growing wait
+///     (5 min → 30 min cap) that stops hammering the resource we need;
+///   * everything else (DNS not propagated yet, network blip, CA 5xx) retries
+///     fast (10 s → 120 s cap), because those clear in seconds and the instance
+///     is dark until they do.
+/// `jitter_unit` is a caller-supplied value in `[0,1)`; it adds up to a quarter
+/// of the delay so two instances booted together never retry in lockstep.
+fn acme_backoff(attempt: u32, err: &str, jitter_unit: f64) -> Duration {
+    let lower = err.to_ascii_lowercase();
+    let ca_refusal = lower.contains("ratelimit")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("too many")
+        || lower.contains("duplicate certificate")
+        || lower.contains("order for this identifier")
+        || lower.contains("retry after");
+    let (base_secs, cap_secs) = if ca_refusal { (300u64, 1800u64) } else { (10u64, 120u64) };
+    let exp = attempt.saturating_sub(1).min(6);
+    let secs = base_secs.saturating_mul(1u64 << exp).min(cap_secs);
+    let jitter_span = (secs / 4).max(1);
+    let jitter = (jitter_unit.clamp(0.0, 0.999_999) * jitter_span as f64) as u64;
+    Duration::from_secs(secs + jitter)
 }
 
 // Builds the OpenSSL SslAcceptor strictly in memory (Zero Disk Storage)
@@ -3696,12 +3781,26 @@ async fn debug_envelope(
     // quote costs a full TDG.MR.REPORT + QGS round-trip). The mint is kept
     // alive for the ops/rotation workflow (calculate-golden-rtmr.mjs) and the
     // manual auditor — the LOGIN flow never touches this route.
-    const ENVELOPE_CACHE_SECS: u64 = 900;
-    if let Some((at, cached)) = state.boot_envelope.read().clone() {
-        if at.elapsed().as_secs() < ENVELOPE_CACHE_SECS {
-            let mut resp = ([(axum::http::header::CONTENT_TYPE, "application/json")], Json(cached)).into_response();
+    // The notary's key is the one part of the body that can go stale inside
+    // the window (a restart mints a new key), so it is probed on every request
+    // — a loopback GET to the child, no quote, no measurement work. The mint
+    // below then reuses this probe instead of asking twice.
+    let proxy_signing_key = attested_proxy_key().await;
+    let live_proxy_key = proxy_signing_key
+        .get("pubkey_sha256")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    if let Some(cached) = state.boot_envelope.read().clone() {
+        if envelope_cache_fresh(cached.at, &cached.proxy_key_sha256, live_proxy_key.as_deref()) {
+            let mut resp = ([(axum::http::header::CONTENT_TYPE, "application/json")], Json(cached.body)).into_response();
             resp.headers_mut().insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, axum::http::HeaderValue::from_static("*"));
             return with_secure_headers(resp);
+        }
+        if !live_proxy_key.as_deref().unwrap_or_default().is_empty() {
+            // Re-minting costs one quote; serving a body that names a dead key
+            // costs every auditor a failed (fail-closed) check instead.
+            info!("envelope cache invalidated: the notary's key changed");
         }
     }
 
@@ -3721,7 +3820,6 @@ async fn debug_envelope(
     );
     let (tls_pubkey_pem, tls_pubkey_sha256) = attested_tls_key(&state);
     let (seal_pubkey_pem, seal_pubkey_sha256) = attested_seal_key(&state);
-    let proxy_signing_key = attested_proxy_key().await;
     let mut report_data = [0u8; 64];
     report_data[0..32].copy_from_slice(&nonce);
     let quote_res = tpm::quote(&hex::encode(nonce), Some(report_data));
@@ -3784,8 +3882,13 @@ async fn debug_envelope(
         "enclave_signature_b64": signature,
     });
 
-    // Refresh the cache window with this fresh mint, then serve it.
-    *state.boot_envelope.write() = Some((Instant::now(), body.clone()));
+    // Refresh the cache window with this fresh mint, then serve it. The
+    // fingerprint recorded here is what a later request compares against.
+    *state.boot_envelope.write() = Some(CachedEnvelope {
+        at: Instant::now(),
+        proxy_key_sha256: live_proxy_key.clone().unwrap_or_default(),
+        body: body.clone(),
+    });
 
     let mut resp = ([(axum::http::header::CONTENT_TYPE, "application/json")], Json(body)).into_response();
     resp.headers_mut().insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, axum::http::HeaderValue::from_static("*"));
@@ -5220,23 +5323,52 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         selfreport::stage("acme");
         let acme_mgr = InRamAcmeManager::new(&config);
-        let mut retry_delay = Duration::from_secs(15);
+        // One account for the whole boot (see `open_account`). A retry re-orders
+        // on the SAME account instead of registering a new one, so a window of
+        // refusals cannot snowball into the CA's per-account limits.
+        let mut account: Option<std::sync::Arc<acme2_eab::Account>> = None;
+        let mut attempt: u32 = 0;
         let cert_chain_pem = loop {
-            match acme_mgr.obtain_certificate_in_ram(&ephemeral_tls_key).await {
+            attempt += 1;
+            let outcome = match account.clone() {
+                Some(acct) => acme_mgr.obtain_certificate_in_ram(&ephemeral_tls_key, &acct).await,
+                None => match acme_mgr.open_account().await {
+                    Ok(acct) => {
+                        account = Some(acct.clone());
+                        acme_mgr.obtain_certificate_in_ram(&ephemeral_tls_key, &acct).await
+                    }
+                    // Account registration itself failed: nothing to order on
+                    // yet, so this is just another retry with the same policy.
+                    Err(e) => Err(e),
+                },
+            };
+            match outcome {
                 Ok(chain) => {
-                    info!("ACME certificate obtained in RAM successfully.");
+                    info!("ACME certificate obtained in RAM successfully (attempt {}).", attempt);
                     break chain;
                 }
                 Err(e) => {
-                    warn!("ACME certificate failed: {}. Retrying in {:?} (no self-signed fallback)...", e, retry_delay);
+                    let reason = format!("acme attempt {}: {}", attempt, e);
+                    // Jitter from the clock; a fresh randomness source per boot
+                    // is not worth a dependency here.
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.subsec_nanos())
+                        .unwrap_or(0);
+                    let retry_delay = acme_backoff(attempt, &e.to_string(), nanos as f64 / 1e9);
+                    warn!("{} — retrying in {:?} (no self-signed fallback)...", reason, retry_delay);
                     // A retry loop serves NOTHING (no self-signed fallback), so
                     // this is the classic "Running + dark" state — publish it
                     // instead of leaving the operator to guess. Includes the
                     // usual `Cloudflare zone not found`, i.e. the reserved-EIP
-                    // / token-scope failure.
-                    selfreport::failure(format!("acme: {}", e));
+                    // / token-scope failure. Attempts 1-3 and then every 10th,
+                    // so a long window cannot flood the sink with one line per
+                    // backoff round.
+                    if attempt <= 3 || attempt % 10 == 0 {
+                        selfreport::failure(reason);
+                    }
+                    selfreport::stage(&format!("acme-retry-{}", attempt));
                     tokio::time::sleep(retry_delay).await;
-                    retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
                 }
             }
         };
@@ -6271,6 +6403,76 @@ mod security_tests {
     // harness and scripts/calculate-golden-rtmr.mjs --selftest) pin all
     // three to identical bytes; drift in any one fails the suite.
     // =====================================================================
+
+    /// v232: a CA refusal must be waited out, a transient error retried fast.
+    /// Getting this backwards is what turns a 30-second DNS hiccup into a
+    /// half-hour dark instance (or a rate limit into a retry storm).
+    #[test]
+    fn acme_backoff_separates_refusals_from_hiccups() {
+        use super::acme_backoff;
+        let secs = |d: std::time::Duration| d.as_secs();
+
+        // Plain failures: 10 s doubling, capped at 120 s, jitter < 1/4.
+        assert_eq!(secs(acme_backoff(1, "dns error: NXDOMAIN", 0.0)), 10);
+        assert_eq!(secs(acme_backoff(2, "connection reset", 0.0)), 20);
+        assert_eq!(secs(acme_backoff(4, "http 503", 0.0)), 80);
+        assert_eq!(secs(acme_backoff(9, "http 503", 0.0)), 120);
+        assert_eq!(secs(acme_backoff(50, "http 503", 0.0)), 120);
+
+        // Rate limits / duplicate-certificate refusals: minutes, not seconds,
+        // and a much higher ceiling.
+        for refusal in [
+            "urn:ietf:params:acme:error:rateLimited",
+            "too many certificates already issued",
+            "duplicate certificate",
+            "Retry after 2026-11-10T05:00:00Z",
+        ] {
+            assert!(secs(acme_backoff(1, refusal, 0.0)) >= 300, "{refusal}");
+            assert!(secs(acme_backoff(6, refusal, 0.0)) >= 1800, "{refusal}");
+        }
+        assert_eq!(secs(acme_backoff(9, "rateLimited", 0.0)), 1800);
+
+        // Jitter is bounded and never negative, whatever the caller passes.
+        for attempt in 1..=8 {
+            for jitter in [0.0, 0.5, 0.999] {
+                let d = secs(acme_backoff(attempt, "http 503", jitter));
+                let base = secs(acme_backoff(attempt, "http 503", 0.0));
+                assert!(d >= base && d <= base + base / 4, "{attempt} {jitter} {d} {base}");
+            }
+            assert_eq!(secs(acme_backoff(attempt, "x", -1.0)), secs(acme_backoff(attempt, "x", 0.0)));
+        }
+    }
+
+    /// v232: the 15-minute envelope cache is invalidated by a notary restart,
+    /// and ONLY by that — a notary that cannot be reached must not turn every
+    /// request into a TD-quote mint.
+    #[test]
+    fn envelope_cache_follows_the_notary_key() {
+        use super::envelope_cache_fresh;
+        use std::time::{Duration, Instant};
+
+        let now = Instant::now();
+        let old = now - Duration::from_secs(901);
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+
+        // Fresh while young and the key still matches.
+        assert!(envelope_cache_fresh(now, &a, Some(&a)));
+        assert!(envelope_cache_fresh(now, "", Some("")));
+
+        // A restarted notary (new key) invalidates immediately, both ways.
+        assert!(!envelope_cache_fresh(now, &a, Some(&b)));
+        assert!(!envelope_cache_fresh(now, "", Some(&a)));
+        assert!(!envelope_cache_fresh(now, &a, Some("")));
+
+        // An unreachable notary keeps the cache: no new key can exist.
+        assert!(envelope_cache_fresh(now, &a, None));
+        assert!(envelope_cache_fresh(now, "", None));
+
+        // Window expiry wins over everything.
+        assert!(!envelope_cache_fresh(old, &a, Some(&a)));
+        assert!(!envelope_cache_fresh(old, &a, None));
+    }
 
     #[test]
     fn sec02_nonce_parity_v168() {

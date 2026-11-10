@@ -520,7 +520,10 @@ async function auditAttestation(rawText, reportText) {
                     : 'MISMATCH: the record\'s key fingerprints to ' + esc(keyFp || '(unavailable)')
                       + ', the report names ' + esc(reportedFp || '(none)')
                       + (samePem ? '' : ' (and the PEM differs)')
-                      + ' — the record was signed by a key this boot\'s attestation does not cover'));
+                      + ' — the record was signed by a key this boot\'s attestation does not cover. '
+                      + 'If the notary restarted between the two, the report is simply older than the record: '
+                      + 're-fetch it from the enclave (a key change re-mints it) and check again; '
+                      + 'if it still names another key, the record is not covered.'));
         }
     }
 

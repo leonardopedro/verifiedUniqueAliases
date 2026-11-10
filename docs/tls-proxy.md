@@ -312,9 +312,12 @@ rebuild, no different image.
    The enclave recomputes the fingerprint from the PEM it received rather than
    copying the child's `pubkey_sha256`; the child's claim is kept alongside as
    `reported_sha256` so a disagreement is visible instead of blessed.
-   A notary restart mints a new key; the report names whichever key was live
-   when it was minted (the envelope is cached for 15 minutes), so a stale
-   report names a stale key and the page fails closed — fetch a fresh report.
+   A notary restart mints a new key, so the enclave checks the live key on
+   every `/debug/envelope` request (a loopback `GET /pubkey`, no quote) and
+   re-mints the cached body the moment it differs. Asking the enclave again is
+   therefore enough to get a report that names the running key; the cache can
+   only go stale while the notary is unreachable, and then no new key exists to
+   name. The page still fails closed on a mismatch instead of assuming.
 5. Compare `sent_sha256`/`received_sha256` with the base64 bytes if you need the
    transcript itself.
 

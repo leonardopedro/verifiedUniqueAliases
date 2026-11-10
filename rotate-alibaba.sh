@@ -429,14 +429,31 @@ phase_verify() {
         return 0
     fi
 
-    local code=""
-    for _ in $(seq 1 40); do
+    # A freshly booted guest serves NOTHING until its certificate exists, and
+    # issuance is a retry loop with no self-signed fallback (by design: a
+    # self-signed cert would be a lie the padlock cannot expose). So "not 200
+    # yet" is a normal boot state for minutes, not a failed deployment — the
+    # wait budget must cover a full issuance retry cycle (the CA's own refusal
+    # windows reach ~30 min), or the rotation aborts on a healthy box and the
+    # operator has to re-run the checks by hand (v231 pass 2 did exactly that).
+    local wait_secs=${VERIFY_WAIT_SECS:-1500}
+    local code="" waited=0 last_note=0
+    while [[ $waited -lt $wait_secs ]]; do
         code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$PROD_URL/" 2>/dev/null || true)
         [[ "$code" == "200" ]] && break
+        if [[ $((waited - last_note)) -ge 60 ]]; then
+            say "   waiting for the guest to finish its boot: ${waited}s elapsed, last HTTP ${code:-no response} (budget ${wait_secs}s)"
+            last_note=$waited
+        fi
         sleep 15
+        waited=$((waited + 15))
     done
-    [[ "$code" == "200" ]] || die "$PROD_URL did not serve 200 (last: ${code:-no response})"
-    ok "HTTPS 200"
+    if [[ "$code" != "200" ]]; then
+        say "   not serving after ${waited}s. If the guest is up but dark, its boot self-report says why:"
+        say "   the ACME retry loop publishes every attempt to the self_request sink (kind=fatal, reason='acme attempt N: …')."
+        die "$PROD_URL did not serve 200 (last: ${code:-no response})"
+    fi
+    ok "HTTPS 200 (after ${waited}s)"
 
     local live_bin
     # Nested under the boot measurements; the top-level fallback keeps this
