@@ -490,9 +490,12 @@ phase_verify() {
     curl -fsS --max-time 20 "$PROD_URL/debug/envelope" >"$envfile"
     rtmr2=$(node scripts/calculate-golden-rtmr.mjs --report "$envfile" 2>/dev/null | sed -n 's/^RTMR2 = //p')
     rm -f "$envfile"
-    pin_rtmr2=$(sed -n "s/.*EXPECTED_RTMR2 = '\([0-9a-f]\{192\}\)'.*/\1/p" verify.html | head -1)
+    # A TDX RTMR is 48 bytes (96 hex); the pins are quoted in the page as vars.
+    pin_rtmr2=$(sed -n "s/.*EXPECTED_RTMR2 = '\([0-9a-f]\{96\}\)'.*/\1/p" verify.html | head -1)
     pin_bin=$(sed -n "s/.*EXPECTED_ENCLAVE_SHA256 = '\([0-9a-f]\{64\}\)'.*/\1/p" verify.html | head -1)
     [[ -n "$rtmr2" ]] || die "could not read RTMR2 from the live TD quote"
+    [[ -n "$pin_rtmr2" ]] || die "verify.html carries no 96-hex EXPECTED_RTMR2 pin — cannot prove the shipped pins describe this boot"
+    [[ -n "$pin_bin" ]] || die "verify.html carries no EXPECTED_ENCLAVE_SHA256 pin"
     if [[ "$rtmr2" != "$pin_rtmr2" ]]; then
         die "live RTMR2 ${rtmr2:0:16}… != verify.html pin ${pin_rtmr2:0:16}… — every audit would fail the silicon gate. Rotate the pins (node scripts/calculate-golden-rtmr.mjs --report <envelope> --update, mirror verify.html to index.html, README digest), rebuild and swap again"
     fi
