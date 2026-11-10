@@ -521,9 +521,10 @@ dial slot to <host> (<addr>)`, which is a queue, not a stall. Eight sessions cos
   away, and a healthy edge pays only a few sessions of extra latency afterwards.
   Widening is immediate and narrowing is gradual on purpose — backing off too
   late loses sessions, recovering too fast only costs a little latency. The
-  spacing in force is per address in the child's own `GET /health`
-  (`dial_spacing_ms`, `dial_spacing_base_ms`, `dial_spacing_max_ms`); the
-  enclave's `/proxy/health` relays the counters, not that map.
+  spacing in force is per address in `dial_spacing_ms` (a map of target address
+  → milliseconds), next to `dial_spacing_base_ms` / `dial_spacing_max_ms` —
+  both on the child's `/health` and, since v241, relayed by the enclave's
+  `/proxy/health`, so the back-off is auditable from outside the VM.
 - **Stall verdict** (`stall_timeout_secs`, default 20): a relayed connection that
   moves no byte for this long is refused as `stalled`, naming the phase and
   telling the prover to retry. Before this, such a session sat until the 120 s

@@ -15,6 +15,10 @@ use std::{
     future::IntoFuture,
     path::PathBuf,
     process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -154,6 +158,11 @@ async fn wait_for_port(port: u16) {
 async fn start_fixture() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind the fixture");
     let port = listener.local_addr().expect("fixture address").port();
+    serve_fixture(listener);
+    port
+}
+
+fn serve_fixture(listener: TcpListener) {
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -164,7 +173,37 @@ async fn start_fixture() -> u16 {
             });
         }
     });
-    port
+}
+
+/// A target whose behaviour can be switched at runtime: silent (accept TCP and
+/// never write — the shape of the edge that stalled eight-wide waves, HANDOVER
+/// §0.55), then the normal TLS fixture on the SAME port and IP.
+///
+/// Same port on purpose: the pacer is keyed by the target ADDRESS, so recovery
+/// can only be exercised if the address that stalled starts answering. The
+/// held sockets are dropped on the switch so the silent phase leaves nothing
+/// half-open behind.
+async fn start_switchable_target() -> (u16, Arc<AtomicBool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind the switchable target");
+    let port = listener.local_addr().expect("switchable target address").port();
+    let serving = Arc::new(AtomicBool::new(false));
+    let flag = serving.clone();
+    tokio::spawn(async move {
+        let mut held: Vec<TcpStream> = Vec::new();
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            if flag.load(Ordering::SeqCst) {
+                tokio::spawn(async move {
+                    let _ = bind_test_server_hyper(stream.compat()).await;
+                });
+            } else {
+                held.push(stream);
+            }
+        }
+    });
+    (port, serving)
 }
 
 /// Commits to a proxy session and then says nothing at all — the shape of a
@@ -822,6 +861,91 @@ async fn closes_a_session_that_never_speaks() -> Result<(), Box<dyn std::error::
     assert!(
         reason.contains("last progress: before the commitment handshake"),
         "a peer that never committed must be reported at that phase, got: {reason}"
+    );
+    Ok(())
+}
+
+/// Pacing must REACT to a stalled target, not just to its own clock: two stalls
+/// widen this address's spacing (100 → 150 → 225 ms), and once the same address
+/// answers cleanly again a run of four sessions narrows it back (225 → 150 ms).
+///
+/// The target is silent at first and then swapped for the working fixture on the
+/// SAME port and IP, because the pacer is keyed by target address — that is what
+/// makes "this edge is having a bad minute" expressible at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stall_widens_pacing_and_clean_runs_narrow_it(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _serial = SERIAL.lock().await;
+    let (port, serving) = start_switchable_target().await;
+    let target = format!("127.0.0.1:{port}");
+    let proxy = Proxy::start(&[
+        ("TLS_PROXY_TARGET_ADDR", target.as_str()),
+        // 4 s: above the prover's own preprocessing (which the hand-over bound
+        // covers — at 1 s the notary kills a HEALTHY prover first), and far
+        // below the 20 s default so two stalls cost seconds, not forty.
+        ("TLS_PROXY_STALL_TIMEOUT", "4"),
+        ("TLS_PROXY_DIAL_SPACING_MS", "100"),
+    ])
+    .await;
+
+    let spacing = |health: &serde_json::Value| -> Option<u64> {
+        health["dial_spacing_ms"]
+            .get("127.0.0.1")
+            .and_then(|v| v.as_u64())
+    };
+
+    // The base is reported before any session runs.
+    let health = proxy.health().await;
+    assert_eq!(health["dial_spacing_base_ms"].as_u64(), Some(100), "{health}");
+    assert_eq!(health["dial_spacing_max_ms"].as_u64(), Some(400), "{health}");
+    assert_eq!(spacing(&health), None, "nothing dialled yet: {health}");
+
+    for wave in 1..=2u64 {
+        let socket = TcpStream::connect(("127.0.0.1", proxy.session_port)).await?;
+        let stalled = tokio::time::timeout(Duration::from_secs(30), prover(socket)).await;
+        assert!(
+            matches!(stalled, Ok(Err(_))) || stalled.is_err(),
+            "a silent target cannot produce a verdict"
+        );
+        let health = proxy.wait_for_failed(wave).await;
+        let want = match wave {
+            1 => 150,
+            _ => 225,
+        };
+        assert_eq!(
+            spacing(&health), Some(want),
+            "after {wave} stall(s) the spacing must be {want}ms: {health}"
+        );
+    }
+
+    // Same address, now answering: four clean sessions must narrow one step
+    // (225 → 150).
+    serving.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    for n in 1..=4u64 {
+        let socket = TcpStream::connect(("127.0.0.1", proxy.session_port)).await?;
+        if let Err(e) = prover(socket).await {
+            panic!("clean session {n} failed: {e}\nproxy log:\n{}", proxy.logs());
+        }
+        loop {
+            let health = proxy.health().await;
+            if health["sessions_ok"].as_u64().unwrap_or(0) >= n {
+                if n < 4 {
+                    assert_eq!(
+                        spacing(&health), Some(225),
+                        "a partial clean run must not narrow: {health}"
+                    );
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let health = proxy.health().await;
+    assert_eq!(
+        spacing(&health), Some(150),
+        "four clean sessions must narrow the spacing one step: {health}"
     );
     Ok(())
 }

@@ -4655,6 +4655,13 @@ async fn proxy_health() -> axum::response::Response {
                     "draining": field("draining"),
                     "sessions_ok": field("sessions_ok"),
                     "sessions_failed": field("sessions_failed"),
+                    // v241: the adaptive pace, so the back-off is visible from
+                    // the public side instead of only from the child's loopback
+                    // API — this is the state that decides whether a burst is
+                    // spaced enough.
+                    "dial_spacing_base_ms": field("dial_spacing_base_ms"),
+                    "dial_spacing_max_ms": field("dial_spacing_max_ms"),
+                    "dial_spacing_ms": field("dial_spacing_ms"),
                 })),
             )
                 .into_response()
