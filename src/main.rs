@@ -2536,6 +2536,13 @@ struct TlsProxyConfig {
     /// "Bursts and stalls" for the measurement behind the default.
     #[serde(default = "proxy_default_stall_timeout")]
     stall_timeout_secs: u64,
+    /// v240: how long a prover has to finish the COMMITMENT handshake, seconds.
+    /// That phase has no target connection yet, so the stall bound cannot see
+    /// it, and a prover that connects and then dies there used to hold a slot
+    /// until `session_timeout_secs`. Set well above the measured cost of a
+    /// healthy commit (2 s alone, 16 s under an eight-wide wave).
+    #[serde(default = "proxy_default_commit_timeout")]
+    commit_timeout_secs: u64,
     /// v238: minimum spacing between the child's outbound dials to one target
     /// ADDRESS, milliseconds; 0 disables pacing. The edge in front of
     /// `api-m.paypal.com` stalls relayed handshakes that arrive together from one
@@ -2605,6 +2612,11 @@ fn proxy_default_stall_timeout() -> u64 {
 
 fn proxy_default_dial_spacing_ms() -> u64 {
     1500
+}
+
+/// v240, kept in step with `DEFAULT_COMMIT_TIMEOUT` in tls-proxy/src/main.rs.
+fn proxy_default_commit_timeout() -> u64 {
+    60
 }
 
 #[derive(Clone)]
@@ -3453,6 +3465,7 @@ const LANDING_HTML: &str = r#"<!DOCTYPE html>
   <a class="dl alt" href="/proxy/health" target="_blank" rel="noopener">&#128273; TLS Notary status (&#47;proxy&#47;health)</a>
   <a class="dl alt" href="/proxy/attestations" target="_blank" rel="noopener">&#128203; Notarized sessions (&#47;proxy&#47;attestations)</a>
   <span class="hint"><code>&#47;proxy&#47;health</code> says whether the child is enabled, running and listening (with its ports and restart count); <code>&#47;proxy&#47;attestations</code> lists recorded sessions by host fingerprint &mdash; transcript bytes stay on loopback. Refused sessions: <a href="/proxy/refusals">&#47;proxy&#47;refusals</a>.</span>
+  <span class="hint" id="lastsession" hidden></span>
 
   <p>If a session of yours is listed there, fetch your own signed record &mdash; <code>&#47;proxy&#47;attestations&#47;&lt;id&gt;?sent_sha256=&hellip;&amp;received_sha256=&hellip;</code> with the digests your proof reveals &mdash; and check it here, offline:</p>
   <a class="dl" id="dlp" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify-proxy.html" download="verify-proxy.html">&#128190; Download verify-proxy.html</a>
@@ -3495,6 +3508,31 @@ function saveDownloader(linkId, hintId, name) {
 }
 saveDownloader('dl', 'hint', 'verify.html');
 saveDownloader('dlp', 'hintp', 'verify-proxy.html');
+
+// v240: a prover whose attempt ended has no shell to read and no way to tell
+// "my proof was refused" from "the target's edge never answered". The notary's
+// refusal ring already distinguishes them (see docs/tls-proxy.md), so the last
+// one is surfaced here, and a `stalled` verdict is spelled out as retryable.
+(async function () {
+  var el = document.getElementById('lastsession');
+  if (!el) return;
+  try {
+    var r = await fetch('/proxy/refusals', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    var j = await r.json();
+    var list = j.refusals || [];
+    var last = list[list.length - 1];
+    if (!last) return;
+    var line = 'Last notary session: ' + last.kind + ' — ' + last.reason;
+    if (last.kind === 'stalled') {
+      line = 'Last notary session stalled: nothing is wrong with your proof, the target\'s edge stopped answering. Retry the same session. (' + last.reason + ')';
+    }
+    el.textContent = line;
+    el.hidden = false;
+  } catch (e) {
+    // The notary being disabled or the API unreachable is not a page error.
+  }
+})();
 </script>
 </body>
 </html>
@@ -4509,6 +4547,10 @@ fn spawn_tls_proxy(cfg: &TlsProxyConfig) -> Arc<ProxySupervisor> {
                 .env(
                     "TLS_PROXY_STALL_TIMEOUT",
                     cfg.stall_timeout_secs.to_string(),
+                )
+                .env(
+                    "TLS_PROXY_COMMIT_TIMEOUT",
+                    cfg.commit_timeout_secs.to_string(),
                 )
                 .env("TLS_PROXY_DIAL_SPACING_MS", cfg.dial_spacing_ms.to_string())
                 .env("TLS_PROXY_CA_BUNDLE", "/etc/ssl/certs/ca-certificates.crt")
@@ -6473,6 +6515,7 @@ mod security_tests {
                     api_port: 8081,
                     session_timeout_secs: 120,
                     stall_timeout_secs: proxy_default_stall_timeout(),
+                    commit_timeout_secs: proxy_default_commit_timeout(),
                     dial_spacing_ms: proxy_default_dial_spacing_ms(),
                     signing_key_pem: None,
                     relay_targets: proxy_default_relay_targets(),

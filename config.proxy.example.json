@@ -25,6 +25,9 @@
             "session_port": 8443,
             "api_port": 8081,
             "session_timeout_secs": 120,
+            "stall_timeout_secs": 20,
+            "commit_timeout_secs": 60,
+            "dial_spacing_ms": 1500,
             "relay_targets": [
                 "api-m.paypal.com",
                 "api-m.sandbox.paypal.com",

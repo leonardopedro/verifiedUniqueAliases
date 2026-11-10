@@ -826,6 +826,56 @@ async fn closes_a_session_that_never_speaks() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+/// A prover that connects and then stops answering during the commitment
+/// handshake must be dropped at the commit bound, not held to the session
+/// timeout, and the verdict must tell the prover to retry.
+///
+/// This was the one phase with no bound at all: no target connection exists yet,
+/// so the stall watchdog has nothing to watch, and a prover that died in tlsn
+/// preprocessing left the notary in `commit()` for the full 120 s. Measured live
+/// (v239): one such session hung the prover harness past a 180 s timeout while
+/// the notary kept the slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closes_a_session_that_connects_and_never_commits(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _serial = SERIAL.lock().await;
+    // Session timeout 60 s on purpose: the commit bound (1 s) has to fire long
+    // before it, and the assertion below fails if it does not.
+    let proxy = Proxy::start(&[("TLS_PROXY_COMMIT_TIMEOUT", "1")]).await;
+    let mut socket = TcpStream::connect(("127.0.0.1", proxy.session_port)).await?;
+
+    let started = Instant::now();
+    let drained = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut buf = [0u8; 256];
+        loop {
+            match socket.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => continue,
+            }
+        }
+    })
+    .await;
+    drained.expect("the proxy held a silent prover open past the commit bound");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the commit bound did not end the session, took {:?}",
+        started.elapsed()
+    );
+
+    proxy.wait_for_failed(1).await;
+    let refusals = proxy.refusals().await;
+    assert_eq!(
+        refusals["refusals"][0]["kind"], "stalled",
+        "a prover that stops answering is retryable, not rejected: {refusals}"
+    );
+    let reason = refusals["refusals"][0]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("commitment handshake") && reason.contains("retry this session"),
+        "the verdict must name the phase and the fix, got: {reason}"
+    );
+    Ok(())
+}
+
 /// The operator's list must name the host a recorded session was about.
 ///
 /// v217 shipped a `list` that read `server_name` from a `body` object which
@@ -1082,8 +1132,11 @@ async fn refuses_a_relayed_session_that_never_answers(
         "a silent relay is a stall, not a timeout or a refusal of the prover: {refusals}"
     );
     let reason = last["reason"].as_str().unwrap_or("");
+    // The verdict names the silence with the bound it exceeded, from either of
+    // the two places a stall can be judged: the relay itself ("moved no byte")
+    // or the hand-over after the dial ("sent nothing").
     assert!(
-        reason.contains("moved no byte for 2s"),
+        reason.contains("moved no byte for 2s") || reason.contains("sent nothing for 2s"),
         "the reason must name the silence: {reason}"
     );
     assert!(

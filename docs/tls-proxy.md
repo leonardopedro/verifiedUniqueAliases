@@ -45,7 +45,8 @@ existed before this feature.
     "api_port": 8081,            // loopback-only attestation API
     "session_timeout_secs": 120,   // hard ceiling for one session
     "stall_timeout_secs": 20,       // silence on the relayed connection = stall
-    "dial_spacing_ms": 1500,        // spacing between dials to ONE target address
+    "commit_timeout_secs": 60,      // ceiling on the commitment handshake
+    "dial_spacing_ms": 1500,        // base spacing between dials to ONE target address
     "signing_key_pem": null,     // null/absent = fresh per-boot RSA-2048 key
     "restart_token": null,       // v233: operator token for POST /proxy/restart
     "relay_targets": [           // hosts a prover may commit to
@@ -183,10 +184,11 @@ file`, and the explanation existed only in the operator's refusal ring.
 `/refusals` answers the operator's question "why was that session rejected?"
 without a shell: each entry is `{at, kind, reason}`, where `kind` is `rejected`
 (a verdict was reached and refused — MPC mode, no revealed server identity, a
-mismatched name, a transcript over the bound), `stalled` (the relayed
-connection moved no byte for `stall_timeout_secs` — the target's edge accepted
-the TCP connection and then said nothing; retryable, see "Bursts and stalls"
-below) or `timeout` (no verdict in `session_timeout_secs`, with the last thing
+mismatched name, a transcript over the bound), `stalled` (nothing moved for a
+stall bound — the relayed connection was silent for `stall_timeout_secs` because
+the target's edge accepted the TCP connection and then said nothing, or the
+prover connected and stopped answering during the commitment handshake for
+`commit_timeout_secs`; retryable, see "Bursts and stalls" below) or `timeout` (no verdict in `session_timeout_secs`, with the last thing
 the session did before it ran out — normally the address it was relaying to). Every refusal names its own cause,
 so a prover who got no answer at all has to be told what went wrong rather than
 being left with a bare disconnect. The reason quotes the prover's own commit, so it is
@@ -511,10 +513,25 @@ Two mechanisms answer that, both fail-soft:
   spaced out. A session that waits is logged and reported as `queued N.Ns for a
 dial slot to <host> (<addr>)`, which is a queue, not a stall. Eight sessions cost
   at most `7 × spacing` of extra wait for the last one.
+- **Adaptive spacing** (v240): the base is a starting point, not a constant. A
+  session refused as `stalled` widens that ADDRESS's spacing by half again, up
+  to `4 × dial_spacing_ms` (6 s on the default); each run of 4 sessions without
+  a stall narrows it by a third, never below the base. An edge having a bad
+  minute is then dialled less insistently instead of having its sessions thrown
+  away, and a healthy edge pays only a few sessions of extra latency afterwards.
+  Widening is immediate and narrowing is gradual on purpose — backing off too
+  late loses sessions, recovering too fast only costs a little latency. The
+  spacing in force is per address in `/health`'s `dial_spacing_ms` map.
 - **Stall verdict** (`stall_timeout_secs`, default 20): a relayed connection that
   moves no byte for this long is refused as `stalled`, naming the phase and
   telling the prover to retry. Before this, such a session sat until the 120 s
   `session_timeout_secs`, holding its slot for 100 s of nothing.
+- **Commit ceiling** (`commit_timeout_secs`, default 60): the commitment
+  handshake has no target connection yet, so the stall watchdog has nothing to
+  watch — and tlsn's preprocessing is CPU-bound on the prover, quiet for seconds
+  between messages (2 s alone, 16 s under an eight-wide wave). A prover that
+  connects and then dies here used to hold its slot for the full 120 s; it is now
+  refused as `stalled` at this bound, with "retry this session" in the reason.
 
 A prover should therefore retry once when an attempt ends before its verdict
 (the bundled harness does): with spacing in place a retry lands on a healthy
@@ -536,7 +553,8 @@ that reason.
   TLS to <host> (<address>)`): the address comes from the boot-time pin and
   cannot be re-derived afterwards, so a stall with no address in it is
   unactionable for an operator. A relayed connection that goes silent is cut at
-  `stall_timeout_secs` instead, so a stalled session frees its slot in 20 s.
+  `stall_timeout_secs` instead, so a stalled session frees its slot in 20 s, and
+  a prover that never finishes committing is cut at `commit_timeout_secs` (60 s).
 - Concurrent sessions are bounded by the target edge, not by the guest: 1–2 at a
   time is unconditionally safe, 4 works against both measured edges, and the
   notary itself serves 8 (see "Bursts and stalls").
