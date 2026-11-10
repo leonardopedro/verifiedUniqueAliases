@@ -2830,7 +2830,7 @@ handshake == report, sealed `/callback` refusals, notary named in the report.
 
 ### Live checks on v233b
 
-- `check-live-proxy-restart.mjs`: **OK** — `697ab9dc… → 64a9690085…2020`, cache
+- `check-live-proxy-restart.mjs`: **OK** — `697ab9dc… → 64a96900…`, cache
   served identical bytes before and after, re-mint inside a 132-second-old
   window.
 - Landing page over HTTPS links `PRIVACY.md`/`TERMS.md` (github.com blob) and
