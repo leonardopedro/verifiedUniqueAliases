@@ -64,13 +64,19 @@ if (!connected) fail(`${host}:${h.session_port} does not accept connections`);
 ok(`${host}:${h.session_port} accepts a session connection`);
 
 // A running child that refuses every proof is still a dead service: the list
-// route is the one the prover uses to find their own record.
+// route is the one the prover uses to find their own record. The shape is the
+// documented one — { service, running, count, sessions[], redaction } — not a
+// bare array.
 const list = await get('/proxy/attestations');
 if (list.status !== 200) fail(`/proxy/attestations → HTTP ${list.status}: ${list.text.slice(0, 200)}`);
-let arr;
-try { arr = JSON.parse(list.text); } catch { fail('/proxy/attestations is not JSON'); }
-if (!Array.isArray(arr)) fail(`/proxy/attestations is ${typeof arr}, expected an array`);
-ok(`/proxy/attestations answers 200 with ${arr.length} record(s)`);
+let l;
+try { l = JSON.parse(list.text); } catch { fail('/proxy/attestations is not JSON'); }
+if (l.service !== 'tls-proxy' || l.running !== true) {
+  fail(`/proxy/attestations reports service=${JSON.stringify(l.service)} running=${JSON.stringify(l.running)}`);
+}
+if (!Array.isArray(l.sessions)) fail(`/proxy/attestations has sessions: ${typeof l.sessions}, expected an array`);
+if (l.count !== l.sessions.length) fail(`/proxy/attestations count=${l.count} but lists ${l.sessions.length}`);
+ok(`/proxy/attestations answers 200 with ${l.count} record(s)`);
 
 // Give the health counters a moment to reflect the connect above; the numbers
 // are informational (a bare connect-and-close is counted as a failed session by
