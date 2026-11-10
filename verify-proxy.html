@@ -167,6 +167,19 @@
         </p>
     </div>
 
+    <div class="card">
+        <label for="reportInput">Attestation report (optional, from <code>GET /debug/envelope</code>)</label>
+        <input class="file-input" type="file" id="reportFile" accept=".json,.txt,application/json">
+        <textarea id="reportInput" spellcheck="false" placeholder='{"attestation_report":{"session_context":{"proxy_signing_key":{…}}}}'></textarea>
+        <p class="note">
+            The notary's key is generated per boot, so the record can only say "signed by this key". Paste this
+            boot's attestation report — the same JSON the login hands back, or a raw <code>/debug/envelope</code>
+            response — and this page checks the record's key against the key the report names. That report is
+            what <a href="verify.html">verify.html</a> audits against the TDX quote and the pinned measurements;
+            this page cannot repeat that check, and does not pretend to.
+        </p>
+    </div>
+
     <div class="results" id="results">
         <div class="status-card">
             <div class="verdict" id="verdict"></div>
@@ -181,9 +194,10 @@
             </details>
             <p class="note">
                 This page proves the record was produced and signed by the holder of
-                <code>enclave_pubkey_pem</code> and has not changed since. It does <em>not</em> prove that key is
-                the enclave's: that link is the hardware quote over the VM, checked by
-                <a href="verify.html">verify.html</a> against the attested disk. See
+                <code>enclave_pubkey_pem</code> and has not changed since, and — when you paste the attestation
+                report — that this boot's report names exactly that key. What it still cannot do is verify the
+                report's own quote: that link is the hardware quote over the VM, checked by
+                <a href="verify.html">verify.html</a> against the pinned measurements. See
                 <a href="docs/tls-proxy.md">docs/tls-proxy.md</a> for the full chain.
             </p>
         </div>
@@ -340,7 +354,7 @@ function checkDnsName(name) {
 }
 
 // Pure verification. No DOM, so scripts/test-verify-proxy.mjs drives it directly.
-async function auditAttestation(rawText) {
+async function auditAttestation(rawText, reportText) {
     const row = (id, title, state, desc) => ({ id, title, state, desc });
     const rows = [];
     let parsed;
@@ -461,10 +475,54 @@ async function auditAttestation(rawText) {
             ? 'the full notarized transcript is stored'
             : 'the stored transcript is a TRUNCATED prefix of the session (the signed digests cover only this part)'));
 
-    // 8. The one thing this page cannot do, stated as a row rather than a footnote.
-    rows.push(row('binding', 'Key bound to the enclave hardware', 'warning',
-        "not checked here — this page verifies the record, not who holds the key. Bind enclave_pubkey_pem "
-        + '(SHA-256 ' + esc(keyFp || '(unavailable)') + ") to the VM's hardware quote in verify.html."));
+    // 8. The key binding. The record's key is per-boot and self-asserted, so the
+    //    record alone cannot say it belongs to the enclave. The enclave's
+    //    attestation report (GET /debug/envelope, or the report a login hands
+    //    back) names the notary key and its fingerprint inside a body signed by
+    //    the enclave's identity key — and that identity key is what the TDX
+    //    quote's report_data commits to, together with /init and the disk
+    //    manifest. So a matching fingerprint here is the link from this record
+    //    to the hardware: not a new trust anchor, one more hop on the anchor
+    //    verify.html already checks.
+    const bindingText = String(reportText || '').trim();
+    if (!bindingText) {
+        rows.push(row('binding', 'Key bound to the enclave hardware', 'warning',
+            'not checked — paste the attestation report (GET /debug/envelope, or the report your login returned) '
+            + 'above to check it. The record alone names its key (SHA-256 ' + esc(keyFp || '(unavailable)') + '), which proves '
+            + 'nothing about who holds it.'));
+    } else {
+        let reportDoc = null;
+        let why = '';
+        try {
+            const env = JSON.parse(bindingText);
+            reportDoc = env && env.attestation_report ? env.attestation_report : env;
+            if (!reportDoc || typeof reportDoc !== 'object') throw new Error('no attestation_report object in the pasted JSON');
+        } catch (e) {
+            why = esc(e.message);
+        }
+        const named = reportDoc && reportDoc.session_context && reportDoc.session_context.proxy_signing_key;
+        if (why) {
+            rows.push(row('binding', 'Key bound to the enclave hardware', false,
+                'the pasted report is not usable: ' + why));
+        } else if (!named || named.available !== true) {
+            rows.push(row('binding', 'Key bound to the enclave hardware', false,
+                'the report does not name a notary key: '
+                + esc((named && named.reason) || 'session_context.proxy_signing_key is missing or available:false')
+                + ' — a record signed by this key is therefore not covered by a quote from this boot.'));
+        } else {
+            const reportedFp = String(named.pubkey_sha256 || '').toLowerCase();
+            const samePem = String(named.pubkey_pem || '') === String(parsed.enclave_pubkey_pem || '');
+            const sameFp = /^[0-9a-f]{64}$/.test(reportedFp) && reportedFp === keyFp;
+            rows.push(row('binding', 'Key bound to the enclave hardware', samePem && sameFp,
+                samePem && sameFp
+                    ? 'the report names this record\'s key: SHA-256 ' + reportedFp
+                      + ' — audit that report with verify.html to reach the TDX quote'
+                    : 'MISMATCH: the record\'s key fingerprints to ' + esc(keyFp || '(unavailable)')
+                      + ', the report names ' + esc(reportedFp || '(none)')
+                      + (samePem ? '' : ' (and the PEM differs)')
+                      + ' — the record was signed by a key this boot\'s attestation does not cover'));
+        }
+    }
 
     const ok = rows.every(r => r.state !== false);
     let transcript = '';
@@ -505,8 +563,9 @@ function renderAudit(res) {
 
 async function runProxyAudit() {
     const input = document.getElementById('attestationInput');
+    const report = document.getElementById('reportInput');
     const raw = input ? input.value : '';
-    const res = await auditAttestation(raw);
+    const res = await auditAttestation(raw, report ? report.value : '');
     renderAudit(res);
     return res.ok;
 }
@@ -515,6 +574,17 @@ if (typeof document !== 'undefined' && document.getElementById) {
     document.addEventListener('DOMContentLoaded', () => {
         const btn = document.getElementById('auditBtn');
         if (btn) btn.addEventListener('click', () => { runProxyAudit(); });
+        const reportFile = document.getElementById('reportFile');
+        if (reportFile) reportFile.addEventListener('change', (e) => {
+            const f = e.target.files && e.target.files[0];
+            if (!f) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                const input = document.getElementById('reportInput');
+                if (input) { input.value = String(reader.result); runProxyAudit(); }
+            };
+            reader.readAsText(f);
+        });
         const file = document.getElementById('attestationFile');
         if (file) file.addEventListener('change', (e) => {
             const f = e.target.files && e.target.files[0];

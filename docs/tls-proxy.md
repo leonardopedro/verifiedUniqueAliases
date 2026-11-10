@@ -130,6 +130,7 @@ nothing, and stops demanding PayPal app credentials only for the proxy-only case
 |---|---|
 | `TCP :8443` (`session_port`) | one TLSNotary session per connection |
 | `GET :8081/health` | counters: sessions total/ok/failed, stored attestations, stored refusals, uptime |
+| `GET :8081/pubkey` | the attestation signing key + its SPKI-DER SHA-256 — what the enclave's quoted report names |
 | `GET :8081/attestations` | ids, server names, timestamps |
 | `GET :8081/attestations/{id}` | the signed attestation |
 | `GET :8081/refusals` | why the last 32 sessions were refused, newest last |
@@ -226,9 +227,16 @@ The signature covers the **first ten fields in that order**, serialized as JSON
 (`serde_json` preserves declaration order, so a verifier rebuilds the exact bytes
 by copying them out of the response in the same order and dropping
 `enclave_pubkey_pem`, `signature_alg`, `signature_b64`). The public key is in the
-response, so verification needs no shared secret; what makes the key trustworthy
-is the hardware quote over the VM, which covers the measured initramfs that
-contains this binary.
+response, so verification needs no shared secret.
+
+What makes that key trustworthy is a second document, not the record: the
+enclave's attestation report publishes `session_context.proxy_signing_key` with
+the same PEM and its `pubkey_sha256` (SHA-256 of the SPKI DER). The report body is
+signed by the enclave's identity key, and the TDX quote's `report_data` commits to
+that identity key together with `/init` and the disk manifest — so the notary key
+is covered by the same hardware measurement that covers the PayPal flow. A
+verifier compares the record's key against the report's; it never has to take the
+record's word for whose key it is.
 
 ## What it proves, and what it does not
 
@@ -276,21 +284,37 @@ Ship a config with the `services` block (see `config.proxy.example.json`) as
 `user_data`. To run the same image as PayPal-only, ship a config without it — no
 rebuild, no different image.
 
-## Verifying an attestation
-
-0. Open `verify-proxy.html` (in this repository, or saved to disk) and paste the
-   attestation into it. It loads nothing — no CDN, no fonts, no fetch — because
-   every check it makes is RSA PKCS#1 v1.5 / SHA-256 through WebCrypto. It cuts
-   the signed byte range out of *your* copy of the file (falling back to dropping
-   insignificant whitespace if you re-formatted it), verifies the signature over
-   exactly those bytes, recomputes both digests, and reports the one thing it
-   cannot check: that `enclave_pubkey_pem` is the enclave's key. Do that with the
-   VM's hardware quote.
+## Verifying an attestation0. Open `verify-proxy.html` (in this repository, or saved to disk) and paste the
+   attestation into it, plus — in the second box — this boot's attestation
+   report (`GET /debug/envelope`, or the report your login returned). The page
+   loads nothing — no CDN, no fonts, no fetch — because every check it makes is
+   RSA PKCS #1 v1.5 / SHA-256 through WebCrypto. It cuts the signed byte range
+   out of *your* copy of the file (falling back to dropping insignificant
+   whitespace if you re-formatted it), verifies the signature over exactly
+   those bytes, recomputes both digests, and compares the record's key
+   fingerprint with the one the report names (see step 4).
 1. Fetch `GET :8081/attestations/<id>`.
 2. Rebuild the signed byte string (first ten fields, in order, compact JSON).
 3. Check `signature_b64` against `enclave_pubkey_pem` (RSA PKCS#1 v1.5, SHA-256).
-4. Bind `enclave_pubkey_pem` to the VM's TDX quote (the quote is what makes the
-   key the enclave's, not the operator's).
+4. Bind `enclave_pubkey_pem` to the enclave: the key is per-boot and
+   self-asserted, so the record alone proves nothing about who holds it. The
+   pipeline is:
+   `GET :8081/pubkey` → `{pubkey_pem, pubkey_sha256}` (SHA-256 over the
+   SubjectPublicKeyInfo DER) → the enclave fetches that same endpoint while
+   minting its attestation report and publishes it as
+   `session_context.proxy_signing_key = {available, algorithm, signature_alg,
+   pubkey_pem, pubkey_sha256, reported_sha256}` → the report body is signed by
+   the enclave's identity key, and the TDX quote's `report_data` commits to that
+   identity key **and** to `/init` and the disk manifest → so a fingerprint match
+   is a chain to the hardware, not a new anchor. Audit the report itself with
+   `verify.html`; `verify-proxy.html` performs the fingerprint comparison and
+   says plainly that the quote check lives there.
+   The enclave recomputes the fingerprint from the PEM it received rather than
+   copying the child's `pubkey_sha256`; the child's claim is kept alongside as
+   `reported_sha256` so a disagreement is visible instead of blessed.
+   A notary restart mints a new key; the report names whichever key was live
+   when it was minted (the envelope is cached for 15 minutes), so a stale
+   report names a stale key and the page fails closed — fetch a fresh report.
 5. Compare `sent_sha256`/`received_sha256` with the base64 bytes if you need the
    transcript itself.
 

@@ -1421,6 +1421,64 @@ fn pubkey_fingerprint(pem: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The notary's attestation-signing key, named in this report so a signed
+/// TLSNotary record can be tied to this hardware quote.
+///
+/// v231 (the caveat v230 shipped with): a proxy record authenticates itself with
+/// a per-boot RSA key that the record also carries, which on its own says only
+/// "whoever wrote this record had that key". The proxy now publishes the key and
+/// its SPKI-DER fingerprint on its loopback API, and every report minted here
+/// names them — so the quote's report_data (which binds this enclave's identity
+/// key, /init, and the disk manifest) transitively covers the notary key, and a
+/// record verifier can compare instead of trust.
+///
+/// The fingerprint is recomputed here from the PEM rather than copied from the
+/// child's answer: a wrong or missing PEM yields an empty field, never a value
+/// this process did not calculate.
+async fn attested_proxy_key() -> serde_json::Value {
+    let sup = match PROXY_SUPERVISOR.get() {
+        Some(sup) if sup.alive.load(Ordering::Relaxed) => sup,
+        _ => {
+            return serde_json::json!({
+                "available": false,
+                "reason": "services.tls_proxy is not enabled or its process is not running"
+            })
+        }
+    };
+    let body = match proxy_loopback_json("pubkey", sup.api_port, "/pubkey").await {
+        Ok(v) => v,
+        Err(_) => {
+            return serde_json::json!({
+                "available": false,
+                "reason": "the notary did not answer GET /pubkey on its loopback API"
+            })
+        }
+    };
+    let pem = body
+        .get("pubkey_pem")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let sha256 = pubkey_fingerprint(&pem);
+    if pem.is_empty() || sha256.is_empty() {
+        return serde_json::json!({
+            "available": false,
+            "reason": "the notary answered /pubkey without a usable public key"
+        });
+    }
+    serde_json::json!({
+        "available": true,
+        "algorithm": body.get("algorithm").cloned().unwrap_or(serde_json::Value::Null),
+        "signature_alg": body.get("signature_alg").cloned().unwrap_or(serde_json::Value::Null),
+        "pubkey_pem": pem,
+        "pubkey_sha256": sha256,
+        // The child's own claim, kept for cross-checking: a mismatch here means
+        // the PEM and its advertised fingerprint disagree, which is worth seeing
+        // rather than silently fixing.
+        "reported_sha256": body.get("pubkey_sha256").cloned().unwrap_or(serde_json::Value::Null),
+    })
+}
+
 /// The `nonce` seal slot's public key, in the same two forms as the TLS slot.
 ///
 /// v225 (user directive — two seals, one boot): a user may want to bind BOTH a
@@ -3663,6 +3721,7 @@ async fn debug_envelope(
     );
     let (tls_pubkey_pem, tls_pubkey_sha256) = attested_tls_key(&state);
     let (seal_pubkey_pem, seal_pubkey_sha256) = attested_seal_key(&state);
+    let proxy_signing_key = attested_proxy_key().await;
     let mut report_data = [0u8; 64];
     report_data[0..32].copy_from_slice(&nonce);
     let quote_res = tpm::quote(&hex::encode(nonce), Some(report_data));
@@ -3708,6 +3767,11 @@ async fn debug_envelope(
                 "code": { "pem": &tls_pubkey_pem, "sha256": &tls_pubkey_sha256 },
                 "nonce": { "pem": &seal_pubkey_pem, "sha256": &seal_pubkey_sha256 },
             },
+            // v231: the TLSNotary notary's signing key, so a proxy record's
+            // signature is anchored to this report instead of being trusted on
+            // its own say-so. `available: false` with a reason when the second
+            // service is not part of this deployment.
+            "proxy_signing_key": proxy_signing_key,
         },
         "hardware_level_attestation": quote_res,
         "timestamp_ms": chrono::Utc::now().timestamp_millis() as u64,
@@ -4050,6 +4114,9 @@ async fn callback(
     report_data[32..64].copy_from_slice(&client_session_binding(&client_pub, &client_nonce));
     let (tls_pubkey_pem, tls_pubkey_sha256) = attested_tls_key(&state);
     let (seal_pubkey_pem, seal_pubkey_sha256) = attested_seal_key(&state);
+    // v231: also name the notary key here, so the report a PayPal user keeps as
+    // their own evidence covers both webservices of this boot.
+    let proxy_signing_key = attested_proxy_key().await;
     let quote_res = tpm::quote(&hex::encode(nonce), Some(report_data));
 
     // v168 (plan Phase 2.2): FAIL-CLOSED report minting.
@@ -4119,6 +4186,9 @@ async fn callback(
                 "code": { "pem": &tls_pubkey_pem, "sha256": &tls_pubkey_sha256 },
                 "nonce": { "pem": &seal_pubkey_pem, "sha256": &seal_pubkey_sha256 },
             },
+            // v231: the notary's signing key, so a TLSNotary record's signature
+            // can be checked against the report a user already audits.
+            "proxy_signing_key": proxy_signing_key,
             // v179 (plan Phase 1.1): the client session bound into the quote's
             // report_data[32..64] is echoed here for transparency. The auditor
             // compares the QUOTE bytes against ITS OWN session values — this

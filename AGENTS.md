@@ -831,6 +831,7 @@ the order that finds bugs fastest (validated live 2026-10-23).
 
 ## Known Constraints & Notes
 
+- **TLSNotary record key binding (v231)**: the notary's record-signing key is per-boot and self-asserted in the record, so it is named in the enclave's attestation report instead — `session_context.proxy_signing_key = {available, algorithm, signature_alg, pubkey_pem, pubkey_sha256, reported_sha256}`. The proxy exposes `GET :8081/pubkey` (`pubkey_sha256` = SHA-256 over the SPKI DER); the enclave fetches it while minting `/debug/envelope` and the callback report, recomputes the fingerprint itself from the PEM, and keeps the child's own claim in `reported_sha256` so a mismatch is visible. `verify-proxy.html` compares the record's key fingerprint with the report's; the report's quote is audited by `verify.html`. A notary restart mints a new key, and the envelope is cached 15 minutes, so a stale report names a stale key and the page fails closed.
 - **EK Certificate ≠ Session AK** (by design): Never compare them during any verification pass. This mismatch is expected.
 - **No persistent AK handles on GCP**: `tpm2 getcap handles-persistent` always returns empty on GCP Confidential VMs — the enclave creates a session signing AK via `tpm2_createprimary` each boot.
 - **NVRAM buffer must be unbounded**: `tpm2 nvread -s <size>` truncates large certs. Always use `tpm2 nvread` without a size argument to retrieve the complete 1560-byte EC certificate blob.

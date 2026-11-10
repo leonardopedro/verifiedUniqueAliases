@@ -13,7 +13,7 @@ import { readFileSync, writeFileSync, mkdtempSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { createHash, generateKeyPairSync, sign as rsaSign } from 'crypto';
+import { createHash, createPublicKey, generateKeyPairSync, sign as rsaSign } from 'crypto';
 
 const repoRoot = new URL('..', import.meta.url).pathname;
 
@@ -236,6 +236,44 @@ console.log('\nTest 13: not-JSON and non-object inputs fail closed');
     check('array rejected', r2.ok === false);
     const r3 = await auditAttestation('{}');
     check('empty object rejected', r3.ok === false && r3.rows[0].id === 'shape');
+}
+
+console.log('\nTest 14: the record key vs the key this boot\'s report names');
+{
+    const fp = (pem) => hashOf(createPublicKey(pem).export({ type: 'spki', format: 'der' }));
+    const honestFp = fp(pubPem);
+    const withReport = (proxyKey) => JSON.stringify({
+        attestation_report: { session_context: { proxy_signing_key: proxyKey } },
+    });
+    const bindingOf = async (report) => {
+        const res = await auditAttestation(honest.text, report);
+        return { row: res.rows.find(r => r.id === 'binding'), ok: res.ok };
+    };
+
+    const good = await bindingOf(withReport({ available: true, pubkey_pem: pubPem, pubkey_sha256: honestFp }));
+    check('matching report → binding passes', good.row.state === true, JSON.stringify(good.row));
+    check('matching report → audit ok', good.ok === true);
+
+    // A raw /debug/envelope body carries attestation_report one level down; a
+    // bare report pasted without the wrapper must work the same way.
+    const bare = await bindingOf(JSON.stringify({ session_context: { proxy_signing_key: { available: true, pubkey_pem: pubPem, pubkey_sha256: honestFp } } }));
+    check('unwrapped report accepted', bare.row.state === true, JSON.stringify(bare.row));
+
+    const otherPem = generateKeyPairSync('rsa', { modulusLength: 2048 })
+        .publicKey.export({ type: 'spki', format: 'pem' }).toString();
+    const wrongKey = await bindingOf(withReport({ available: true, pubkey_pem: otherPem, pubkey_sha256: fp(otherPem) }));
+    check('a report naming another key → binding fails', wrongKey.row.state === false, JSON.stringify(wrongKey.row));
+    check('…and the audit fails', wrongKey.ok === false);
+
+    const wrongFp = await bindingOf(withReport({ available: true, pubkey_pem: pubPem, pubkey_sha256: 'a'.repeat(64) }));
+    check('a fingerprint that is not the key\'s → binding fails', wrongFp.row.state === false);
+
+    const absent = await bindingOf(withReport({ available: false, reason: 'services.tls_proxy is not enabled' }));
+    check('a report that names no notary → binding fails', absent.row.state === false);
+    check('…and says why', /not enabled/.test(absent.row.desc), absent.row.desc);
+
+    const garbage = await bindingOf('not json');
+    check('unusable report → binding fails, record still judged', garbage.row.state === false);
 }
 
 console.log(`\n${fail === 0 ? '✅ all checks passed' : '❌ failures'}: ${pass} passed, ${fail} failed`);

@@ -460,6 +460,32 @@ async fn attests_a_real_tls_session_end_to_end() -> Result<(), Box<dyn std::erro
         "the enclave signature must verify over the ten signed fields"
     );
 
+    // 6b. The key that signed this record is the one `/pubkey` names, and the
+    // fingerprint it advertises is the SHA-256 of the SPKI DER — the value the
+    // enclave recomputes and publishes inside its quoted report, and the value
+    // `verify-proxy.html` derives from `enclave_pubkey_pem`. All three must be
+    // the same number, or the record's key is not the one the quote covers.
+    let (status, pub_body) = http_get(api_port, "/pubkey").await?;
+    assert_eq!(status, 200, "pubkey: {pub_body}");
+    let pubkey_doc: serde_json::Value = serde_json::from_str(&pub_body)?;
+    assert_eq!(pubkey_doc["service"], "tls-proxy");
+    assert_eq!(
+        pubkey_doc["pubkey_pem"].as_str().unwrap_or(""),
+        attestation["enclave_pubkey_pem"].as_str().unwrap_or("<none>"),
+        "/pubkey must name the exact key that signs records"
+    );
+    use sha2::Digest as _;
+    let der = pubkey.public_key_to_der()?;
+    let expected_fp: String = sha2::Sha256::digest(&der)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        pubkey_doc["pubkey_sha256"].as_str().unwrap_or(""),
+        expected_fp,
+        "the advertised fingerprint must be SHA-256 over the SPKI DER"
+    );
+
     // 7. Tampering is detectable: one changed byte must break that signature.
     let mut tampered = signed_bytes.clone();
     tampered[0] ^= 0x01;

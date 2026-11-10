@@ -27,6 +27,9 @@
 //!                                per accepted connection
 //!   HTTP TLS_PROXY_HTTP_LISTEN   (default 127.0.0.1:8081, loopback only)
 //!        GET  /health            counters, in-flight sessions, drain state
+//!        GET  /pubkey            the attestation signing key + its SPKI-DER
+//!                                SHA-256, so the enclave's quoted report can
+//!                                name the key that signs records
 //!        POST /drain             stop accepting sessions; let running ones finish
 //!        GET /attestations       ids, server names, timestamps
 //!        GET /attestations/{id}  the signed attestation
@@ -154,6 +157,11 @@ struct RefusalRecord {
 struct SigningKey {
     key: PKey<openssl::pkey::Private>,
     pubkey_pem: String,
+    /// SHA-256 of the SubjectPublicKeyInfo DER — the same value
+    /// `pubkey_fingerprint()` computes in the enclave and `verify-proxy.html`
+    /// recomputes from `enclave_pubkey_pem`. Not the hash of the PEM text: a
+    /// verifier that re-encodes the key must land on the same bytes.
+    pubkey_der_sha256: String,
 }
 
 impl SigningKey {
@@ -161,7 +169,8 @@ impl SigningKey {
         let key = PKey::private_key_from_pem(pem.as_bytes())
             .map_err(|e| format!("TLS_PROXY_SIGNING_KEY_PEM is not a usable private key: {e}"))?;
         let pubkey_pem = String::from_utf8(key.public_key_to_pem()?)?;
-        Ok(Self { key, pubkey_pem })
+        let pubkey_der_sha256 = sha256_hex(&key.public_key_to_der()?);
+        Ok(Self { key, pubkey_pem, pubkey_der_sha256 })
     }
 
     /// Per-boot ephemeral key: nothing is written to disk, and the key dies
@@ -169,7 +178,8 @@ impl SigningKey {
     fn ephemeral() -> Result<Self, BoxError> {
         let key = PKey::from_rsa(Rsa::generate(2048)?)?;
         let pubkey_pem = String::from_utf8(key.public_key_to_pem()?)?;
-        Ok(Self { key, pubkey_pem })
+        let pubkey_der_sha256 = sha256_hex(&key.public_key_to_der()?);
+        Ok(Self { key, pubkey_pem, pubkey_der_sha256 })
     }
 
     fn sign(&self, body: &AttestedBody) -> Result<String, BoxError> {
@@ -500,6 +510,31 @@ async fn health(State(st): State<Arc<ProxyState>>) -> Json<serde_json::Value> {
     }))
 }
 
+/// `GET /pubkey` — the key that signs attestations, named by fingerprint so the
+/// enclave's hardware-attested report can commit to it.
+///
+/// This route exists because the record alone cannot say whose key signed it:
+/// `enclave_pubkey_pem` is per-boot and self-asserted. The PayPal service mints
+/// a TDX quote over its own identity plus the measured disk, and it fetches this
+/// endpoint while building that report, so the report names this key. A verifier
+/// then has two independent things — a signed record, and a quoted report that
+/// names the key — instead of one self-signed claim.
+///
+/// The fingerprint is over the SubjectPublicKeyInfo DER, so a verifier that
+/// re-encodes the PEM lands on the same bytes (`verify-proxy.html` does exactly
+/// that with WebCrypto). `pubkey_pem` is the exact string a record carries as
+/// `enclave_pubkey_pem`.
+async fn pubkey(State(st): State<Arc<ProxyState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "service": "tls-proxy",
+        "version": "tls-proxy/1",
+        "algorithm": "RSA-2048",
+        "signature_alg": "RSA-PKCS1-v1_5-SHA256",
+        "pubkey_pem": st.signer.pubkey_pem,
+        "pubkey_sha256": st.signer.pubkey_der_sha256,
+    }))
+}
+
 /// `POST /drain` — begin a graceful stop.
 ///
 /// New sessions are refused from here on; sessions already accepted keep
@@ -726,6 +761,7 @@ async fn main() -> Result<(), BoxError> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/pubkey", get(pubkey))
         .route("/drain", post(drain))
         .route("/attestations", get(list))
         .route("/attestations/{id}", get(get_one))

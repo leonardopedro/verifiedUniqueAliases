@@ -12,7 +12,8 @@
 //
 // Env: PROD_URL (default https://login.airma.de)
 //
-// Exit 0 = enabled, running, session port listening, attestation list readable.
+// Exit 0 = enabled, running, session port listening, list readable, notary key
+// named by the attested report.
 import { connect } from 'net';
 import { setTimeout as sleep } from 'timers/promises';
 
@@ -78,6 +79,31 @@ if (!Array.isArray(l.sessions)) fail(`/proxy/attestations has sessions: ${typeof
 if (l.count !== l.sessions.length) fail(`/proxy/attestations count=${l.count} but lists ${l.sessions.length}`);
 ok(`/proxy/attestations answers 200 with ${l.count} record(s)`);
 
+// The record key must be named by this boot's attestation report, or a signed
+// record is only self-asserted. The report is cached for 15 minutes, so a notary
+// restart can leave it naming a previous key — that is a real failure for an
+// auditor and is reported as one rather than retried away.
+const envelope = await get('/debug/envelope');
+if (envelope.status !== 200) fail(`/debug/envelope → HTTP ${envelope.status}: ${envelope.text.slice(0, 200)}`);
+let env;
+try { env = JSON.parse(envelope.text); } catch { fail('/debug/envelope is not JSON'); }
+const named = env?.attestation_report?.session_context?.proxy_signing_key;
+if (!named || named.available !== true) {
+  fail('the attestation report does not name the notary key (session_context.proxy_signing_key) — ' +
+       `a proxy record cannot be tied to the hardware quote: ${JSON.stringify(named?.reason || 'field missing')}`);
+}
+const { createHash, createPublicKey } = await import('crypto');
+const expectedFp = createHash('sha256')
+  .update(createPublicKey(named.pubkey_pem).export({ type: 'spki', format: 'der' }))
+  .digest('hex');
+if (named.pubkey_sha256 !== expectedFp) {
+  fail(`the report's proxy key fingerprint ${named.pubkey_sha256} is not SHA-256(SPKI DER) ${expectedFp}`);
+}
+if (named.reported_sha256 && named.reported_sha256 !== expectedFp) {
+  fail(`the notary advertises ${named.reported_sha256} but its PEM hashes to ${expectedFp}`);
+}
+ok(`the attestation report names the notary key (SPKI-DER SHA-256 ${expectedFp.slice(0, 16)}…) and it matches its PEM`);
+
 // Give the health counters a moment to reflect the connect above; the numbers
 // are informational (a bare connect-and-close is counted as a failed session by
 // design), so they are reported, never asserted.
@@ -88,4 +114,4 @@ try {
   ok(`counters: sessions_ok=${a.sessions_ok}, sessions_failed=${a.sessions_failed}, active=${a.active_sessions}`);
 } catch { /* informational only */ }
 
-console.log('RESULT: notary is enabled, spawned, listening and serving its attestation list — OK');
+console.log('RESULT: notary is enabled, spawned, listening, serving its list, and named by the attested report — OK');
