@@ -2752,3 +2752,102 @@ RTMR3 zero — all held. `verify.html`/`index.html` byte-identical, 302,938 B,
   while every other check passes (500/1). The repo copy is the trusted one — the
   pages copy is explicitly outside the trust model — but the gate stays red until
   the Pages build for `main` lands.
+
+---
+
+## 0.49 — v233: GitHub Pages is gone, and the notary can be cycled (2026-11-10)
+
+### Why Pages had to go (user directive, 2026-11-10)
+
+The project published `verify.html`, `zk.html`, `zk-rsa.html`, `privacy.html`,
+`terms.html` and the whole `zk/` artifact set on
+`leonardopedro.github.io/verifiedUniqueAliases/`, **and the security suite gated
+on that copy**. The directive: *Pages must not be used by this project, because
+it leads to a false sense of safety.* The trace backs it up:
+
+- The Pages build of `main` had been **failing** every run since the crash
+  before v231 (`pages build and deployment` → step `Upload artifact` → failure),
+  while the github.io copies kept serving the **v230-era page** (`7a6d9bd3…`).
+  Nothing said so: the site simply looked like the auditor, with old pins.
+- So the "served-auditor drift gate" (Test 46) was checking a host that (a) is
+  not deployed by any of this project's pipelines, (b) is not measured by any
+  attestation, and (c) had already been stale for hours twice (v192, v231) while
+  looking authoritative. A second, unmeasured copy of the page that *claims* to
+  be pinned is worse than no second copy.
+
+**What changed:**
+
+| Was | Now |
+|---|---|
+| `verify.html`/`zk.html`/`zk-rsa.html`/legal docs on Pages | repo only, fetched over `raw.githubusercontent.com` |
+| `zk.html`: `ZK_BASE = '…github.io/…/zk/'` | `ZK_BASE = 'https://raw.githubusercontent.com/…/main/zk/'` (raw sends `ACAO: *`; wasm 2.9 MB, zkey parts 60 MB + 45 MB, both under raw's 100 MB cap; `?v=` cache-busters still 200) |
+| `privacy.html` / `terms.html` (Pages-only HTML) | `PRIVACY.md` / `TERMS.md` in the repo, linked as GitHub blob (rendered), so the auditor's "Legal:" line points at a document nobody has to trust |
+| `origin/main` = "Pages source branch" | mirror of `alibabacloud` for readers; **no Pages origin in the project** |
+| Test 46 = "Pages copy == repo verify.html" (network, flaky, red whenever the Pages build stalled) | Test 46 = **"no GitHub Pages dependency"**: no shipped page or `src/main.rs` may contain a `github.io` URL, the auditor must take `zk.html` from raw, `zk.html` must take its artifacts from raw, the legal docs must be `PRIVACY.md`/`TERMS.md`, and `.nojekyll` must be gone |
+| `PAGES_PARITY` / `PAGES_VERIFY_URL` / `PAGES_ZK_ARTIFACTS` env in CI | removed (`build-attest.yml` has no Pages env) |
+| Auditor may run key flows from "`file://` or the pinned Pages copy" | `file://` only — which the page already enforced (`location.protocol === 'file:'`); only the prose was wrong |
+
+`zk.html`, `zk-rsa.html` and the auditor are still *standalone files the user
+saves and opens*, so nothing about the audit changes: the page already refused
+to generate keys anywhere but `file://`.
+
+### The notary can now be cycled without rebooting (v233)
+
+`POST /proxy/restart`, gated on `services.tls_proxy.restart_token` from the
+instance config (header `X-Proxy-Restart`). Without a token the route does not
+exist and answers `404`; a wrong token gets the same `404` — a caller who cannot
+use it is not told it is there. The supervisor `select!`s between `child.wait()`
+and a `Notify`, kills and re-execs on request, resets its backoff to 1 s (a
+requested cycle is not a crash), and keeps counting in `/proxy/health`
+(`restarts`). The token is compared as a SHA-256 of both sides so a guess costs
+the same work whatever its length. Unit test:
+`security_tests::proxy_restart_requires_the_configured_token`.
+
+This is what makes the v232 cache fix **provable live**, which was its one open
+caveat: `scripts/check-live-proxy-restart.mjs` shows, in five steps,
+
+1. two fetches inside the window are byte-identical (the cache still suppresses
+   TD quotes),
+2. `POST /proxy/restart` → `202`, `/proxy/health` `restarts 0 → 1`, notary back
+   up,
+3. the next fetch — still inside that window — names the NEW key, with a newer
+   `timestamp_ms` and a different enclave signature (re-minted, not spliced),
+4. the named key, its PEM and the report's own `reported_sha256` agree,
+5. the re-minted body is cached again (the re-mint did not disable the cache).
+
+### Release
+
+| pass | image | disk sha256 | note |
+|---|---|---|---|
+| 3 | `m-2ze7sffsyqktt4k7dvmt` | `b48e86b7…` | Pages removal + restart route, binary `6c9b3f5f…` |
+| **4 (live)** | **`m-2ze2yp6ozth582t22n3n`** (`paypal-tdx-esp-v233b-202611100851`) | **`ee291132…`** | page + pins in the ESP |
+
+Pins: `EXPECTED_RTMR2` `1e52cff6… → 45de4b4a…`, `EXPECTED_ENCLAVE_SHA256`
+`defbdd21… → 6c9b3f5f…`; MRTD `e0199499…`, RTMR0 `06a32a2f…`, RTMR1 `6fa03523…`,
+RTMR3 zero — held. `verify.html`/`index.html` byte-identical, 303,020 B,
+`90480d0f…`. Both passes: `HTTPS 200 (after 45s)`, `PARITY OK`, cert ==
+handshake == report, sealed `/callback` refusals, notary named in the report.
+
+### Live checks on v233b
+
+- `check-live-proxy-restart.mjs`: **OK** — `697ab9dc… → 64a9690085…2020`, cache
+  served identical bytes before and after, re-mint inside a 132-second-old
+  window.
+- Landing page over HTTPS links `PRIVACY.md`/`TERMS.md` (github.com blob) and
+  `verify.html` (raw) — zero `github.io` links.
+- `raw.githubusercontent.com` serves `zk/identity_escrow.wasm` (2,863,855 B),
+  `…zkey.part0` (60,000,000 B) and `…vkey.json` with `access-control-allow-origin: *`,
+  and `?v=` cache-busters still return 200.
+- `cargo test` 49/49 (new: restart-token gate), `test-verify-security` 505/0
+  (Test 46 rewritten, and the suite is green for the first time in this cycle
+  because nothing depends on a Pages build any more), `test-verify-proxy` 53/0,
+  `check-workflows` 3/3, `check-relay-targets` OK.
+
+### Notes for the next operator
+
+- The restart token is in the instance `user_data` (write-only from here — read
+  it with `aliyun ecs DescribeUserData`). Rotating it is a config-only change,
+  but it only takes effect on the next boot (config is read at boot).
+- `pages build and deployment` will keep failing on `main` until the Pages site
+  is deleted or its source repointed in repo settings — that is now harmless and
+  irrelevant: nothing in the project reads that origin.
