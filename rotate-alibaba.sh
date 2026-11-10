@@ -13,6 +13,7 @@
 # Gates:
 #   1 preflight  tools present, config JSON parses, instance exists,
 #                verify.html == index.html (byte-identical repo invariant),
+#                zk.html wasm/zkey pins == committed artifacts,
 #                tree clean (the disk digest must map to a commit)
 #   2 build      build-alibaba-docker.sh -> disk sha256/md5/size + binary sha
 #   3 stage      bytes to OSS, then Content-Length == local size and
@@ -182,6 +183,13 @@ phase_preflight() {
     local page_sha; page_sha=$(sha256_of verify.html)
     grep -q "$page_sha" README.md \
         || warn "README digest rows do not carry this verify.html sha256 — auditors would check a stale one"
+
+    # zk.html refuses to prove unless the bytes it downloads hash to its baked-in
+    # pins, and nothing at runtime compares a pin with the COMMITTED artifact —
+    # a half-rotated wasm/zkey would only ever fail in a user's browser.
+    node scripts/check-zk-pins.mjs --quiet \
+        || die "ZK artifact pins do not match the committed wasm/split zkey (run: node scripts/check-zk-pins.mjs)"
+    ok "ZK pins match the committed prover artifacts ($(sha256_of zk/identity_escrow.wasm | cut -c1-16)…)"
 
     [[ -n "$CONFIG_FILE" ]] || die "set ALI_CONFIG_FILE_PATH (the enclave config JSON for user_data)"
     [[ -f "$CONFIG_FILE" ]] || die "config not found: $CONFIG_FILE"
