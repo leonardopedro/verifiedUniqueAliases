@@ -183,25 +183,26 @@ the file it describes:
 
 | Artifact | Size | SHA-256 |
 |---|---|---|
-| `verify.html` | 303,020 bytes | `90480d0f06c20224f07ec287488ee2ba2ef25040bbf17ef8f0830f3327d265a9` |
+| `verify.html` | 303,002 bytes | `f50d441f8710b608e42bc54aa5c54668ce22c644baab72d4d8c34030c6cc4321` |
 | `zk.html` | 112,085 bytes | `aca1131c1d87f4149ddad7abb8541a2370c2b12c5d772d9516d696a553728cfc` |
 | `zk-rsa.html` | 100,043 bytes | `36e829ea21652cd4cebd71f58f1ce407735f5bf13aba42d157a7dfe5673ad4cb` |
-| `PRIVACY.md` | 1,871 bytes | `67276cda767d99dc7d687b51b04528a048c65efc21e05951d8e95ee95ba02a84` |
-| `TERMS.md` | 1,096 bytes | `0094202cf1dd9f4ffc7b1ce5c10dbd2749f5b956d97c3c1a1b8a9cb6346f74a4` |
+| `privacy.html` | 4,673 bytes | `e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8` |
+| `terms.html` | 3,663 bytes | `9e8daa06da92308c19aa85b1cf33ee44d92be19b0daebe031eecc952002fb61f` |
 
 ```bash
-sha256sum verify.html zk.html zk-rsa.html PRIVACY.md TERMS.md
-# 90480d0f06c20224f07ec287488ee2ba2ef25040bbf17ef8f0830f3327d265a9  verify.html
+sha256sum verify.html zk.html zk-rsa.html privacy.html terms.html
+# f50d441f8710b608e42bc54aa5c54668ce22c644baab72d4d8c34030c6cc4321  verify.html
 # aca1131c1d87f4149ddad7abb8541a2370c2b12c5d772d9516d696a553728cfc  zk.html
 # 36e829ea21652cd4cebd71f58f1ce407735f5bf13aba42d157a7dfe5673ad4cb  zk-rsa.html
-# 67276cda767d99dc7d687b51b04528a048c65efc21e05951d8e95ee95ba02a84  PRIVACY.md
-# 0094202cf1dd9f4ffc7b1ce5c10dbd2749f5b956d97c3c1a1b8a9cb6346f74a4  TERMS.md
+# e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8  privacy.html
+# 9e8daa06da92308c19aa85b1cf33ee44d92be19b0daebe031eecc952002fb61f  terms.html
 ```
 
 **What the service serves (v206):** `https://login.airma.de/` is a minimal
 landing only — the title, one paragraph on what this is, the two legal links
-(`PRIVACY.md` / `TERMS.md` in this repository — v233: no GitHub Pages origin is
-used anywhere in the project), a **Download `verify.html`** link to the
+(`privacy.html` / `terms.html`, hosted on the project's GitHub Pages site —
+v234: Pages exists for that extra information and nothing else), a **Download
+`verify.html`** link to the
 repository copy, and
 three short steps on what to do with it (open the saved file, log in there,
 load the encrypted report back). There is no path box and no link builder on
@@ -351,17 +352,26 @@ certificate only covers `*.githubusercontent.com`). That is the point: the bytes
 are checked against `boot_measurements.disk_manifest.verify.html` in the signed
 report, so the host serving them cannot quietly substitute a page.
 
-**v233: GitHub Pages is not used by this project at all.** It used to serve a
-"pinned" mirror of `verify.html` and the ZK artifacts; that mirror was a false
-sense of safety — nobody deploys it or measures it, so it silently served stale
-pins for hours (v192, v231) while reading as the authoritative copy. The
-repository (fetched over `raw.githubusercontent.com`) is the only network source
-for the auditor, the prover and the proving artifacts, and the legal documents
-live in it too (`PRIVACY.md`, `TERMS.md`). No origin outside the measured image
+**v234: GitHub Pages serves the legal pages only.** v233 had removed the origin
+entirely. It stays useful for exactly one thing — hosted, human-readable extra
+information (`privacy.html`, `terms.html` at the repository root). What must not
+come back is a "pinned" mirror of `verify.html` or of the ZK artifacts: that
+mirror was a false sense of safety — nobody deploys it or measures it, so it
+silently served stale pins for hours (v192, v231) while reading as the
+authoritative copy. The repository (fetched over `raw.githubusercontent.com`) is
+the only network source for the auditor, the prover and the proving artifacts.
+No origin outside the measured image
 is a redirect target either: one can change under a Return URL PayPal keeps
 forever, exactly the false assurance a "stable URL" gives. Only a saved
 `file://` copy may generate keys — every network-served copy is refused for the
 secure login.
+
+**Why the Pages build froze (fixed in v234).** `result` and `result-dev` were
+*committed* as symlinks into `/nix/store`; Jekyll's safe build refuses links that
+leave the repository, so the `Build with Jekyll` step failed on every push while
+the previously deployed site kept serving a months-old copy. They are now
+untracked and ignored, and `_config.yml` excludes the proving keys and the disk
+image so the published site stays under a megabyte.
 
 `scripts/check-live-tls-cert.mjs` enforces the certificate claim against the
 deployed service: the PEM served by `/tls-cert.pem`, the leaf the live handshake

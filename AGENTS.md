@@ -6,8 +6,8 @@
 |---|---|---|
 | **`alibabacloud`** (default branch) | ✅ Active line of work | Alibaba Cloud / **aliyun CLI** stack: `Dockerfile.alibaba`, `build-alibaba-docker.sh` (the build; wraps `build-alibaba-image.sh` + `build-initramfs-tools.sh`), `deploy-alibaba.sh`, `import-alibaba-image.sh`, `build-scripts/create-alien-deb.sh`. **Legacy (do not use for deploys)**: `build-alibaba.sh`, `build-alibaba-disk.sh` and `build-alibaba-simple.sh` are retired hard-fail stubs (v184/v185 — they produced non-bootable/unused artifacts) |
 | `oraclecloud` | 🧊 Archive — do not develop here | Former `main`: Oracle OCI stack (`Dockerfile.oci`, `build-oci-*.sh`, `deploy-oci.sh`, `import-oci-image.sh`), the v161–v162 security hardenings, and the `oasis/` Sapphire + SEV-SNP sub-project |
-| `oldmain` | 🧊 Archive ref — preserved 2026-10-26 | The former `main` (frozen at the v164 era, `67f5952`) that GitHub Pages used to deploy from; kept so the Pages re-point was fully reversible. **v233 removed Pages from the project entirely**, so this ref is history only |
-| `origin/main` | ✅ = `alibabacloud` (since 2026-10-26) | Mirror of the active line for readers. **v233 (user directive): no GitHub Pages origin is used by this project** — the auditor, the ZK prover and the proving artifacts are fetched from `raw.githubusercontent.com` only, and a second "pinned" https copy of the auditor was a false sense of safety (nobody deploys or measures it; it served stale pins for hours in the v192 and v231 incidents). Before 2026-10-26 it was `oraclecloud` content minus `capture-golden-pcrs.mjs`, later frozen at a v164 sync |
+| `oldmain` | 🧊 Archive ref — preserved 2026-10-26 | The former `main` (frozen at the v164 era, `67f5952`) that GitHub Pages used to deploy from; kept so the Pages re-point was fully reversible. Pages now publishes from `origin/main`, so this ref is history only |
+| `origin/main` | ✅ = `alibabacloud` (since 2026-10-26) | Mirror of the active line for readers, and the branch GitHub Pages publishes from. **v234 (user directive): Pages hosts the legal pages only** (`privacy.html`, `terms.html`) — the auditor, the ZK prover and the proving artifacts are fetched from `raw.githubusercontent.com`, because a second "pinned" https copy of the auditor was a false sense of safety (nobody deploys or measures it; it served stale pins for hours in the v192 and v231 incidents). Before 2026-10-26 it was `oraclecloud` content minus `capture-golden-pcrs.mjs`, later frozen at a v164 sync |
 
 - **The OCI files are NOT on this branch.** `build-oci-*.sh`, `Dockerfile.oci`, the v161+ `verify.html`/`scripts/` tooling and `oasis/` live only on `oraclecloud`. To resume Oracle work: `git switch oraclecloud`.
 - OCI local build state (host `ol10/` staging, `.build-provenance`, qcow2/UKI/initramfs images, `node_modules/`) was deliberately deleted from this worktree on 2026-10-16 — it is all gitignored/regenerable (`bash build-oci-docker.sh`, `bash extract-ol10-platform.sh`).
@@ -899,8 +899,9 @@ collude). What changed:
    `EXPECTED_ENCLAVE_SHA256` comment in verify.html. Harness Test 21d asserts
    the new semantics.
 2. **Auditor isolation (plan 3.3)** — key generation / login / decryption run
-   ONLY in a trusted auditor context (a saved `file://` copy; v233 removed the
-   GitHub Pages exception). The copy served by the enclave's own origin REFUSES all
+   ONLY in a trusted auditor context (a saved `file://` copy; v227 removed the
+   GitHub Pages exception — Pages now hosts the legal pages only, v234). The copy
+   served by the enclave's own origin REFUSES all
    key-generating flows (Web Auditor Tampering: the owner can rewrite that
    script at will); paste-report auditing still works there. Harness Test 24.
 3. **Malicious-App defense (plan 3.1)** — PayPal client id is hardware-bound

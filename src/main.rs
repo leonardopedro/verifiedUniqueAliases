@@ -2402,7 +2402,7 @@ const CALLBACK_CONTENT: &str = r#"<h1>Authentication Succeeded</h1>
                 <p><b>⏳ 1/3 — download in progress:</b> <code>encrypted-attestation-report.json</code> was saved the moment this page loaded. It is CIPHERTEXT, sealed to a throwaway key that only ever existed in the tab where you started the login — useless to anyone else, including this site.</p>
                 <p><b>🔒 2/3 — save the TLS certificate of THIS page:</b> this tab is the response that carried your attestation, so its certificate panel is the only independent record of that connection. <b>Chrome / Edge:</b> padlock → <i>Connection is secure</i> → <i>Certificate is valid</i> → Details → Export → PEM. <b>Firefox:</b> padlock → <i>Connection secure</i> → <i>More information</i> → View Certificate → ⋯ → Save/Export PEM. <b>Safari:</b> ⋯ → Show Certificate → drag it out. Do <b>not</b> use this site's <code>/tls-cert.pem</code> instead: it is served by the same party whose report you are about to check, so it can never disagree with the report. Script cannot read its own connection certificate — that is why this step is manual.</p>
                 <p><b>⬅️ 3/3 — go back to the PREVIOUS (local) tab</b> — your saved <code>verify.html</code> (the file you opened from <code>file://</code>). Load <code>encrypted-attestation-report.json</code> with the “Attestation JSON report” picker and the certificate you exported with the “Browser TLS certificate” picker, then run the audit. That trusted copy decrypts with the key it generated on load; with a certificate supplied, the channel row proves the endpoint you reached served exactly the chain recorded in the hardware-signed report. This tab holds nothing else — close it with the ✖ button whenever you like.</p>
-                <p style="margin:14px 0 0; font-size:0.85rem; color:#8b949e;">Further reading: <a href="https://github.com/leonardopedro/verifiedUniqueAliases/blob/main/PRIVACY.md" style="color:#64b5f6;">Privacy Policy</a> · <a href="https://github.com/leonardopedro/verifiedUniqueAliases/blob/main/TERMS.md" style="color:#64b5f6;">User Agreement</a> — served by this service, the party they describe.</p>
+                <p style="margin:14px 0 0; font-size:0.85rem; color:#8b949e;">Further reading: <a href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html" style="color:#64b5f6;">Privacy Policy</a> · <a href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html" style="color:#64b5f6;">User Agreement</a> — hosted by the project, the party they describe.</p>
                 <p id="cert-reminder" style="margin:12px 0 0; padding:10px 12px; border-radius:6px; background:#0d1117; border:1px solid #d29922; color:#d29922; font-size:0.9rem;">🔒 Export this tab's certificate <b>before</b> closing it — a closed tab's certificate cannot be retrieved. Nothing is held here: the ciphertext above is useless without the key that only ever existed in your other tab.</p>
                 <textarea id="e2ee-blob-view" readonly style="width:100%; height:180px; background:#0d1117; color:#9e9e9e; font-size:12px; border:1px solid #30363d; border-radius:6px; padding:10px; box-sizing:border-box;"></textarea>
                 <p><button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); t.select(); try{document.execCommand('copy');this;}catch(e){} try{navigator.clipboard.writeText(t.value);}catch(e){} this.textContent='✅ Copied — paste it into a trusted auditor';})()" style="margin-top:10px;">📋 Copy encrypted report</button> <button class="btn" onclick="window.close()" style="margin-top:10px;"> ✖ Close this tab</button></p>
@@ -3369,10 +3369,13 @@ fn html_with_secure_headers(bytes: Vec<u8>) -> Response {
 //   * the auditor and the ZK prover are taken from the project's GitHub
 //     repository — a copy that the enclave operator cannot rewrite on the way
 //     out is the whole point, and serving it from here defeated that;
-//   * the legal documents live in the repository (PRIVACY.md / TERMS.md), which
-//     is linked, not copied — v233: no GitHub Pages origin is used anywhere,
-//     here or in the auditor, because a second "pinned" copy of the page reads
-//     as a trusted one while nobody measures it;
+//   * the legal documents are hosted on the project's GitHub Pages site
+//     (privacy.html / terms.html at the repository root, published by the
+//     "pages build and deployment" workflow) and linked, never copied here.
+//     v234 (user directive): Pages is used ONLY for that human-readable extra
+//     information — the auditor, the ZK prover and the proving artifacts are
+//     still fetched from raw.githubusercontent.com, because a "pinned" copy of
+//     the page itself reads as trusted while nobody deploys or measures it;
 //   * what remains at `/` is a small static landing: the title, one paragraph
 //     of what this is, the two legal links, a DOWNLOAD link for verify.html
 //     from the repository, and numbered instructions on what to do next. No
@@ -3409,7 +3412,7 @@ const LANDING_HTML: &str = r#"<!DOCTYPE html>
 <div class="card">
   <h1>Hardware and PayPal-Attested Unique Aliases</h1>
   <p>One PayPal login, bound to genuine confidential-computing hardware (Intel TDX), yields one verified unique alias &mdash; mostly anonymous, provable by the receiver, and impossible to mint twice.</p>
-  <p class="legal">Legal: <a href="https://github.com/leonardopedro/verifiedUniqueAliases/blob/main/PRIVACY.md">Privacy Policy</a> &middot; <a href="https://github.com/leonardopedro/verifiedUniqueAliases/blob/main/TERMS.md">User Agreement</a></p>
+  <p class="legal">Legal: <a href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html">Privacy Policy</a> &middot; <a href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html">User Agreement</a></p>
 
   <a class="dl" id="dl" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html" download="verify.html">&#128190; Download verify.html</a>
   <span class="hint" id="hint"></span>

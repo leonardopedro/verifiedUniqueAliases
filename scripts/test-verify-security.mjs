@@ -2433,12 +2433,13 @@ console.log('\nTest 51: local-copy rescue card — non-file:// origins get save 
     html.includes('onclick="saveLocalCopy(this); return false;"'),
     'onclick still returns a promise');
   // v205 (user directive): the service serves ONLY the landing, so the legal
-  // documents are links into the repository (v233: PRIVACY.md / TERMS.md, no
-  // GitHub Pages origin) and the auditor/prover come from the same repository.
-  // Nothing legal is copied onto the service.
-  check('legal links point at the legal documents themselves',
-    html.includes('href="https://github.com/leonardopedro/verifiedUniqueAliases/blob/main/PRIVACY.md"')
-      && html.includes('href="https://github.com/leonardopedro/verifiedUniqueAliases/blob/main/TERMS.md"'),
+  // documents are hosted elsewhere and linked. v234 (user directive): that
+  // "elsewhere" is the project's GitHub Pages site, which exists for exactly
+  // this kind of human-readable extra information (privacy.html/terms.html at
+  // the repository root). Nothing legal is copied onto the service.
+  check('legal links point at the hosted legal documents (GitHub Pages)',
+    html.includes('href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html"')
+      && html.includes('href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html"'),
     'legal links missing or wrong');
   // And they are the ONLY legal links: no second copy buried in the login card
   // or the audit card.
@@ -2448,13 +2449,16 @@ console.log('\nTest 51: local-copy rescue card — non-file:// origins get save 
     check('exactly one Privacy Policy and one User Agreement link remain',
       legal === 1 && terms === 1, `privacy=${legal} terms=${terms}`);
   }
-  // v233: the auditor links to NO GitHub Pages origin at all — the legal
-  // documents live in the repository, and the auditor and the ZK prover are
-  // taken from raw.githubusercontent.com.
+  // v234: Pages may host the INFORMATIONAL pages only. Every audit byte —
+  // verify.html itself, zk.html, the wasm and the proving key — comes from
+  // raw.githubusercontent.com, because a "pinned" copy of the page that no
+  // pipeline deploys and no attestation measures reads as trusted while it is
+  // not (the v192/v231 stale-pin incidents).
   {
-    const pagesHrefs = [...html.matchAll(/href="(https:\/\/[\w.-]*github\.io[^"]*)"/g)].map((m) => m[1]);
-    check('the auditor links to no GitHub Pages origin (legal docs are in the repo)',
-      pagesHrefs.length === 0, JSON.stringify(pagesHrefs.slice(0, 4)));
+    const pagesHrefs = [...html.matchAll(/href="(https?:\/\/[\w.-]*github\.io\/[^"]*)"/g)].map((m) => m[1]);
+    const legalOnly = pagesHrefs.every((h) => /\/(privacy|terms)\.html$/.test(h));
+    check('every GitHub Pages link in the auditor is a legal page, nothing else',
+      pagesHrefs.length === 2 && legalOnly, JSON.stringify(pagesHrefs.slice(0, 4)));
     check('the ZK prover link points at the repository, not at Pages',
       html.includes('href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/zk.html"'),
       'zk prover still linked to Pages');
@@ -3566,35 +3570,55 @@ console.log('\nTest 45: real Groth16 credential from the CAPTURED odd-length rep
     opened.sha256 === rep.paypal_user_info_raw_hash);
 }
 
-console.log('\nTest 46: no GitHub Pages dependency (v233 directive)');
+console.log('\nTest 46: Pages hosts the legal pages ONLY — never an audit byte (v234 directive)');
 {
-  // The project used to publish verify.html, zk.html and the ZK artifacts on
-  // leonardopedro.github.io and this suite gated on that copy. The gate was
-  // itself the problem: Pages is a build nobody deploys or measures, it
-  // silently served stale pins for hours (the v192 and v231 incidents), and a
-  // second "pinned" copy of the auditor reads as authoritative while no
-  // attestation ever covers it — a false sense of safety. v233 removes the
-  // origin from the project: raw.githubusercontent.com is the only byte source
-  // for the auditor, the prover and the proving artifacts. This test fails if
-  // any shipped page or the service starts pointing at Pages again.
-  const pagesRe = /https?:\/\/[\w.-]*github\.io\//;
-  const shipped = ['verify.html', 'index.html', 'zk.html', 'zk-rsa.html', 'src/main.rs'];
-  const hits = shipped.filter((f) => {
-    try { return pagesRe.test(readFileSync(join(repoRoot, f), 'utf8')); } catch { return false; }
-  });
-  check('no shipped page or service file references a GitHub Pages origin',
-    hits.length === 0, hits.length ? `found in ${hits.join(', ')}` : 'clean');
+  // v233 removed Pages wholesale; v234 (user directive) brought back the part
+  // it is actually good for: hosted, human-readable extra information such as
+  // the privacy policy and the user agreement. What must NOT come back is the
+  // second "pinned" copy of the auditor or of the proving artifacts — that one
+  // silently served stale pins for hours (the v192 and v231 incidents) while
+  // no pipeline deployed it and no attestation measured it. This test pins the
+  // boundary from both sides.
+  const pagesRe = /https?:\/\/[\w.-]*github\.io\/([^"'\s)]*)/;
+  const auditBytes = ['verify.html', 'index.html', 'zk.html', 'zk-rsa.html', 'src/main.rs'];
+  const offenders = [];
+  for (const f of auditBytes) {
+    let txt = '';
+    try { txt = readFileSync(join(repoRoot, f), 'utf8'); } catch { continue; }
+    for (const m of txt.matchAll(new RegExp(pagesRe, 'g'))) {
+      if (!/(^|\/)(privacy|terms)\.html$/.test(m[1])) offenders.push(f + ' → ' + m[0]);
+    }
+  }
+  check('no shipped page or service file takes anything but the legal pages from Pages',
+    offenders.length === 0, offenders.slice(0, 4).join('; ') || 'clean');
   const auditor = readFileSync(join(repoRoot, 'verify.html'), 'utf8');
   check('the auditor downloads zk.html from raw.githubusercontent.com',
     /var ZK_PROVER_URL = 'https:\/\/raw\.githubusercontent\.com\//.test(auditor));
   const prover = readFileSync(join(repoRoot, 'zk.html'), 'utf8');
   check('zk.html loads its proving artifacts from raw.githubusercontent.com',
     /var ZK_BASE = 'https:\/\/raw\.githubusercontent\.com\//.test(prover));
-  const legal = ['PRIVACY.md', 'TERMS.md'];
-  check('legal documents live in the repository, not on a hosted site',
-    legal.every((f) => existsSync(join(repoRoot, f))) && !existsSync(join(repoRoot, 'privacy.html')),
-    'expected PRIVACY.md + TERMS.md and no privacy.html');
-  check('.nojekyll (a Pages-only artifact) is gone', !existsSync(join(repoRoot, '.nojekyll')));
+  check('the legal pages exist at the repository root, where Pages publishes them',
+    existsSync(join(repoRoot, 'privacy.html')) && existsSync(join(repoRoot, 'terms.html')),
+    'privacy.html / terms.html missing');
+  // The 2026-11 Pages freeze: `result`/`result-dev` were COMMITTED as symlinks
+  // into /nix/store, and Jekyll's safe build refuses links that leave the
+  // repository — so "Build with Jekyll" failed on every push and the site kept
+  // serving a months-old copy while looking healthy. They must stay untracked.
+  {
+    const tracked = execFileSync('git', ['ls-files', '-s', 'result', 'result-dev'], { cwd: repoRoot, encoding: 'utf8' });
+    check('no nix build outputs are committed as symlinks (this froze the Pages build)',
+      tracked.trim() === '', tracked.trim());
+    const ignore = readFileSync(join(repoRoot, '.gitignore'), 'utf8');
+    check('the nix build outputs are ignored instead',
+      /^\/result$/m.test(ignore) && /^\/result-dev$/m.test(ignore), '/result not in .gitignore');
+  }
+  check('the Pages build is small: the proving keys and the disk image are excluded',
+    (() => {
+      const cfg = readFileSync(join(repoRoot, '_config.yml'), 'utf8');
+      return /^exclude:/m.test(cfg) && /(^|\s)-\s*zk$/m.test(cfg) && /(^|\s)-\s*output-alibaba$/m.test(cfg);
+    })(), '_config.yml does not exclude zk/output-alibaba');
+  check('.nojekyll (which would skip the Jekyll build Pages actually runs) is absent',
+    !existsSync(join(repoRoot, '.nojekyll')));
 }
 
 console.log('\nTest 47: zk-rsa.html — RSA ZK escrow credential (PGP / X.509 / PEM / raw)');

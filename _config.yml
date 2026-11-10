@@ -1,0 +1,17 @@
+# GitHub Pages settings (v234).
+#
+# Pages publishes the INFORMATIONAL pages only: the landing/auditor copy, the
+# ZK prover pages, and the legal documents (privacy.html, terms.html) the user
+# asked to keep hosted. Every byte an audit depends on (verify.html, zk.html,
+# the witness wasm, the Groth16 proving key) is served by
+# raw.githubusercontent.com and pinned by SHA-256 inside those pages — Pages is
+# never a source of audit data.
+#
+# The excludes keep that build small: the proving key parts and the released
+# disk image are ~160 MB of binary that a web page must never serve, and the
+# build runs on every push.
+exclude:
+  - zk
+  - output-alibaba
+  - build-scripts
+  - tls-proxy
