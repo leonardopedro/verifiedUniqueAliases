@@ -2650,3 +2650,105 @@ fetch a fresh report.
 
 Live `i-2ze1zdxis0hcsg91qbh5`, image `m-2zedx7ou4muj4ulruuxz`, EIP
 `101.200.178.251`; PayPal service on :443, notary on :8443 (api 127.0.0.1:8081).
+
+---
+
+## 0.48 — v232: the two caveats from v231 are closed (2026-11-10)
+
+### 1. A restarted notary no longer leaves a report naming a dead key
+
+The 15-minute `/debug/envelope` cache existed to keep TD-quote generation off the
+request path (v180). It was keyed on time only, so after a notary restart the
+cached body kept naming the previous boot's key, and `verify-proxy.html` failed
+its (fail-closed) binding check until the window expired.
+
+The cache now remembers *what* it published: `CachedEnvelope { at,
+proxy_key_sha256, body }`. Every request probes the child's loopback
+`GET /pubkey` — 4 s timeout, no quote, no measurement work — and
+`envelope_cache_fresh()` re-mints the moment the live fingerprint differs:
+
+| cache state | live notary key | served |
+|---|---|---|
+| < 15 min, same fingerprint | same | cached body (no quote cost) |
+| < 15 min, different fingerprint | new | **re-minted** |
+| < 15 min, cached "no key" (`""`) | any key | **re-minted** |
+| < 15 min | unreachable | cached body |
+| ≥ 15 min | anything | re-minted |
+
+An unreachable notary deliberately does NOT invalidate: a process that cannot
+answer has not minted a new key, and re-minting per request would turn a crashed
+child into a quote generator — the exact DoS surface v180 removed. The probe
+costs one loopback GET, already bounded per-IP by `record_egress` (8 KiB/request,
+25 MB/hour).
+
+`verify-proxy.html`'s MISMATCH row now says what to do: re-fetch the report (a
+key change re-mints it) and check again; a second mismatch means the record
+really is not covered. Unit tests: `security_tests::envelope_cache_follows_the_notary_key`
+(covers all five rows plus window expiry) and the live proof below — two
+requests 2 s apart return byte-identical bodies, so the cache still suppresses
+quotes, and both name the running key.
+
+### 2. Boot no longer goes dark for half an hour
+
+v231 pass 2 sat "Running + dark" for 27 minutes: :8443 was up, :443 closed,
+because issuance at boot is a retry loop with no self-signed fallback (a
+self-signed cert would be a lie the padlock cannot expose — that stays). Two
+real defects made the window that long:
+
+* **Every retry registered a new ACME account.** `obtain_certificate_in_ram`
+  built the directory + account + order in one function, so each backoff round
+  created another account and another order at the CA — the behaviour that
+  *causes* per-account and per-IP rate limits. It is now split:
+  `open_account()` runs once per boot and `obtain_certificate_in_ram(&key,
+  &account)` re-orders on that same `Arc<Account>`.
+* **The backoff was blind.** A flat 15 s doubling to 300 s, whatever failed. Now
+  `acme_backoff(attempt, err, jitter)` reads the failure: a CA refusal
+  (`rateLimited`, "too many", duplicate certificate, pending order, "retry
+  after") waits 5 min → 30 min, while everything transient (DNS not propagated,
+  network blip, CA 5xx) retries 10 s → 120 s with up to 25 % jitter. A refusal
+  is waited out instead of hammered; a hiccup is not punished with a 5-minute
+  nap. `security_tests::acme_backoff_separates_refusals_from_hiccups` pins both
+  branches. Retries publish `acme attempt N: …` to the self-report sink (first
+  3, then every 10th) and advance the stage to `acme-retry-N`, so a dark box
+  explains itself in the bucket instead of needing `GetInstanceConsoleOutput`.
+
+`rotate-alibaba.sh` also stops treating a booting guest as a failed image: the
+`200` poll now runs for `VERIFY_WAIT_SECS` (default 1500 s, was a hard 10 min)
+and prints progress every minute, with a pointer to the self-report sink on
+timeout. That window is a legal boot state — v231 pass 2 needed 27 minutes and
+was healthy.
+
+### Release (two passes, both green on the first attempt)
+
+| pass | image | disk sha256 | note |
+|---|---|---|---|
+| 1 | `m-2zeg6aswcjkklkjjiku6` | `ea1b79de…` | pins read live; verify green, HTTPS in 45 s |
+| **2 (live)** | **`m-2zeiafiaongj0n5dolkf`** (`paypal-tdx-esp-v232b-202611100726`) | **`4f123cae…`** | page + pins in the ESP |
+
+Pins: `EXPECTED_RTMR2` `c436335f… → 1e52cff6…`, `EXPECTED_ENCLAVE_SHA256`
+`33308970… → defbdd21…`; MRTD `e0199499…`, RTMR0 `06a32a2f…`, RTMR1 `6fa03523…`,
+RTMR3 zero — all held. `verify.html`/`index.html` byte-identical, 302,938 B,
+`d5f2cd35…`. Both boots reached `200` in 45 s; no dark window at all this time.
+
+### Live checks on v232b
+
+- `PARITY OK` (deployed ESP == `disk-alibaba.raw`, `4f123cae…`); cert download ==
+  handshake == report; `/callback` sealed refusals; notary gate green with the
+  report naming key `d28f79f6…`.
+- Prover on `www.sandbox.paypal.com/signin`: 200 OK, 103 → 38,004 B, record
+  `9850c0d2…` fetched from this non-interactive machine (200, 52,089 B),
+  signature **VALID**, binding **VERIFIED** against `d28f79f6…`, report binary
+  `defbdd21…`.
+- `cargo test` 48/48 (2 new), proxy session 8/8, `test-verify-proxy` 53/0.
+
+### Remaining, known, not fixed here
+
+- **The stale-cache path is proven by unit test, not live**: restarting the
+  notary needs the child to exit, and nothing outside the enclave can make it
+  (that is deliberate). The decision logic is pure and covered; the wiring is one
+  probe + one re-mint.
+- **GitHub Pages is behind** (`7a6d9bd3…`, the v230-era page) and has not picked
+  up any of today's pushes, so `test-verify-security.mjs` Test 46 fails on drift
+  while every other check passes (500/1). The repo copy is the trusted one — the
+  pages copy is explicitly outside the trust model — but the gate stays red until
+  the Pages build for `main` lands.
