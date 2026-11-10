@@ -2456,3 +2456,98 @@ Live `i-2ze1zdxis0hcsg91qbh5`, image `m-2zefbu7nyrwv18mu8o31`; rollback
 `m-2ze907s3a43tcv075rd2` (v228b, same binary and RTMR2 — pins still apply).
 Superseded v228b image and its snapshot deleted; relay
 stopped; `/tmp` config and report captures removed.
+
+---
+
+## 0.46 — v230: the notary was missing from the disk, and is now tested live (2026-11-10)
+
+### What the test found before it could test anything
+
+Asked to exercise the newest webservice (the TLSNotary proxy), the first probe
+was the deployed one:
+
+```
+GET https://login.airma.de/proxy/health
+{"service":"tls-proxy","enabled":true,"running":false,
+ "last":"spawn failed: No such file or directory (os error 2)","restarts":0}
+GET /proxy/attestations → 503
+```
+
+`enabled: true` was only the *config's* wish. `build-alibaba-docker.sh` invoked
+`podman build -f Dockerfile.alibaba` without `--build-arg TLS_PROXY=1`, so
+Dockerfile.alibaba took its documented `TLS_PROXY=0` default, left `/tls-proxy-bin`
+empty and never installed the binary — while the production `user_data` still
+said `services.tls_proxy.enabled: true`. The v216 dual-service disk (built by
+`build-tls-proxy-image.sh`, which does pass the arg) was replaced at **v227**,
+and v227/v228/v229 consequently shipped a PayPal-only disk onto a config that
+asked for two services. PID 1 retried a file that was not there, every boot,
+for three releases — and nothing in the rotation noticed, because every gate
+looked at the PayPal service.
+
+### The fix (two halves, deliberately)
+
+1. **The build** (`build-alibaba-docker.sh`): `--build-arg TLS_PROXY="${TLS_PROXY:-1}"`.
+   Default on, because the deployed config enables the service; `TLS_PROXY=0`
+   still works for a deliberate PayPal-only deployment and now prints a warning
+   saying so.
+2. **The gate** (`scripts/check-live-notary.mjs`, new): asserts the thing that
+   was false — `/proxy/health` must report `enabled: true` **and** `running: true`
+   (and names the usual cause when it does not), the session port from that
+   response must accept a TCP connection, and `/proxy/attestations` must answer
+   200 with the documented `{count, running, sessions[]}` shape. It runs in the
+   rotation's verify phase (after the certificate and callback checks) and as a
+   third step in the daily `live-service-checks` workflow.
+
+The first draft of the list check asserted a bare array; the live route answers
+an object. The failure was caught by the gate itself during pass 1 and fixed
+before the release — the shape now asserted is the one in the source
+(`Attestation` flattened under `count`/`running`/`redaction`/`sessions`).
+
+### Release
+
+RTMR2 moved (the initramfs now carries the proxy binary); MRTD/RTMR0/1/3 and the
+PayPal binary did not. Two passes, as always when a pin moves.
+
+| pass | image | disk sha256 | RTMR2 |
+|---|---|---|---|
+| 1 (pin rotation) | `m-2zefbu7nyrwv18mu8o31` → built, swapped, pin read live | — | `3d58e6da…` |
+| **2 (live)** | **`m-2ze1wtngcskhet1y3lnn`** (`paypal-tdx-esp-v230b-202611100258`) | **`b3295c41…`** | **`3d58e6da…`** |
+
+Pin rotation: `EXPECTED_RTMR2` `a2b7baf1…` → `3d58e6da…`; `EXPECTED_MRTD`,
+`EXPECTED_RTMR0/1/3` and `EXPECTED_ENCLAVE_SHA256` (`406cdcb3…`) unchanged.
+Page `verify.html`/`index.html` 302,610 B, `7a6d9bd3…`; README rows updated.
+
+Rotation verify, all green: `PARITY OK`; certificate download == handshake ==
+report; `/callback` refuses junk in sealed plain text; **notary spawned,
+listening and serving its list**; security **508/0**, proxy **44/0**, seal
+`card` + `sealed-return`.
+
+### The live prover sessions (the actual test)
+
+`cargo test --manifest-path tls-proxy/Cargo.toml --test live -- --ignored --nocapture`
+with `LIVE_NOTARY=101.200.178.251:8443`, built locally against nix OpenSSL
+(`OPENSSL_DIR` → `nix build nixpkgs#openssl.dev`, because this box has no system
+headers):
+
+| target | attempt | time | status | transcript |
+|---|---|---|---|---|
+| `www.sandbox.paypal.com/signin` | **1/3** | 35.0 s | `200 OK` | 103 B → 37,996 B |
+| `sandbox.paypal.com/` | 2/3 | 57.0 s | `301 Moved Permanently` (expected — the sandbox apex redirects; the harness does not follow) | 89 B → 5,532 B |
+| `sandbox.paypal.com/robots.txt` | 1/3 | 22.1 s | `200 OK` | 99 B → 3,479 B |
+| `www.sandbox.paypal.com/robots.txt` | 1/3 | 11.6 s | `200 OK` | 107 B → 3,428 B |
+
+The capability URL the harness prints was then fetched from this machine (not
+the VM): `GET /proxy/attestations/e183297a…?sent_sha256=…&received_sha256=…`
+→ **200, 52,081 B**. The record verifies offline the way the service documents:
+rebuilt the signed bytes in declaration order, `crypto.verify("sha256", …)`
+against `enclave_pubkey_pem` → **valid (RSA-PKCS1-v1_5-SHA256)**, `sent_b64` and
+`received_b64` re-hash to the advertised digests, and the received transcript
+begins `HTTP/1.1 200 OK`. One retry on the bare-apex target is the documented
+edge-closing behaviour, not a regression.
+
+### State
+
+Live `i-2ze1zdxis0hcsg91qbh5`, image `m-2ze1wtngcskhet1y3lnn`, EIP
+`101.200.178.251`; notary `:8443` up, API `127.0.0.1:8081`. Rollback: the pass-1
+image (`paypal-tdx-esp-v230-…`, same RTMR2, old page). v229 image and snapshot
+deleted; relay stopped; `/tmp` config and record captures removed.
