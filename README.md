@@ -188,14 +188,18 @@ the file it describes:
 | `zk-rsa.html` | 100,043 bytes | `36e829ea21652cd4cebd71f58f1ce407735f5bf13aba42d157a7dfe5673ad4cb` |
 | `privacy.html` | 4,673 bytes | `e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8` |
 | `terms.html` | 3,663 bytes | `9e8daa06da92308c19aa85b1cf33ee44d92be19b0daebe031eecc952002fb61f` |
+| `PRIVACY.md` | 1,871 bytes | `67276cda767d99dc7d687b51b04528a048c65efc21e05951d8e95ee95ba02a84` |
+| `TERMS.md` | 1,096 bytes | `0094202cf1dd9f4ffc7b1ce5c10dbd2749f5b956d97c3c1a1b8a9cb6346f74a4` |
 
 ```bash
-sha256sum verify.html zk.html zk-rsa.html privacy.html terms.html
+sha256sum verify.html zk.html zk-rsa.html privacy.html terms.html PRIVACY.md TERMS.md
 # f50d441f8710b608e42bc54aa5c54668ce22c644baab72d4d8c34030c6cc4321  verify.html
 # aca1131c1d87f4149ddad7abb8541a2370c2b12c5d772d9516d696a553728cfc  zk.html
 # 36e829ea21652cd4cebd71f58f1ce407735f5bf13aba42d157a7dfe5673ad4cb  zk-rsa.html
 # e570784f6d65f3af0efa99fcb0c803146a1c20b43ac6635bd30aac66d01ac7c8  privacy.html
 # 9e8daa06da92308c19aa85b1cf33ee44d92be19b0daebe031eecc952002fb61f  terms.html
+# 67276cda767d99dc7d687b51b04528a048c65efc21e05951d8e95ee95ba02a84  PRIVACY.md
+# 0094202cf1dd9f4ffc7b1ce5c10dbd2749f5b956d97c3c1a1b8a9cb6346f74a4  TERMS.md
 ```
 
 **What the service serves (v206):** `https://login.airma.de/` is a minimal

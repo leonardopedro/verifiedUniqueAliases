@@ -2870,8 +2870,11 @@ the user agreement. v234 draws the boundary instead of dropping the origin:
   and are pinned by SHA-256 inside those pages. Test 46 now asserts BOTH halves:
   every `github.io` link in a shipped page must be `/privacy.html` or
   `/terms.html`, and the prover/artifact base must stay on raw.
-- `PRIVACY.md`/`TERMS.md` were deleted again (one source of truth: the hosted
-  pages).
+- `PRIVACY.md`/`TERMS.md` stay in the repository as *compatibility copies*:
+  the **deployed** v233b landing still links `github.com/…/blob/main/PRIVACY.md`,
+  so deleting them 404'd the user-visible legal links the moment v234 was pushed
+  (checked live). Delete them only after a release whose landing points at
+  Pages.
 
 ### Why the Pages build had been failing (root cause, not a guess)
 
