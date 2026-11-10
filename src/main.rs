@@ -3417,7 +3417,13 @@ const LANDING_HTML: &str = r#"<!DOCTYPE html>
   <a class="dl" id="dl" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html" download="verify.html">&#128190; Download verify.html</a>
   <span class="hint" id="hint"></span>
   <a class="dl alt" id="cert" href="/tls-cert.pem" download="enclave-tls-certificate.pem">&#128274; Download this connection&rsquo;s TLS certificate</a>
-  <span class="hint">Your browser&rsquo;s padlock shows the same certificate &mdash; compare the fingerprints. PayPal returns to <code>https://login.airma.de/callback</code> on this server, so this is the key a sealed code must name.</span>
+  <span class="hint">Your browser&rsquo;s padlock shows the same certificate &mdash; compare the fingerprints. PayPal returns the code to <code>https://login.airma.de/callback</code> on this server (the Return URL registered on the PayPal app), so no page in between ever holds it.</span>
+
+  <h2>Second webservice &mdash; TLS Notary</h2>
+  <p>The enclave also supervises an independent TLSNotary notary child. Its public endpoints, so you can see it exists without a shell:</p>
+  <a class="dl alt" href="/proxy/health" target="_blank" rel="noopener">&#128273; TLS Notary status (&#47;proxy&#47;health)</a>
+  <a class="dl alt" href="/proxy/attestations" target="_blank" rel="noopener">&#128203; Notarized sessions (&#47;proxy&#47;attestations)</a>
+  <span class="hint"><code>&#47;proxy&#47;health</code> says whether the child is enabled, running and listening (with its ports and restart count); <code>&#47;proxy&#47;attestations</code> lists recorded sessions by host fingerprint &mdash; transcript bytes stay on loopback. Refused sessions: <a href="/proxy/refusals">&#47;proxy&#47;refusals</a>.</span>
 
   <h2>What to do next</h2>
   <ol>

@@ -338,16 +338,19 @@
             <input type="text" id="customInfoInput" maxlength="512"
                 placeholder="Optional: your public key / wallet / nonce — bound into the hardware quote and the report"
                 style="width: 100%; padding: 10px; margin-top: 10px; border-radius: 4px; border: 1px solid #30363d; background: #0d1117; color: white;">
-            <!-- v225 (user directive — no redirect race): PayPal returns the code
-                 to THIS page instead of the enclave's /callback, so the code is
-                 sealed here before anything can consume it. Requires this page's
-                 exact URL to be allow-listed by the enclave AND registered as a
-                 redirect URI on the PayPal app. -->
-            <label style="display:block; margin-top:10px; font-weight:400; color:var(--text-dim); font-size:0.85rem; line-height:1.5;">
-                <input type="checkbox" id="sealedRedirectToggle" style="vertical-align:middle; margin-right:6px;">
-                <b>Seal the code in this page (no Esc needed)</b> — PayPal returns you here, this page encrypts the code to the attested key
-                and only then opens the enclave's <code>/callback</code>. Needs <code>https://</code> and this page allow-listed by the enclave.
-            </label>
+            <!-- v234 (user directive): the seal card and its checkbox are gone.
+                 PayPal delivers the authorization code to the Return URL
+                 REGISTERED ON THE PAYPAL APP (developer.paypal.com, "Enter a
+                 Return URL … your users are redirected to this URL") — not to
+                 the page that started the login — and a registered Return URL
+                 must be https. This auditor runs from file://, so it can never
+                 be that URL and never sees the code: there is nothing to paste
+                 and nothing to seal by hand. The boot binding is proven by the
+                 🔑 row instead, which compares the TLS key the report names
+                 with the one this browser recorded from the last audit. -->
+            <p style="display:block; margin-top:10px; color:var(--text-dim); font-size:0.85rem; line-height:1.5;">
+                PayPal returns the code to <code>https://login.airma.de/callback</code> — the Return URL registered on the PayPal app — which exchanges it for an attestation bound to <i>this</i> browser's session. No page sits between PayPal and the exchange, and nothing here has to copy, paste or seal the code.
+            </p>
             <label style="font-weight:400; color:var(--text-dim); font-size:0.85rem;">🚔 Optional Police escrow key (PGP public key — the enclave encrypts a SECOND copy of your attestation to it at login; leave empty for none; prefilled = Bundeskriminalamt)</label>
             <textarea id="policePgpInput" spellcheck="false" style="width:100%; height:90px; margin-top:6px; border-radius:4px; border:1px solid #30363d; background:#0d1117; color:#e6edf3; font-family:monospace; font-size:11px;">-----BEGIN PGP PUBLIC KEY BLOCK-----
 
@@ -494,27 +497,27 @@ Wmw2oAio9A==
                 </div>
             </div>
 
-            <!-- v224 (user directive): the key a sealed PayPal code must be
-                 encrypted to, named by the attestation itself. Two duties: the
-                 reported fingerprint must hash the reported PEM, and a report
-                 naming a key OTHER than the one this browser sealed to is a
-                 DIFFERENT BOOT — fail closed. -->
+            <!-- v234 (user directive): the attested TLS key is a READ-ONLY
+                 fact. The declared SHA-256 must hash the PEM the report ships
+                 (fail closed), and the key is compared with the one this
+                 browser recorded on its last audit of the same enclave — equal
+                 is the same boot, different is a reboot or another instance. -->
             <div id="tlsKeyCheck" class="check-item">
                 <div class="check-icon">🔑</div>
                 <div class="check-text">
                     <h4>Attested TLS Key</h4>
-                    <p id="tlsKeyDesc">Names the key this boot terminates TLS with — the key a sealed PayPal code must be encrypted to.</p>
+                    <p id="tlsKeyDesc">Names the key this boot terminates TLS with — the key PayPal's code reaches through <code>/callback</code>.</p>
                 </div>
             </div>
 
-            <!-- v225 (user directive — two seals, one boot): the report's SECOND
-                 slot. A nonce sealed to it comes back as user_nonce_sha256 in
-                 the same report as the PayPal identity. -->
+            <!-- v225: the report's SECOND key slot. Its PEM must hash to the
+                 declared fingerprint too; a sealed nonce comes back as
+                 user_nonce_sha256 in the same report as the PayPal identity. -->
             <div id="nonceCheck" class="check-item">
                 <div class="check-icon">🔏</div>
                 <div class="check-text">
                     <h4>Seal Slots (code + nonce)</h4>
-                    <p id="nonceDesc">Both keys this boot will open a seal with — the PayPal code’s and your own nonce’s.</p>
+                    <p id="nonceDesc">Both keys this boot publishes for seals — the TLS key and the nonce key — each hashed against its own PEM.</p>
                 </div>
             </div>
 
@@ -542,35 +545,6 @@ Wmw2oAio9A==
         <p id="zkHandoffStatus" style="margin:8px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);">Save both files, open zk.html from disk, then load the bundle there.</p>
     </div>
 
-    <!-- v224 (user directive): SEAL THE PAYPAL CODE TO THE ATTESTED TLS KEY.
-         The audit above says WHICH key this boot terminates TLS with; this
-         card encrypts the PayPal code to that key IN THIS BROWSER, so the code
-         exists in plaintext only here and inside the audited boot. The TLS key
-         is minted in RAM at boot and never persisted, so a different VM (or a
-         reboot of this one) cannot open the ciphertext — the second, data-
-         bearing attestation cannot come from a swapped instance. -->
-    <div id="sealCard" class="status-card" style="margin-top:20px;">
-        <label>🔑 Seal the PayPal code to the attested key <span style="font-weight:400; color:var(--text-dim);">(optional — binds the second attestation to the same boot)</span></label>
-        <p style="color: var(--text-dim); font-size: 0.85rem;">
-            <b>1.</b> Audit a <b>data-free</b> attestation above — the 🔑 row names the key this boot terminates TLS with.
-            <b>2.</b> Log in with PayPal in another tab. When PayPal sends you back to <code>/callback?code=…&amp;state=…</code>, press <b>Esc</b> (or the Stop button) before that page loads and copy the URL — the code must reach this page before anything consumes it.
-            <b>3.</b> Paste the URL below: the code is encrypted <b>here</b>, with WebCrypto RSA-OAEP/SHA-256, to exactly the key you audited, and the callback opens with <code>code_enc</code> instead of a clear code.
-            Only that boot holds the private half, so a replaced or rebooted instance answers “cannot open the sealed code with this boot’s TLS key” rather than handing back a report.
-        </p>
-        <label style="font-weight:400; color:var(--text-dim); font-size:0.9rem;">Attested TLS public key (auto-filled by the audit above)</label>
-        <textarea id="sealKeyInput" spellcheck="false" oninput="sealShowKeyFingerprint()" placeholder="-----BEGIN PUBLIC KEY----- … (session_context.tls_public_key_pem from the report you audited)" style="height:110px;"></textarea>
-        <p id="sealKeyStatus" style="margin:6px 0 0; font-size:0.82rem; word-break:break-all; color:var(--text-dim);"></p>
-        <label style="margin-top:12px; font-weight:400; color:var(--text-dim); font-size:0.9rem;">PayPal code — or the whole redirect URL</label>
-        <input type="text" id="sealCodeInput" spellcheck="false" placeholder="C21AA… or https://…/callback?code=C21AA…&amp;state=eyJ2Ijo…" style="width:100%; padding:10px; border-radius:4px; border:1px solid #30363d; background:#0d1117; color:#e6edf3;">
-        <label style="margin-top:12px; font-weight:400; color:var(--text-dim); font-size:0.9rem;">Session state (filled from the pasted URL, or from this tab’s login session)</label>
-        <input type="text" id="sealStateInput" spellcheck="false" placeholder="eyJ2Ijoi… (the state from the same redirect)" style="width:100%; padding:10px; border-radius:4px; border:1px solid #30363d; background:#0d1117; color:#e6edf3;">
-        <label style="margin-top:12px; font-weight:400; color:var(--text-dim); font-size:0.9rem;">Your own nonce <span style="opacity:0.75;">(optional — sealed to the report’s SECOND slot, so one boot is bound to both your code and your nonce)</span></label>
-        <input type="text" id="sealNonceInput" maxlength="512" spellcheck="false" placeholder="e.g. a commitment, an order id, a random string — signed back as user_nonce_sha256" style="width:100%; padding:10px; border-radius:4px; border:1px solid #30363d; background:#0d1117; color:#e6edf3;">
-        <p id="sealNonceStatus" style="margin:6px 0 0; font-size:0.82rem; word-break:break-all; color:var(--text-dim);"></p>
-        <button onclick="sealCodeAndOpen(); return false;" style="margin-top:14px;">🔒 Seal the code and open the callback</button>
-        <a id="sealOpenLink" href="#" style="display:none; margin-top:10px; word-break:break-all; font-size:0.8rem; color:#58a6ff;"></a>
-        <p id="sealStatus" style="margin:8px 0 0; font-size:0.85rem; min-height:1.2em; color:var(--text-dim);"></p>
-    </div>
     </div>
 </div>
 
@@ -862,11 +836,6 @@ Wmw2oAio9A==
     // verified — [0..32] stays strictly enforced, the slot is informational.
     var auditorSessionBindingHex = null;
     var lastAuditedPubKeyPem = null;
-    // v224: the TLS public key named by the report that last passed the audit,
-    // and the seal this browser performed against it (see sealCodeAndOpen).
-    var lastAuditedTlsKeyPem = null;
-    // v225: the `nonce` slot's key from the last audited report (seal_slots).
-    var lastAuditedNonceKeyPem = null;
     // v199: the envelope that last passed the audit, and the Police copy once
     // it has been decrypted — whichever arrives second completes the compare.
     var lastAuditedEnvelope = null;
@@ -1151,13 +1120,10 @@ Wmw2oAio9A==
                 throw new Error('the Police escrow box does not contain a PGP PUBLIC KEY BLOCK — fix it or clear it');
             }
 
-            // v225 (user directive — no redirect race): with the toggle on,
-            // PayPal returns the code to THIS page, which seals it before the
-            // enclave ever sees it. The URI must be allow-listed by the enclave
-            // and registered on the PayPal app; the enclave echoes the exact
-            // value it signed below, so a substitution is caught here.
-            const sealHere = !!(document.getElementById('sealedRedirectToggle') || {}).checked;
-            const hereUri = sealHere ? pageRedirectUri() : '';
+            // v234: the code comes back to the Return URL registered on the
+            // PayPal app — https://login.airma.de/callback — never to this
+            // saved file. No redirect_uri is requested, so there is nothing to
+            // substitute and no code to seal here.
 
             say('🔐 Requesting login session (no pre-login attestation — the PayPal login IS the filter)…');
             // v180 (user directive — no pre-login attestation): the enclave no
@@ -1172,7 +1138,7 @@ Wmw2oAio9A==
             const resp = await fetch(enclaveBase + '/attest/login-session', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ client_ecdh_pub_b64: pubB64, client_nonce_hex: nonceHex, flow: flow || 'verified', custom_info: customInfo === 'NONE' ? '' : customInfo, pgp_recipient: pgpKeyText, redirect_uri: hereUri || undefined })
+                body: JSON.stringify({ client_ecdh_pub_b64: pubB64, client_nonce_hex: nonceHex, flow: flow || 'verified', custom_info: customInfo === 'NONE' ? '' : customInfo, pgp_recipient: pgpKeyText })
             });
             if (!resp.ok) {
                 let errBody = '';
@@ -1214,13 +1180,6 @@ Wmw2oAio9A==
             // A mismatch means the enclave or the transport substituted the
             // session — abort before the user is sent to PayPal.
             const sf = pf.signed_fields;
-            // v225: whatever the enclave signed is what PayPal will be told.
-            // When this page asked to receive the code itself, the signed value
-            // must be exactly this page's URL — anything else would send the
-            // code to a different origin.
-            if (sealHere && String(sf.redirect_uri || '') !== hereUri) {
-                throw new Error('REDIRECT SUBSTITUTION: this tab asked for the code to return to ' + hereUri + ' but the enclave signed redirect_uri="' + String(sf.redirect_uri || '') + '" — aborting before PayPal.');
-            }
             const expectedBinding = await clientSessionBindingHex(new Uint8Array(pubRaw), nonceHex);
             if ((sf.custom_info || 'NONE') !== customInfo
                 || (sf.client_session_binding_hex || '').toLowerCase() !== expectedBinding) {
@@ -1267,24 +1226,6 @@ Wmw2oAio9A==
                 // prove the ciphertext's PKESK key-id == that signed value.
                 pgpTargetFp: escrowFpRaw || '',
             }));
-            // v225: remember the sealed-redirect round so the return trip to
-            // THIS page knows which state is its own and which enclave key was
-            // pinned at session time. The nonce (user-chosen, not a secret) is
-            // kept so one step can seal both slots later; the code never is.
-            if (sealHere) {
-                try {
-                    localStorage.setItem('pav_sealed_login_v1', JSON.stringify({
-                        host: enclaveBase, redirect: hereUri, state: sf.state,
-                        p_enc: pf.enclave_signing_public_key,
-                        // v225: both seal slots, as THIS enclave signed them in
-                        // the login response — the return leg seals from here,
-                        // so no attestation is fetched before or after PayPal.
-                        slots: sf.seal_slots || null,
-                        nonce: ((document.getElementById('sealNonceInput') || {}).value || '').trim(),
-                        at: Date.now(),
-                    }));
-                } catch (e) { /* no storage */ }
-            }
             try {
                 if (escrowFpRaw) sessionStorage.setItem('pav_pgp_target_fp', escrowFpRaw);
                 else sessionStorage.removeItem('pav_pgp_target_fp');
@@ -3948,45 +3889,43 @@ Wmw2oAio9A==
                 updateStatus('tlsCheck', 'warning', "ℹ️ Optional channel cross-check not requested — paste your browser's TLS certificate (field above) to bind this report to the live connection. Every other row does not depend on it.");
             }
 
-            // 6b. v224 (user directive): ATTESTED TLS KEY — what a sealed PayPal
-            // code must be encrypted to. Two duties, both fail-closed:
-            //   (a) the reported fingerprint must hash the reported PEM
-            //       (an internally inconsistent report is refused), and
-            //   (b) if this browser already sealed a code, the report must name
-            //       THAT key. The TLS key is minted in RAM every boot, so a
-            //       different key means a different (or rebooted) instance: the
-            //       seal cannot be opened there, and the report in hand is not
-            //       the boot the user sealed to. Never silently accept it.
+            // 6b. v234 (user directive): ATTESTED TLS KEY, read-only. The row
+            // states the key this boot terminates TLS with and refuses a report
+            // whose declared SHA-256 does not hash its own PEM (internally
+            // inconsistent = forged bookkeeping). It also compares the key with
+            // the one this browser recorded on its PREVIOUS audit of the same
+            // enclave: equal means the same boot, different means a reboot or
+            // another instance (a fact, never a failure — every reboot mints a
+            // new key in RAM).
             {
                 const sc = report.session_context || {};
                 const keyPem = String(sc.tls_public_key_pem || '').trim();
                 const declaredFp = String(sc.tls_public_key_sha256 || '').trim().toLowerCase();
                 if (!keyPem) {
                     updateStatus('tlsKeyCheck', 'warning',
-                        'ℹ️ This report names no TLS key (pre-v223 enclave, or the listener had not started yet) — there is nothing to seal a PayPal code to. Re-run the data-free attestation once the enclave is listening.');
+                        'ℹ️ This report names no TLS key (pre-v223 enclave, or the listener had not started yet) — the connection this report is about cannot be identified. Re-run the attestation once the enclave is listening.');
                 } else {
                     const fp = await tlsKeyFingerprint(keyPem);
-                    lastAuditedTlsKeyPem = keyPem;
-                    const keyField = document.getElementById('sealKeyInput');
-                    if (keyField && !keyField.value.trim()) keyField.value = keyPem;
-                    try { sealShowKeyFingerprint(); } catch (e) { /* no DOM */ }
                     if (declaredFp && declaredFp !== fp) {
                         updateStatus('tlsKeyCheck', false,
                             '❌ <b>Attested key fingerprint does not hash the PEM this report ships:</b> it declares <code>' + esc(declaredFp.slice(0, 24)) + '…</code> but the key hashes to <code>' + fp.slice(0, 24) + '…</code>. The report is internally inconsistent — refusing it.');
                         throw new Error('TLS KEY SELF-CONSISTENCY FAILED: session_context.tls_public_key_sha256 does not hash session_context.tls_public_key_pem.');
                     }
-                    const sealed = sealedKeyRecord();
-                    if (sealed) {
-                        if (sealed.sha256 !== fp) {
-                            updateStatus('tlsKeyCheck', false,
-                                '❌ <b>DIFFERENT BOOT — this is not the VM you sealed to.</b> This browser sealed a PayPal code to key <code>' + sealed.sha256.slice(0, 24) + '…</code>' + (sealed.host ? ' on <code>' + esc(sealed.host) + '</code>' : '') + ', but this report names <code>' + fp.slice(0, 24) + '…</code>. The TLS key is generated in RAM at every boot and never persisted, so the sealed code cannot be opened by whoever produced these bytes — and this attestation does not describe the instance you audited. Start again from a fresh data-free attestation.');
-                            throw new Error('TLS KEY MISMATCH: the report names key ' + fp.slice(0, 16) + '… but this browser sealed the PayPal code to ' + sealed.sha256.slice(0, 16) + '… — the enclave changed between the two attestations.');
-                        }
-                        updateStatus('tlsKeyCheck', true,
-                            '✅ <b>Same boot as the key you sealed to.</b> Fingerprint <code>' + fp.slice(0, 32) + '…</code> (SHA-256 of the SPKI DER, consistent with the reported value) matches the key this browser encrypted your PayPal code to on <code>' + esc(sealed.host || 'this enclave') + '</code> — so these bytes come from the instance that could open it.');
+                    // v234: no seal card, so the row states the key and, when
+                    // this browser audited a report from the same enclave
+                    // before, whether the boot is the same one. A different
+                    // key is NOT a failure — every reboot mints a new one — so
+                    // it is reported, never thrown: the audit of a report the
+                    // user asked for must not fail over a reboot.
+                    const prev = auditedTlsKeyRecord();
+                    const sameHostPrev = prev && prev.host && prev.host === lastEnclaveHost();
+                    rememberAuditedTlsKey({ host: lastEnclaveHost(), sha256: fp, at: Date.now() });
+                    if (sameHostPrev && prev.sha256 !== fp) {
+                        updateStatus('tlsKeyCheck', 'warning',
+                            '🔑 This boot’s TLS key: <code>' + fp.slice(0, 32) + '…</code> (SHA-256 of the SPKI DER, consistent with the reported value). Your last audit of <code>' + esc(prev.host) + '</code> named <code>' + prev.sha256.slice(0, 32) + '…</code> — a different key, which is expected after a reboot or on another instance. The key is generated in RAM at every boot and never persisted, so a report can only be matched to the boot that produced it.');
                     } else {
                         updateStatus('tlsKeyCheck', true,
-                            '🔑 This boot’s TLS key: <code>' + fp.slice(0, 32) + '…</code> (SHA-256 of the SPKI DER, consistent with the reported value). Seal your PayPal code to it in the card below — only this boot holds the private half, and only the boot that opened your seal can produce the data-bearing report.');
+                            '🔑 This boot’s TLS key: <code>' + fp.slice(0, 32) + '…</code> (SHA-256 of the SPKI DER, consistent with the reported value).' + (sameHostPrev ? ' Same key as your last audit of this enclave.' : ''));
                     }
                 }
             }
@@ -4002,16 +3941,15 @@ Wmw2oAio9A==
                 const slots = sc.seal_slots || null;
                 if (!slots) {
                     updateStatus('nonceCheck', 'warning',
-                        'ℹ️ This report names no seal slots (pre-v225 enclave) — a PayPal code can still be sealed to the TLS key above, but a custom nonce has no slot.');
+                        'ℹ️ This report names no seal slots (pre-v225 enclave) — only the TLS key above is published, and a custom nonce has no slot.');
                 } else {
                     const noncePem = String(((slots.nonce || {}).pem) || '').trim();
                     const nonceDecl = String(((slots.nonce || {}).sha256) || '').trim().toLowerCase();
                     let fp = '';
                     if (!noncePem) {
-                        updateStatus('nonceCheck', 'warning', 'ℹ️ The report names a `code` slot but no `nonce` slot — sealing a nonce is not available on this boot.');
+                        updateStatus('nonceCheck', 'warning', 'ℹ️ The report names a `code` slot but no `nonce` slot — a nonce seal is not available on this boot.');
                     } else {
                         fp = await tlsKeyFingerprint(noncePem);
-                        lastAuditedNonceKeyPem = noncePem;
                         if (nonceDecl && nonceDecl !== fp) {
                             updateStatus('nonceCheck', false,
                                 '❌ <b>Nonce slot is internally inconsistent:</b> it declares <code>' + esc(nonceDecl.slice(0, 24)) + '…</code> but its PEM hashes to <code>' + fp.slice(0, 24) + '…</code>. Refusing the report.');
@@ -4236,38 +4174,41 @@ Wmw2oAio9A==
     }
 
     // ========================================================================
-    // v224 (user directive) — SEALING THE PAYPAL CODE TO THE ATTESTED TLS KEY.
+    // v234 (user directive) — the seal card is gone; this primitive is not.
     //
-    // The report names the public half of the key this boot terminates TLS
-    // with (session_context.tls_public_key_pem). The private half is generated
-    // in RAM at boot, never persisted, and dies with the instance. So:
-    //   * encrypt the PayPal code to THAT key, in this browser, and the only
-    //     party that can open it is the boot whose attestation you just read;
-    //   * a replaced VM, a rebooted VM, or the webservice owner's second
-    //     instance simply cannot open it — the enclave answers "cannot open the
-    //     sealed code with this boot's TLS key" instead of a report.
-    // That is what makes the SECOND (data-bearing) attestation provably the
-    // same machine as the FIRST (data-free) one.
+    // PayPal delivers the authorization code to the Return URL registered on
+    // the app, and that URL must be https. This auditor runs from file://, so
+    // it never receives the code and nothing here has to encrypt it: the old
+    // card (and its checkbox) only existed because a redirect to a saved local
+    // file is impossible.
     //
-    // Wire format (pinned by src/main.rs rsa_oaep_open): RSA-OAEP with SHA-256
-    // for both the OAEP digest and MGF1, empty label, ciphertext = exactly the
-    // modulus size, transported as STANDARD base64 (with padding) in `code_enc`.
+    // What the page still needs is the fingerprint check below. The report
+    // names the public half of the key this boot terminates TLS with
+    // (session_context.tls_public_key_pem) plus its SHA-256, and the audit
+    // refuses a report whose two halves disagree.
     // ========================================================================
-    var SEAL_RECORD_KEY = 'pav_sealed_tls_key_v1';
-    // v225 (second slot): what this browser committed to, never the nonce text
-    // itself is required for the audit — only its SHA-256, which is what the
-    // report signs back as user_nonce_sha256.
-    var SEALED_NONCE_KEY = 'pav_sealed_nonce_v1';
 
-    function bytesToB64Std(u8) {
-        var s = '';
-        for (var i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
-        return btoa(s);
+    // The last TLS key this browser audited, per enclave. It exists so the 🔑
+    // row can say "same key as your last audit of this enclave" — the boot
+    // binding the user used to have to seal a code to, now a read-only fact.
+    var AUDITED_TLS_KEY = 'pav_audited_tls_key_v1';
+
+    function lastEnclaveHost() {
+        try {
+            return String((document.getElementById('localEnclaveHost') || {}).value || '').trim().replace(/\/+$/, '');
+        } catch (e) { return ''; }
     }
 
-    async function sha256Hex(text) {
-        const d = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(text))));
-        return Array.from(d).map(b => b.toString(16).padStart(2, '0')).join('');
+    function auditedTlsKeyRecord() {
+        try {
+            const o = JSON.parse(localStorage.getItem(AUDITED_TLS_KEY) || 'null');
+            if (o && typeof o.sha256 === 'string' && /^[0-9a-f]{64}$/.test(o.sha256)) return o;
+        } catch (e) { /* no storage */ }
+        return null;
+    }
+
+    function rememberAuditedTlsKey(rec) {
+        try { localStorage.setItem(AUDITED_TLS_KEY, JSON.stringify(rec)); } catch (e) { /* no storage */ }
     }
 
     // SHA-256 of an SPKI PEM's DER, lowercase hex — the same value the enclave
@@ -4277,258 +4218,6 @@ Wmw2oAio9A==
         const d = new Uint8Array(await crypto.subtle.digest('SHA-256', der));
         return Array.from(d).map(b => b.toString(16).padStart(2, '0')).join('');
     }
-
-    // v225: one sealing primitive for both slots. RSA-OAEP/SHA-256, empty
-    // label, exactly the modulus-size ciphertext the enclave opens.
-    async function sealToPem(pem, text) {
-        const der = pemToBytes(pem);
-        const fp = await tlsKeyFingerprint(pem);
-        let key;
-        try {
-            key = await crypto.subtle.importKey('spki', der, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['encrypt']);
-        } catch (e) {
-            throw new Error('that key cannot be used for RSA-OAEP/SHA-256 (' + e.message + ') — it must be an RSA public key from the report, not the enclave signing key.');
-        }
-        const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, key, new TextEncoder().encode(text)));
-        return { b64: bytesToB64Std(ct), len: ct.length, fp: fp };
-    }
-
-    // The exact URL PayPal should return the code to, for the "no Esc" flow:
-    // this page, without a query string or fragment (PayPal matches the
-    // registered redirect URI exactly). https only — PayPal refuses anything
-    // else, and so does the enclave's allowlist.
-    function pageRedirectUri() {
-        if (typeof location === 'undefined' || !/^https:$/.test(location.protocol)) {
-            throw new Error('the sealed redirect needs this page served over https:// from an origin the enclave allow-lists — a file:// copy cannot receive a PayPal redirect. Leave this box unticked: PayPal then returns to the enclave\u2019s own https://login.airma.de/callback, over the certificate you can download from it.');
-        }
-        return location.origin + location.pathname;
-    }
-
-    // The seal this browser performed: which key, for which enclave, when. The
-    // code itself is NEVER stored — only the fact that a code was sealed to a
-    // fingerprint, so a later report naming another key can be refused.
-    function sealedKeyRecord() {
-        try {
-            const o = JSON.parse(localStorage.getItem(SEAL_RECORD_KEY) || 'null');
-            if (o && typeof o.sha256 === 'string' && /^[0-9a-f]{64}$/.test(o.sha256)) return o;
-        } catch (e) { /* no storage */ }
-        return null;
-    }
-
-    function rememberSealedKey(rec) {
-        try { localStorage.setItem(SEAL_RECORD_KEY, JSON.stringify(rec)); } catch (e) { /* no storage */ }
-        try { sessionStorage.setItem(SEAL_RECORD_KEY, JSON.stringify(rec)); } catch (e) { /* no storage */ }
-    }
-
-    function sealSay(msg, color) {
-        const el = document.getElementById('sealStatus');
-        if (!el) return;
-        el.innerText = msg;
-        el.style.color = color || 'var(--text-dim)';
-    }
-
-    function sealKeySay(html, color) {
-        const el = document.getElementById('sealKeyStatus');
-        if (!el) return;
-        el.innerHTML = html;
-        el.style.color = color || 'var(--text-dim)';
-    }
-
-    // Live fingerprint of whatever key is in the seal field, plus whether it is
-    // the key this tab already sealed to.
-    async function sealShowKeyFingerprint() {
-        const el = document.getElementById('sealKeyInput');
-        const pem = el && el.value ? String(el.value).trim() : '';
-        if (!pem) {
-            sealKeySay('No key yet — audit a report above (its 🔑 row names one) or paste the key by hand.');
-            return;
-        }
-        let fp;
-        try { fp = await tlsKeyFingerprint(pem); }
-        catch (e) { sealKeySay('⚠️ That does not parse as a PEM public key (' + esc(e.message) + ').', '#d29922'); return; }
-        const sealed = sealedKeyRecord();
-        let tail = '';
-        let color = 'var(--text-dim)';
-        if (sealed) {
-            if (sealed.sha256 === fp) { tail = ' — <b>the key this tab sealed to</b> ✓'; color = '#3fb950'; }
-            else { tail = ' — ⚠️ NOT the key this tab sealed to (' + esc(sealed.sha256.slice(0, 24)) + '…' + (sealed.host ? ' on ' + esc(sealed.host) : '') + ')'; color = '#d29922'; }
-        }
-        sealKeySay('Fingerprint (SHA-256 of the SPKI DER): <code>' + fp.slice(0, 32) + '…</code>' + tail, color);
-    }
-
-    // Accept either a bare code or the whole PayPal redirect URL. A URL wins:
-    // it carries the state token the code was minted for, so the two can never
-    // be paired by hand wrongly.
-    function parseCallbackUrl(raw) {
-        const s = String(raw || '').trim();
-        const out = { code: '', state: '' };
-        if (!s) return out;
-        if (s.indexOf('code=') !== -1) {
-            let q = s;
-            const qi = q.indexOf('?');
-            if (qi !== -1) q = q.slice(qi + 1);
-            const hi = q.indexOf('#');
-            if (hi !== -1) q = q.slice(0, hi);
-            q.split('&').forEach(function (kv) {
-                const i = kv.indexOf('=');
-                if (i === -1) return;
-                const k = kv.slice(0, i);
-                let v = kv.slice(i + 1);
-                try { v = decodeURIComponent(v.replace(/\+/g, ' ')); } catch (e) { /* keep raw */ }
-                if (k === 'code') out.code = v;
-                else if (k === 'state') out.state = v;
-            });
-            if (out.code) return out;
-        }
-        out.code = s;
-        return out;
-    }
-
-    // One click: encrypt the code to the audited key, remember WHICH key it went
-    // to, then open /callback with code_enc (never a plaintext code). Nothing
-    // leaves this page unencrypted — no network call happens for the sealing
-    // itself, and the code is not stored anywhere.
-    async function sealCodeAndOpen() {
-        try {
-            const keyEl = document.getElementById('sealKeyInput');
-            const pem = keyEl && keyEl.value ? String(keyEl.value).trim() : '';
-            if (!pem) throw new Error('no attested TLS key in the field above — audit a data-free report first (its 🔑 row fills it in), or paste the key from that report.');
-            const host = ((document.getElementById('localEnclaveHost') || {}).value || '').trim().replace(/\/+$/, '');
-            if (!/^https:\/\/[^\/]+/.test(host)) throw new Error('enter the enclave origin (https://<enclave>) in the enclave-address field of the login card.');
-            const parsed = parseCallbackUrl((document.getElementById('sealCodeInput') || {}).value);
-            const code = parsed.code;
-            if (!code) throw new Error('paste the PayPal code (or the whole redirect URL) first — there is nothing to seal yet.');
-            const stField = ((document.getElementById('sealStateInput') || {}).value || '').trim();
-            const st = parsed.state || stField;
-            if (!st) throw new Error('no session state: the PayPal redirect URL carries it (?state=…) — paste the whole URL, or start the login from this tab so the state is remembered.');
-
-            sealSay('⏳ encrypting in this browser to the audited key (RSA-OAEP/SHA-256)…', '#d29922');
-            const sealed = await sealToPem(pem, code);
-            const fp = sealed.fp;
-            rememberSealedKey({ host: host, sha256: fp, at: Date.now() });
-            await sealShowKeyFingerprint();
-
-            // v225 (second slot): the user's own nonce, sealed to the report's
-            // `nonce` slot — the same boot, the same submission. Refused rather
-            // than silently dropped when a nonce was typed but no second slot
-            // key is known.
-            let noncePart = '';
-            let nonceNote = '';
-            const nonceText = ((document.getElementById('sealNonceInput') || {}).value || '').trim();
-            if (nonceText) {
-                if (!lastAuditedNonceKeyPem) throw new Error('a nonce was typed, but no second seal slot is known — audit a report that carries session_context.seal_slots (v225+) first.');
-                const sn = await sealToPem(lastAuditedNonceKeyPem, nonceText);
-                noncePart = '&nonce_enc=' + encodeURIComponent(sn.b64);
-                try { localStorage.setItem(SEALED_NONCE_KEY, JSON.stringify({ sha256: await sha256Hex(nonceText), at: Date.now() })); } catch (e) { /* no storage */ }
-                const ns = document.getElementById('sealNonceStatus');
-                if (ns) { ns.innerHTML = '🔏 Sealed to the nonce slot ' + sn.fp.slice(0, 32) + '… — the report will carry <code>user_nonce_sha256</code> = ' + esc((await sha256Hex(nonceText)).slice(0, 32)) + '…'; ns.style.color = '#3fb950'; }
-                nonceNote = ' + your nonce';
-            }
-
-            const url = host + '/callback?code_enc=' + encodeURIComponent(sealed.b64) + noncePart + '&state=' + encodeURIComponent(st);
-            const a = document.getElementById('sealOpenLink');
-            if (a) { a.href = url; a.style.display = 'block'; a.innerText = '↗ open the sealed callback (if the automatic jump was blocked)'; }
-            sealSay('🔒 Sealed ' + sealed.len + ' bytes to key ' + fp.slice(0, 16) + '…' + nonceNote + ' — opening the callback; a copy of the encrypted attestation will download there.', '#3fb950');
-            try { window.location.assign(url); } catch (e) { sealSay('⚠️ the automatic jump was blocked (' + e.message + ') — use the link above.', '#d29922'); }
-        } catch (e) {
-            sealSay('❌ ' + e.message, '#f85149');
-        }
-        return false;
-    }
-
-    // v225 (user directive — no redirect race): PayPal returned the code to
-    // THIS page. Seal it here, to the key the enclave attested for this boot,
-    // and only then open /callback with code_enc. Nothing the user does — no
-    // Esc, no copy/paste — can race the redirect, because the enclave's
-    // /callback is never in PayPal's return path.
-    (async function finishSealedLogin() {
-        try {
-            if (typeof location === 'undefined' || !location.search) return;
-            const q = new URLSearchParams(location.search);
-            const code = q.get('code') || '';
-            const st = q.get('state') || '';
-            if (!code || !st) return;
-            const note = (m, c) => {
-                const el = document.getElementById('loginProgress');
-                if (el) { el.textContent = m; el.style.color = c || '#58a6ff'; }
-            };
-            let marker = null;
-            try { marker = JSON.parse(localStorage.getItem('pav_sealed_login_v1') || 'null'); } catch (e) { /* no storage */ }
-            if (!marker || marker.state !== st) {
-                note('⚠️ PayPal returned a code to this page, but no sealed login in this tab matches it. If you meant to seal it, paste the redirect URL into the seal card below.', '#d29922');
-                return;
-            }
-            // v225 negative path: the code must have come back to the URI this
-            // session asked PayPal for. A marker whose recorded redirect is a
-            // different page means the code was delivered somewhere else (a
-            // substituted return URL, or another tab's round) — refuse instead
-            // of sealing a code that this page never asked to receive.
-            try {
-                const here = pageRedirectUri();
-                if (marker.redirect && String(marker.redirect) !== here) {
-                    throw new Error('REDIRECT SUBSTITUTION ON RETURN: PayPal returned this code to ' + here + ' but this login session asked for ' + String(marker.redirect) + ' — refusing to seal it. Paste the redirect URL into the seal card below if it is yours.');
-                }
-            } catch (e) {
-                // pageRedirectUri throws on non-https copies (file://): there is
-                // nothing to compare against, and the login toggle could not
-                // have been used from there either.
-                if (/REDIRECT SUBSTITUTION/.test(e.message)) throw e;
-            }
-            note('🔒 PayPal returned here — sealing the code to the key this boot signed…');
-            // No fetch: the keys came in the S_enc-signed login response, so
-            // nothing here relies on a fresh, unverified read (v180 keeps the
-            // page off the attestation routes entirely) and a boot change
-            // between login and return shows up as a fingerprint mismatch.
-            const slots = marker.slots || {};
-            const codePem = String(((slots.code || {}).pem) || '').trim();
-            if (!codePem) throw new Error('this login session carried no seal slot key — paste the redirect URL into the seal card below');
-            const declared = String(((slots.code || {}).sha256) || '').toLowerCase();
-            const s = await sealToPem(codePem, code);
-            if (declared !== s.fp) throw new Error('KEY SELF-CONSISTENCY FAILED: the fingerprint this session signed does not hash the key it shipped');
-            rememberSealedKey({ host: marker.host, sha256: s.fp, at: Date.now() });
-
-            // Second slot, same boot, same submission.
-            let noncePart = '';
-            const nonceText = String(marker.nonce || '').trim();
-            if (nonceText) {
-                const noncePem = String(((slots.nonce || {}).pem) || '').trim();
-                if (!noncePem) throw new Error('a nonce was requested at login, but the session carried no nonce seal slot');
-                const sn = await sealToPem(noncePem, nonceText);
-                if (String(((slots.nonce || {}).sha256) || '').toLowerCase() !== sn.fp) throw new Error('NONCE SLOT KEY MISMATCH: the session does not name the key it shipped');
-                // v225 negative path: the two slots are published as INDEPENDENT
-                // boot keys, and the audit says so. A session that ships one key
-                // in both slots is claiming a property it does not have, so a
-                // collapsed pair is refused rather than sealed twice.
-                if (sn.fp === s.fp) throw new Error('SLOT SUBSTITUTION: the code slot and the nonce slot are the SAME key — the two slots must be independent, so nothing was sealed. Reload and start a new login.');
-                noncePart = '&nonce_enc=' + encodeURIComponent(sn.b64);
-                try { localStorage.setItem(SEALED_NONCE_KEY, JSON.stringify({ sha256: await sha256Hex(nonceText), at: Date.now() })); } catch (e) { /* no storage */ }
-            }
-
-            try { localStorage.removeItem('pav_sealed_login_v1'); } catch (e) { /* no storage */ }
-            // The clear code is in this tab's address bar/history: drop it
-            // before navigating on, so a later Back cannot resurrect it.
-            try { history.replaceState(null, '', location.pathname); } catch (e) { /* no history */ }
-            const url = marker.host + '/callback?code_enc=' + encodeURIComponent(s.b64) + noncePart + '&state=' + encodeURIComponent(st);
-            note('🔒 Sealed ' + s.len + ' bytes to ' + s.fp.slice(0, 16) + '… — opening the enclave callback.', '#3fb950');
-            location.assign(url);
-        } catch (e) {
-            const el = document.getElementById('loginProgress');
-            if (el) { el.textContent = '❌ ' + e.message + ' — paste the redirect URL into the seal card below to seal it by hand.'; el.style.color = '#f85149'; }
-        }
-    })();
-
-    // Prefill the state from this tab's last login session (if any). The pasted
-    // redirect URL always wins inside sealCodeAndOpen, so a stale value here is
-    // never used silently.
-    (function () {
-        try {
-            const sess = JSON.parse(localStorage.getItem('pav_local_session') || 'null');
-            const st = document.getElementById('sealStateInput');
-            if (st && !st.value && sess && sess.state) st.value = String(sess.state);
-            const k = document.getElementById('sealKeyInput');
-            if (k && !k.value) sealShowKeyFingerprint();
-        } catch (e) { /* no DOM / no storage */ }
-    })();
 
 </script>
 

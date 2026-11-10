@@ -2499,10 +2499,24 @@ console.log('\nTest 51: local-copy rescue card — non-file:// origins get save 
     check('the landing offers the connection certificate the code is sealed to',
       /href="\/tls-cert\.pem"/.test(landing) && /login\.airma\.de\/callback/.test(landing),
       'landing is missing the /tls-cert.pem download or the callback return leg');
-    check('the sealed-redirect error no longer sends users to a Pages copy',
-      html.includes('function pageRedirectUri')
-        && !/use the GitHub Pages copy/.test(html),
-      'pageRedirectUri still recommends Pages');
+    // v234 (user directive): the seal card and its checkbox are GONE. PayPal
+    // returns the code to the app's registered Return URL (https), never to
+    // this saved file, so a page-received code was unreachable and its inputs
+    // only invited the user to paste a code nothing could use. The removal is
+    // pinned here so it cannot creep back in with the next page edit.
+    check('the seal card and its inputs are removed from the auditor',
+      !/id="sealCard"/.test(html) && !/id="sealKeyInput"/.test(html)
+        && !/id="sealCodeInput"/.test(html) && !/id="sealStateInput"/.test(html)
+        && !/id="sealedRedirectToggle"/.test(html) && !/sealCodeAndOpen/.test(html),
+      'seal-card machinery is still present');
+    check('the auditor no longer requests a page redirect_uri for the code',
+      !/redirect_uri: hereUri/.test(html) && !/function pageRedirectUri/.test(html)
+        && !/pav_sealed_login_v1/.test(html),
+      'the page-redirect/seal return leg is still wired');
+    check('the auditor still pins the TLS-key fingerprint primitive',
+      /async function tlsKeyFingerprint\(pem\)/.test(html)
+        && /auditedTlsKeyRecord\(\)/.test(html),
+      'the read-only attested-key row lost its fingerprint check');
     check('the landing carries NO auditor code (no keys, no pins, no crypto)',
       landing.length > 0
         && !/generateKey|subtle\.|EXPECTED_ENCLAVE_SHA256|EXPECTED_RTMR|EXPECTED_MRTD/.test(landing),

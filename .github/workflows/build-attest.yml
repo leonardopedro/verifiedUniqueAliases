@@ -63,17 +63,6 @@ jobs:
           npm install
           node scripts/test-verify-security.mjs
 
-      # v225: the seal path, driven through the page's own script against real
-      # RSA keys and real openssl. `card` covers the pasted-key card; 
-      # `sealed-return` covers PayPal returning to this page and the tab sealing
-      # the code (and optional nonce) to the slots its login response signed,
-      # with a failed-fetch guard so no attestation route creeps back in
-      # pre-login (v180). Both are offline and deterministic.
-      - name: verify.html seal-path tests (seal card + sealed redirect)
-        run: |
-          node scripts/test-seal-page.mjs card
-          node scripts/test-seal-page.mjs sealed-return
-
       - uses: docker/setup-buildx-action@v3
 
       - name: Build and extract artifacts
