@@ -2936,19 +2936,48 @@ rotation, `test-verify-security` re-run after the link/pin change.
 
 ## 0.51 — v234 pass 5: the landing links Pages, so the Markdown copies go (2026-11-10)
 
-### Release
+### Release (two cycles — the pin rotation was caught, not assumed)
 
 | pass | image | disk sha256 | note |
 |---|---|---|---|
-| 5 (live) | `m-2zeggtx23lhbjgtv2pj6` (`paypal-tdx-esp-202611101011`) | `f59c65bd…` | landing links Pages; ZK pin gate in preflight |
+| 5A | `m-2zeggtx23lhbjgtv2pj6` (`paypal-tdx-esp-202611101011`) | `f59c65bd…` | landing links Pages; ZK pin gate in preflight; **pins stale** |
+| **5B (live)** | **`m-2zehwizs08eo6wszxhsi`** | **`216df463…`** | same binary `cfafb15d…`, ESP carries the rotated pins |
 
-Deployed binary `cfafb15d…` == the locally built `paypal-auth-vm`
-(`/debug/envelope` → `boot_measurements.binary_sha256`), `check-manifest-parity`
-**PARITY OK**, `HTTPS 200`, cert == handshake == report (`51325411…`), sealed
-`/callback` refusals (403/400, identical bodies for missing vs forged input),
-notary named and serving, and the **new `check-live-proxy-restart.mjs` step ran
-inside the rotation** — `✅ envelope cache re-mints with the new notary key
-across a live restart`. Rotation exit 0.
+Cycle A deployed the new binary (`cfafb15d…`, `/debug/envelope` ==
+`sha256sum paypal-auth-vm`) with `PARITY OK`, `HTTPS 200`, cert == handshake ==
+report, sealed `/callback` refusals (403/400, identical bodies for missing vs
+forged input), notary serving, and the **new `check-live-proxy-restart.mjs`
+step running inside the rotation** — but its TD quote carried **RTMR2
+`5dfcc495…`** while `verify.html` still pinned `45de4b4a…`. That is a *hard*
+audit failure: a new binary means a new initrd, RTMR2 rotates, and every visitor
+would have died on the silicon row while the service looked perfectly healthy.
+
+So the sanctioned two-cycle procedure ran for real:
+
+1. `calculate-golden-rtmr.mjs --report <cycle-A envelope> --update` →
+   `EXPECTED_RTMR2 45de4b4a… → 5dfcc495…` (MRTD `e0199499…`, RTMR0 `06a32a2f…`,
+   RTMR1 `6fa03523…`, RTMR3 zero — held); `EXPECTED_ENCLAVE_SHA256`
+   `6c9b3f5f… → cfafb15d…`; `index.html` mirrored (byte-identical),
+   `verify.html` **303,002 B `de4fbc53…`**, README digest rotated, committed
+   `0dc6c53`.
+2. Cycle B rebuilt (binary byte-identical) and swapped to `m-2zehwizs08eo6wszxhsi`
+   — RTMR2 held at `5dfcc495…`, which is the whole point of the second cycle.
+
+The verify phase on 5B: `running binary matches the build`, `auditor pins match
+the live quote (RTMR2 5dfcc495…, binary cfafb15d…)`, `PARITY OK`, TLS leaf
+`50bea236…` == `/tls-cert.pem` == handshake == report, sealed callback refusals,
+notary serving, restart re-mint. Exit 0.
+
+### The gate that would have shipped the stale pins
+
+Nothing compared the live TD quote with the pins in the page being shipped, so
+`rotate-alibaba.sh` phase 6 now fetches `/debug/envelope`, recomputes RTMR2 with
+`calculate-golden-rtmr.mjs`, and **dies** when it disagrees with
+`EXPECTED_RTMR2` (or when `EXPECTED_ENCLAVE_SHA256` != the binary just built),
+with the fix spelled out in the message. Writing it caught two of its own bugs
+before they could mislead a later operator: a 192-hex pattern for a 48-byte
+(96-hex) TDX RTMR read the pin as empty and failed a *correct* deployment
+(`125a083`), so an empty pin now fails with its own message.
 
 ### A release gate for the ZK pins (`scripts/check-zk-pins.mjs`)
 
@@ -2979,7 +3008,11 @@ green** — `Build with Jekyll` success, `Upload artifact` success, `deploy`
 success. Live:
 
 ```
-/ (verify.html)  200  303,002 B  f50d441f…   == repo
+/ (verify.html)  200  303,002 B  de4fbc53…   == repo (run 42792730857, sha 125a083)
 /privacy.html    200    4,673 B  e570784f…   == repo
 /terms.html      200    3,663 B  9e8daa06…   == repo
 ```
+
+The landing on the running instance links
+`…github.io/verifiedUniqueAliases/privacy.html` and `…/terms.html` and nothing
+else legal — that is what made the `PRIVACY.md`/`TERMS.md` removal safe.
