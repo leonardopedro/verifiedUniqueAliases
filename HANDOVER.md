@@ -2510,7 +2510,7 @@ PayPal binary did not. Two passes, as always when a pin moves.
 
 | pass | image | disk sha256 | RTMR2 |
 |---|---|---|---|
-| 1 (pin rotation) | `m-2zefbu7nyrwv18mu8o31` → built, swapped, pin read live | — | `3d58e6da…` |
+| 1 (pin rotation) | `m-2ze3p7ienfczexh43acn` (`paypal-tdx-esp-v230-202611100246`) → built, swapped, pin read live | — | `3d58e6da…` |
 | **2 (live)** | **`m-2ze1wtngcskhet1y3lnn`** (`paypal-tdx-esp-v230b-202611100258`) | **`b3295c41…`** | **`3d58e6da…`** |
 
 Pin rotation: `EXPECTED_RTMR2` `a2b7baf1…` → `3d58e6da…`; `EXPECTED_MRTD`,
