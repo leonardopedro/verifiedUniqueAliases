@@ -30,7 +30,11 @@
 #                push BEFORE the swap is discarded.
 #   6 verify     HTTPS 200, /debug/envelope binary_sha256 == the binary just
 #                built, check-manifest-parity.mjs -> PARITY OK against the
-#                local disk (proves the deployed ESP is this file).
+#                local disk (proves the deployed ESP is this file), then the
+#                three live behaviour checks: TLS certificate binding, sealed
+#                callback refusals, the notary answering — plus (v234) a real
+#                notary restart through POST /proxy/restart proving the
+#                envelope cache re-mints with the NEW key.
 #
 # Usage:
 #   export ALI_INSTANCE_ID=i-xxxxxxxx          # prod instance to rotate
@@ -426,6 +430,7 @@ phase_verify() {
         say "   [dry-run] then run: node scripts/check-live-tls-cert.mjs --url $PROD_URL"
         say "   [dry-run] then run: node scripts/check-live-callback.mjs --url $PROD_URL"
         say "   [dry-run] then run: node scripts/check-live-notary.mjs --url $PROD_URL"
+        say "   [dry-run] then run: PROXY_RESTART_TOKEN=… node scripts/check-live-proxy-restart.mjs --url $PROD_URL"
         return 0
     fi
 
@@ -497,6 +502,21 @@ phase_verify() {
         printf '%s\n' "$notchk" | tail -20; die "live notary check failed (was the disk built with TLS_PROXY=1?)"; }
     printf '%s\n' "$notchk" | grep -E '✅|❌|RESULT' | tail -8
     ok "TLSNotary notary spawned, listening and serving its attestation list"
+
+    # v234: the envelope cache must FOLLOW the notary key, not just exist. The
+    # check cycles the child through the operator-gated POST /proxy/restart and
+    # proves /debug/envelope names the NEW key inside the old 15-minute window —
+    # exactly the bug v232 fixed (a cached envelope published the previous
+    # boot's signing key, so every auditor's fail-closed binding check failed
+    # until the window ran out). Running it here means every release proves it on
+    # the real instance instead of trusting a unit test.
+    local token restartchk
+    token=$(node -e 'const c=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(String(((c.services||{}).tls_proxy||{}).restart_token||""))' "$CONFIG_FILE")
+    [[ -n "$token" ]] || die "config has no services.tls_proxy.restart_token — the notary restart path cannot be exercised from outside (add one; see docs/tls-proxy.md)"
+    restartchk=$(PROXY_RESTART_TOKEN="$token" node scripts/check-live-proxy-restart.mjs --url "$PROD_URL" 2>&1) || {
+        printf '%s\n' "$restartchk" | tail -20; die "live notary-restart check failed — does /debug/envelope still follow the notary key?"; }
+    printf '%s\n' "$restartchk" | grep -E '✅|❌|RESULT' | tail -8
+    ok "envelope cache re-mints with the new notary key across a live restart"
 }
 
 # ── run ──────────────────────────────────────────────────────────────────────

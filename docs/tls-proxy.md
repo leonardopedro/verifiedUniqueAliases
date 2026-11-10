@@ -73,6 +73,10 @@ caller who cannot use the route is not told it is there. `/proxy/health` reports
 The envelope cache follows the new key by itself (`/debug/envelope` probes the
 child on every request and re-mints when the fingerprint changes), which
 `scripts/check-live-proxy-restart.mjs` proves end-to-end on a live instance.
+`rotate-alibaba.sh` runs that check in its verify phase on every release: it
+reads `restart_token` from the config it just pushed, so a deployment whose
+route is unconfigured — or whose cache stops following the key — fails the
+rotation instead of an auditor's binding check days later.
 
 Example:
 

@@ -2848,6 +2848,83 @@ handshake == report, sealed `/callback` refusals, notary named in the report.
 - The restart token is in the instance `user_data` (write-only from here — read
   it with `aliyun ecs DescribeUserData`). Rotating it is a config-only change,
   but it only takes effect on the next boot (config is read at boot).
-- `pages build and deployment` will keep failing on `main` until the Pages site
-  is deleted or its source repointed in repo settings — that is now harmless and
-  irrelevant: nothing in the project reads that origin.
+- `pages build and deployment` was failing on `main` at that point; **§0.50 finds
+  the cause (committed `/nix/store` symlinks) and fixes it — v234 brings Pages
+  back for `privacy.html`/`terms.html` only.**
+
+---
+
+## 0.50 — v234: Pages is back for the legal pages, and the freeze is diagnosed (2026-11-10)
+
+### The directive changed
+
+v233 removed GitHub Pages from the project entirely. The user then asked for it
+back for one purpose: hosting the **extra information** — the privacy policy and
+the user agreement. v234 draws the boundary instead of dropping the origin:
+
+- **Pages publishes** `privacy.html` and `terms.html` (repository root, next to
+  the landing/auditor copies) — that is what the landing page and `verify.html`
+  link to.
+- **Pages never publishes audit bytes.** `verify.html`, `zk.html`, the witness
+  wasm and the Groth16 proving key still come from `raw.githubusercontent.com`
+  and are pinned by SHA-256 inside those pages. Test 46 now asserts BOTH halves:
+  every `github.io` link in a shipped page must be `/privacy.html` or
+  `/terms.html`, and the prover/artifact base must stay on raw.
+- `PRIVACY.md`/`TERMS.md` were deleted again (one source of truth: the hosted
+  pages).
+
+### Why the Pages build had been failing (root cause, not a guess)
+
+`git ls-files -s` showed two **committed symlinks**:
+
+```
+120000 … result      -> /nix/store/q1fgk31h…-openssl-3.6.5
+120000 … result-dev  -> /nix/store/f0lcjigad…-openssl-3.6.5-dev
+```
+
+Jekyll's safe build refuses symlinks that leave the repository, so the built-in
+`pages build and deployment` workflow failed at **step 4, "Build with Jekyll"**
+(step 5 "Upload artifact" is skipped, which is why the earlier note blamed the
+wrong step). The last successful deployment stayed live for months while every
+push reported a red Pages run.
+
+Evidence (public API, no auth needed for run/job metadata):
+
+```
+GET /repos/leonardopedro/verifiedUniqueAliases/actions/runs?branch=main
+  42779700771  pages build and deployment  failure
+GET …/runs/42779700771/jobs
+  build: 3 Checkout success · 4 Build with Jekyll FAILURE · 5 Upload artifact skipped
+  deploy: skipped
+```
+
+Fix: `git rm --cached result result-dev`, `/result` + `/result-dev` in
+`.gitignore`, and a new `_config.yml` whose `exclude:` keeps `zk/`,
+`output-alibaba/` and `build-scripts/` out of the published site (the proving key
+parts plus the released disk image are ~160 MB of binary that a web page must
+never serve, and the build runs on every push).
+
+### ZK prover re-verified against raw (user request)
+
+End-to-end, with the artifacts fetched from `raw.githubusercontent.com` exactly
+as `zk.html` fetches them (BASE + name + `?v=<pin>`):
+
+| Step | Result |
+|---|---|
+| `identity_escrow.wasm` | 200, 2,863,855 B, `ACAO: *`, sha256 `b8ce562f…` == page pin == committed file |
+| `…zkey.part0` / `part1` | 200, 60,000,000 B / 45,429,603 B, `ACAO: *` |
+| assembled zkey | sha256 `e320086d…` == page pin == committed part0+part1 |
+| witness + `groth16.fullProve` | proof in 2.9 s, 271 public signals, `verified=1`, hash bits == report hash |
+| `groth16.verify` | true with the vkey **embedded in `zk.html`** and with `zk/identity_escrow_vkey.json` (byte-identical) |
+| escrow decrypt | ciphertext decrypts to the exact identity JSON |
+
+### Rotation now proves the envelope cache too
+
+`rotate-alibaba.sh` phase 6 runs `scripts/check-live-proxy-restart.mjs`, taking
+`services.tls_proxy.restart_token` from the config it just pushed. A config
+without a token fails the rotation with an explicit message (the restart path
+must be exercisable from outside), and a cache that stops following the notary
+key fails the release instead of an auditor's binding check later.
+
+Checks this pass: `node --check` on the changed scripts, `bash -n` on the
+rotation, `test-verify-security` re-run after the link/pin change.
