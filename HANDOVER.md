@@ -3287,3 +3287,101 @@ it names the boot-pinned address, which cannot be re-derived later.
   `check-auditor-pins --live`: pins == live quote, `PARITY OK`.
 - Cleanup: pass-A image `m-2zedx7ou4mujffeqlg90` deleted; rollback left is
   `m-2ze7c8jev53jh1d6ufby`; relay `i-2zefiag79exwsshidi3z` → `StopCharging`.
+
+## 0.55 — v238/v239: the concurrency stall was the target's edge, and the notary now says so in 20 s (2026-11-11 06:30 UTC)
+
+### What actually stalled
+
+§0.54 measured 8 concurrent → 5/8 and recorded it as "the relayed handshake
+against PayPal's edge". This cycle turned that into a cause. On one boot
+(2 vCPU, one EIP), all sessions to `api-m.paypal.com` (pinned
+`104.16.124.74`):
+
+| Load | Result |
+|---|---|
+| 4 simultaneous | **4/4** |
+| 6 simultaneous | 5/6 |
+| 8 simultaneous | 3/8 and 5/8 (two runs) |
+| 8 at 0.4 s spacing | 3/8 |
+| 8 at 1.5 s spacing | **8/8** |
+| 8 simultaneous → Fastly (`api-m.sandbox`, `146.75.123.1`) | **8/8** |
+| 8 over three edges | 6/8 — every failure on Cloudflare |
+| 8 raw TLS handshakes from another host | **8/8 in 71 ms** |
+
+Failure shape never varies: the TCP connection is accepted, the ClientHello
+goes out, no ServerHello ever comes back, silence until the 120 s session
+timeout. One address, spaced dials, no CPU pressure: the edge in front of
+`api-m.paypal.com` degrades when several handshakes arrive together **from the
+same source address**, and Fastly's edge in front of `api-m.sandbox` does not.
+Egress is not the constraint either — measured **85 B sent / 5.7 KB received**
+per session.
+
+So the fix is three small things in the notary, not a redesign:
+
+- **`DialPacer`** (`tls-proxy/src/main.rs`) spaces outbound dials **per target
+  IP**, default `dial_spacing_ms = 1500`. Simultaneous provers still run
+  concurrently; only the dials are spaced, and a session logs
+  `queued 1.5s for a dial slot to …` when it waits.
+- **Stall verdict** — `RelayActivity` + `Stamped<S>` count bytes in both
+  directions on the relayed connection. Silence for `stall_timeout_secs`
+  (default **20 s**) ends the session with a new, retryable refusal kind
+  **`stalled`** (distinct from `timeout` and `rejected`) that names the pinned
+  address: `relayed session moved no byte for 20s — last progress: relaying TLS
+  to host:5c868ab7 (104.16.124.74:443); retry this session`. The bound covers
+  the hand-over (`accept()`) as well as the relay, because a live v238 wave lost
+  a whole session to a prover that died in tlsn preprocessing and left the
+  notary waiting in `accept()` for the full 120 s.
+- **Retry-once** in the prover harness: `tls-proxy/tests/live.rs`
+  `LIVE_ATTEMPTS` now defaults to **2**.
+
+Both knobs are `TlsProxyConfig` fields (`stall_timeout_secs`, `dial_spacing_ms`)
+passed to the child as `TLS_PROXY_STALL_TIMEOUT_SECS` /
+`TLS_PROXY_DIAL_SPACING_MS`, with the same defaults baked into the binary so a
+config that omits them behaves identically.
+
+### Live result
+
+Pass A of v238 (binary changed, initrd changed) → pin rotation → pass B.
+Waves of 8 simultaneous provers against `api-m.paypal.com` on the v239b boot:
+
+| Wave | Result |
+|---|---|
+| 8 wide (v238b) | 8/8, 7/8 (prover-internal), 8/8 — completions spaced 9.6 → 21.3 s |
+| 8 wide (v239b run 1, no retry) | 7/8 |
+| 8 wide (v239b run 2, no retry) | 7/8 |
+| 8 wide (v239b, retry-once = the shipped default) | **8/8** |
+
+The residual single failure per wave is now **prover-side**, not the edge:
+`preprocessing proxy-tls failed … bootstrap COT error: io error: … connection is
+closed`, or a notary `rejected io error: failed to receive proxy finished
+message` — i.e. the prover dropped its end of the MPC before the relay. The
+retry-once default absorbs it, which is why the shipped configuration is 8/8.
+Live `stalled` verdicts, all to `104.16.124.74:443`, appear at 20 s in
+`/proxy/refusals` instead of the old 120 s `timeout`, so a failed session frees
+its slot **6× faster**.
+
+Known residual: a prover that connects and then stalls **before** the target
+connection exists (still in the commitment handshake) is only bounded by the
+120 s session timeout — the stall watchdog is armed at the dial, because that is
+where the measured silence starts, and arming it at the accept would kill
+provers that are legitimately slow in tlsn preprocessing.
+
+### Tests and release
+
+- `cargo +1.99.0 test` in the tls-proxy container: 5/5 unit, **13/13**
+  `tests/session.rs` — new `serves_eight_simultaneous_sessions`,
+  `paces_repeated_dials_to_the_same_target`,
+  `refuses_a_relayed_session_that_never_answers`,
+  `refuses_a_prover_that_commits_then_vanishes`.
+- `scripts/test-verify-security.mjs` 511/0 against the v238 pages;
+  `cargo +1.91.1 check --all-targets` clean in the enclave; parent `service`
+  tests 3/3.
+- v238 pass B: image **`m-2ze9lskiq4fqrq8r3app`** / disk
+  `68d51be3…`, `EXPECTED_RTMR2 → cfe694d8…`.
+- v239 pass B (this ship): image **`m-2ze4lto0m4wqw3hxx9q0`** / disk
+  **`932a5641b032c00ce515067ab5cd80936a7e8fbdcfbbe920feb0df5e0c6282ec`**,
+  `EXPECTED_RTMR2 → 3ac86bf8eb669da7…`, binary unchanged
+  `e8b052ae8212b410…`, `verify.html` == `index.html` **280,318 B
+  `766b77f9d2aa2fa1928e36507c760779d3e2f714c11b1424dea5bbad5bc624c1`**
+  (README rotated same commit). `check-auditor-pins --live`: **pins == live
+  quote**, `PARITY OK`.
