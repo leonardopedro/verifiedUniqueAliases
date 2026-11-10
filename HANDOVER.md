@@ -2970,14 +2970,47 @@ notary serving, restart re-mint. Exit 0.
 
 ### The gate that would have shipped the stale pins
 
-Nothing compared the live TD quote with the pins in the page being shipped, so
-`rotate-alibaba.sh` phase 6 now fetches `/debug/envelope`, recomputes RTMR2 with
-`calculate-golden-rtmr.mjs`, and **dies** when it disagrees with
-`EXPECTED_RTMR2` (or when `EXPECTED_ENCLAVE_SHA256` != the binary just built),
-with the fix spelled out in the message. Writing it caught two of its own bugs
-before they could mislead a later operator: a 192-hex pattern for a 48-byte
-(96-hex) TDX RTMR read the pin as empty and failed a *correct* deployment
-(`125a083`), so an empty pin now fails with its own message.
+Nothing compared the live TD quote with the pins in the page being shipped.
+`scripts/check-auditor-pins.mjs` now does, in two modes:
+
+- **static** (CI, deterministic, no network): every pin is single and
+  well-formed (48-byte MRTD/RTMR0-2 = 96 hex, zero RTMR3), `verify.html` is
+  byte-identical to `index.html`, and the README digest row carries the page's
+  real sha256 and size. Runs in `build-attest.yml` next to `check-zk-pins.mjs`,
+  so a half-rotated tree never gets built or attested.
+- **`--live <url> [--binary <sha>]`** (rotation phase 6): fetches
+  `/debug/envelope`, recomputes MRTD/RTMR0-3 from the TD quote and requires all
+  of them plus the binary to equal the shipped pins — the only mode that can
+  prove the page describes the box actually serving.
+
+Writing it caught two of its own bugs before they could mislead an operator: a
+192-hex pattern for a 48-byte TDX RTMR read the pin as empty and failed a
+*correct* deployment (`125a083`), so an empty pin now fails with its own
+message. Negative-tested both ways: a one-byte pin change turns the gate red
+(static: mirror/README drift; live: `live RTMR2 != pin`), and both scripts exit
+non-zero.
+
+### Live ZK re-proof on the 5B boot
+
+Tying the running box to the prover, using the new pins:
+
+| Step | Result |
+|---|---|
+| live `/debug/envelope` | binary `cfafb15d…`, ESP `verify.html` `de4fbc53…` |
+| page from raw == deployed ESP page | yes (`de4fbc53…`), and it pins `cfafb15d…` + RTMR2 `5dfcc495…` |
+| raw wasm / zkey parts | 2,863,855 B / 60,000,000 + 45,429,603 B, `ACAO *`, both hash to the `zk.html` pins |
+| assembled zkey | `e320086d…` == pin |
+| Groth16 `fullProve` | 3.1 s, 271 public signals |
+| `groth16.verify` with the vkey embedded in `zk.html` | true |
+| a different identity | different statement, still verifies (the proof is about the identity it proved) |
+
+### Cleanup after the swap
+
+`m-2zeggtx23lhbjgtv2pj6` (pass 5A) and its snapshot `s-2zeggtx23lhbjgty66mh`
+deleted (`DeleteImage --Force` left the snapshot behind, so it was deleted
+explicitly and confirmed gone); relay `i-2zefiag79exwsshidi3z` left
+`Stopped/StopCharging`; prod `i-2ze1zdxis0hcsg91qbh5` running
+`m-2zehwizs08eo6wszxhsi`.
 
 ### A release gate for the ZK pins (`scripts/check-zk-pins.mjs`)
 
