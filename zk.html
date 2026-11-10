@@ -271,22 +271,23 @@
     // ========================================================================
     // v188 (circom.md §5) — ZK ESCROW CREDENTIAL constants. Additive layer;
     // it NEVER gates the audit above. Proving artifacts (wasm ~2.9 MB +
-    // Groth16 zkey) live on the pinned GitHub Pages origin — the enclave's
-    // 25 MB/h egress budget can never carry them — and are fetched ONLY when
+    // Groth16 zkey) live on raw.githubusercontent.com — the enclave's
+    // 25 MB/h egress budget can never carry them, and no origin outside the
+    // repository is trusted to serve them — and are fetched ONLY when
     // a ZK action runs, each byte-checked against the pinned SHA-256 below
     // (the SRI philosophy applied to data files). snarkjs 0.7.5 is lazy-
     // loaded with an SRI attribute (same pattern as forge/1.3.1). The
     // verification key is EMBEDDED (zkCredVkey) so credential verification
     // works offline in any copy of this auditor.
     // ========================================================================
-    var ZK_BASE = 'https://leonardopedro.github.io/verifiedUniqueAliases/zk/';
+    var ZK_BASE = 'https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/zk/';
     var ZK_WASM_SHA256 = 'b8ce562f3cfe936786d3041da572d520621469531b38b3d7640ef0debd585e8d';
     var ZK_ZKEY_SHA256 = 'e320086d4d79a66443fe3c860bf13b00db6971f5bcf0900d0d709cb974327365';
     // R2 finding (F5 — deployability): the assembled proving key is
     // 105,429,251 B, which GitHub refuses for ANY git object (>100 MB hard
     // limit — release assets don't send CORS headers either), so the repo
-    // ships it SPLIT; the browser fetches both parts from the pinned
-    // Pages origin (ACAO:*) and hashes the ASSEMBLED buffer against the
+    // ships it SPLIT; the browser fetches both parts from
+    // raw.githubusercontent.com (ACAO:*) and hashes the ASSEMBLED buffer against the
     // single pin above — one digest covers every byte either way.
     var ZK_ZKEY_PARTS = ['identity_escrow_final.zkey.part0', 'identity_escrow_final.zkey.part1'];
     var ZK_SNARKJS_URL = 'https://cdn.jsdelivr.net/npm/snarkjs@0.7.5/build/snarkjs.min.js';

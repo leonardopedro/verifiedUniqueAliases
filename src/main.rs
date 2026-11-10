@@ -2402,7 +2402,7 @@ const CALLBACK_CONTENT: &str = r#"<h1>Authentication Succeeded</h1>
                 <p><b>⏳ 1/3 — download in progress:</b> <code>encrypted-attestation-report.json</code> was saved the moment this page loaded. It is CIPHERTEXT, sealed to a throwaway key that only ever existed in the tab where you started the login — useless to anyone else, including this site.</p>
                 <p><b>🔒 2/3 — save the TLS certificate of THIS page:</b> this tab is the response that carried your attestation, so its certificate panel is the only independent record of that connection. <b>Chrome / Edge:</b> padlock → <i>Connection is secure</i> → <i>Certificate is valid</i> → Details → Export → PEM. <b>Firefox:</b> padlock → <i>Connection secure</i> → <i>More information</i> → View Certificate → ⋯ → Save/Export PEM. <b>Safari:</b> ⋯ → Show Certificate → drag it out. Do <b>not</b> use this site's <code>/tls-cert.pem</code> instead: it is served by the same party whose report you are about to check, so it can never disagree with the report. Script cannot read its own connection certificate — that is why this step is manual.</p>
                 <p><b>⬅️ 3/3 — go back to the PREVIOUS (local) tab</b> — your saved <code>verify.html</code> (the file you opened from <code>file://</code>). Load <code>encrypted-attestation-report.json</code> with the “Attestation JSON report” picker and the certificate you exported with the “Browser TLS certificate” picker, then run the audit. That trusted copy decrypts with the key it generated on load; with a certificate supplied, the channel row proves the endpoint you reached served exactly the chain recorded in the hardware-signed report. This tab holds nothing else — close it with the ✖ button whenever you like.</p>
-                <p style="margin:14px 0 0; font-size:0.85rem; color:#8b949e;">Further reading: <a href="/privacy.html" style="color:#64b5f6;">Privacy Policy</a> · <a href="/terms.html" style="color:#64b5f6;">User Agreement</a> — served by this service, the party they describe.</p>
+                <p style="margin:14px 0 0; font-size:0.85rem; color:#8b949e;">Further reading: <a href="https://github.com/leonardopedro/verifiedUniqueAliases/blob/main/PRIVACY.md" style="color:#64b5f6;">Privacy Policy</a> · <a href="https://github.com/leonardopedro/verifiedUniqueAliases/blob/main/TERMS.md" style="color:#64b5f6;">User Agreement</a> — served by this service, the party they describe.</p>
                 <p id="cert-reminder" style="margin:12px 0 0; padding:10px 12px; border-radius:6px; background:#0d1117; border:1px solid #d29922; color:#d29922; font-size:0.9rem;">🔒 Export this tab's certificate <b>before</b> closing it — a closed tab's certificate cannot be retrieved. Nothing is held here: the ciphertext above is useless without the key that only ever existed in your other tab.</p>
                 <textarea id="e2ee-blob-view" readonly style="width:100%; height:180px; background:#0d1117; color:#9e9e9e; font-size:12px; border:1px solid #30363d; border-radius:6px; padding:10px; box-sizing:border-box;"></textarea>
                 <p><button class="btn" onclick="(function(){var t=document.getElementById('e2ee-blob-view'); t.select(); try{document.execCommand('copy');this;}catch(e){} try{navigator.clipboard.writeText(t.value);}catch(e){} this.textContent='✅ Copied — paste it into a trusted auditor';})()" style="margin-top:10px;">📋 Copy encrypted report</button> <button class="btn" onclick="window.close()" style="margin-top:10px;"> ✖ Close this tab</button></p>
@@ -2542,6 +2542,15 @@ struct TlsProxyConfig {
     /// unconfigured deployment behaving exactly as it always has.
     #[serde(default = "proxy_default_relay_targets")]
     relay_targets: Vec<String>,
+    /// v233: operator token for `POST /proxy/restart` — cycle the notary child
+    /// without rebooting the enclave (a wedged notary has no shell to reach, and
+    /// the boot path is the only other way to restart it). The token lives in the
+    /// instance's `user_data` beside the PayPal secrets, so it is exactly as
+    /// reachable as the rest of the config and no further. Absent = the route
+    /// does not exist (404), which is the default for anything but a managed
+    /// deployment.
+    #[serde(default)]
+    restart_token: Option<String>,
 }
 
 /// Longest list accepted. Every target costs a /etc/hosts line and an address
@@ -3360,7 +3369,10 @@ fn html_with_secure_headers(bytes: Vec<u8>) -> Response {
 //   * the auditor and the ZK prover are taken from the project's GitHub
 //     repository — a copy that the enclave operator cannot rewrite on the way
 //     out is the whole point, and serving it from here defeated that;
-//   * the legal documents live on GitHub Pages, which is linked, not copied;
+//   * the legal documents live in the repository (PRIVACY.md / TERMS.md), which
+//     is linked, not copied — v233: no GitHub Pages origin is used anywhere,
+//     here or in the auditor, because a second "pinned" copy of the page reads
+//     as a trusted one while nobody measures it;
 //   * what remains at `/` is a small static landing: the title, one paragraph
 //     of what this is, the two legal links, a DOWNLOAD link for verify.html
 //     from the repository, and numbered instructions on what to do next. No
@@ -3397,7 +3409,7 @@ const LANDING_HTML: &str = r#"<!DOCTYPE html>
 <div class="card">
   <h1>Hardware and PayPal-Attested Unique Aliases</h1>
   <p>One PayPal login, bound to genuine confidential-computing hardware (Intel TDX), yields one verified unique alias &mdash; mostly anonymous, provable by the receiver, and impossible to mint twice.</p>
-  <p class="legal">Legal: <a href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html">Privacy Policy</a> &middot; <a href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html">User Agreement</a></p>
+  <p class="legal">Legal: <a href="https://github.com/leonardopedro/verifiedUniqueAliases/blob/main/PRIVACY.md">Privacy Policy</a> &middot; <a href="https://github.com/leonardopedro/verifiedUniqueAliases/blob/main/TERMS.md">User Agreement</a></p>
 
   <a class="dl" id="dl" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html" download="verify.html">&#128190; Download verify.html</a>
   <span class="hint" id="hint"></span>
@@ -4409,6 +4421,12 @@ struct ProxySupervisor {
     alive: Arc<AtomicBool>,
     restarts: Arc<AtomicU64>,
     last: Arc<RwLock<Option<String>>>,
+    /// v233: `POST /proxy/restart` (operator token) wakes the supervisor, which
+    /// kills the child and re-execs it. This is also how the live test proves the
+    /// envelope cache follows a key change without a reboot: the enclave, its
+    /// cache and its listeners all stay up; only the notary cycles.
+    restart: Arc<tokio::sync::Notify>,
+    restart_token: Option<String>,
 }
 
 /// Start the proxy child and keep it up.
@@ -4425,6 +4443,8 @@ fn spawn_tls_proxy(cfg: &TlsProxyConfig) -> Arc<ProxySupervisor> {
         alive: Arc::new(AtomicBool::new(false)),
         restarts: Arc::new(AtomicU64::new(0)),
         last: Arc::new(RwLock::new(None)),
+        restart: Arc::new(tokio::sync::Notify::new()),
+        restart_token: cfg.restart_token.clone(),
     });
     let cfg = cfg.clone();
     let task_sup = sup.clone();
@@ -4452,14 +4472,39 @@ fn spawn_tls_proxy(cfg: &TlsProxyConfig) -> Arc<ProxySupervisor> {
                 Ok(mut child) => {
                     task_sup.alive.store(true, Ordering::Relaxed);
                     info!("tls-proxy started (pid {})", child.id().unwrap_or(0));
-                    let status = child.wait().await;
+                    // v233: an operator (or the live re-mint test) can ask for a
+                    // cycle. `kill` + `wait` is a real restart — the child mints
+                    // a fresh signing key on boot, which is exactly the event the
+                    // envelope cache has to notice.
+                    let requested = tokio::select! {
+                        s = child.wait() => {
+                            let msg = match s {
+                                Ok(s) => format!("exited: {s}"),
+                                Err(e) => format!("wait failed: {e}"),
+                            };
+                            Some(msg)
+                        }
+                        _ = task_sup.restart.notified() => {
+                            info!("tls-proxy restart requested — cycling the child");
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                            None
+                        }
+                    };
                     task_sup.alive.store(false, Ordering::Relaxed);
                     task_sup.restarts.fetch_add(1, Ordering::Relaxed);
-                    let msg = match status {
-                        Ok(s) => format!("exited: {s}"),
-                        Err(e) => format!("wait failed: {e}"),
-                    };
-                    warn!("tls-proxy {} — restarting in {:?}", msg, backoff);
+                    let msg = requested
+                        .clone()
+                        .unwrap_or_else(|| "restart requested".to_string());
+                    match requested {
+                        Some(_) => warn!("tls-proxy {} — restarting in {:?}", msg, backoff),
+                        // A requested cycle is not a crash: come back immediately
+                        // rather than paying the crash backoff for the operator.
+                        None => {
+                            warn!("tls-proxy {}", msg);
+                            backoff = Duration::from_secs(1);
+                        }
+                    }
                     *task_sup.last.write() = Some(msg);
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(60));
@@ -4525,6 +4570,58 @@ async fn proxy_health() -> axum::response::Response {
         )
             .into_response(),
     }
+}
+
+/// Does this caller hold the operator's restart token?
+///
+/// Pure so the routing decision is testable without an enclave. Both sides are
+/// hashed before comparison: the point is not to make a SHA-256 collision
+/// infeasible (it already is) but to do the same amount of work for a short
+/// guess and a long one, so the token's length does not leak through timing.
+/// A build with no token configured has no restart route at all.
+fn restart_token_ok(configured: Option<&str>, presented: Option<&str>) -> bool {
+    use sha2::Digest;
+    let (Some(c), Some(p)) = (configured, presented) else {
+        return false;
+    };
+    if c.is_empty() || p.is_empty() {
+        return false;
+    }
+    sha2::Sha256::digest(c.as_bytes()) == sha2::Sha256::digest(p.as_bytes())
+}
+
+/// `POST /proxy/restart` — cycle the notary child, keeping the enclave up.
+///
+/// Why this exists: the notary is a separate process with its own per-boot
+/// signing key, and the only other way to restart it is to reboot the enclave —
+/// which on this platform means re-running the whole attestation boot. An
+/// operator who needs a fresh key (a wedged session, a rotated policy, the live
+/// test below) should not have to do that.
+///
+/// It is a control surface, so it is gated on the operator token from the
+/// instance config and it answers 404 — not 401/403 — when the token is absent or
+/// wrong: a caller who cannot use the route is not told it exists. The only
+/// thing a holder can do is make the notary come back with a new key, which is
+/// what `/proxy/health` already reports (`restarts`).
+async fn proxy_restart(headers: axum::http::HeaderMap) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(sup) = PROXY_SUPERVISOR.get() else {
+        return (axum::http::StatusCode::NOT_FOUND, "").into_response();
+    };
+    let presented = headers.get("x-proxy-restart").and_then(|v| v.to_str().ok());
+    if !restart_token_ok(sup.restart_token.as_deref(), presented) {
+        return (axum::http::StatusCode::NOT_FOUND, "").into_response();
+    }
+    sup.restart.notify_one();
+    (
+        axum::http::StatusCode::ACCEPTED,
+        axum::Json(serde_json::json!({
+            "service": "tls-proxy",
+            "restarting": true,
+            "restarts_before": sup.restarts.load(Ordering::Relaxed),
+        })),
+    )
+        .into_response()
 }
 
 /// `/proxy/refusals` — the proxy's refusal ring, readable on the public origin.
@@ -5236,7 +5333,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let app = Router::new()
             // v205: the service serves the landing only. The auditor and the
             // ZK prover come from the GitHub repository, the legal documents
-            // from GitHub Pages (linked, never copied).
+            // from the same repository (linked, never copied).
             .route("/", get(serve_landing))
             // Kept as an alias so an old bookmark lands on the instructions
             // instead of a 404 — it serves the same landing, never the auditor.
@@ -5247,6 +5344,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // origin, so an operator can see whether the proxy child is alive
             // without reaching the loopback API.
             .route("/proxy/health", get(proxy_health))
+            // v233: operator-gated cycle of the notary child (404 without the
+            // token from the instance config).
+            .route("/proxy/restart", axum::routing::post(proxy_restart))
             // The refusal ring, on the same origin: health says the child is
             // alive, this says why a session was refused when there is no
             // shell and no serial console to read.
@@ -6321,6 +6421,7 @@ mod security_tests {
                     session_timeout_secs: 120,
                     signing_key_pem: None,
                     relay_targets: proxy_default_relay_targets(),
+                    restart_token: None,
                 }),
             }),
             seal_redirect_uris: Vec::new(),
@@ -6472,6 +6573,28 @@ mod security_tests {
         // Window expiry wins over everything.
         assert!(!envelope_cache_fresh(old, &a, Some(&a)));
         assert!(!envelope_cache_fresh(old, &a, None));
+    }
+
+    /// v233: `/proxy/restart` is a control surface, so the gate is pinned: no
+    /// token configured = no route (404), and an empty or wrong token never
+    /// matches, in either direction.
+    #[test]
+    fn proxy_restart_requires_the_configured_token() {
+        use super::restart_token_ok;
+
+        assert!(restart_token_ok(Some("s3cret-token"), Some("s3cret-token")));
+
+        // Unconfigured: the route does not exist, whatever the caller sends.
+        assert!(!restart_token_ok(None, Some("s3cret-token")));
+        assert!(!restart_token_ok(None, None));
+        // Configured but nothing presented, or the empty string either way.
+        assert!(!restart_token_ok(Some("s3cret-token"), None));
+        assert!(!restart_token_ok(Some(""), Some("")));
+        assert!(!restart_token_ok(Some("s3cret-token"), Some("")));
+        // Near misses, including a prefix and a case change.
+        assert!(!restart_token_ok(Some("s3cret-token"), Some("s3cret-toke")));
+        assert!(!restart_token_ok(Some("s3cret-token"), Some("s3cret-token ")));
+        assert!(!restart_token_ok(Some("s3cret-token"), Some("S3CRET-TOKEN")));
     }
 
     #[test]

@@ -6,8 +6,8 @@
 |---|---|---|
 | **`alibabacloud`** (default branch) | ✅ Active line of work | Alibaba Cloud / **aliyun CLI** stack: `Dockerfile.alibaba`, `build-alibaba-docker.sh` (the build; wraps `build-alibaba-image.sh` + `build-initramfs-tools.sh`), `deploy-alibaba.sh`, `import-alibaba-image.sh`, `build-scripts/create-alien-deb.sh`. **Legacy (do not use for deploys)**: `build-alibaba.sh`, `build-alibaba-disk.sh` and `build-alibaba-simple.sh` are retired hard-fail stubs (v184/v185 — they produced non-bootable/unused artifacts) |
 | `oraclecloud` | 🧊 Archive — do not develop here | Former `main`: Oracle OCI stack (`Dockerfile.oci`, `build-oci-*.sh`, `deploy-oci.sh`, `import-oci-image.sh`), the v161–v162 security hardenings, and the `oasis/` Sapphire + SEV-SNP sub-project |
-| `oldmain` | 🧊 Archive ref — preserved 2026-10-26 | The former `main` (frozen at the v164 era, `67f5952`) that GitHub Pages used to deploy from; kept so the Pages re-point was fully reversible |
-| `origin/main` | ✅ = `alibabacloud` (since 2026-10-26) | GitHub Pages **source branch** — force-pushed from `alibabacloud` so the trusted remote auditor (`leonardopedro.github.io/verifiedUniqueAliases/`) serves current bytes instead of the stale v164 copy. Before 2026-10-26 it was `oraclecloud` content minus `capture-golden-pcrs.mjs`, later frozen at a v164 sync |
+| `oldmain` | 🧊 Archive ref — preserved 2026-10-26 | The former `main` (frozen at the v164 era, `67f5952`) that GitHub Pages used to deploy from; kept so the Pages re-point was fully reversible. **v233 removed Pages from the project entirely**, so this ref is history only |
+| `origin/main` | ✅ = `alibabacloud` (since 2026-10-26) | Mirror of the active line for readers. **v233 (user directive): no GitHub Pages origin is used by this project** — the auditor, the ZK prover and the proving artifacts are fetched from `raw.githubusercontent.com` only, and a second "pinned" https copy of the auditor was a false sense of safety (nobody deploys or measures it; it served stale pins for hours in the v192 and v231 incidents). Before 2026-10-26 it was `oraclecloud` content minus `capture-golden-pcrs.mjs`, later frozen at a v164 sync |
 
 - **The OCI files are NOT on this branch.** `build-oci-*.sh`, `Dockerfile.oci`, the v161+ `verify.html`/`scripts/` tooling and `oasis/` live only on `oraclecloud`. To resume Oracle work: `git switch oraclecloud`.
 - OCI local build state (host `ol10/` staging, `.build-provenance`, qcow2/UKI/initramfs images, `node_modules/`) was deliberately deleted from this worktree on 2026-10-16 — it is all gitignored/regenerable (`bash build-oci-docker.sh`, `bash extract-ol10-platform.sh`).
@@ -29,7 +29,7 @@ Supported build target: **Alibaba Cloud Intel TDX, compiled unconditionally** (t
 ### Login Flow (v183 — no pre-login attestation, PKCE-bound)
 
 The old **pre-flight** (`POST /attest/preflight`, one TD quote per unauthenticated click) is **removed** — it was a trivially reachable enclave resource-exhaustion surface. The flow is now:
-1. Trusted auditor copy (file:// / GitHub Pages) generates the ECDH keypair + nonce, then calls **`POST /attest/login-session`** — S_enc-signed fields only (app, scope, environment, `state`, **`code_challenge`/S256**), **no quote minted**; the ONLY thing stored server-side is this login's **PKCE verifier** (bounded table, TTL 600 s, enclave-RAM-only, never echoed).
+1. Trusted auditor copy (a saved `file://` copy — v233: no network origin qualifies) generates the ECDH keypair + nonce, then calls **`POST /attest/login-session`** — S_enc-signed fields only (app, scope, environment, `state`, **`code_challenge`/S256**), **no quote minted**; the ONLY thing stored server-side is this login's **PKCE verifier** (bounded table, TTL 600 s, enclave-RAM-only, never echoed).
 2. The browser builds the PayPal authorize URL from the audited-app allow-list **including `code_challenge` + `code_challenge_method=S256`** (R3-1 — the auditor hard-REFUSES a challenge-less login: the owner holds the PayPal client secret and observes the redirect code, so without PKCE they could exchange the code directly and read the identity in plaintext); the client session travels inside the OAuth **`state`** token (base64url JSON `{v,p,n,f,c,r}`).
 3. After PayPal, **`/callback`** resolves the PKCE verifier for the state (fail-closed — forged/expired states never reach PayPal), exchanges the code with `code_verifier` (PayPal enforces), zeroizes it, then mints the hardware quote — gated behind the PayPal-verified code exchange (**PayPal is the attacker filter**) — binding `report_data[32..64] = SHA-256(P_client ∥ Nonce_client)` and returning the report E2EE'd to `P_client`. Signed `timestamp_ms` comes from PayPal's `Date` header when available (the platform clock is provider-controlled and runs +8 h off — R3-3).
 4. `/debug/envelope` is served from a **15-minute boot cache**; it is no longer part of any login path (kept for pin-rotation tooling only).
@@ -899,8 +899,8 @@ collude). What changed:
    `EXPECTED_ENCLAVE_SHA256` comment in verify.html. Harness Test 21d asserts
    the new semantics.
 2. **Auditor isolation (plan 3.3)** — key generation / login / decryption run
-   ONLY in a trusted auditor context (`file://` copy or the pinned GitHub Pages
-   copy). The copy served by the enclave's own origin REFUSES all
+   ONLY in a trusted auditor context (a saved `file://` copy; v233 removed the
+   GitHub Pages exception). The copy served by the enclave's own origin REFUSES all
    key-generating flows (Web Auditor Tampering: the owner can rewrite that
    script at will); paste-report auditing still works there. Harness Test 24.
 3. **Malicious-App defense (plan 3.1)** — PayPal client id is hardware-bound
@@ -1014,7 +1014,7 @@ tests. Everything below is fixed and covered by a regression test.
   ciphertext whose key never leaves the browser; knowing `state` buys a DoS
   (claiming it first), not disclosure.
 - **The auditor's own provenance cannot be fixed in-band.**
-  `verify.html` is fetched from GitHub Pages / a saved file, and the owner
+  `verify.html` is fetched from `raw.githubusercontent.com` / a saved file, and the owner
   controls that repository. **Mitigated, not eliminated**: `README.md` now
   publishes the auditor's SHA-256 **and byte size** in the "Verify the auditor
   itself first" table, and harness **Test 28** fails the suite if that value

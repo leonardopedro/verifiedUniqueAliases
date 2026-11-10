@@ -45,6 +45,7 @@ existed before this feature.
     "api_port": 8081,            // loopback-only attestation API
     "session_timeout_secs": 120,
     "signing_key_pem": null,     // null/absent = fresh per-boot RSA-2048 key
+    "restart_token": null,       // v233: operator token for POST /proxy/restart
     "relay_targets": [           // hosts a prover may commit to
       "api-m.paypal.com",
       "api-m.sandbox.paypal.com",
@@ -53,6 +54,32 @@ existed before this feature.
     ]
   }
 }
+```
+
+### Restarting the notary without a reboot
+
+The notary is a supervised child process that mints a fresh signing key every
+boot, so a wedged session, a policy change or a key that has to be retired used
+to mean rebooting the whole enclave — the only other thing that restarts it.
+
+With `restart_token` set in the config, `POST /proxy/restart` with the header
+`X-Proxy-Restart: <token>` asks the supervisor to kill and re-exec the child.
+The token lives in the instance's `user_data` next to the PayPal secrets, so it
+is exactly as reachable as the rest of the config. Without a token the route
+does not exist and answers `404`; a wrong token gets the same `404`, because a
+caller who cannot use the route is not told it is there. `/proxy/health` reports
+`restarts`, so the cycle is observable.
+
+The envelope cache follows the new key by itself (`/debug/envelope` probes the
+child on every request and re-mints when the fingerprint changes), which
+`scripts/check-live-proxy-restart.mjs` proves end-to-end on a live instance.
+
+Example:
+
+```bash
+curl -sS -X POST https://login.airma.de/proxy/restart \
+  -H "x-proxy-restart: $PROXY_RESTART_TOKEN"
+# {"service":"tls-proxy","restarting":true,"restarts_before":0}
 ```
 
 ### Relay targets

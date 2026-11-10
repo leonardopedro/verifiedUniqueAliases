@@ -19,7 +19,7 @@
 //     provenance fail-closed, static source pins (no old bogus offsets)
 //
 // Usage:  npm install --no-save node-forge && node scripts/test-verify-security.mjs
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync } from 'fs';
 import { execFileSync, spawnSync } from 'child_process';
 import * as https from 'https';
 import { tmpdir } from 'os';
@@ -2433,11 +2433,12 @@ console.log('\nTest 51: local-copy rescue card — non-file:// origins get save 
     html.includes('onclick="saveLocalCopy(this); return false;"'),
     'onclick still returns a promise');
   // v205 (user directive): the service serves ONLY the landing, so the legal
-  // documents are links to GitHub Pages and the auditor/prover come from the
-  // repository. Nothing legal is copied onto the service.
+  // documents are links into the repository (v233: PRIVACY.md / TERMS.md, no
+  // GitHub Pages origin) and the auditor/prover come from the same repository.
+  // Nothing legal is copied onto the service.
   check('legal links point at the legal documents themselves',
-    html.includes('href="https://leonardopedro.github.io/verifiedUniqueAliases/privacy.html"')
-      && html.includes('href="https://leonardopedro.github.io/verifiedUniqueAliases/terms.html"'),
+    html.includes('href="https://github.com/leonardopedro/verifiedUniqueAliases/blob/main/PRIVACY.md"')
+      && html.includes('href="https://github.com/leonardopedro/verifiedUniqueAliases/blob/main/TERMS.md"'),
     'legal links missing or wrong');
   // And they are the ONLY legal links: no second copy buried in the login card
   // or the audit card.
@@ -2447,13 +2448,13 @@ console.log('\nTest 51: local-copy rescue card — non-file:// origins get save 
     check('exactly one Privacy Policy and one User Agreement link remain',
       legal === 1 && terms === 1, `privacy=${legal} terms=${terms}`);
   }
-  // GitHub Pages may serve the LEGAL documents only. The auditor and the ZK
-  // prover are taken from the repository (raw), never from the mirror.
+  // v233: the auditor links to NO GitHub Pages origin at all — the legal
+  // documents live in the repository, and the auditor and the ZK prover are
+  // taken from raw.githubusercontent.com.
   {
-    const pagesHrefs = [...html.matchAll(/href="(https:\/\/leonardopedro\.github\.io[^"]*)"/g)].map((m) => m[1]);
-    check('GitHub Pages is linked ONLY for the legal documents',
-      pagesHrefs.every((u) => /\/(privacy|terms)\.html$/.test(u)),
-      JSON.stringify(pagesHrefs.slice(0, 4)));
+    const pagesHrefs = [...html.matchAll(/href="(https:\/\/[\w.-]*github\.io[^"]*)"/g)].map((m) => m[1]);
+    check('the auditor links to no GitHub Pages origin (legal docs are in the repo)',
+      pagesHrefs.length === 0, JSON.stringify(pagesHrefs.slice(0, 4)));
     check('the ZK prover link points at the repository, not at Pages',
       html.includes('href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/zk.html"'),
       'zk prover still linked to Pages');
@@ -3565,187 +3566,35 @@ console.log('\nTest 45: real Groth16 credential from the CAPTURED odd-length rep
     opened.sha256 === rep.paypal_user_info_raw_hash);
 }
 
-console.log('\nTest 46: GitHub Pages copy == repo verify.html (served-auditor drift gate)');
+console.log('\nTest 46: no GitHub Pages dependency (v233 directive)');
 {
-  // Found in the v192 cycle (2026-10-26): GitHub Pages publishes from `main`
-  // while the active line of work is `alibabacloud`. After the v192 pin
-  // rotation Pages kept serving the PREVIOUS verify.html — old RTMR2 /
-  // EXPECTED_ENCLAVE_SHA256 pins — so the "GitHub Pages auditor" link failed
-  // every audit against the deployment the enclave, repo and README all
-  // agreed on. The ZK artifacts (wasm + zkey parts) live on the SAME Pages
-  // branch, so a stale branch serves a stale AUDITOR next to correct
-  // downloads: silent, and only visible by comparing digests across the wire.
-  //
-  // This gate fetches the Pages copy over HTTPS and compares it byte-for-byte
-  // with the working tree. A MISMATCH fails; a network failure only fails
-  // under PAGES_PARITY=1 (offline `node scripts/…` stays usable), and
-  // PAGES_PARITY=0 skips the test entirely.
-  const mode = process.env.PAGES_PARITY || '';
-  if (mode === '0') {
-    console.log('  ⏭  PAGES_PARITY=0 — skipped by request');
-  } else {
-    const strict = mode === '1';
-    const PAGES_VERIFY_URL = process.env.PAGES_VERIFY_URL
-      || 'https://leonardopedro.github.io/verifiedUniqueAliases/verify.html';
-    const git = (...args) => {
-      try { return execFileSync('git', args, { cwd: repoRoot, encoding: 'utf8' }).trim(); }
-      catch { return null; }
-    };
-    const sha = (buf) => createHash('sha256').update(buf).digest('hex');
-    // Raw https (NOT globalThis.fetch): the harness stubs fetch from line ~63
-    // to drive the provenance row offline.
-    const httpGet = (url, redirects = 3) => new Promise((resolve) => {
-      let req;
-      try { req = https.get(url, { headers: { 'User-Agent': 'test-verify-security', Accept: '*/*' }, timeout: 15000 }, (res) => {
-        const status = res.statusCode || 0;
-        if (status >= 300 && status < 400 && res.headers.location && redirects > 0) {
-          res.resume();
-          return resolve(httpGet(new URL(res.headers.location, url).href, redirects - 1));
-        }
-        if (status !== 200) { res.resume(); return resolve(null); }
-        const chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => resolve(Buffer.concat(chunks)));
-      }); } catch { return resolve(null); }
-      req.on('error', () => resolve(null));
-      req.on('timeout', () => req.destroy(new Error('timeout')));
-    });
-
-    const repoDigest = sha(readFileSync(join(repoRoot, 'verify.html')));
-    const body = await httpGet(PAGES_VERIFY_URL);
-    if (!body) {
-      // Not drift — we learned nothing about the served bytes.
-      if (strict) check('GitHub Pages copy fetched over HTTPS', false, `GET ${PAGES_VERIFY_URL} failed`);
-      else console.log(`  ⚠️  Pages copy NOT fetched (${PAGES_VERIFY_URL}) — network down? PAGES_PARITY=1 makes this fatal`);
-    } else {
-      const pagesDigest = sha(body);
-      if (pagesDigest === repoDigest) {
-        check('GitHub Pages serves byte-identical verify.html', true, pagesDigest.slice(0, 16));
-        const rm = await httpGet(new URL('README.md', PAGES_VERIFY_URL).href);
-        if (rm) check('Pages README publishes the CURRENT verify.html digest',
-          rm.toString('utf8').includes(repoDigest), 'Pages README digest is stale');
-        else console.log('  ⚠️  Pages README not fetched — verify.html parity already proven');
-
-        // v194: zk.html (the ZK engine) is a Pages-served security file too —
-        // the SAME stale-branch trap that bit verify.html applies to it, and
-        // the prover's pins only protect you if Pages serves THIS build.
-        const zkRepoBuf = readFileSync(join(repoRoot, 'zk.html'));
-        const zkBody = await httpGet(new URL('zk.html', PAGES_VERIFY_URL).href);
-        if (zkBody) {
-          const zkPages = sha(zkBody), zkRepo = sha(zkRepoBuf);
-          check('GitHub Pages serves byte-identical zk.html', zkPages === zkRepo,
-            `pages=${zkPages.slice(0, 16)} repo=${zkRepo.slice(0, 16)} — push to the Pages branch (both-branches rule)`);
-        } else {
-          check('GitHub Pages zk.html fetched over HTTPS', !strict, `GET ${new URL('zk.html', PAGES_VERIFY_URL).href} failed`);
-        }
-
-        // v193: the ZK artifacts live on the SAME Pages branch and are fetched
-        // by the auditor with `force-cache` — so a stale Pages (or a stale
-        // browser copy of it) serves the WRONG wasm/zkey beside a correct
-        // auditor. That is the live incident behind the `6300a547… vs
-        // b8ce562f…` INTEGRITY FAILURE: the gate fired, but only in the
-        // victim's browser. Pin them here too, byte-for-byte, against the
-        // repo files AND against the digests the auditor embeds.
-        if (process.env.PAGES_ZK_ARTIFACTS !== '0') {
-          // v194: the pins moved into zk.html with the engine.
-          const vsrc = zkHtml;
-          const wasmPin = (vsrc.match(/var ZK_WASM_SHA256 = '([0-9a-f]{64})'/) || [])[1];
-          const zkeyPin = (vsrc.match(/var ZK_ZKEY_SHA256 = '([0-9a-f]{64})'/) || [])[1];
-          const wasmLocal = readFileSync(join(repoRoot, 'zk', 'identity_escrow.wasm'));
-          const part0 = readFileSync(join(repoRoot, 'zk', 'identity_escrow_final.zkey.part0'));
-          const part1 = readFileSync(join(repoRoot, 'zk', 'identity_escrow_final.zkey.part1'));
-          check('repo wasm == the ZK_WASM_SHA256 the auditor embeds',
-            sha(wasmLocal) === wasmPin, `${sha(wasmLocal).slice(0, 16)} vs pin ${String(wasmPin).slice(0, 16)}`);
-          check('repo zkey parts assemble to the ZK_ZKEY_SHA256 the auditor embeds',
-            sha(Buffer.concat([part0, part1])) === zkeyPin,
-            `${sha(Buffer.concat([part0, part1])).slice(0, 16)} vs pin ${String(zkeyPin).slice(0, 16)}`);
-          const zkBase = new URL('zk/', PAGES_VERIFY_URL).href;
-          const wanted = [
-            ['identity_escrow.wasm', wasmLocal],
-            ['identity_escrow_final.zkey.part0', part0],
-            ['identity_escrow_final.zkey.part1', part1],
-          ];
-          for (const [file, localBuf] of wanted) {
-            const got = await httpGet(zkBase + file);
-            if (!got) {
-              check(`Pages serves zk/${file}`, strict, `GET ${zkBase}${file} failed`);
-              continue;
-            }
-            const pagesSha = sha(got), repoSha = sha(localBuf);
-            check(`Pages zk/${file} byte-identical to the repo artifact`,
-              pagesSha === repoSha,
-              `pages=${pagesSha.slice(0, 16)} repo=${repoSha.slice(0, 16)} — every browser auditing from Pages would hit INTEGRITY FAILURE`);
-          }
-        }
-      } else {
-        // Classify the mismatch so the failure says WHICH branch is stale.
-        // GITHUB_REF_NAME covers CI's detached checkout (git reports `HEAD`).
-        const branchRaw = git('rev-parse', '--abbrev-ref', 'HEAD');
-        const branch = (branchRaw && branchRaw !== 'HEAD') ? branchRaw
-          : (process.env.GITHUB_REF_NAME || null);
-        const headSha = git('rev-parse', 'HEAD');
-        const ageMin = headSha
-          ? (Date.now() / 1000 - Number(git('log', '-1', '--format=%ct') || 0)) / 60
-          : Number.POSITIVE_INFINITY;
-        let pagesRun = null;
-        let apiOk = false;
-        const m = /^https?:\/\/([^.]+)\.github\.io\/([^/]+)\//.exec(PAGES_VERIFY_URL);
-        if (m) {
-          const raw = await httpGet(`https://api.github.com/repos/${m[1]}/${m[2]}/actions/runs?per_page=20`);
-          try {
-            const j = JSON.parse(raw.toString('utf8'));
-            pagesRun = (j.workflow_runs || []).find((r) => r.name === 'pages build and deployment') || null;
-            apiOk = !!pagesRun || Array.isArray(j.workflow_runs);
-          } catch { /* API unavailable → fall through to the age rule */ }
-        }
-        let reason;
-        if (pagesRun && branch && pagesRun.head_branch && pagesRun.head_branch !== branch) {
-          // Pages publishes from ANOTHER branch. If that branch ALREADY has
-          // this commit (the push-both-branches rule was followed) the site is
-          // simply about to update — that is the push race, not drift. Only a
-          // commit that is NOT on the Pages branch is real drift.
-          git('fetch', '--quiet', 'origin', pagesRun.head_branch);
-          const tip = git('rev-parse', 'FETCH_HEAD');
-          let onPagesBranch = !!tip && tip === headSha;
-          if (!onPagesBranch && tip && headSha) {
-            const r = spawnSync('git', ['merge-base', '--is-ancestor', headSha, tip], { cwd: repoRoot });
-            onPagesBranch = r.status === 0;
-          }
-          if (onPagesBranch && (!strict || process.env.CI) && ageMin < 20) {
-            check('GitHub Pages verify.html == repo verify.html (Pages branch push race, grace)', true,
-              `pages=${pagesDigest.slice(0, 16)} repo=${repoDigest.slice(0, 16)} — Pages builds from \`${pagesRun.head_branch}\`, which already has ${headSha.slice(0, 7)}; rebuild pending`);
-            reason = undefined;
-          } else if (onPagesBranch) {
-            reason = `Pages builds from \`${pagesRun.head_branch}\` and ${headSha.slice(0, 7)} IS on it, but the served copy still differs — the Pages rebuild for that commit has not landed (check the 'pages build and deployment' run)`;
-          } else {
-            reason = `Pages builds from \`${pagesRun.head_branch}\` but ${headSha ? headSha.slice(0, 7) : 'this commit'} is not on it — push it too (git push origin ${branch}:${pagesRun.head_branch}) or repoint the Pages source`;
-          }
-        } else if (pagesRun && headSha && pagesRun.head_sha === headSha
-              && pagesRun.status === 'completed' && pagesRun.conclusion === 'success') {
-          reason = `Pages finished building ${headSha.slice(0, 7)} yet serves a different file`;
-        } else if (pagesRun && headSha && pagesRun.head_sha === headSha
-              && pagesRun.status && pagesRun.status !== 'completed') {
-          // Pages is building THIS commit right now — in flight, not drift.
-          // Survives strict mode so CI on a push-to-both-branches is not red
-          // for the ~1-3 min the Pages job needs.
-          check('GitHub Pages verify.html == repo verify.html (Pages build in flight, grace)', true,
-            `pages=${pagesDigest.slice(0, 16)} repo=${repoDigest.slice(0, 16)} — ${pagesRun.status}; re-run after it completes`);
-          reason = undefined;
-        } else if ((!strict || process.env.CI) && ageMin < 20) {
-          // CI runs seconds after the push, before Pages can rebuild a matching
-          // branch — strict there would be red for a race, not a regression.
-          check('GitHub Pages verify.html == repo verify.html (rebuild pending, grace)', true,
-            `pages=${pagesDigest.slice(0, 16)} repo=${repoDigest.slice(0, 16)} — commit is ${ageMin.toFixed(0)} min old, Pages has not rebuilt it yet; re-run after the pages build`);
-          reason = undefined;
-        } else {
-          reason = `pages=${pagesDigest.slice(0, 16)} repo=${repoDigest.slice(0, 16)}`
-            + `${apiOk ? '' : ' (GitHub API unavailable — could not classify)'}`
-            + `${strict ? ' (PAGES_PARITY=1: no grace)' : ''}`;
-        }
-        if (reason) check('GitHub Pages serves byte-identical verify.html', false, reason);
-      }
-    }
-  }
+  // The project used to publish verify.html, zk.html and the ZK artifacts on
+  // leonardopedro.github.io and this suite gated on that copy. The gate was
+  // itself the problem: Pages is a build nobody deploys or measures, it
+  // silently served stale pins for hours (the v192 and v231 incidents), and a
+  // second "pinned" copy of the auditor reads as authoritative while no
+  // attestation ever covers it — a false sense of safety. v233 removes the
+  // origin from the project: raw.githubusercontent.com is the only byte source
+  // for the auditor, the prover and the proving artifacts. This test fails if
+  // any shipped page or the service starts pointing at Pages again.
+  const pagesRe = /https?:\/\/[\w.-]*github\.io\//;
+  const shipped = ['verify.html', 'index.html', 'zk.html', 'zk-rsa.html', 'src/main.rs'];
+  const hits = shipped.filter((f) => {
+    try { return pagesRe.test(readFileSync(join(repoRoot, f), 'utf8')); } catch { return false; }
+  });
+  check('no shipped page or service file references a GitHub Pages origin',
+    hits.length === 0, hits.length ? `found in ${hits.join(', ')}` : 'clean');
+  const auditor = readFileSync(join(repoRoot, 'verify.html'), 'utf8');
+  check('the auditor downloads zk.html from raw.githubusercontent.com',
+    /var ZK_PROVER_URL = 'https:\/\/raw\.githubusercontent\.com\//.test(auditor));
+  const prover = readFileSync(join(repoRoot, 'zk.html'), 'utf8');
+  check('zk.html loads its proving artifacts from raw.githubusercontent.com',
+    /var ZK_BASE = 'https:\/\/raw\.githubusercontent\.com\//.test(prover));
+  const legal = ['PRIVACY.md', 'TERMS.md'];
+  check('legal documents live in the repository, not on a hosted site',
+    legal.every((f) => existsSync(join(repoRoot, f))) && !existsSync(join(repoRoot, 'privacy.html')),
+    'expected PRIVACY.md + TERMS.md and no privacy.html');
+  check('.nojekyll (a Pages-only artifact) is gone', !existsSync(join(repoRoot, '.nojekyll')));
 }
 
 console.log('\nTest 47: zk-rsa.html — RSA ZK escrow credential (PGP / X.509 / PEM / raw)');
