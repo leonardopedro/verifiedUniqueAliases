@@ -3049,3 +3049,70 @@ success. Live:
 The landing on the running instance links
 `…github.io/verifiedUniqueAliases/privacy.html` and `…/terms.html` and nothing
 else legal — that is what made the `PRIVACY.md`/`TERMS.md` removal safe.
+
+## 0.52 — v235: the dead seal card goes, and the notary gets a link (2026-11-10 12:53 UTC)
+
+### What the user reported
+
+1. "I don't see in `login.airma.de` any link for the TLS Notary webservice."
+2. The auditor's card *"Seal the PayPal code to the attested key (optional —
+   binds the second attestation to the same boot)"* is unneeded.
+3. It should be automatic: the first *Log in with PayPal* already hands the
+   page the attested TLS key, so the second login needs no text box and no
+   extra button.
+
+### Why the seal card could never work (the fact that settled it)
+
+PayPal delivers the authorization code to the **Return URL registered on the
+app** (`developer.paypal.com` → *Enter a Return URL … your users are
+redirected to this URL*, https required) — not to the page that started the
+login. `https://login.airma.de/callback` **is** a route the enclave serves: the
+browser arrives with `?code=…&state=…`, the enclave exchanges it and returns the
+success page that auto-downloads the encrypted report. So the code is in the
+request line the enclave already received; sealing it *after* that arrival
+cannot keep it out of the server's hands, and a saved `file://` auditor can
+never be a registered Return URL. The card could only ever have worked with a
+pasted code, i.e. exactly the manual step the user called unneeded. Logins are
+also `file://`-only (`trustedAuditorContext()`), which v168 requires.
+
+### What changed
+
+- `verify.html` == `index.html` (280,318 B, `037ccd85…`): `#sealCard`, the
+  `#sealedRedirectToggle` checkbox, and ~18 KB of seal JS (`sealToPem`,
+  `sealCodeAndOpen`, `parseCallbackUrl`, `pageRedirectUri`,
+  `finishSealedLogin`, the prefill IIFE, `SEAL_RECORD_KEY`,
+  `SEALED_NONCE_KEY`, `lastAuditedTlsKeyPem`, `lastAuditedNonceKeyPem`) are
+  gone; `redirect_uri` left the login-session body; the toggle's slot now
+  states that PayPal returns to `/callback` on the server. The 🔑 row stays
+  read-only: it records the attested TLS key (`pav_audited_tls_key_v1`) and
+  says whether it matches the last audit of the same enclave — informational,
+  never fatal, since every reboot mints a new key. `tlsKeyFingerprint` is the
+  only surviving primitive.
+- `src/main.rs` `LANDING_HTML`: new section *Second webservice — TLS Notary*
+  with `/proxy/health`, `/proxy/attestations` and `/proxy/refusals`.
+- `scripts/test-seal-page.mjs` deleted and its `build-attest.yml` step removed —
+  the client-side flow it tested no longer exists. The enclave's `code_enc` /
+  `nonce_enc` support is untouched.
+- `scripts/test-verify-security.mjs`: the old "`pageRedirectUri` exists" check
+  became three pins — no seal card/inputs, no page-redirect return leg, TLS-key
+  fingerprint primitive still present. 510 passed / 0 failed.
+
+### Release (two cycles again — RTMR2 rotated, as predicted)
+
+| pass | image | disk sha256 | note |
+|---|---|---|---|
+| A | `m-2ze42sho12vn8h0900h9` (`paypal-tdx-esp-202611101313`) | `a11cb7fc…` | new binary `f5a469dc…`; **pins stale** (verify: RTMR2 4a431f43… ≠ pin 5dfcc495…, binary pin cfafb15d… ≠ f5a469dc…) |
+| **B (live)** | **`m-2zehwizs08eo9fkf40oh`** (`paypal-tdx-esp-202611101346`) | **`39a203bd…`** | same binary + initramfs (`267eab0e…`, unchanged → RTMR2 holds), ESP carries the rotated pins |
+
+Pass B: `HTTPS 200`, `running binary matches the build (f5a469dc…)`,
+`auditor pins are consistent with the live quote` (MRTD `e0199499…`,
+RTMR0 `06a32a2f…`, RTMR1 `6fa03523…`, **RTMR2 `4a431f43…`**, RTMR3 zero,
+`EXPECTED_ENCLAVE_SHA256 f5a469dc…`), `PARITY OK`, TLS chain, sealed
+`/callback` refusals, notary spawned/named by the report (`dac8f4f5…`), and the
+restart re-mint to a new key (`717b9231…`). Live landing now carries both
+notary links. Pass-A image + snapshot deleted; relay
+`i-2zefiag79exwsshidi3z` back to `StopCharging`.
+
+The `/verify.html` path on the enclave is still the 5,529-byte pointer page —
+the real auditor is only ever the repo file at
+`raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html`.
