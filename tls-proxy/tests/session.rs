@@ -789,6 +789,14 @@ async fn closes_a_session_that_never_speaks() -> Result<(), Box<dyn std::error::
         refusals["refusals"][0]["kind"], "timeout",
         "an idle peer is a timeout, not a rejected presentation: {refusals}"
     );
+    // v237: the timeout names where the session had got to, because "no verdict"
+    // alone cannot be told apart from a slow prover, and the address it was
+    // relaying to is not re-derivable after the boot-time pin is gone.
+    let reason = refusals["refusals"][0]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("last progress: before the commitment handshake"),
+        "a peer that never committed must be reported at that phase, got: {reason}"
+    );
     Ok(())
 }
 

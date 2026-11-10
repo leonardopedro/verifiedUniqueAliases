@@ -2490,6 +2490,13 @@ console.log('\nTest 51: local-copy rescue card — non-file:// origins get save 
     check('the landing tells the visitor what to do next',
       landing.includes('file:///') && landing.includes('Log in with PayPal'),
       'next-step instructions missing');
+    // v237: the notary section linked /proxy/attestations but not the auditor
+    // that checks a record from it — the page was unreachable from anywhere.
+    check('the landing links the notary record auditor',
+      landing.includes('raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify-proxy.html')
+        && landing.includes('Download verify-proxy.html')
+        && landing.indexOf('verify-proxy.html') > landing.indexOf("Second webservice"),
+      'landing is missing the verify-proxy.html download');
     // v227 (user directive): GitHub Pages is NOT a redirect target and not a
     // trusted origin. The auditor comes from raw as a download; PayPal returns
     // to the enclave's own /callback, whose certificate the visitor can save.

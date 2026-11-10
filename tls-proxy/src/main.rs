@@ -306,7 +306,9 @@ struct Verified {
 enum SessionOutcome {
     Verified(Verified),
     Rejected(BoxError),
-    TimedOut,
+    /// The session hit `session_timeout`; the string is where it had got to,
+    /// so the verdict says whether the relayed connection or the prover stalled.
+    TimedOut(String),
 }
 
 async fn handle_session(stream: TcpStream, peer: SocketAddr, st: Arc<ProxyState>) {
@@ -329,8 +331,11 @@ async fn handle_session(stream: TcpStream, peer: SocketAddr, st: Arc<ProxyState>
             st.sessions_failed.fetch_add(1, Ordering::Relaxed);
             warn!("session from {peer}: rejected: {reason}");
         }
-        SessionOutcome::TimedOut => {
-            let reason = format!("no verdict within {:?}", st.session_timeout);
+        SessionOutcome::TimedOut(where_at) => {
+            let reason = format!(
+                "no verdict within {:?} — last progress: {where_at}",
+                st.session_timeout
+            );
             st.remember_refusal("timeout", reason.clone());
             st.sessions_failed.fetch_add(1, Ordering::Relaxed);
             warn!("session from {peer}: {reason} — closed");
@@ -340,6 +345,15 @@ async fn handle_session(stream: TcpStream, peer: SocketAddr, st: Arc<ProxyState>
 
 async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> SessionOutcome {
     stream.set_nodelay(true).ok();
+
+    // Where the session got to. A stall with no verdict is otherwise
+    // indistinguishable from a slow prover, and the address the notary was
+    // dialling is the one fact an operator needs: it comes from the boot-time
+    // pin in /etc/hosts, not from a lookup, so it cannot be re-derived later.
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(String::from(
+        "before the commitment handshake",
+    )));
+    let phase = progress.clone();
 
     let session = Session::new(stream.compat());
     let (driver, mut handle) = session.split();
@@ -419,6 +433,7 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
         };
         client.set_nodelay(true).ok();
         info!("session from {peer}: relaying TLS to {server_name} ({addr})");
+        *phase.lock().unwrap() = format!("relaying TLS to {server_name} ({addr})");
 
         let verifier = verifier.accept().await?;
         let verifier = verifier.run(client.compat()).await?;
@@ -482,7 +497,7 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
     let outcome = match tokio::time::timeout(st.session_timeout, protocol).await {
         Ok(Ok(verified)) => SessionOutcome::Verified(verified),
         Ok(Err(e)) => SessionOutcome::Rejected(e),
-        Err(_) => SessionOutcome::TimedOut,
+        Err(_) => SessionOutcome::TimedOut(progress.lock().unwrap().clone()),
     };
 
     handle.close();

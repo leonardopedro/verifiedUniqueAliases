@@ -182,7 +182,10 @@ file`, and the explanation existed only in the operator's refusal ring.
 without a shell: each entry is `{at, kind, reason}`, where `kind` is `rejected`
 (a verdict was reached and refused — MPC mode, no revealed server identity, a
 mismatched name, a transcript over the bound) or `timeout` (no verdict in
-`session_timeout_secs`). The reason quotes the prover's own commit, so it is
+`session_timeout_secs`, with the last thing the session did before it ran out
+— normally the address it was relaying to). Every refusal names its own cause,
+so a prover who got no answer at all has to be told what went wrong rather than
+being left with a bare disconnect. The reason quotes the prover's own commit, so it is
 capped at 400 characters; these records are diagnostics, never evidence, and
 they are not signed.
 
@@ -483,6 +486,9 @@ elf64-x86-64`.
 - At most 256 attestations are retained, per boot; the queue is FIFO.
 - A session that produces no verdict within `session_timeout_secs` is closed and
   counted failed, and its driver is aborted so the peer's socket cannot outlive
-  the verdict.
+  the verdict. The refusal says where it had got to (`last progress: relaying
+  TLS to <host> (<address>)`): the address comes from the boot-time pin and
+  cannot be re-derived afterwards, so a stall with no address in it is
+  unactionable for an operator.
 - `tlsn` is alpha software; the pinned revision is the one this crate was written
   against, not an audited one.

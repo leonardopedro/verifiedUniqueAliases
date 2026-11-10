@@ -3377,9 +3377,12 @@ fn html_with_secure_headers(bytes: Vec<u8>) -> Response {
 //     still fetched from raw.githubusercontent.com, because a "pinned" copy of
 //     the page itself reads as trusted while nobody deploys or measures it;
 //   * what remains at `/` is a small static landing: the title, one paragraph
-//     of what this is, the two legal links, a DOWNLOAD link for verify.html
-//     from the repository, and numbered instructions on what to do next. No
-//     text boxes, no key handling, no user data, no auditor code.
+//     of what this is, the two legal links, DOWNLOAD links for verify.html and
+//     verify-proxy.html from the repository, and numbered instructions on what
+//     to do next. No text boxes, no key handling, no user data, no auditor code.
+//     v237: the notary section links its own auditor too — a prover who can
+//     fetch a record from /proxy/attestations had no way to reach the page that
+//     checks it, and the page is useless unless it is found.
 //
 // The protocol endpoints (/attest/login-session, /callback, /tls-cert.pem,
 // /e2ee-blob, /debug/envelope) are untouched: they are the service.
@@ -3425,6 +3428,10 @@ const LANDING_HTML: &str = r#"<!DOCTYPE html>
   <a class="dl alt" href="/proxy/attestations" target="_blank" rel="noopener">&#128203; Notarized sessions (&#47;proxy&#47;attestations)</a>
   <span class="hint"><code>&#47;proxy&#47;health</code> says whether the child is enabled, running and listening (with its ports and restart count); <code>&#47;proxy&#47;attestations</code> lists recorded sessions by host fingerprint &mdash; transcript bytes stay on loopback. Refused sessions: <a href="/proxy/refusals">&#47;proxy&#47;refusals</a>.</span>
 
+  <p>If a session of yours is listed there, fetch your own signed record &mdash; <code>&#47;proxy&#47;attestations&#47;&lt;id&gt;?sent_sha256=&hellip;&amp;received_sha256=&hellip;</code> with the digests your proof reveals &mdash; and check it here, offline:</p>
+  <a class="dl" id="dlp" href="https://raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify-proxy.html" download="verify-proxy.html">&#128190; Download verify-proxy.html</a>
+  <span class="hint" id="hintp">The notary record auditor: it opens no connection and sends nothing, so it works with the network off. It checks the enclave&rsquo;s RSA signature over the signed fields, recomputes both transcript digests, and shows the key &mdash; compare that key with the one named by <code>&#47;debug&#47;envelope</code>.</span>
+
   <h2>What to do next</h2>
   <ol>
     <li>Open the downloaded file by double-clicking it (or with <b>Ctrl+O</b> / <b>&#8984;O</b>). The address bar must read <code>file:///&hellip;/verify.html</code> &mdash; the offline audit only runs from that local copy.</li>
@@ -3438,24 +3445,30 @@ const LANDING_HTML: &str = r#"<!DOCTYPE html>
 // raw.githubusercontent.com serves text/plain (the browser would show source),
 // so fetch the file and hand it to the browser as a download. Without JS the
 // link still works — it just opens the copy on GitHub.
-document.getElementById('dl').addEventListener('click', async function (ev) {
-  var hint = document.getElementById('hint');
-  ev.preventDefault();
-  try {
-    var r = await fetch(this.href, { cache: 'no-store' });
-    var t = await r.text();
-    if (!r.ok || t.indexOf('<html') === -1) throw new Error('HTTP ' + r.status);
-    var u = URL.createObjectURL(new Blob([t], { type: 'text/html;charset=utf-8' }));
-    var a = document.createElement('a');
-    a.href = u; a.download = 'verify.html';
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(function () { URL.revokeObjectURL(u); }, 10000);
-    hint.textContent = 'Saved to your downloads folder.';
-  } catch (e) {
-    hint.textContent = 'Could not save it here \u2014 save the page that just opened with Ctrl+S as verify.html.';
-    try { window.open(this.href, '_blank'); } catch (e2) {}
-  }
-});
+function saveDownloader(linkId, hintId, name) {
+  var link = document.getElementById(linkId);
+  if (!link) return;
+  link.addEventListener('click', async function (ev) {
+    var hint = document.getElementById(hintId);
+    ev.preventDefault();
+    try {
+      var r = await fetch(link.href, { cache: 'no-store' });
+      var t = await r.text();
+      if (!r.ok || t.indexOf('<html') === -1) throw new Error('HTTP ' + r.status);
+      var u = URL.createObjectURL(new Blob([t], { type: 'text/html;charset=utf-8' }));
+      var a = document.createElement('a');
+      a.href = u; a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function () { URL.revokeObjectURL(u); }, 10000);
+      hint.textContent = 'Saved to your downloads folder.';
+    } catch (e) {
+      hint.textContent = 'Could not save it here — save the page that just opened with Ctrl+S as ' + name + '.';
+      try { window.open(link.href, '_blank'); } catch (e2) {}
+    }
+  });
+}
+saveDownloader('dl', 'hint', 'verify.html');
+saveDownloader('dlp', 'hintp', 'verify-proxy.html');
 </script>
 </body>
 </html>

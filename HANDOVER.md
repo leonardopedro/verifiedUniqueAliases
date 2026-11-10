@@ -3206,3 +3206,84 @@ slow sessions. Operator remedy: pin the name in the config with
 - Cleanup: images `m-2ze6iuaofgxevbmu9lrf` and `m-2zehwizs08eo9fkf40oh`
   (+ their snapshots) deleted; rollback left is `m-2ze5cnizkdv1hdsxfpzk`; relay
   `i-2zefiag79exwsshidi3z` back to `StopCharging`.
+
+## 0.54 — v237: the notary's targets get pinned, and it gets measured (2026-11-10 18:35 UTC)
+
+### Two targets fixed by pinning, one still intermittent
+
+`sandbox.paypal.com` was the documented open hole in §0.53 (commit accepted,
+TCP connect fine, relayed handshake never completes). The cause was **not** the
+proxy: the notary resolves `relay_targets` once at boot, and the bare name
+resolved to an edge that stalls for this enclave — while the same names from the
+relay host answered 301/403 in <1.2 s (`api-m.paypal.com` on `104.16.124.74`,
+`104.17.128.66`, `api-m.sandbox.paypal.com` on `146.75.123.1`,
+`sandbox.paypal.com` on `151.101.195.1`). Pinning is the fix that stays inside
+the design (the resolver is closed after boot on purpose).
+
+Prod `relay_targets` is now **all four names pinned**:
+
+```json
+["api-m.paypal.com@104.16.124.74", "api-m.sandbox.paypal.com@146.75.123.1",
+ "sandbox.paypal.com@151.101.195.1", "www.sandbox.paypal.com@151.101.195.1"]
+```
+
+`api-m` was pinned too on measured evidence: on the pass-B boot it resolved to
+`104.17.128.66` and 2 of 5 sequential sessions stalled at the handshake, while
+`104.16.124.74` is the address the enclave's own hardened PayPal client already
+uses for token exchange. After the pin, sequential sessions are **10/10**
+(`api-m` 5/5, `sandbox` 5/5, 15–30 s each) and the `/proxy/refusals` ring is
+empty. Config-only change — pushed with Stop → `ModifyInstanceAttribute
+--UserData` → Start, no disk swap, so **no pin rotation** was involved.
+
+### Measured ceiling under concurrency
+
+Same boot, `api-m.paypal.com`, one session per prover process:
+
+| Load | Result |
+|---|---|
+| sequential | **10 / 10** |
+| 4 concurrent (×2 back-to-back) | 4/4, then 2/4 |
+| 4 concurrent after 75 s idle | 3/4 |
+| 8 concurrent | 5/8 |
+
+Failure shape is always the same and never a refusal the notary intends: the
+prover dies with `connection closed before message completed` right after
+`relayed TLS handshake started`, and the notary record is
+`timeout | no verdict within 120s — last progress: relaying TLS to host:5c868ab7
+(104.16.124.74:443)` (once `rejected | io error: failed to receive proxy
+finished message caused by: unexpected end of file`). So the stall is the
+**relayed handshake against PayPal's edge**, not commit, not the MPC, and not
+the pinned address (sequential uses the same address and never fails). The
+enclave is `ecs.c9i.large` (2 vCPU) and `/proxy/health` stayed at
+`active_sessions: 0` afterwards — nothing is leaked; the 120 s timeout is what
+holds a failed session open. Practical statement: **1–2 concurrent is safe,
+4 ≈ 75 % per session, 8 ≈ 62 %**, and a prover should retry once.
+
+### Landing page
+
+The "Second webservice — TLS Notary" section now carries a
+`Download verify-proxy.html` button (`id="dlp"`, the raw.githubusercontent blob,
+saved to disk by the same `saveDownloader()` helper the report link uses), so a
+prover can fetch the auditor for their notary record without leaving the page.
+
+### Timeout refusals now carry progress
+
+`SessionOutcome::TimedOut(String)` + an `Arc<Mutex<String>>` progress cell set
+after connect and at each phase, so a 120 s timeout reads
+`no verdict within 120s — last progress: relaying TLS to host:<fingerprint>
+(<addr>:443)`. That is what made the load-test failures diagnosable above, and
+it names the boot-pinned address, which cannot be re-derived later.
+
+### Verification and release
+
+- `test-verify-security` **511/511** (new landing-link check), `check-auditor-pins`
+  static + `--live` OK, `check-zk-pins` OK, `cargo +1.99.0 test --test session`
+  **9/9** (timeout refusal asserts the progress text).
+- Pass B: image **`m-2zedag1i2kjh7iiv86w2`** / disk **`b4126b0fdd0bc40274ff0c2fcce823068df1e72ef2fcc9edb95c271af6ba7ee6`**,
+  initramfs `bdafdaf885ae…`, `EXPECTED_RTMR2 → f4c67695512baabf…`,
+  `EXPECTED_ENCLAVE_SHA256 → d1d65de9ec7e84f2…`, `verify.html` == `index.html`
+  **280,318 B `205b0eae67506242dfd94840ee0abe56c1ae62bcc5c67db4889360d203fc4aa9`**
+  (README rotated same commit). Post-swap config push, TLS 200 at t+50 s,
+  `check-auditor-pins --live`: pins == live quote, `PARITY OK`.
+- Cleanup: pass-A image `m-2zedx7ou4mujffeqlg90` deleted; rollback left is
+  `m-2ze7c8jev53jh1d6ufby`; relay `i-2zefiag79exwsshidi3z` → `StopCharging`.
