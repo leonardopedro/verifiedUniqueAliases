@@ -2551,3 +2551,102 @@ Live `i-2ze1zdxis0hcsg91qbh5`, image `m-2ze1wtngcskhet1y3lnn`, EIP
 `101.200.178.251`; notary `:8443` up, API `127.0.0.1:8081`. Rollback: the pass-1
 image (`paypal-tdx-esp-v230-…`, same RTMR2, old page). v229 image and snapshot
 deleted; relay stopped; `/tmp` config and record captures removed.
+
+---
+
+## 0.47 — v231: the notary's key is now named by the attested report (2026-11-10)
+
+### The caveat v230 shipped with
+
+A TLSNotary record is signed by the notary's per-boot RSA key, and the record
+carries that key. `verify-proxy.html` checked the signature and said, honestly,
+that it could not check whose key it was. That left the chain short: the record
+proved "signed by K", and nothing tied K to the enclave. The record could have
+been produced by anyone who held a key.
+
+### The fix: one hop, no new trust anchor
+
+The enclave's attestation report already is a hardware-anchored statement: its
+quote's `report_data` commits to the enclave identity key, `/init` and the disk
+manifest, and its body is signed by that identity key. So the notary key is now
+named *inside* that body:
+
+1. **Proxy** — new `GET :8081/pubkey` returns
+   `{pubkey_pem, pubkey_sha256, algorithm, signature_alg}`, where
+   `pubkey_sha256` is SHA-256 over the **SubjectPublicKeyInfo DER** (not the PEM
+   text), so any verifier that re-encodes the key lands on the same bytes.
+2. **Enclave** — `attested_proxy_key()` fetches that route while minting a
+   report and publishes
+   `session_context.proxy_signing_key = {available, algorithm, signature_alg,
+   pubkey_pem, pubkey_sha256, reported_sha256}` in **both** reports: the
+   data-free envelope and the post-login callback report. The fingerprint is
+   recomputed from the PEM with the existing `pubkey_fingerprint()`, and the
+   child's own claim is kept beside it as `reported_sha256`, so a disagreement is
+   visible rather than silently repaired. When the second service is absent the
+   field is `{available:false, reason:"…"}` — never an invented key.
+3. **Auditor** — `verify-proxy.html` gained a second input (the report) and turns
+   the old warning into a check: the record's key PEM and fingerprint must equal
+   the report's, otherwise the audit fails closed. The page still states what it
+   cannot do — verify the report's own quote — and points at `verify.html`.
+4. **Gate** — `scripts/check-live-notary.mjs` now fetches `/debug/envelope` and
+   asserts the report names the notary key and that the fingerprint is
+   SHA-256(SPKI DER) of the PEM it published, so a regression fails the rotation.
+
+Tests: `tls-proxy/tests/session.rs` asserts `/pubkey` names the exact record key
+and the advertised fingerprint is the DER hash (8 passed); `test-verify-proxy`
+covers matching / wrong-key / wrong-fingerprint / `available:false` / garbage
+reports (53 passed); `cargo test` 46 passed; security 501/0; seal card +
+sealed-return; workflows.
+
+### Release (two passes)
+
+Both binaries changed, so RTMR2 moved as well as the PayPal binary.
+
+| pass | image | disk sha256 | note |
+|---|---|---|---|
+| 1 | `m-2ze5go7984ubmq6epai0` | `bd07dd67…` | pins read live; verify green |
+| **2 (live)** | **`m-2zedx7ou4muj4ulruuxz`** (`paypal-tdx-esp-v231b-202611100418`) | **`c15b3197…`** | page + pins in the ESP |
+
+Pins: `EXPECTED_RTMR2` `3d58e6da… → c436335f…`, `EXPECTED_ENCLAVE_SHA256`
+`406cdcb3… → 33308970…`; MRTD/RTMR0/1/3 held. `verify.html`/`index.html`
+302938 bytes, `4d9cd6f21d93cfdbf20e4fd18b4af219cff4ce37fb506a278ac7bf2fcb9a17c4`. Rollback: the pass-1 image (same binary and RTMR2, earlier
+page).
+
+**Pass 2's scripted verify aborted on a transient ACME failure**, not on the
+image: the guest booted with the notary listening on :8443 while :443 stayed
+closed (`000` from 04:20), because issuance at boot is a retry loop with no
+self-signed fallback ("Running + dark"). It healed by itself at 04:47:51 with no
+intervention — the retry backoff is 15 s → 300 s. Every verify step was then
+re-run by hand against the live instance and passed:
+
+- running binary `33308970…` == built; `PARITY OK` (ESP == `disk-alibaba.raw`, `c15b3197…`)
+- certificate download == live handshake == report (`5d492667…`)
+- `/callback` refuses missing/forged input in sealed plain text
+- notary enabled, spawned, listening, list readable, **key named by the report** (`3b5c5557…`)
+
+### The live notary test (again, on the new deployment)
+
+`LIVE_NOTARY=101.200.178.251:8443` against `www.sandbox.paypal.com/signin`:
+attempt 1/3, 16.2 s, `200 OK`, 103 B → 37,998 B, presentation complete.
+Record `15f8386a…` fetched from this non-VM machine (HTTP 200, 52,081 B) and
+checked end to end:
+
+| check | result |
+|---|---|
+| record signature (RSA-PKCS1-v1_5-SHA256) | **VALID** |
+| record key fingerprint | `3b5c55575569c231e2f2e4ceafd937bfa3ed61db6d1a0144cc1bfbeffa8cb999` |
+| fingerprint named by `/debug/envelope` | **identical** |
+| notary's own `reported_sha256` | **identical** |
+| `proxy_signing_key.pubkey_pem` == record's `enclave_pubkey_pem` | **true** |
+| report binary | `33308970…` (matches the pin) |
+
+So a record signed by the notary now resolves to the same measured VM the PayPal
+flow attests, and `verify.html` remains the one place the quote and pins are
+checked. Notary restart caveat: a new key is minted, and the envelope is cached
+15 minutes, so a stale report names the previous key and the page fails closed —
+fetch a fresh report.
+
+### State
+
+Live `i-2ze1zdxis0hcsg91qbh5`, image `m-2zedx7ou4muj4ulruuxz`, EIP
+`101.200.178.251`; PayPal service on :443, notary on :8443 (api 127.0.0.1:8081).
