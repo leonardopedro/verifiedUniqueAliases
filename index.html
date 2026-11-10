@@ -2028,7 +2028,7 @@ Wmw2oAio9A==
     // ========================================================================
     var EXPECTED_RTMR0 = '06a32a2f92ea455dd628bc41be9bb5910c2782a2eb93c646c6a5ddebd70291839f197792d289cca528572b6d910294db';
     var EXPECTED_RTMR1 = '6fa0352319182f7ec8cb713223cbc1853506caf719c64d04475a26975ae8ebf72003f592dcf0aafe392cc74de33d3f90';
-    var EXPECTED_RTMR2 = '3d58e6da67a013a8dbb7852deba9aba3b4d7fb5f13466c3f3568e0643483272bcd440061fd300074d9d80dbab610594f';
+    var EXPECTED_RTMR2 = 'c436335fcf89c545d2fbb08a0c083b3f7e7af3e1ca37874edb94a92536d2ad8840a66c59d7672ea87e57b96723cf9840';
     var EXPECTED_RTMR3 = '000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000';
 
     // ========================================================================
@@ -2140,7 +2140,12 @@ Wmw2oAio9A==
     // (`--build-arg TLS_PROXY=1`). The initramfs carries that binary, so RTMR2
     // moved: a2b7baf1… → 3d58e6da…; MRTD/RTMR0/1/3 and the PayPal binary
     // (406cdcb3…) held.
-    var EXPECTED_ENCLAVE_SHA256 = '406cdcb3990d09c69b24c02c76eea7d5604202a99e73c873a5950800c6778897';
+    // v231 rotation (2026-11-10): both binaries changed — the notary publishes
+    // its signing key on /pubkey and the enclave names it in this report as
+    // session_context.proxy_signing_key — so RTMR2 moved again
+    // (3d58e6da… → c436335f…) and the PayPal binary is 33308970….
+    // MRTD/RTMR0/1/3 held.
+    var EXPECTED_ENCLAVE_SHA256 = '333089700adf6156432d55fedb23f64123e8f217aae8c859663008d169b04916';
 
     // ========================================================================
     // v162 (audit VULN-04): GOLDEN PCR PINS — CI-captured constants for the
