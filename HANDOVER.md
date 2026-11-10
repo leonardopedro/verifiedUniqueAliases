@@ -3385,3 +3385,87 @@ provers that are legitimately slow in tlsn preprocessing.
   `766b77f9d2aa2fa1928e36507c760779d3e2f714c11b1424dea5bbad5bc624c1`**
   (README rotated same commit). `check-auditor-pins --live`: **pins == live
   quote**, `PARITY OK`.
+
+## 0.56 — v240: the commit phase gets a bound, pacing adapts, and provers are told to retry (2026-11-11 09:40 UTC)
+
+### The one phase §0.55 left unbounded
+
+The stall watchdog is armed at the dial, because that is where the measured
+silence began. That left the **commitment handshake** wide open: there is no
+target connection yet, so nothing is watched, and a prover that connected and
+then died in tlsn preprocessing held its slot until the 120 s session timeout.
+Observed live in a v239 wave: the prover harness sat at `committing
+api-m.paypal.com` past its own 180 s guard, and the notary only let go when the
+session timeout fired.
+
+`commit_timeout_secs` (default **60**) now bounds that phase. It cannot be a
+silence bound — tlsn preprocessing is CPU-bound on the prover and legitimately
+quiet between messages (measured: 2 s alone, 16 s under an eight-wide wave) — so
+it is a ceiling on the whole handshake, set well above the healthy cost and well
+below the session timeout. The verdict is the retryable `stalled` kind:
+
+```
+the commitment handshake did not finish within 60s — the prover connected and
+then stopped answering — last progress: before the commitment handshake;
+retry this session
+```
+
+Live check on the v240b boot: a raw TCP client that connects to `:8443` and says
+nothing gets the notary's FIN at **65.4 s**, and `/proxy/refusals` carries that
+exact sentence. (A client that does not read its socket will not see the FIN —
+the notary is done at 60 s either way.)
+
+### Dial spacing is adaptive now
+
+`dial_spacing_ms` is a **base**, not a constant. `DialPacer` keeps per-address
+spacing state: a session that ends `stalled` widens that address's spacing by
+half again (cap **4× base**, 6 s on the default), and each run of **4**
+consecutive sessions without a stall narrows it by a third, never below the base.
+Widening is immediate and narrowing gradual on purpose — backing off too late
+loses sessions, recovering too fast only costs latency. Every change is logged
+(`dial spacing for <ip> is now 2250ms after this stall`) and the map is in the
+child's loopback `GET /health`.
+
+### The prover is told, on the page
+
+The landing page (compiled into the enclave binary) gained a strip under the
+notary section: it reads `/proxy/refusals` (same origin) and shows the newest
+verdict. A `stalled` one is spelled out —
+
+> Last notary session stalled: nothing is wrong with your proof, the target's
+> edge stopped answering. Retry the same session. (…)
+
+— because before this a prover with a dead attempt had no way to tell "my proof
+was refused" from "the edge never answered", and the retry hint existed only in
+the operator ring. Without JS, or with the notary disabled, the strip stays
+hidden and nothing else changes.
+
+### Tests and release
+
+- tls-proxy: **6/6** unit (`dial_pacing_widens_on_a_stall_and_settles_back` is
+  new: widen → cap → clean-run narrowing → floor, addresses independent) and
+  **14/14** `tests/session.rs` — new
+  `closes_a_session_that_connects_and_never_commits` (session timeout 60 s,
+  commit bound 1 s, asserts the socket closes and the verdict is `stalled` with
+  the phase and the retry hint). Two older assertions were reworded for the new
+  sentence; no assertion was weakened.
+- Enclave: `cargo +1.91.1 check --all-targets` clean, **49/49** bin tests,
+  `test-verify-security` **511/0**.
+- Pass A learned RTMR2 `2b05eaf1…` and enclave `78e9ffe1…` (both expected: the
+  initrd carries the new notary and the landing page is compiled in); pins
+  rotated, `verify.html` == `index.html` **280,318 B
+  `fa8204bf86f1256b1f8c30c0d97f1cffad0a0e5159454d8d24a8a9e86f0154e1`**, README
+  updated.
+- Pass B: image **`m-2ze024y1756o0dtl3o35`** / disk
+  **`738ea3c1b96222094e961597cb559a110ad637338266f5180f63e8e0f3753c62`**,
+  `check-auditor-pins --live` **OK**, `PARITY OK`, `/callback` sealed refusals OK,
+  notary re-mint across a restart OK.
+- Live 8-wide wave with the shipped retry-once default: **8/8** (no stall).
+
+### Relay VM now stops itself
+
+`rotate-alibaba.sh` starts the relay for the upload leg and now stops it again in
+**economy mode** (`StopInstance --StoppedMode StopCharging`) from an `EXIT` trap,
+so a failed or interrupted rotation no longer leaves the VM billing for the rest
+of the night. It only stops a relay the run itself started: one that was already
+Running belongs to whoever started it.

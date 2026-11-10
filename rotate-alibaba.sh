@@ -76,6 +76,8 @@ BUCKET="${ALI_OSS_BUCKET:-}"
 STAGE_BUCKET="${ALI_STAGE_BUCKET:-}"
 RELAY_INSTANCE_ID="${ALI_RELAY_INSTANCE_ID:-}"
 RELAY_MODE="${RELAY_MODE:-relay}"
+# 0 until this run starts the relay; the EXIT trap only stops what it started.
+RELAY_STARTED=0
 PROD_URL="${PROD_URL:-https://login.airma.de}"
 SYSTEM_DISK_SIZE="${ALI_SYSTEM_DISK_SIZE:-1}"
 IMAGE_NAME="${ALI_IMAGE_NAME:-paypal-tdx-esp-$(date +%Y%m%d%H%M)}"
@@ -127,6 +129,9 @@ relay_ensure_running() { # the relay is stopped between rotations (StopCharging)
         | jq -r '.Instances.Instance[0].Status // empty')
     if [[ "$st" != "Running" ]]; then
         say "   relay $RELAY_INSTANCE_ID is ${st:-unknown} — starting it"
+        # Only a relay this run started is stopped again on exit; one that was
+        # already up belongs to whoever started it.
+        RELAY_STARTED=1
         aliyun ecs StartInstance --RegionId "$REGION" --InstanceId "$RELAY_INSTANCE_ID" >/dev/null 2>&1 || true
         for _ in $(seq 1 48); do
             st=$(aliyun ecs DescribeInstances --RegionId "$REGION" --InstanceIds "[\"$RELAY_INSTANCE_ID\"]" 2>/dev/null \
@@ -140,6 +145,39 @@ relay_ensure_running() { # the relay is stopped between rotations (StopCharging)
     fi
     ok "relay $RELAY_INSTANCE_ID is Running"
 }
+
+relay_status() {
+    aliyun ecs DescribeInstances --RegionId "$REGION" --InstanceIds "[\"$RELAY_INSTANCE_ID\"]" 2>/dev/null \
+        | jq -r '.Instances.Instance[0].Status // empty'
+}
+
+# Stop the relay in ECONOMY mode (no compute charge) — the VM only exists to move
+# an image between the two buckets during a rotation, so nothing needs it
+# afterwards. Driven by an EXIT trap so a failed or interrupted run releases it
+# too: a relay left Running overnight is the one cost this pipeline can leak.
+relay_stop_economy() {
+    [[ -n "$RELAY_INSTANCE_ID" ]] || return 0
+    [[ $DRY_RUN == 1 ]] && return 0
+    [[ "${RELAY_STARTED:-0}" == 1 ]] || return 0
+    local st
+    st=$(relay_status)
+    case "$st" in
+        Running|Starting)
+            say "   relay $RELAY_INSTANCE_ID is ${st} — stopping it in economy mode"
+            aliyun ecs StopInstance --RegionId "$REGION" \
+                --InstanceId "$RELAY_INSTANCE_ID" --StoppedMode StopCharging >/dev/null 2>&1 \
+                || { warn "could not stop relay $RELAY_INSTANCE_ID — stop it by hand (StopInstance --StoppedMode StopCharging)"; return 0; }
+            for _ in $(seq 1 36); do
+                [[ "$(relay_status)" == "Stopped" ]] && { ok "relay $RELAY_INSTANCE_ID stopped (StopCharging)"; return 0; }
+                sleep 5
+            done
+            warn "relay $RELAY_INSTANCE_ID did not reach Stopped — check it"
+            ;;
+        *) ok "relay $RELAY_INSTANCE_ID already ${st:-unknown}" ;;
+    esac
+}
+
+trap relay_stop_economy EXIT
 
 relay_poll() { # STATUSFILE TIMEOUT_S -> prints file content
     local f="$1" limit="${2:-1800}" b64
