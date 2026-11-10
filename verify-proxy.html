@@ -161,7 +161,7 @@
         <button id="auditBtn" type="button">Audit attestation</button>
         <p class="note">
             Nothing is uploaded. Paste the response body exactly as you received it: the signature covers the
-            <em>bytes</em> of the first ten fields, so this page reads your text rather than re-serializing it.
+            <em>bytes</em> of the first eleven fields (the transcript fields plus <code>truncated</code>), so this page reads your text rather than re-serializing it.
             Re-formatted (pretty-printed) input is accepted too, and the page says so when it has to strip
             whitespace to rebuild the signed bytes.
         </p>
@@ -205,17 +205,18 @@
 </div>
 
 <script>
-// The ten fields the enclave signs, in the order it signs them
-// (tls-proxy/src/main.rs: SignedBody). Order is part of the signature: a
-// reordered document must fail, not be silently re-sorted.
+// The eleven fields the enclave signs, in the order it signs them
+// (tls-proxy/src/main.rs: AttestedBody — ten transcript fields plus the
+// `truncated` completeness claim). Order is part of the signature: a reordered
+// document must fail, not be silently re-sorted.
 const SIGNED_FIELDS = [
     'version', 'session_id', 'server_name', 'notarized_at', 'sent_len',
     'received_len', 'sent_sha256', 'received_sha256', 'sent_b64', 'received_b64',
     'truncated',
 ];
-// NOTE: 11 names above on purpose? No — the signed body has ten serialized
-// fields plus `truncated`, making eleven. Keep this list in lock-step with
-// SignedBody in tls-proxy/src/main.rs; the harness pins the count.
+// Keep this list and the count in lock-step with AttestedBody in
+// tls-proxy/src/main.rs; scripts/test-verify-proxy.mjs pins the count, and a
+// drift makes every real record fail the shape row.
 const SIGNED_FIELD_COUNT = 11;
 
 function esc(s) {

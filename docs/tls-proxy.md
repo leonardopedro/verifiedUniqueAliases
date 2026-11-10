@@ -170,6 +170,14 @@ nothing, and stops demanding PayPal app credentials only for the proxy-only case
 | `GET https://<domain>/proxy/attestations` | the recorded sessions on the public origin: id, host fingerprint, time |
 | `GET https://<domain>/proxy/attestations/{id}?sent_sha256=&received_sha256=` | **your own** signed record, from anywhere: served only when both digests match |
 
+Since v236 the same verdict also reaches the **prover**, over the commitment
+protocol: a commit whose host is not in the boot-time `relay_targets` (or whose
+pinned address no longer connects) is answered with a rejection that names the
+reason — `… is not in this notary's boot-time relay_targets (lookup failed: …)`
+— instead of a bare disconnect. Before that, a prover saw only
+`commitment protocol failed to receive response caused by: unexpected end of
+file`, and the explanation existed only in the operator's refusal ring.
+
 `/refusals` answers the operator's question "why was that session rejected?"
 without a shell: each entry is `{at, kind, reason}`, where `kind` is `rejected`
 (a verdict was reached and refused — MPC mode, no revealed server identity, a
@@ -254,11 +262,18 @@ in a proof.
 }
 ```
 
-The signature covers the **first ten fields in that order**, serialized as JSON
+The signature covers the **first eleven fields in that order** — the ten
+`AttestedBody` fields above plus `truncated` — serialized as JSON
 (`serde_json` preserves declaration order, so a verifier rebuilds the exact bytes
-by copying them out of the response in the same order and dropping
+by copying them out of the response in the same order and dropping only
 `enclave_pubkey_pem`, `signature_alg`, `signature_b64`). The public key is in the
 response, so verification needs no shared secret.
+
+`truncated` is inside the signature on purpose: it is the record's claim that the
+transcript is complete, so a relay that flipped it to `false` must invalidate the
+signature. (This paragraph said "ten fields" until v236, which is exactly how an
+independent verifier written from this document fails on every real record — the
+implemented body has eleven, and `verify-proxy.html` checks all eleven.)
 
 What makes that key trustworthy is a second document, not the record: the
 enclave's attestation report publishes `session_context.proxy_signing_key` with
@@ -325,7 +340,8 @@ rebuild, no different image.
    those bytes, recomputes both digests, and compares the record's key
    fingerprint with the one the report names (see step 4).
 1. Fetch `GET :8081/attestations/<id>`.
-2. Rebuild the signed byte string (first ten fields, in order, compact JSON).
+2. Rebuild the signed byte string (first **eleven** fields, in order, compact
+   JSON — `truncated` is signed too).
 3. Check `signature_b64` against `enclave_pubkey_pem` (RSA PKCS#1 v1.5, SHA-256).
 4. Bind `enclave_pubkey_pem` to the enclave: the key is per-boot and
    self-asserted, so the record alone proves nothing about who holds it. The

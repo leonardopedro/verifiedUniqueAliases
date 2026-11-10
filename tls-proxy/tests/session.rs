@@ -574,6 +574,127 @@ async fn refuses_an_mpc_commit() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The prover half of a commit to a host this notary will not relay: proxy
+/// mode, a well-formed name, nothing in the boot-time `relay_targets` for it.
+async fn unreachable_prover(socket: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    let session = Session::new(socket.compat());
+    let (driver, mut handle) = session.split();
+    let driver_task = tokio::spawn(driver);
+
+    let prover = handle.new_prover(ProverConfig::builder().build()?)?;
+    let commit = tokio::time::timeout(
+        Duration::from_secs(15),
+        prover.commit(
+            ProxyTlsConfig::builder()
+                // `.invalid` is reserved by RFC 2606 and never resolves, so this
+                // is exactly the shape of a name outside relay_targets on the
+                // real guest, where the resolver is closed after boot.
+                .server_name(DnsName::try_from("not-a-relay-target.invalid")?)
+                .build()?,
+        ),
+    )
+    .await
+    .map_err(|_| "the proxy never answered the commit")?;
+
+    handle.close();
+    let _ = tokio::time::timeout(Duration::from_secs(5), driver_task).await;
+
+    commit?;
+    Err("the proxy accepted a commit it cannot relay".into())
+}
+
+/// v236: a commit this notary cannot relay is answered **in band** with the
+/// reason, instead of dropping the connection. The live symptom this fixes was
+/// observed on the deployed notary: committing `example.com` gave the prover
+/// only `commitment protocol failed to receive response caused by: unexpected
+/// end of file`, while the reason existed only in the operator-facing ring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refuses_an_unreachable_commit_with_a_reason() -> Result<(), Box<dyn std::error::Error>> {
+    let _serial = SERIAL.lock().await;
+    let proxy = Proxy::start(&[]).await;
+    let socket = TcpStream::connect(("127.0.0.1", proxy.session_port)).await?;
+
+    let outcome = unreachable_prover(socket).await;
+    let refusal = match &outcome {
+        Err(e) => e.to_string(),
+        Ok(()) => String::new(),
+    };
+    assert!(
+        outcome.is_err(),
+        "a host the notary cannot relay must be refused, not accepted"
+    );
+    assert!(
+        refusal.contains("rejected by verifier"),
+        "the refusal must travel over the commitment protocol, not be a bare 
+         disconnect; the prover saw: {refusal}"
+    );
+    assert!(
+        refusal.contains("relay_targets"),
+        "the in-band reason must say what to fix, the prover saw: {refusal}"
+    );
+
+    let health = proxy.wait_for_failed(1).await;
+    assert_eq!(health["sessions_ok"].as_u64(), Some(0), "nothing was verified");
+    assert_eq!(
+        health["attestations"].as_u64(),
+        Some(0),
+        "a refused session must leave no attestation behind"
+    );
+
+    // The operator-facing ring carries the same verdict.
+    let refusals = proxy.refusals().await;
+    assert_eq!(refusals["count"].as_u64(), Some(1));
+    assert!(
+        refusals["refusals"][0]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("relay_targets"),
+        "the API must carry the reason, got: {refusals}"
+    );
+    Ok(())
+}
+
+/// v236: a target whose pinned address never answers is refused in band, and
+/// promptly. Before the bounded connect, the session sat until the whole 120 s
+/// session timeout and the prover saw only "connection closed before message
+/// completed" — observed live against `sandbox.paypal.com` (whose address is
+/// whatever the boot resolved for it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refuses_a_commit_whose_target_never_answers() -> Result<(), Box<dyn std::error::Error>> {
+    let _serial = SERIAL.lock().await;
+    // TEST-NET-1 (RFC 5737) is never routable; whichever way the kernel fails
+    // (refused, unreachable, or a blackhole the bounded connect cuts off), the
+    // verdict has to reach the prover.
+    let proxy = Proxy::start(&[("TLS_PROXY_TARGET_ADDR", "192.0.2.1:443")]).await;
+    let socket = TcpStream::connect(("127.0.0.1", proxy.session_port)).await?;
+
+    let started = std::time::Instant::now();
+    let outcome = unreachable_prover(socket).await;
+    let elapsed = started.elapsed();
+    let refusal = match &outcome {
+        Err(e) => e.to_string(),
+        Ok(()) => String::new(),
+    };
+    assert!(outcome.is_err(), "a dead target must be refused");
+    assert!(
+        refusal.contains("rejected by verifier"),
+        "the refusal must travel over the commitment protocol, the prover saw: {refusal}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "a dead target must be refused promptly, took {elapsed:?}: {refusal}"
+    );
+
+    let health = proxy.wait_for_failed(1).await;
+    assert_eq!(health["sessions_ok"].as_u64(), Some(0), "nothing was verified");
+    assert_eq!(
+        health["attestations"].as_u64(),
+        Some(0),
+        "a refused session must leave no attestation behind"
+    );
+    Ok(())
+}
+
 /// An honest session whose transcript exceeds the bound is still refused
 /// before signing: the bound exists so one prover cannot size the guest's RAM.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

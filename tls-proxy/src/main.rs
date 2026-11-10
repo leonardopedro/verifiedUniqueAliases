@@ -108,6 +108,11 @@ const MAX_REFUSAL_REASON_CHARS: usize = 400;
 /// the only port this service will ever dial, so it cannot be used as an
 /// arbitrary TCP relay.
 const TARGET_PORT: u16 = 443;
+/// How long a relayed connection may take to open. Generous for a real network,
+/// short enough that a target whose boot-time address no longer answers is
+/// refused while the prover is still watching (before v236 the session simply
+/// sat until the 120 s session timeout).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Signed statement
@@ -365,23 +370,53 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
         // address: the prover picks the site, the enclave resolves it itself.
         let server_name = verifier.config().server_name().as_str().to_string();
         if server_name.is_empty() {
-            return Err("commit carried an empty server name".into());
+            // v236: say why, in band. A prover that is simply dropped reads
+            // "unexpected end of file" and has no way to learn that the commit
+            // itself was the problem — the only explanation used to be the
+            // operator-facing /proxy/refusals ring, which a remote prover
+            // cannot line up with their own attempt.
+            let reason = "the commit carried an empty server name";
+            let _ = verifier.reject(Some(reason)).await;
+            return Err(reason.into());
         }
         // `TLS_PROXY_TARGET_ADDR` pins the connection target for local tests:
         // the fixture server listens on 127.0.0.1 while its certificate says
         // test-server.io, and /etc/hosts is not ours to edit. Unset — the
         // shipped configuration — the proxy resolves the committed name itself.
-        let addr: SocketAddr = match std::env::var("TLS_PROXY_TARGET_ADDR") {
-            Ok(pinned) if !pinned.trim().is_empty() => pinned
-                .parse()
-                .map_err(|e| format!("TLS_PROXY_TARGET_ADDR is not a socket address: {e}"))?,
-            _ => tokio::net::lookup_host((server_name.as_str(), TARGET_PORT))
-                .await?
-                .next()
-                .ok_or_else(|| format!("{server_name} did not resolve"))?,
+        let addr: SocketAddr = match resolve_target(&server_name).await {
+            Ok(addr) => addr,
+            Err(reason) => {
+                // Not in the boot-time relay_targets (the resolver is closed
+                // after boot), or its pinned address is stale: either way the
+                // prover gets the reason instead of a bare disconnect.
+                let _ = verifier.reject(Some(reason.as_str())).await;
+                return Err(reason.into());
+            }
         };
 
-        let client = TcpStream::connect(addr).await?;
+        // v236: a target whose pinned address blackholes (a stale CDN address
+        // after the boot-time resolution) used to hold the session until the
+        // whole session timeout — 120 s of nothing, then a prover-side
+        // "connection closed", with the reason only in the operator's ring.
+        // Bounded here so the answer is prompt and names the cause.
+        let client = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(client)) => client,
+            Ok(Err(e)) => {
+                let reason = format!(
+                    "cannot connect to {server_name} ({addr}): {e} — the address comes from the boot-time relay_targets list, so a reboot re-resolves it"
+                );
+                let _ = verifier.reject(Some(reason.as_str())).await;
+                return Err(reason.into());
+            }
+            Err(_) => {
+                let reason = format!(
+                    "connecting to {server_name} ({addr}) timed out after {}s — that address is what this boot resolved for the host, so it may be stale; a reboot re-resolves relay_targets",
+                    CONNECT_TIMEOUT.as_secs()
+                );
+                let _ = verifier.reject(Some(reason.as_str())).await;
+                return Err(reason.into());
+            }
+        };
         client.set_nodelay(true).ok();
         info!("session from {peer}: relaying TLS to {server_name} ({addr})");
 
@@ -463,6 +498,30 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
     }
 
     outcome
+}
+
+/// Resolves the commit's server name to the one address this session will dial.
+///
+/// The error is a *prover-facing* string, not a log line: it is sent back over
+/// the commitment protocol (v236), so it stays short, names no internal path,
+/// and tells the caller what to fix — the name has to be one of the boot-time
+/// `relay_targets`, because the resolver is closed after boot by design.
+async fn resolve_target(server_name: &str) -> Result<SocketAddr, String> {
+    if let Ok(pinned) = std::env::var("TLS_PROXY_TARGET_ADDR") {
+        if !pinned.trim().is_empty() {
+            return pinned
+                .parse()
+                .map_err(|e| format!("TLS_PROXY_TARGET_ADDR is not a socket address: {e}"));
+        }
+    }
+    match tokio::net::lookup_host((server_name, TARGET_PORT)).await {
+        Ok(mut addrs) => addrs.next().ok_or_else(|| {
+            format!("{server_name} resolves to no address; only the boot-time relay_targets list is reachable")
+        }),
+        Err(e) => Err(format!(
+            "{server_name} is not in this notary's boot-time relay_targets (lookup failed: {e}); the resolver is closed after boot by design, so add the host to the configuration and reboot"
+        )),
+    }
 }
 
 fn record_attestation(st: &ProxyState, verified: Verified) -> Result<String, BoxError> {

@@ -192,7 +192,16 @@ async fn public_fetch_url(
     sent: &str,
     received: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let base = format!("https://{}", origin.trim_end_matches('/'));
+    // Accept either form: `LIVE_PUBLIC=login.airma.de` and
+    // `LIVE_PUBLIC=https://login.airma.de` both mean the same origin. Before
+    // v236 a full URL became `https://https//…` and the harness reported a
+    // nonsense connect error instead of printing the download link.
+    let origin = origin.trim_end_matches('/');
+    let base = if origin.contains("://") {
+        origin.to_string()
+    } else {
+        format!("https://{origin}")
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?;
