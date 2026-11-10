@@ -3116,3 +3116,93 @@ notary links. Pass-A image + snapshot deleted; relay
 The `/verify.html` path on the enclave is still the 5,529-byte pointer page —
 the real auditor is only ever the repo file at
 `raw.githubusercontent.com/leonardopedro/verifiedUniqueAliases/main/verify.html`.
+
+## 0.53 — v236: the notary, debugged end to end (2026-11-10 16:00 UTC)
+
+### The chain that now works, proven against prod
+
+1. **Session** — the live harness (`tls-proxy/tests/live.rs`, `--ignored`) committed
+   to `api-m.paypal.com` against `101.200.178.251:8443`: `commit accepted` at
+   44 s (≈35 s of that is tlsn's COT bootstrap), relayed `GET /` answered
+   `406 Not Acceptable`, transcript **85 B sent / 431 B received**, prover
+   `presentation complete`.
+2. **Record** — `GET /proxy/attestations` listed the session with the host
+   fingerprinted (`host:5c868ab7`); `GET /proxy/attestations/<id>?sent_sha256=…&
+   received_sha256=…` answered `200` with the 1,960 B record; a wrong digest
+   answered a uniform `404`.
+3. **Signature** — the record verifies with `verify-proxy.html`'s own code
+   (`auditAttestation` driven by indirect eval) **and** with node: RSA PKCS#1
+   v1.5/SHA-256 over the **eleven** signed fields, both digests recompute, the
+   lengths match.
+4. **Key binding** — the record's `enclave_pubkey_pem` hashes (SPKI DER) to
+   `ecf9c409…`, which is exactly the `pubkey_sha256` the enclave's quoted
+   `/debug/envelope` names after the notary restart. Session → record → key →
+   quote is one uninterrupted chain.
+
+### Four defects found and fixed
+
+1. **The documented signed body was wrong** (`docs/tls-proxy.md`, and a stale
+   comment in `verify-proxy.html`): both said the signature covers the *first
+   ten* fields. It covers **eleven** — `truncated` is signed too (deliberately:
+   it is the completeness claim). Proven by verifying a live record: ten fields
+   → `INVALID`, eleven → `VALID`. `verify-proxy.html` had it right; anybody
+   writing a verifier from the document failed on every real record. Fixed in
+   the doc and the page comment (`truncated` must stay unsigned-optional).
+2. **A refused commit was silent.** Committing `example.com` (outside
+   `relay_targets`) gave the prover only `commitment protocol failed to receive
+   response caused by: unexpected end of file` — the reason existed solely in
+   the operator-facing `/proxy/refusals` ring. The verifier's `reject(Some(msg))`
+   is available at the commit stage, so now the prover reads:
+   `example.com is not in this notary's boot-time relay_targets (lookup failed:
+   … Temporary failure in name resolution); the resolver is closed after boot by
+   design, so add the host to the configuration and reboot`. Same treatment for
+   an empty commit name and for a connect failure.
+3. **A blackholed target held the session for 120 s.** `TcpStream::connect` had
+   no bound, so a stale boot-resolved address parked the session until the
+   whole `session_timeout`. Now a 10 s `CONNECT_TIMEOUT` cuts it, with the
+   reason sent in band (`connecting to <host> (<addr>) timed out after 10s —
+   that address is what this boot resolved … a reboot re-resolves
+   relay_targets`).
+4. **`LIVE_PUBLIC` could not take a URL.** The harness prefixed `https://` blindly,
+   so the documented `LIVE_PUBLIC=https://…` produced
+   `https://https//login.airma.de/proxy/attestations` and the "fetch your
+   record" link never printed. Both forms work now (verified in the container:
+   it printed the real capability URL).
+
+### Known limitation found, not fixed (tlsn has no hook for it)
+
+`sandbox.paypal.com` — one of the four **default** relay targets — accepts the
+commit and the TCP connect, then the **relayed TLS handshake never completes**;
+the session sits until the 120 s timeout (refusal kind `timeout`) and the prover
+sees `connection closed before message completed`. `www.sandbox.paypal.com` and
+`api-m.paypal.com` work on the same boot, so this is the bare name's
+boot-resolved edge, not the proxy. There is no in-band rejection available after
+`verifier.run()` is entered (the verifier is moved and its context is gone), so
+the only lever is the session timeout — shortening it would also cut legitimate
+slow sessions. Operator remedy: pin the name in the config with
+`"sandbox.paypal.com@<address>"`, or drop it from `relay_targets`.
+
+### Verification and release
+
+- Hermetic suite (`podman` → `tlsproxytest` image, `cargo +1.99.0 test --test
+  session`): **9 passed** — including the two new tests
+  `refuses_an_unreachable_commit_with_a_reason` (`.invalid` host) and
+  `refuses_a_commit_whose_target_never_answers` (TEST-NET-1, must be refused in
+  <30 s). Live harness: 1 passed (session + capability URL). `test-verify-proxy`
+  53/53, `test-verify-security` 510/510, `check-auditor-pins` static+live OK,
+  `check-zk-pins` OK.
+- Release: **two cycles**, as always when the initramfs moves (the notary is a
+  second binary in it, so RTMR2 rotates even though the PayPal binary does not):
+  pass A `m-2ze5cnizkdv1hdsxfpzk` / disk `848a83e2…` (pins stale, RTMR2
+  `e4c60c2b…`), pass B **`m-2ze7c8jev53jh1d6ufby` / disk `9ca7d465…`** with
+  `verify.html` == `index.html` **280,318 B `148bc3f9…`**, `README` digest
+  rotated, `EXPECTED_RTMR2 4a431f43… → e4c60c2b…` and
+  `EXPECTED_ENCLAVE_SHA256 f5a469dc…` unchanged (the PayPal binary was not
+  touched). Verify phase: HTTPS 200, binary == build, pins == live quote
+  (`check-auditor-pins --live` re-run by hand: OK), `PARITY OK`, TLS chain,
+  sealed callback refusals, notary named by the report, restart re-mint
+  (`c4613021… → ecf9c409…`). A stale-presigned-URL failure in the relay leg made
+  one extra `--from stage` run necessary; nothing else retried.
+- Cleanup: images `m-2ze6iuaofgxevbmu9lrf` and `m-2zehwizs08eo9fkf40oh`
+  (+ their snapshots) deleted; rollback left is `m-2ze5cnizkdv1hdsxfpzk`; relay
+  `i-2zefiag79exwsshidi3z` back to `StopCharging`.
