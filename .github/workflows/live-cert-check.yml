@@ -49,3 +49,10 @@ jobs:
         env:
           TARGET_URL: ${{ github.event.inputs.url || 'https://login.airma.de' }}
         run: node scripts/check-live-callback.mjs --url "$TARGET_URL"
+
+      # The notary is a second binary in the same image: a disk built with
+      # TLS_PROXY=0 leaves PID 1 retrying a file that is not there.
+      - name: Confirm the TLSNotary notary is spawned and listening
+        env:
+          TARGET_URL: ${{ github.event.inputs.url || 'https://login.airma.de' }}
+        run: node scripts/check-live-notary.mjs --url "$TARGET_URL"

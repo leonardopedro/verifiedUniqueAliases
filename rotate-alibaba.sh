@@ -425,6 +425,7 @@ phase_verify() {
         say "   [dry-run] then run: node scripts/check-manifest-parity.mjs $PROD_URL $DISK_FILE"
         say "   [dry-run] then run: node scripts/check-live-tls-cert.mjs --url $PROD_URL"
         say "   [dry-run] then run: node scripts/check-live-callback.mjs --url $PROD_URL"
+        say "   [dry-run] then run: node scripts/check-live-notary.mjs --url $PROD_URL"
         return 0
     fi
 
@@ -469,6 +470,16 @@ phase_verify() {
         printf '%s\n' "$cbchk" | tail -20; die "live callback refusal check failed"; }
     printf '%s\n' "$cbchk" | grep -E '✅|❌|RESULT' | tail -8
     ok "callback refuses missing/forged/denied input in sealed plain text"
+
+    # The second webservice: the config can say `services.tls_proxy.enabled` all
+    # it likes, but only the disk decides whether the binary exists. A rotation
+    # that ships a PayPal-only disk onto this config looks healthy everywhere
+    # else and silently drops the notary (v227–v229).
+    local notchk
+    notchk=$(node scripts/check-live-notary.mjs --url "$PROD_URL" 2>&1) || {
+        printf '%s\n' "$notchk" | tail -20; die "live notary check failed (was the disk built with TLS_PROXY=1?)"; }
+    printf '%s\n' "$notchk" | grep -E '✅|❌|RESULT' | tail -8
+    ok "TLSNotary notary spawned, listening and serving its attestation list"
 }
 
 # ── run ──────────────────────────────────────────────────────────────────────

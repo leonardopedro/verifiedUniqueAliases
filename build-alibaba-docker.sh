@@ -28,8 +28,17 @@ echo "============================================================"
 echo "🐳 Building Alibaba Cloud TDX disk image"
 echo "============================================================"
 
-# Build the Docker image (initramfs + binary + assembled ESP disk)
-$ENGINE build -f Dockerfile.alibaba -t paypal-auth-vm:alibaba .
+# Build the Docker image (initramfs + binary + assembled ESP disk).
+#
+# TLS_PROXY defaults to 1: the production config enables services.tls_proxy, and
+# a disk built without the binary boots a supervisor that can only log
+# `spawn failed: No such file or directory`. That is exactly how v227–v229 lost
+# the notary — the rotation's default disk replaced the dual-service one while
+# the config still asked for the second service. Override with TLS_PROXY=0 only
+# for a deliberately PayPal-only deployment, and expect
+# scripts/check-live-notary.mjs to fail there.
+$ENGINE build --build-arg TLS_PROXY="${TLS_PROXY:-1}" -f Dockerfile.alibaba -t paypal-auth-vm:alibaba .
+[[ "${TLS_PROXY:-1}" == 1 ]] || echo "⚠️  TLS_PROXY=0 — this disk ships WITHOUT the TLSNotary notary"
 
 # Extract artifacts from the container
 echo ""
