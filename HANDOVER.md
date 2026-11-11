@@ -3469,3 +3469,56 @@ hidden and nothing else changes.
 so a failed or interrupted rotation no longer leaves the VM billing for the rest
 of the night. It only stops a relay the run itself started: one that was already
 Running belongs to whoever started it.
+
+## 0.57 — v241: the pacing map is visible from outside, and the forced-stall test proves it (2026-11-11 07:20 UTC)
+
+### What changed
+
+- **`/proxy/health` now relays the pacing map.** The enclave's supervision view
+  carries `dial_spacing_base_ms` (1500), `dial_spacing_max_ms` (6000) and
+  `dial_spacing_ms` — a `{target address: milliseconds}` map the child keeps in
+  `DialPacer`. Before v241 the numbers existed only on the child's loopback
+  `:8081/health`, so an operator without a shell could not tell a widened
+  notary from a fresh one. Live after pass B:
+  `{"151.101.195.1":2250}` — a single live session against
+  `www.sandbox.paypal.com` that hit the FC-edge bootstrap-COOT error widened
+  1500 → 2250 (1.5×), recorded without anyone touching the box.
+- **`stall_widens_pacing_and_clean_runs_narrow_it`** (`tls-proxy/tests/session.rs`):
+  a switchable target (`start_switchable_target` → `(port, Arc<AtomicBool>)`)
+  stays silent for two dials, so the notary records two stalls and the spacing
+  widens 100 → 150 → 225 ms; flipping the flag turns the *same port* into the
+  working fixture and four clean sessions narrow it to 150 ms (floor = base).
+  The stall bound in that test is **4 s**, not 1 s: at 1 s the notary killed a
+  healthy prover's own preprocessing ("prover sent nothing for 1s"), which is
+  exactly the mistake the hand-over arm exists to catch — the bound must clear
+  the quiet phase of a real prover.
+- `docs/tls-proxy.md` documents the relayed map as the auditable surface.
+
+### Tests
+
+- tls-proxy **6/6** unit, **15/15** `tests/session.rs` (106 s wall — the new
+  test is the slowest at ~38 s because it pays four stalls and four clean
+  sessions).
+- Enclave `cargo +1.91.1 check --all-targets` clean, **49/49** bin tests,
+  `test-verify-security` **511/0**.
+
+### Release (two-cycle, pins rotated)
+
+- Pass A: image `paypal-tdx-esp-v241a-…` **`m-2zeiafiaongjdsosprpy`**, learned
+  RTMR2 **`62babfb096ee3982…`** and enclave **`863f9d03d6ea90a4…`** (initrd
+  carries the rebuilt notary, landing page is compiled in — both expected), then
+  failed the pin gate exactly as designed.
+- Pass B: image **`m-2zebw9kc74ccmafdu4dq`** / disk
+  **`b4bf3fe63e34059184c146e117285c69e11f9f1e59d0a6c01406fc43b75d1dca`**;
+  `check-auditor-pins --live` **OK**, `PARITY OK`, TLS cert/report parity OK,
+  `/callback` sealed-refusal OK, notary enabled+spawned+served OK, envelope cache
+  follows a notary restart (`ed677a931d0736c1…` → `1ba8725aa4063496…`).
+- `verify.html` == `index.html` **280,318 B**
+  **`7e8fb0ef4b0974cb826c268053b9bb694ccf4da95f237e2c3470cc04f10504e9`**, README
+  digest rotated (a `sed` that rewrote every 64-hex token in README was caught
+  and reverted — only the `verify.html` digest moved).
+- Live: `www.sandbox.paypal.com` session **PASS** with retry available; a
+  `host/path` arg to the wave harness fails with `invalid DNS name` (harness
+  form, not a notary regression).
+- Relay VM **Stopped** after the run (`StopInstance --StoppedMode StopCharging`
+  from the `EXIT` trap).
