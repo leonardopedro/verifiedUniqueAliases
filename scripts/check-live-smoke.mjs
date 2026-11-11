@@ -22,10 +22,11 @@
 //   node scripts/check-live-smoke.mjs --no-failover
 //
 // The third phase is the failover probe: a host pinned to several addresses
-// (default `api-m.paypal.com`, served by two different CDN edges) is dialled one
-// session at a time. A dark FIRST address is the failure this catches — the edge
-// that accepts the TCP connection and withholds the handshake. It passes when a
-// session passes, and it fails when `/proxy/health` shows an address struck off
+// (default `sandbox.paypal.com`, served by two different CDN edges) is dialled
+// one session at a time. A dark FIRST address is the failure this catches — the
+// edge that accepts the TCP connection and withholds the handshake. It passes
+// when a session passes, and it fails when `/proxy/health` shows an address
+// struck off
 // (zero_byte_runs) while no other pinned address has ever answered, which is
 // exactly the shape of the v243 bug: the strike was recorded, the alternates
 // never existed, and every session kept dialling the dead edge.
@@ -83,7 +84,8 @@ const failoverOnly = Boolean(args['failover-only']);
 // the prover protocol on :8443, while /proxy/health is published on the origin
 // that fronts it. The failover probe needs the latter.
 const origin = (args.origin ?? process.env.PROD_URL ?? 'https://login.airma.de').replace(/\/$/, '');
-const failoverHost = args['failover-host'] ?? process.env.SMOKE_FAILOVER_HOST ?? 'api-m.paypal.com';
+const failoverHost =
+  args['failover-host'] ?? process.env.SMOKE_FAILOVER_HOST ?? 'sandbox.paypal.com';
 const failoverSessions = Number(args['failover-sessions'] ?? process.env.SMOKE_FAILOVER_SESSIONS ?? 2);
 
 function buildLiveBinary() {
@@ -249,7 +251,12 @@ async function runFailover(executable) {
   if (struck.length > 0 && answered.length === 0) {
     return {
       ok: false,
-      verdict: `every session to ${failoverHost} failed and no pinned address ever answered (${summary}) — the failover is not reaching a second address`,
+      verdict:
+        `every session to ${failoverHost} failed and no pinned address ever answered (${summary}) — ` +
+        'the failover is not reaching a second address. If a solo session to another host passes, ' +
+        'the target edge is refusing this notary\'s egress on every pinned address instead ' +
+        '(a target-policy finding: confirm with a direct handshake from the notary\'s network), ' +
+        'which is not something another address can fix',
     };
   }
   return { ok: false, verdict: `${failoverHost} failed ${attempts.length}/${attempts.length} (${summary})` };

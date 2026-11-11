@@ -3740,3 +3740,75 @@ under 10 s of margin over a single healthy session. The bound is doing its job
 harness is simply slow. A release prover has not been measured from here, so the
 default stays 60 s (`TLS_PROXY_COMMIT_TIMEOUT` is the notary-side knob) rather
 than relaxing the anti-abuse bound on debug-build evidence.
+
+## 0.61 — v246: a silent target only indicts the edge if the prover spoke, and api-m refuses this egress outright (2026-11-11 18:05 UTC)
+
+### The release that shipped a false-strike bug, and the fix
+
+v245 went out as image `m-2ze1fndlq910jjn09frx` (disk `c9973a5a…`, RTMR2
+`d6e62f59…`, verify.html `aadaab09…`, 280,318 B) after the usual two passes: pass
+A learned RTMR2, pins were rotated, pass B cleared `check-auditor-pins`,
+`check-manifest-parity`, `check-live-tls-cert`, the notary list check and the
+envelope re-mint. The shipped `initramfs` was unpacked and checked for the v245
+log string before the release was declared. The first live smoke on it then failed
+the failover phase 2/2 with **both** api-m addresses struck, in 3 s and 47 s.
+
+The first session's verdict was a prover-side abort —
+`preprocessing proxy-tls failed … bootstrap COT error` — and the notary had struck
+`146.75.123.1` for it. v245 (and v244 before it) treated *any* relayed session that
+ended with zero bytes from the target as silence, and a prover that dies in its own
+preprocessing produces exactly that shape. One prover abort therefore cost the
+address its credibility, the next session dialled the other address and struck that
+too, and a healthy notary read as broken.
+
+v246 counts bytes in each direction separately: `Stamped` carries `to_target`
+alongside `from_target`, and `note_silence` takes `prover_spoke` (the strike is
+skipped when the prover never sent its handshake; `to_target > 0` at both call
+sites and at the end-of-session feed). Unit test
+`stamped_counts_each_direction_separately` fixes the direction split; the smoking
+gun is a debug-build abort, which is why the smoke check now also treats
+`bootstrap COT error` / `preprocessing proxy-tls failed` as **inconclusive**, not as
+a failover failure.
+
+### api-m.paypal.com is dark on both pinned addresses for this egress
+
+With the strike rule corrected the failover phase still fails, and now it is
+telling the truth. `/proxy/refusals` from the live v246 build:
+
+| Address | Notary's verdict | Duration |
+|---|---|---|
+| `146.75.123.1` (Fastly) | closed without sending a byte of its handshake (`unexpected end of file`) | 27.9 s |
+| `104.16.124.74` (Cloudflare) | accepted the connection, no byte for the 20 s bound | 46.2 s |
+
+Both after the prover had spoken, so these are real refusals of this notary's
+egress, not prover aborts. Evidence that the addresses themselves are still
+correct and serving the name: `openssl s_client -connect 146.75.123.1:443
+-servername api-m.paypal.com` from another network returns
+`CN=api-m.paypal.com` (DigiCert chain), and in the *same* smoke run every sandbox
+host on the same two providers is **8/8** (solo PASS, wave 8/8, wall 63.3 s).
+Two pinned addresses cannot save a host that refuses the source address, so
+production api-m is currently notarizable only from a different egress — a target
+policy finding to raise with PayPal, not a notary defect.
+
+The failover probe's default host is therefore `sandbox.paypal.com` (two Fastly
+addresses, both healthy): it proves the two-address path and catches a dark first
+address, without turning the one-command check red for an external refusal.
+`--failover-host api-m.paypal.com` reproduces the refusal on demand, and the FAIL
+text now says which of the two situations it is in.
+
+### Release facts
+
+- **v246 image** `m-2zeht6xe70y29n247a4q` (`paypal-tdx-esp-202611111739`), disk
+  sha256 `a8f038d9c2d74717f9d04491b867cc2e4d92e3893ffea5f2159f8b7df56142cf`
+  (56,623,104 B), committed with the pins.
+- **Pins**: RTMR2 `313a87c629fe95ee24…`, verify.html `1c0f4bcc07a86852…`
+  (280,318 B) mirrored to `index.html`, README digest updated. MRTD/RTMR0/RTMR1
+  and the enclave binary pin (`0400da03…`) unchanged — only tls-proxy moved.
+- **Superseded this pass**: v245 `m-2ze1fndlq910jjn09frx` (shipped the
+  false-strike rule) and v246 pass A `m-2ze847tm8leymqn2laor` (pre-rotation
+  boot). Rollback to a known-good build is now **v244
+  `m-2zeetx0vmo1cat2x5hv3`**, whose pins predate both fixes.
+- Gates after the v246 deploy: `check-auditor-pins` OK, `check-manifest-parity`
+  PARITY OK, `check-live-tls-cert` OK, `/notary` list 200, envelope re-mints
+  across a live restart (`6d5d993e…` → `7e02966a…`).
+- Tests: tls-proxy `--bins` **11/11**, `--test session` **16/16** (115.95 s).

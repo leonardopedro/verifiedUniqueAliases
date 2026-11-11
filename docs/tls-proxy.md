@@ -169,6 +169,16 @@ rather than abandoned for the rest of the boot. Measured on 2026-11-11:
 name's Fastly address served it, and the two addresses are both valid for the
 host's certificate (checked with `openssl s_client -servername api-m.paypal.com`).
 
+That failover only helps when *one* address of a host is dark. Since 2026-11-11
+17:39 UTC `api-m.paypal.com` is dark on both pinned addresses for this notary's
+egress: `146.75.123.1` accepts and hangs up without a byte, `104.16.124.74`
+accepts and stays silent through the 20 s bound, while a direct
+`openssl s_client` to the same Fastly address from another network still returns
+`CN=api-m.paypal.com`, and every sandbox host stays 8/8 from the same notary in
+the same run. Two addresses cannot fix a refusal aimed at the source address, so
+the smoke check's failover probe defaults to `sandbox.paypal.com`; point it at
+`api-m.paypal.com` with `--failover-host` to watch the refusal.
+
 The state is visible from outside: `/proxy/health` carries `relay_endpoints` as
 `{address: {zero_byte_runs, last_byte_secs_ago}}`, next to the pacing map, so a
 failover is something an operator reads instead of inferring from a success
@@ -518,6 +528,14 @@ outputs in the store are 32-bit and fail with `incompatible with
 elf64-x86-64`.
 
 ## Bursts and stalls
+
+A note on what counts against an address: only a session where the **prover
+spoke first** and the target sent nothing. A prover that dies in its own
+preprocessing (`bootstrap COT error`, a commitment it never finishes) closes the
+relay with zero bytes from the target too, and before v246 that struck the
+address — one such abort on 2026-11-11 struck both api-m addresses and made a
+healthy notary read as broken. The relay now counts bytes in each direction and
+the strike requires the prover's own bytes.
 
 `api-m.paypal.com` sits behind Cloudflare (`104.16.124.74`), and that edge
 tolerates only a few relayed TLS handshakes arriving from one source address at

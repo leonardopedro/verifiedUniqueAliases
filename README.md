@@ -287,9 +287,15 @@ any failed). That is the whole release check: the solo pass proves the relay, th
 commitment bound and the signed record; the burst proves the dial pacing and the
 retry path, which only appear when several provers arrive together; and the probe
 proves the notary still reaches a host served by two CDN edges — it dials
-`api-m.paypal.com` one session at a time and reads `/proxy/health`, so a dark
+`sandbox.paypal.com` one session at a time and reads `/proxy/health`, so a dark
 first address (an edge that accepts the connection and withholds the handshake)
-is caught here instead of in a customer's failed login. Point it explicitly with
+is caught here instead of in a customer's failed login. The probe uses a sandbox
+host on purpose: `api-m.paypal.com` currently refuses relayed handshakes from the
+notary's egress on **both** its pinned addresses (Fastly hangs up, Cloudflare
+holds silent) while `openssl s_client -servername api-m.paypal.com` from another
+network still gets a certificate — a target-policy finding an address change
+cannot fix, and a red probe that says nothing about the notary. Aim it at that
+host when you want to watch the refusal itself. Point it explicitly with
 `--target www.sandbox.paypal.com/robots.txt`, reuse a built binary with
 `--binary tls-proxy/target/.../deps/live-…`, skip a phase with `--solo-only` /
 `--wave-only` / `--no-failover`, or aim the probe with `--failover-host` and
