@@ -161,9 +161,10 @@ function runOne(executable, { server = target, attempts = 1 } = {}) {
         seconds: ((Date.now() - started) / 1000).toFixed(1),
         verdict: verdict.slice(0, 240),
         // The notary's own sentence when it has one: a stall names the edge, and
-        // "the commitment handshake" means the prover was slow, not the target.
+        // a prover that dies in its own preprocessing (commitment or the COT
+        // bootstrap behind it) says nothing about the target at all.
         stalled: /stalled|sent no byte|accepted the connection and sent nothing/i.test(out),
-        commit: /commitment handshake|computed its commitment/i.test(out),
+        prover: /commitment handshake|computed its commitment|preprocessing proxy-tls failed|bootstrap COT error/i.test(out),
       });
     });
   });
@@ -216,12 +217,12 @@ async function runFailover(executable) {
     attempts.push(run);
     console.log(`    ${run.ok ? 'PASS' : 'FAIL'} ${run.seconds}s${run.ok ? '' : `  ${run.verdict}`}`);
     if (run.ok) break;
-    // A commit-phase failure says nothing about the target's edge: the next
+    // A prover-side failure says nothing about the target's edge: the next
     // session would prove nothing either, and each costs a minute.
-    if (run.commit && !run.stalled) {
+    if (run.prover && !run.stalled) {
       return {
         ok: true,
-        note: `inconclusive: the prover's own commitment did not complete (${run.verdict.slice(0, 120)})`,
+        note: `inconclusive: the prover itself failed (${run.verdict.slice(0, 120)})`,
       };
     }
   }

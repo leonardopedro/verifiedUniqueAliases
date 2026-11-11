@@ -500,10 +500,15 @@ fn note_silence(
     book: &EndpointBook,
     ip: IpAddr,
     noted: &AtomicBool,
+    prover_spoke: bool,
     peer: SocketAddr,
     server_name: &str,
 ) {
-    if noted.swap(true, Ordering::SeqCst) {
+    // A prover that died in its own preprocessing produces the same "no byte
+    // from the target" shape as an edge that hung up, and it is not the
+    // address's fault: only a session that got as far as sending its handshake
+    // says anything about the edge.
+    if !prover_spoke || noted.swap(true, Ordering::SeqCst) {
         return;
     }
     if book.note_silence(ip) {
@@ -587,14 +592,27 @@ struct Stamped<S> {
     /// edge that hung up from a prover that gave up, and it outlives the phase
     /// (the session reads it after the relay has ended).
     from_target: Arc<AtomicU64>,
+    /// Bytes this connection sent TO the target. A session where the target said
+    /// nothing is only the edge's fault if the prover actually spoke first; a
+    /// prover that died in its own preprocessing produced the same "no byte from
+    /// the target" shape and must not cost the address its credibility (measured
+    /// 2026-11-11: a `bootstrap COT error` struck both api-m addresses in one
+    /// smoke run and made the notary look broken).
+    to_target: Arc<AtomicU64>,
 }
 
 impl<S> Stamped<S> {
-    fn new(inner: S, activity: Arc<RelayActivity>, from_target: Arc<AtomicU64>) -> Self {
+    fn new(
+        inner: S,
+        activity: Arc<RelayActivity>,
+        from_target: Arc<AtomicU64>,
+        to_target: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             inner,
             activity,
             from_target,
+            to_target,
         }
     }
 }
@@ -630,6 +648,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Stamped<S> {
         if let Poll::Ready(Ok(n)) = &poll {
             if *n > 0 {
                 me.activity.stamp();
+                me.to_target.fetch_add(*n as u64, Ordering::Relaxed);
             }
         }
         poll
@@ -653,6 +672,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Stamped<S> {
         if let Poll::Ready(Ok(n)) = &poll {
             if *n > 0 {
                 me.activity.stamp();
+                me.to_target.fetch_add(*n as u64, Ordering::Relaxed);
             }
         }
         poll
@@ -858,6 +878,9 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
     // separates an edge that hung up from a prover that gave up, and it is what
     // the endpoint book uses to prefer a different address next time.
     let from_target = Arc::new(AtomicU64::new(0));
+    // Bytes the prover sent toward the target: a silent target only indicts the
+    // edge if the prover actually spoke first (see `Stamped::to_target`).
+    let to_target = Arc::new(AtomicU64::new(0));
     let relayed_started = Arc::new(AtomicBool::new(false));
     // Set once this session has already told the endpoint book that its address
     // answered with silence, so the same session is not counted twice and the
@@ -1038,7 +1061,12 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
         let activity = RelayActivity::new(st.stall_timeout);
         activity.arm();
         relayed_started.store(true, Ordering::SeqCst);
-        let relayed = Stamped::new(client, activity.clone(), from_target.clone());
+        let relayed = Stamped::new(
+            client,
+            activity.clone(),
+            from_target.clone(),
+            to_target.clone(),
+        );
         *phase.lock().unwrap() = format!("relayed TLS handshake to {server_name} ({addr})");
         let verifier = tokio::select! {
             outcome = verifier.run(relayed.compat()) => match outcome {
@@ -1056,7 +1084,14 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
                         *stall_reason.lock().unwrap() = Some(format!(
                             "the target edge for {server_name} ({addr}) closed the connection without sending a byte of its handshake ({e})"
                         ));
-                        note_silence(&st.endpoints, addr.ip(), &edge_noted, peer, &server_name);
+                        note_silence(
+                            &st.endpoints,
+                            addr.ip(),
+                            &edge_noted,
+                            to_target.load(Ordering::Relaxed) > 0,
+                            peer,
+                            &server_name,
+                        );
                     }
                     return Err(e.into());
                 }
@@ -1084,7 +1119,14 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
                     )
                 });
                 if from_target.load(Ordering::Relaxed) == 0 {
-                    note_silence(&st.endpoints, addr.ip(), &edge_noted, peer, &server_name);
+                    note_silence(
+                        &st.endpoints,
+                        addr.ip(),
+                        &edge_noted,
+                        to_target.load(Ordering::Relaxed) > 0,
+                        peer,
+                        &server_name,
+                    );
                 }
                 return Err(format!(
                     "the relayed connection to {server_name} ({addr}) moved no byte for {:?}",
@@ -1190,10 +1232,11 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
     if let Some(ip) = dialled {
         if relayed_started.load(Ordering::SeqCst) {
             let answered = from_target.load(Ordering::Relaxed) > 0;
-            if answered || !edge_noted.load(Ordering::SeqCst) {
-                st.endpoints.observe(ip, answered);
-            }
-            if !answered && !edge_noted.load(Ordering::SeqCst) {
+            let spoke = to_target.load(Ordering::Relaxed) > 0;
+            if answered {
+                st.endpoints.observe(ip, true);
+            } else if spoke && !edge_noted.load(Ordering::SeqCst) {
+                st.endpoints.observe(ip, false);
                 warn!(
                     "session from {peer}: {ip} accepted the connection and sent nothing — the next session to that host will prefer another pinned address"
                 );
@@ -1916,6 +1959,41 @@ mod tests {
             !pacer.snapshot().contains_key(&b.to_string()),
             "pacing for one address must not invent state for another"
         );
+    }
+
+    /// The two wire counters are directional: a prover that never sent a byte
+    /// must not look like a target that never answered. That distinction is what
+    /// keeps a prover's own preprocessing failure from striking an address
+    /// (measured 2026-11-11: a `bootstrap COT error` struck both pinned api-m
+    /// addresses in one smoke run and read as a notary fault).
+    #[tokio::test]
+    async fn stamped_counts_each_direction_separately() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (near, mut far) = tokio::io::duplex(64);
+        let from_target = Arc::new(AtomicU64::new(0));
+        let to_target = Arc::new(AtomicU64::new(0));
+        let activity = RelayActivity::new(Duration::from_secs(30));
+        let mut stamped = Stamped::new(
+            near,
+            activity,
+            from_target.clone(),
+            to_target.clone(),
+        );
+
+        // The prover's bytes count toward the target, not toward the target's
+        // answer.
+        stamped.write_all(b"hello").await.unwrap();
+        let mut buf = [0_u8; 5];
+        far.read_exact(&mut buf).await.unwrap();
+        assert_eq!(to_target.load(Ordering::Relaxed), 5);
+        assert_eq!(from_target.load(Ordering::Relaxed), 0);
+
+        far.write_all(b"hi").await.unwrap();
+        let mut buf = [0_u8; 2];
+        stamped.read_exact(&mut buf).await.unwrap();
+        assert_eq!(from_target.load(Ordering::Relaxed), 2);
+        assert_eq!(to_target.load(Ordering::Relaxed), 5);
     }
 
     /// A relayed connection is not "stalled" before it is armed, is stale the
