@@ -1181,14 +1181,22 @@ async fn resolve_targets(server_name: &str) -> Result<Vec<SocketAddr>, String> {
                 .map_err(|e| format!("TLS_PROXY_TARGET_ADDR is not a socket address: {e}"));
         }
     }
+    // `/etc/hosts` FIRST, parsed by hand, because `lookup_host` does not hand
+    // back every address of a multi-address hosts line: measured 2026-11-11
+    // with tokio 1.x on glibc, `104.16.124.74 146.75.123.1 api-m.paypal.com`
+    // resolves to the first address only, so a `host@a,b` pin silently had one
+    // candidate and the failover could never happen. The file is the authority
+    // here (the enclave writes it at boot and the resolver is closed after), so
+    // reading it directly is both correct and cheaper than a getaddrinfo.
+    let mut pinned = pinned_from_hosts(server_name, &std::fs::read_to_string("/etc/hosts").unwrap_or_default());
     match tokio::net::lookup_host((server_name, TARGET_PORT)).await {
         Ok(addrs) => {
-            let mut candidates: Vec<SocketAddr> = Vec::new();
             for addr in addrs {
-                if !candidates.contains(&addr) {
-                    candidates.push(addr);
+                if !pinned.contains(&addr) {
+                    pinned.push(addr);
                 }
             }
+            let candidates = pinned;
             if candidates.is_empty() {
                 return Err(format!(
                     "{server_name} resolves to no address; only the boot-time relay_targets list is reachable"
@@ -1196,10 +1204,53 @@ async fn resolve_targets(server_name: &str) -> Result<Vec<SocketAddr>, String> {
             }
             Ok(candidates)
         }
-        Err(e) => Err(format!(
-            "{server_name} is not in this notary's boot-time relay_targets (lookup failed: {e}); the resolver is closed after boot by design, so add the host to the configuration and reboot"
-        )),
+        // A name with no hosts line and no resolver answer is not a target of
+        // this boot: the prover gets the reason, not a bare disconnect.
+        Err(e) => {
+            if !pinned.is_empty() {
+                return Ok(pinned);
+            }
+            Err(format!(
+                "{server_name} is not in this notary's boot-time relay_targets (lookup failed: {e}); the resolver is closed after boot by design, so add the host to the configuration and reboot"
+            ))
+        }
     }
+}
+
+/// Every address `/etc/hosts` pins to `server_name`, in file order.
+///
+/// Pure so it can be tested without a filesystem: the enclosure reads the real
+/// file, the test reads a fixture. Lines are `address [address …] name [alias …]`,
+/// `#` starts a comment, and IPv6 entries are skipped because the relay is
+/// IPv4-only (the egress rule matches `ip daddr` on the IPv4 table).
+fn pinned_from_hosts(server_name: &str, hosts: &str) -> Vec<SocketAddr> {
+    let wanted = server_name.trim_end_matches('.').to_ascii_lowercase();
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for line in hosts.lines() {
+        let line = line.split('#').next().unwrap_or("");
+        let mut addresses: Vec<std::net::Ipv4Addr> = Vec::new();
+        let mut named = false;
+        for field in line.split_whitespace() {
+            match field.parse::<std::net::Ipv4Addr>() {
+                Ok(ip) => addresses.push(ip),
+                Err(_) => {
+                    if field.eq_ignore_ascii_case(&wanted) {
+                        named = true;
+                    }
+                }
+            }
+        }
+        if !named {
+            continue;
+        }
+        for ip in addresses {
+            let addr = SocketAddr::new(IpAddr::V4(ip), TARGET_PORT);
+            if !out.contains(&addr) {
+                out.push(addr);
+            }
+        }
+    }
+    out
 }
 
 fn record_attestation(st: &ProxyState, verified: Verified) -> Result<String, BoxError> {
@@ -1644,6 +1695,38 @@ mod tests {
     /// front. Ties keep the configured order, so a host with a single address —
     /// every host today except the ones explicitly configured otherwise — dials
     /// exactly where it always did.
+    #[test]
+    /// The bug this exists for: `lookup_host` returns ONE address for a
+    /// multi-address hosts line, so a `host@a,b` pin yielded a single candidate
+    /// and no failover was possible. The parse is what makes the second
+    /// address reachable at all, so it is tested without a filesystem.
+    #[test]
+    fn every_address_of_a_hosts_line_is_a_candidate_in_file_order() {
+        let hosts = "\
+127.0.0.1 localhost
+104.16.124.74 146.75.123.1 api-m.paypal.com
+151.101.195.1 www.sandbox.paypal.com sandbox.paypal.com  # shared edge
+::1 api-m.paypal.com
+";
+        let candidates = pinned_from_hosts("api-m.paypal.com", hosts);
+        assert_eq!(
+            candidates,
+            vec![
+                "104.16.124.74:443".parse::<SocketAddr>().unwrap(),
+                "146.75.123.1:443".parse::<SocketAddr>().unwrap(),
+            ],
+            "both pinned addresses, in the order the enclave wrote them, IPv6 skipped"
+        );
+        // Aliases on one line share its addresses; the match is exact, so a
+        // longer name never picks up another host's addresses.
+        assert_eq!(
+            pinned_from_hosts("sandbox.paypal.com", hosts),
+            vec!["151.101.195.1:443".parse::<SocketAddr>().unwrap()]
+        );
+        assert!(pinned_from_hosts("paypal.com", hosts).is_empty());
+        assert!(pinned_from_hosts("API-M.PAYPAL.COM", hosts).len() == 2);
+    }
+
     #[test]
     fn endpoint_book_fails_over_and_recovers() {
         let cloudflare: SocketAddr = "104.16.124.74:443".parse().unwrap();

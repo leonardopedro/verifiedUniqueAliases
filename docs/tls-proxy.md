@@ -152,8 +152,11 @@ A name served by more than one edge can be pinned to all of them, in dial order:
 ```
 
 Both addresses go on one `/etc/hosts` line (`104.16.124.74 146.75.123.1
-api-m.paypal.com`) and both are admitted on 443. The first is what the notary
-dials, and each relayed session feeds an **endpoint book**: a session that ends
+api-m.paypal.com`) and both are admitted on 443. The proxy reads that line
+itself rather than trusting `getaddrinfo`, which returns only the **first**
+address of a multi-address hosts line (measured with tokio 1.x on glibc — the
+reason a two-address pin silently had one candidate before v244). The first is
+what the notary dials, and each relayed session feeds an **endpoint book**: a session that ends
 without the target sending a single byte (the edge accepted the TCP connection
 and then hung up, or sat silent through the whole stall bound) counts against
 that address, and the next session for that host dials the next candidate. One
