@@ -532,13 +532,20 @@ dial slot to <host> (<addr>)`, which is a queue, not a stall. Eight sessions cos
 - **Stall verdict** (`stall_timeout_secs`, default 20): a relayed connection that
   moves no byte for this long is refused as `stalled`, naming the phase and
   telling the prover to retry. Before this, such a session sat until the 120 s
-  `session_timeout_secs`, holding its slot for 100 s of nothing.
+  `session_timeout_secs`, holding its slot for 100 s of nothing. This bound
+  applies **after** `accept()`, where the relay is live — not to the wait between
+  the dial and the prover's first relayed message, which is still tlsn
+  preprocessing (see the commit ceiling below).
 - **Commit ceiling** (`commit_timeout_secs`, default 60): the commitment
   handshake has no target connection yet, so the stall watchdog has nothing to
   watch — and tlsn's preprocessing is CPU-bound on the prover, quiet for seconds
   between messages (2 s alone, 16 s under an eight-wide wave). A prover that
   connects and then dies here used to hold its slot for the full 120 s; it is now
   refused as `stalled` at this bound, with "retry this session" in the reason.
+  The same bound covers the dial-to-first-byte wait for the same reason: measured
+  on the deployed notary (2026-11-11), healthy solo provers over a 215 ms link
+  took 8–31 s to reach `accept()`, and the 20 s relay bound sitting there refused
+  2 of 3 good sessions while their COT was still running.
 
 A prover should therefore retry once when an attempt ends before its verdict
 (the bundled harness does): with spacing in place a retry lands on a healthy
