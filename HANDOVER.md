@@ -3527,3 +3527,87 @@ Running belongs to whoever started it.
   `m-2ze4lto0m4wqw3hxx9q0` (+`s-2ze4lto0m4wqw3htj730`) deleted; v241b (live,
   `s-2zebw9kc74ccmafedmst`) and v240b (rollback, `s-2ze024y1756o0dtq25no`)
   remain.
+
+## 0.58 — v242: the stall bound now covers only the phase it was measured in (2026-11-11 08:40 UTC)
+
+### Root cause
+
+The 20 s silence bound (v238) was armed on the **dial → `accept()`** wait, not on
+the relayed connection. That wait is tlsn *preprocessing* on the prover: it is
+CPU-bound, and the target's bytes cannot arrive before the commitment finishes.
+Measured live against the deployed notary over a 215 ms link, healthy **solo**
+provers took 8–31 s to reach `accept()`, so the bound was killing good sessions
+(the prover reads `bootstrap COT error: … unexpected end of file` while
+`/proxy/refusals` blames the notary as `stalled`). Same mistake `commit_timeout`
+was introduced to fix, one phase later.
+
+### What changed
+
+- `run_session` (`tls-proxy/src/main.rs`) now keeps **two** `RelayActivity`
+  instances: `preprocessing` armed right before `verifier.accept()` with
+  `commit_timeout` (60 s), `relayed` armed after `accept()` with
+  `stall_timeout` (20 s). Only the relayed phase keeps the "bytes within 2 s"
+  bound.
+- A preprocessing overrun has its own sentence:
+  `the prover computed its commitment for … without sending the next message to
+  <host> (<addr>) — last progress: …`, so the two verdicts are no longer
+  indistinguishable in the refusal ring.
+- `refuses_a_prover_that_commits_then_vanishes` sets `TLS_PROXY_COMMIT_TIMEOUT=2`
+  rather than relying on the 20 s default; `docs/tls-proxy.md` scopes the knob
+  table (the stall bound is post-`accept()`; the dial→first-byte wait is
+  preprocessing) and records the 8–31 s measurement; README gained the four-tier
+  test table (unit / live / burst / no-shell).
+- `tls-proxy/tests/live.rs`: `LIVE_SERVER=host/path` splits the path off the host
+  (`LIVE_PATH` wins; a host still carrying `/` is rejected up front instead of
+  failing as `invalid DNS name`). `scripts/check-live-wave.mjs` is the
+  reproducible wave harness: builds once, runs N concurrent provers from one
+  binary (`--binary`/`WAVE_BINARY`, `--width/--attempts/--spacing/--timeout/
+  --target`), prints per-slot PASS/FAIL + `n/width`, exits 1 on any failure.
+
+### Tests
+
+- tls-proxy **6/6** unit, **15/15** `tests/session.rs` (109 s), live split test
+  **1/1**, wave harness exercised at width 4 and width 8.
+- Enclave unchanged (the notary is a separate binary in the initramfs).
+
+### Release (two-cycle, pins rotated)
+
+- Pass A: image `paypal-tdx-esp-v242a-202611110820`
+  **`m-2ze5go7984uc8hhof2tp`** imported, learned RTMR2
+  **`2b8a09ec4c4e9e6d…`** (initrd carries the rebuilt notary) and confirmed the
+  enclave binary is unchanged (**`863f9d03d6ea90a4…`** — the landing page is not
+  compiled in), then failed the pin gate as designed. The first pass-A attempt
+  died at podman layer commit (`no space left on device`): `podman image prune
+  -f` reclaimed 117 GB of dangling layers (134 GB → 4 GB used).
+- Pass B: image **`m-2ze6iuaofgxf90wkfbnv`** / disk
+  **`f9c117b51f3d46c8a613e51e84291309ed557f15f074e22183ed98c1275b1352`**;
+  `check-auditor-pins --live` **OK**, `PARITY OK`, TLS cert/report parity OK,
+  `/callback` sealed-refusal OK, notary enabled+spawned+served OK, envelope cache
+  follows a notary restart OK.
+- `verify.html` == `index.html` **280,318 B**
+  **`c3c959b99b23a946e9cdf089d49e77ad09f97d5a2fd7433081d2107fc9ec4ccf`**; README
+  digest rotated by replacing only the old `verify.html` digest.
+- Relay VM **Stopped** (`StopCharging`); storage swept to **two** images / **two**
+  snapshots — pass-A `m-2ze5go7984uc8hhof2tp` (+`s-2ze5go7984uc8hhk9kvf`) and
+  superseded v241b `m-2zebw9kc74ccmafdu4dq` (+`s-2zebw9kc74ccmafedmst`) deleted;
+  v242b (live, `s-2ze6iuaofgxf90wlii4a`) and v240b (rollback,
+  `s-2ze024y1756o0dtq25no`) remain.
+
+### Live measurements on v242b (fresh child, counters from 1 restart)
+
+- **Solo, `www.sandbox.paypal.com/robots.txt` (Fastly 151.101.195.1): 5/5 PASS.**
+  Commit accept landed at **9.4 s, 15.2 s, 21.7 s, 22.2 s, 31.2 s** — four of the
+  five would have been killed by the old 20 s bound. Transcript ~107 B sent /
+  3,479 B received, `200 OK`, 30 s end to end.
+- **Wave, width 8, `api-m.sandbox.paypal.com/robots.txt` (Fastly 146.75.123.1),
+  `--attempts 2 --spacing 2000`: 8/8 PASS**, wall 49 s, per-slot 14.7–40.0 s.
+- **`api-m.paypal.com` (Cloudflare 104.16.124.74) was edge-hostile throughout:**
+  3/3 solo attempts reached `accept()` and then got no ServerHello for 20 s →
+  `stalled` with the retry hint, and `/proxy/health` widened that address to the
+  6000 ms cap. This is the v238 edge behaviour, still real today for that target;
+  it is not the preprocessing bug (the verdict now says *relayed*, not
+  *committing*).
+- Intermittent immediate post-`accept()` closes (`rejected … failed to receive
+  proxy finished message`) occurred in 3 of 10 attempts on the Fastly target and
+  then vanished; 5 clean solo runs afterwards. Unknown cause, tracked as the
+  remaining reliability risk — retries absorb it.
