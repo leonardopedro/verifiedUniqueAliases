@@ -970,13 +970,18 @@ mod enclave_init {
             // `host@address`: the operator already knows the address, so it is
             // pinned as given rather than resolved — this is how a host whose
             // DNS rotates (or does not answer at boot) stays reachable.
-            if let Some((host, address)) = entry.split_once('@') {
-                lines.push_str(&format!("{address} {host}\n"));
-                if !granted.contains(&address.to_string()) {
-                    granted.push(address.to_string());
+            if let Some((host, addresses)) = entry.split_once('@') {
+                // One line, all addresses, in the configured order: the hosts
+                // file is what hands `getaddrinfo` the candidate list the proxy
+                // fails over through, so the order here is the dial order.
+                lines.push_str(&format!("{} {host}\n", addresses.replace(',', " ")));
+                for address in addresses.split(',') {
+                    if !granted.contains(&address.to_string()) {
+                        granted.push(address.to_string());
+                    }
                 }
                 kmsg(&format!(
-                    "relay target {host} pinned in /etc/hosts to {address} (configured address, not resolved)"
+                    "relay target {host} pinned in /etc/hosts to {addresses} (configured addresses, not resolved)"
                 ));
                 continue;
             }
@@ -2578,6 +2583,11 @@ struct TlsProxyConfig {
 /// in a firewall rule, and a proxy needs a handful, not a catalogue.
 const MAX_RELAY_TARGETS: usize = 32;
 
+/// Most addresses a single `host@a,b,…` pin may carry. Two covers the observed
+/// case (one CDN address dead for our egress, the other serving); more than a
+/// few would make "why did it dial that?" unanswerable from the config alone.
+const MAX_RELAY_TARGET_ADDRESSES: usize = 4;
+
 /// Defaults: the two API hosts a prover attests PayPal *responses* from, plus
 /// the sandbox *website* a person actually logs into. `sandbox.paypal.com` only
 /// answers 301 to `www.sandbox.paypal.com`, and a TLSNotary session attests the
@@ -2946,11 +2956,14 @@ fn validate_relay_target(target: &str) -> Result<(), String> {
     if target.trim() != target {
         return Err(format!("{target:?} has surrounding whitespace"));
     }
-    // `host@address` pins a known address for a name instead of resolving it at
-    // boot — the answer for a host whose DNS rotates or is unusable at boot.
-    // The left side must be a real hostname: the prover commits a name, and
-    // tlsn rejects an IP as a server name (`InvalidDnsNameError`), so a literal
-    // on the left would be a target nobody can use.
+    // `host@address`, or `host@address,candidate` to pin several: the proxy
+    // dials the first and fails over to the next when an edge accepts the
+    // connection and then hangs up (api-m.paypal.com is served by both
+    // Cloudflare and Fastly, and one of them can go dark for our egress
+    // address without the host being unreachable). The left side must be a real
+    // hostname: the prover commits a name, and tlsn rejects an IP as a server
+    // name (`InvalidDnsNameError`), so a literal on the left would be a target
+    // nobody can use.
     match target.split_once('@') {
         Some((host, address)) => {
             if address.contains('@') {
@@ -2962,9 +2975,25 @@ fn validate_relay_target(target: &str) -> Result<(), String> {
                     "{target}: the part before '@' must be a hostname — a prover cannot commit an address"
                 ));
             }
-            address.parse::<std::net::Ipv4Addr>().map(|_| ()).map_err(|_| {
-                format!("{target}: '{address}' after '@' is not an IPv4 address")
-            })
+            let mut seen: Vec<std::net::Ipv4Addr> = Vec::new();
+            for candidate in address.split(',') {
+                let ip = candidate.parse::<std::net::Ipv4Addr>().map_err(|_| {
+                    format!(
+                        "{target}: '{candidate}' after '@' is not an IPv4 address (use host@a,b for several)"
+                    )
+                })?;
+                if seen.contains(&ip) {
+                    return Err(format!("{target}: {ip} is listed twice"));
+                }
+                seen.push(ip);
+            }
+            if seen.len() > MAX_RELAY_TARGET_ADDRESSES {
+                return Err(format!(
+                    "{target}: {} addresses after '@', more than the {MAX_RELAY_TARGET_ADDRESSES} this build accepts",
+                    seen.len()
+                ));
+            }
+            Ok(())
         }
         None => validate_relay_hostname(target),
     }
@@ -3425,6 +3454,93 @@ fn html_with_secure_headers(bytes: Vec<u8>) -> Response {
 // The protocol endpoints (/attest/login-session, /callback, /tls-cert.pem,
 // /e2ee-blob, /debug/envelope) are untouched: they are the service.
 // ============================================================================
+const NOTARY_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TLS Notary — login.airma.de</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.55 ui-sans-serif, system-ui, sans-serif; max-width: 46rem; margin: 3rem auto; padding: 0 1.25rem; }
+  h1 { font-size: 1.6rem; margin-bottom: .25rem; }
+  h2 { font-size: 1.05rem; margin-top: 2rem; }
+  p.lead { margin-top: 0; opacity: .8; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .875rem; }
+  pre { background: rgba(127,127,127,.12); padding: .75rem 1rem; border-radius: 6px; overflow-x: auto; }
+  #status { display: grid; grid-template-columns: max-content 1fr; gap: .2rem 1rem; font-size: .9rem; }
+  #status dt { opacity: .7; }
+  #status dd { margin: 0; }
+  .bad { color: #c0392b; } .good { color: #2e7d32; }
+  a { color: inherit; }
+  footer { margin-top: 3rem; font-size: .8rem; opacity: .6; }
+</style>
+</head>
+<body>
+<h1>TLS Notary</h1>
+<p class="lead">A hardware-attested TLSNotary notary runs on this origin. It relays one TLS connection for a prover and signs a record of the bytes that went through, so a third party can check a page was served by the real host without trusting you.</p>
+
+<h2>Connect to it</h2>
+<p>Notary endpoint: <code>login.airma.de:8443</code> (plain TCP, no TLS — the session is authenticated by the prover against the notary's pinned public key).</p>
+
+<h2>Live status</h2>
+<dl id="status"><dt>loading…</dt><dd></dd></dl>
+<p><a href="/proxy/attestations">Recent notarised sessions</a> · <a href="/proxy/refusals">Why a session was refused</a> · <a href="/verify.html">Auditor</a></p>
+
+<h2>Run a session</h2>
+<p>The prover runs on your machine — it is the party holding the connection to the site. Clone the repository and run the smoke check, which does one solo session and then an eight-wide burst:</p>
+<pre>git clone https://github.com/leonardopedro/verifiedUniqueAliases
+cd verifiedUniqueAliases
+node scripts/check-live-smoke.mjs --target www.sandbox.paypal.com/robots.txt</pre>
+<p>Or one session, printing the download URL of the record it produces:</p>
+<pre>LIVE_NOTARY=login.airma.de:8443 \
+LIVE_SERVER=www.sandbox.paypal.com/robots.txt \
+LIVE_ATTEMPTS=2 LIVE_PUBLIC=login.airma.de \
+cargo test --manifest-path tls-proxy/Cargo.toml --test live -- --ignored --nocapture</pre>
+<p>The notary only relays hosts on its configured allowlist — <code>api-m.paypal.com</code>, <code>api-m.sandbox.paypal.com</code>, <code>sandbox.paypal.com</code>, <code>www.sandbox.paypal.com</code> — so a session to anything else is refused in band with the reason.</p>
+
+<h2>Check the record</h2>
+<p>Every session prints a <code>sent_sha256</code> / <code>received_sha256</code> pair. Those two digests fetch the signed record at <code>/proxy/attestations/&lt;id&gt;</code>; load it into the <a href="/verify.html">auditor</a> with the hardware report from <code>/debug/envelope</code> and check it offline.</p>
+<p>If a session fails, <a href="/proxy/refusals">/proxy/refusals</a> says which side stalled. A <code>stalled</code> verdict is retryable by design: the target's edge accepted the connection and withheld its handshake, and the sentence names the host and address it dialled.</p>
+
+<script>
+  (async () => {
+    const dl = document.getElementById('status');
+    const row = (k, v, cls) => {
+      const dt = document.createElement('dt');
+      dt.textContent = k;
+      const dd = document.createElement('dd');
+      dd.textContent = v;
+      if (cls) dd.className = cls;
+      dl.append(dt, dd);
+    };
+    try {
+      const r = await fetch('/proxy/health', { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const h = await r.json();
+      dl.textContent = '';
+      row('notary', h.running ? 'running' : 'not running', h.running ? 'good' : 'bad');
+      row('sessions verified', String(h.sessions_ok));
+      row('sessions failed', String(h.sessions_failed));
+      row('in flight', String(h.active_sessions));
+      const spacing = Object.entries(h.dial_spacing_ms || {});
+      row('dial spacing', spacing.length ? spacing.map(([ip, ms]) => ip + ' ' + ms + ' ms').join(', ') : 'base ' + h.dial_spacing_base_ms + ' ms');
+      const endpoints = Object.entries(h.relay_endpoints || {});
+      if (endpoints.length) {
+        row('edge health', endpoints.map(([ip, s]) => ip + (s.zero_byte_runs ? ' silent x' + s.zero_byte_runs : ' answering')).join(', '));
+      }
+    } catch (e) {
+      dl.textContent = '';
+      row('status', 'unavailable (' + e.message + ')', 'bad');
+    }
+  })();
+</script>
+
+<footer>Served from the measured enclave image. No cookies, no third-party scripts, no request logging beyond the notary's own counters.</footer>
+</body>
+</html>
+"##;
+
 const LANDING_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3542,6 +3658,18 @@ saveDownloader('dlp', 'hintp', 'verify-proxy.html');
 /// no auditor code, so there is nothing to rotate independently of the binary.
 async fn serve_landing() -> impl IntoResponse {
     html_with_secure_headers(LANDING_HTML.as_bytes().to_vec())
+}
+
+/// `GET /notary` — the public front door of the TLSNotary webservice (v243).
+///
+/// A user asking "how do I use the notary?" had no answer short of reading the
+/// repository and building a prover. This page is that answer: the endpoint to
+/// connect to, live numbers fetched from the same `/proxy/health` an operator
+/// reads, the exact commands, and links to the records and refusals. It is
+/// static HTML plus one same-origin fetch — nothing here mints a quote, signs a
+/// record or touches the notary's state, so it adds no attestation surface.
+async fn serve_notary() -> impl IntoResponse {
+    html_with_secure_headers(NOTARY_HTML.as_bytes().to_vec())
 }
 
 // ----------------------------------------------------------------------------
@@ -5458,6 +5586,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // because the attestation list lives on the loopback API. Hosts are
             // fingerprinted; transcript bytes stay on loopback.
             .route("/proxy/attestations", get(proxy_attestations))
+            // v243: the public front door of the notary — endpoint, live
+            // numbers and the exact commands, so using it does not require
+            // reading the repository first.
+            .route("/notary", get(serve_notary))
             // v222: the prover's own record, fetched from anywhere with the
             // digest pair their proof reveals — the list above publishes ids,
             // never transcripts, so this is the only way back to a session
@@ -5867,6 +5999,9 @@ mod security_tests {
 
         // host@address: pinned instead of resolved, for a host whose DNS rotates.
         assert!(validate_relay_target("www.sandbox.paypal.com@151.101.195.1").is_ok());
+        // host@a,b: several addresses, dialled in this order, for a name served
+        // by more than one edge when one of them stops answering our egress.
+        assert!(validate_relay_target("api-m.paypal.com@104.16.124.74,146.75.123.1").is_ok());
         for bad in [
             "www.sandbox.paypal.com@",
             "@151.101.195.1",
@@ -5874,10 +6009,14 @@ mod security_tests {
             "www.sandbox.paypal.com@::1",
             "151.101.195.1@151.101.195.1",
             "a@b@c",
+            "www.sandbox.paypal.com@151.101.195.1,",
+            "www.sandbox.paypal.com@151.101.195.1,not-an-address",
+            "www.sandbox.paypal.com@151.101.195.1,151.101.195.1",
+            "www.sandbox.paypal.com@1.1.1.1,2.2.2.2,3.3.3.3,4.4.4.4,5.5.5.5",
         ] {
             assert!(
                 validate_relay_target(bad).is_err(),
-                "{bad:?} must be rejected — the left side is a hostname, the right an IPv4 address"
+                "{bad:?} must be rejected — the left side is a hostname, the right a bounded IPv4 list"
             );
         }
 

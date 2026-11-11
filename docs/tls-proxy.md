@@ -143,6 +143,31 @@ left side must be a hostname and the right side an IPv4 address (IPv6 is refused
 the egress rule matches `ip daddr` only); a duplicate name with two addresses is
 fine, two entries for the same name are not.
 
+#### Several addresses for one host, and failing over between them
+
+A name served by more than one edge can be pinned to all of them, in dial order:
+
+```json
+"relay_targets": ["api-m.paypal.com@104.16.124.74,146.75.123.1"]
+```
+
+Both addresses go on one `/etc/hosts` line (`104.16.124.74 146.75.123.1
+api-m.paypal.com`) and both are admitted on 443. The first is what the notary
+dials, and each relayed session feeds an **endpoint book**: a session that ends
+without the target sending a single byte (the edge accepted the TCP connection
+and then hung up, or sat silent through the whole stall bound) counts against
+that address, and the next session for that host dials the next candidate. One
+byte from the target clears the count, so the preferred address is retried
+rather than abandoned for the rest of the boot. Measured on 2026-11-11:
+`api-m.paypal.com`'s Cloudflare address answered nothing for days while the same
+name's Fastly address served it, and the two addresses are both valid for the
+host's certificate (checked with `openssl s_client -servername api-m.paypal.com`).
+
+The state is visible from outside: `/proxy/health` carries `relay_endpoints` as
+`{address: {zero_byte_runs, last_byte_secs_ago}}`, next to the pacing map, so a
+failover is something an operator reads instead of inferring from a success
+rate.
+
 A bare IPv4 literal is accepted too, but understand what it buys: it opens 443 to
 that address with no DNS and no hosts entry, yet **nothing can be relayed to it**,
 because a prover commits a *server name* and tlsn rejects an address as one
@@ -168,7 +193,8 @@ nothing, and stops demanding PayPal app credentials only for the proxy-only case
 | `GET :8081/attestations` | ids, server names, timestamps |
 | `GET :8081/attestations/{id}` | the signed attestation |
 | `GET :8081/refusals` | why the last 32 sessions were refused, newest last |
-| `GET https://<domain>/proxy/health` | same liveness answer on the public origin |
+| `GET https://<domain>/notary` | public quickstart: endpoint, live health, the commands, links to records and refusals |
+| `GET https://<domain>/proxy/health` | same liveness answer on the public origin, including `dial_spacing_ms` and `relay_endpoints` |
 | `GET https://<domain>/proxy/refusals` | the refusal ring on the public origin, hostnames fingerprinted |
 | `GET https://<domain>/proxy/attestations` | the recorded sessions on the public origin: id, host fingerprint, time |
 | `GET https://<domain>/proxy/attestations/{id}?sent_sha256=&received_sha256=` | **your own** signed record, from anywhere: served only when both digests match |
@@ -535,7 +561,15 @@ dial slot to <host> (<addr>)`, which is a queue, not a stall. Eight sessions cos
   `session_timeout_secs`, holding its slot for 100 s of nothing. This bound
   applies **after** `accept()`, where the relay is live — not to the wait between
   the dial and the prover's first relayed message, which is still tlsn
-  preprocessing (see the commit ceiling below).
+  preprocessing (see the commit ceiling below). The sentence also says which
+  shape it was: a target that has sent **no byte of its handshake** is named as
+  the edge giving up (`the target edge for <host> (<addr>) accepted the
+  connection and sent no byte of its handshake for 20s`), which is a different
+  fault from a relay that was carrying bytes and then went quiet. A session
+  whose relay fails with the target still silent gets the same treatment —
+  `closed the connection without sending a byte of its handshake` — because
+  tlsn reports that as an io error while the prover sees only `connection closed
+  before message completed`, and neither names the side that gave up.
 - **Commit ceiling** (`commit_timeout_secs`, default 60): the commitment
   handshake has no target connection yet, so the stall watchdog has nothing to
   watch — and tlsn's preprocessing is CPU-bound on the prover, quiet for seconds

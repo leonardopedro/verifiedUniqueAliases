@@ -386,6 +386,92 @@ impl DialPacer {
     }
 }
 
+/// Chooses which pinned address a host is dialled at.
+///
+/// A host may be pinned to several addresses: the enclave writes every address
+/// it is configured with into `/etc/hosts`, and `getaddrinfo` hands them back in
+/// that order. The first is the usual one, but an edge can accept the TCP
+/// connection and then hang up before its handshake — measured on the deployed
+/// notary against `api-m.paypal.com`'s Cloudflare address while the same name's
+/// Fastly address served it fine. A session that ends without the target
+/// sending a single byte counts against that address, so the next session dials
+/// the next candidate; one byte from the target clears the count again, so the
+/// preferred address is retried rather than abandoned for the whole boot.
+struct EndpointBook {
+    entries: Mutex<HashMap<IpAddr, EndpointEntry>>,
+}
+
+#[derive(Default)]
+struct EndpointEntry {
+    zero_byte_runs: u32,
+    last_byte_at: Option<Instant>,
+}
+
+impl EndpointBook {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The candidate to dial: fewest consecutive zero-byte sessions wins, and a
+    /// tie keeps the configured order, so a host with one address (or an
+    /// untouched one) dials exactly as it did before this existed.
+    fn pick(&self, candidates: &[SocketAddr]) -> SocketAddr {
+        let map = self.entries.lock().unwrap();
+        let runs = |addr: &SocketAddr| {
+            map.get(&addr.ip())
+                .map(|e| e.zero_byte_runs)
+                .unwrap_or(0)
+        };
+        let mut best = candidates[0];
+        let mut best_runs = runs(&best);
+        for candidate in &candidates[1..] {
+            let candidate_runs = runs(candidate);
+            if candidate_runs < best_runs {
+                best = *candidate;
+                best_runs = candidate_runs;
+            }
+        }
+        best
+    }
+
+    /// Feeds one relayed session back in. `target_sent_a_byte` is false only
+    /// when the target accepted the connection and then produced nothing at all
+    /// before the session ended — the shape that means "this address is not
+    /// serving us right now", not "this prover failed".
+    fn observe(&self, addr: IpAddr, target_sent_a_byte: bool) {
+        let mut map = self.entries.lock().unwrap();
+        let entry = map.entry(addr).or_default();
+        if target_sent_a_byte {
+            entry.zero_byte_runs = 0;
+            entry.last_byte_at = Some(Instant::now());
+        } else {
+            entry.zero_byte_runs = entry.zero_byte_runs.saturating_add(1);
+        }
+    }
+
+    /// Per address: how many sessions in a row this address answered with
+    /// nothing, and how long ago it last did answer. The health report carries
+    /// this so a failover is visible instead of inferred from a success rate.
+    fn snapshot(&self) -> HashMap<String, serde_json::Value> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(addr, e)| {
+                (
+                    addr.to_string(),
+                    serde_json::json!({
+                        "zero_byte_runs": e.zero_byte_runs,
+                        "last_byte_secs_ago": e.last_byte_at.map(|at| at.elapsed().as_secs()),
+                    }),
+                )
+            })
+            .collect()
+    }
+}
+
 /// Byte activity of the relayed connection, so "no verdict yet" can be told
 /// apart from "the edge accepted the TCP connection and then said nothing".
 ///
@@ -455,11 +541,20 @@ impl RelayActivity {
 struct Stamped<S> {
     inner: S,
     activity: Arc<RelayActivity>,
+    /// Bytes this connection received FROM the target. Kept separately from the
+    /// activity stamp because "did the target ever speak?" is what tells an
+    /// edge that hung up from a prover that gave up, and it outlives the phase
+    /// (the session reads it after the relay has ended).
+    from_target: Arc<AtomicU64>,
 }
 
 impl<S> Stamped<S> {
-    fn new(inner: S, activity: Arc<RelayActivity>) -> Self {
-        Self { inner, activity }
+    fn new(inner: S, activity: Arc<RelayActivity>, from_target: Arc<AtomicU64>) -> Self {
+        Self {
+            inner,
+            activity,
+            from_target,
+        }
     }
 }
 
@@ -473,8 +568,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for Stamped<S> {
         let filled_before = buf.filled().len();
         let poll = Pin::new(&mut me.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = &poll {
-            if buf.filled().len() > filled_before {
+            let read = buf.filled().len() - filled_before;
+            if read > 0 {
                 me.activity.stamp();
+                me.from_target.fetch_add(read as u64, Ordering::Relaxed);
             }
         }
         poll
@@ -542,6 +639,8 @@ struct ProxyState {
     stall_timeout: Duration,
     /// Spaces outbound dials per target address; see [`DEFAULT_DIAL_SPACING_MS`].
     pacer: DialPacer,
+    /// Picks which of a host's pinned addresses to dial; see [`EndpointBook`].
+    endpoints: EndpointBook,
     /// Refusal bound for `sent + received`; see [`MAX_TRANSCRIPT_BYTES`].
     max_transcript_bytes: usize,
     started_at: u64,
@@ -713,6 +812,12 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
     let stall_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // The address this session dialled, so its outcome can feed the pacer.
     let mut dialled: Option<IpAddr> = None;
+    // Bytes the target sent this session, and whether the relay started at all.
+    // Both outlive the protocol block: "the target never said a byte" is what
+    // separates an edge that hung up from a prover that gave up, and it is what
+    // the endpoint book uses to prefer a different address next time.
+    let from_target = Arc::new(AtomicU64::new(0));
+    let relayed_started = Arc::new(AtomicBool::new(false));
 
     let session = Session::new(stream.compat());
     let (driver, mut handle) = session.split();
@@ -773,8 +878,8 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
         // the fixture server listens on 127.0.0.1 while its certificate says
         // test-server.io, and /etc/hosts is not ours to edit. Unset — the
         // shipped configuration — the proxy resolves the committed name itself.
-        let addr: SocketAddr = match resolve_target(&server_name).await {
-            Ok(addr) => addr,
+        let candidates = match resolve_targets(&server_name).await {
+            Ok(candidates) => candidates,
             Err(reason) => {
                 // Not in the boot-time relay_targets (the resolver is closed
                 // after boot), or its pinned address is stale: either way the
@@ -783,6 +888,21 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
                 return Err(reason.into());
             }
         };
+        // Which of the host's pinned addresses to dial. The first is the normal
+        // one; an address that answered the last session with silence is
+        // skipped, so a host reachable through two CDNs survives one of them
+        // going dark for our egress address (measured against api-m.paypal.com).
+        let addr = st.endpoints.pick(&candidates);
+        if addr != candidates[0] {
+            info!(
+                "session from {peer}: {server_name} dial at {addr} instead of {} — the preferred address has not answered",
+                candidates[0]
+            );
+            *phase.lock().unwrap() = format!(
+                "failing over to {addr} for {server_name} (preferred {} has not answered)",
+                candidates[0]
+            );
+        }
 
         // Space this dial from the previous one to the SAME address: a burst of
         // simultaneous sessions makes the edge in front of `api-m.paypal.com`
@@ -872,18 +992,51 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
         // the target and the prover, so silence really is the edge stalling us.
         let activity = RelayActivity::new(st.stall_timeout);
         activity.arm();
-        let relayed = Stamped::new(client, activity.clone());
+        relayed_started.store(true, Ordering::SeqCst);
+        let relayed = Stamped::new(client, activity.clone(), from_target.clone());
         *phase.lock().unwrap() = format!("relayed TLS handshake to {server_name} ({addr})");
         let verifier = tokio::select! {
-            outcome = verifier.run(relayed.compat()) => outcome?,
+            outcome = verifier.run(relayed.compat()) => match outcome {
+                Ok(verifier) => verifier,
+                Err(e) => {
+                    // The fast shape of the same edge behaviour the stall bound
+                    // names: the target accepts the TCP connection and then
+                    // closes it before a single handshake byte comes back. That
+                    // is retryable (and, with a host pinned to more than one
+                    // address, worth trying elsewhere), not a refusal. Without
+                    // this the prover saw only "connection closed before message
+                    // completed" and the ring blamed nobody — measured live on
+                    // api-m.paypal.com's Cloudflare address, 2026-11-11.
+                    if from_target.load(Ordering::Relaxed) == 0 {
+                        *stall_reason.lock().unwrap() = Some(format!(
+                            "the target edge for {server_name} ({addr}) closed the connection without sending a byte of its handshake ({e})"
+                        ));
+                    }
+                    return Err(e.into());
+                }
+            },
             _ = activity.clone().stalled() => {
                 // Recorded rather than typed into an error: the outcome has to
                 // say "stalled" ("retry this"), not "refused" ("don't bother"),
                 // and the sentence outlives this block's error.
-                *stall_reason.lock().unwrap() = Some(format!(
-                    "the relayed connection to {server_name} ({addr}) moved no byte for {:?}",
-                    st.stall_timeout
-                ));
+                //
+                // A target that sent NOTHING is named as the edge giving up,
+                // not as a slow relay: the prover's handshake went out and the
+                // edge answered with silence, which is what an edge does when
+                // it has stopped serving our egress (measured on
+                // api-m.paypal.com's Cloudflare address), whereas a relay that
+                // was carrying bytes and then went quiet is a different fault.
+                *stall_reason.lock().unwrap() = Some(if from_target.load(Ordering::Relaxed) == 0 {
+                    format!(
+                        "the target edge for {server_name} ({addr}) accepted the connection and sent no byte of its handshake for {:?}",
+                        st.stall_timeout
+                    )
+                } else {
+                    format!(
+                        "the relayed connection to {server_name} ({addr}) moved no byte for {:?}",
+                        st.stall_timeout
+                    )
+                });
                 return Err(format!(
                     "the relayed connection to {server_name} ({addr}) moved no byte for {:?}",
                     st.stall_timeout
@@ -977,6 +1130,21 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
             None => {}
         }
     }
+    // Feed the same outcome to the endpoint book. Only a session whose relay
+    // actually started says anything about the target: a commit that never got
+    // as far as the dial is not the edge's fault, and one that never got as far
+    // as a handshake does not disprove the address either.
+    if let Some(ip) = dialled {
+        if relayed_started.load(Ordering::SeqCst) {
+            let answered = from_target.load(Ordering::Relaxed) > 0;
+            st.endpoints.observe(ip, answered);
+            if !answered {
+                warn!(
+                    "session from {peer}: {ip} accepted the connection and sent nothing — the next session to that host will prefer another pinned address"
+                );
+            }
+        }
+    }
 
     handle.close();
     // The driver has the session's last word; give it a moment, then abort it.
@@ -993,24 +1161,41 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
     outcome
 }
 
-/// Resolves the commit's server name to the one address this session will dial.
+/// Resolves the commit's server name to the candidates this session may dial,
+/// in the order `/etc/hosts` gives them (i.e. the configuration order).
+///
+/// More than one is the normal case for a configured `host@a,b` pin and for a
+/// bare host that had several A records at boot; the caller picks among them
+/// ([`EndpointBook::pick`]) so one dead edge does not make the host unusable.
 ///
 /// The error is a *prover-facing* string, not a log line: it is sent back over
 /// the commitment protocol (v236), so it stays short, names no internal path,
 /// and tells the caller what to fix — the name has to be one of the boot-time
 /// `relay_targets`, because the resolver is closed after boot by design.
-async fn resolve_target(server_name: &str) -> Result<SocketAddr, String> {
+async fn resolve_targets(server_name: &str) -> Result<Vec<SocketAddr>, String> {
     if let Ok(pinned) = std::env::var("TLS_PROXY_TARGET_ADDR") {
         if !pinned.trim().is_empty() {
             return pinned
                 .parse()
+                .map(|addr: SocketAddr| vec![addr])
                 .map_err(|e| format!("TLS_PROXY_TARGET_ADDR is not a socket address: {e}"));
         }
     }
     match tokio::net::lookup_host((server_name, TARGET_PORT)).await {
-        Ok(mut addrs) => addrs.next().ok_or_else(|| {
-            format!("{server_name} resolves to no address; only the boot-time relay_targets list is reachable")
-        }),
+        Ok(addrs) => {
+            let mut candidates: Vec<SocketAddr> = Vec::new();
+            for addr in addrs {
+                if !candidates.contains(&addr) {
+                    candidates.push(addr);
+                }
+            }
+            if candidates.is_empty() {
+                return Err(format!(
+                    "{server_name} resolves to no address; only the boot-time relay_targets list is reachable"
+                ));
+            }
+            Ok(candidates)
+        }
         Err(e) => Err(format!(
             "{server_name} is not in this notary's boot-time relay_targets (lookup failed: {e}); the resolver is closed after boot by design, so add the host to the configuration and reboot"
         )),
@@ -1063,6 +1248,10 @@ async fn health(State(st): State<Arc<ProxyState>>) -> Json<serde_json::Value> {
         "dial_spacing_max_ms": st.pacer.max.as_millis() as u64,
         // Per target address: widened by a stall, narrowed by a clean run.
         "dial_spacing_ms": st.pacer.snapshot(),
+        // Per target address: sessions in a row the target answered with not a
+        // single byte (an edge that accepts and hangs up), and when it last did
+        // answer. A host pinned to several addresses fails over on this.
+        "relay_endpoints": st.endpoints.snapshot(),
     }))
 }
 
@@ -1325,6 +1514,7 @@ async fn main() -> Result<(), BoxError> {
         commit_timeout: Duration::from_secs(commit_timeout_secs),
         stall_timeout: Duration::from_secs(stall_timeout_secs),
         pacer: DialPacer::new(Duration::from_millis(dial_spacing_ms)),
+        endpoints: EndpointBook::new(),
         max_transcript_bytes,
         started_at: now_unix(),
         sessions_total: AtomicU64::new(0),
@@ -1447,6 +1637,49 @@ mod tests {
         let disabled = DialPacer::new(Duration::ZERO);
         assert_eq!(disabled.claim(a).await, Duration::ZERO);
         assert_eq!(disabled.claim(a).await, Duration::ZERO);
+    }
+
+    /// Failover is by evidence, and it is reversible: an address that answered
+    /// nothing moves to the back, and one byte from it brings it back to the
+    /// front. Ties keep the configured order, so a host with a single address —
+    /// every host today except the ones explicitly configured otherwise — dials
+    /// exactly where it always did.
+    #[test]
+    fn endpoint_book_fails_over_and_recovers() {
+        let cloudflare: SocketAddr = "104.16.124.74:443".parse().unwrap();
+        let fastly: SocketAddr = "146.75.123.1:443".parse().unwrap();
+        let candidates = [cloudflare, fastly];
+        let book = EndpointBook::new();
+
+        // Untouched: the configured order wins.
+        assert_eq!(book.pick(&candidates), cloudflare);
+
+        // The preferred address accepted and sent nothing → the next one is
+        // dialled, and the health report says why.
+        book.observe(cloudflare.ip(), false);
+        assert_eq!(book.pick(&candidates), fastly);
+        let snapshot = book.snapshot();
+        assert_eq!(snapshot[&cloudflare.ip().to_string()]["zero_byte_runs"], 1);
+        assert!(
+            snapshot[&cloudflare.ip().to_string()]["last_byte_secs_ago"].is_null(),
+            "an address that never answered has no last-byte timestamp"
+        );
+
+        // Sticky while the fallback works: a second failure does not flip back.
+        book.observe(cloudflare.ip(), false);
+        assert_eq!(book.pick(&candidates), fastly);
+
+        // One byte from the preferred address clears its count, so it is tried
+        // again instead of being abandoned for the rest of the boot.
+        book.observe(cloudflare.ip(), true);
+        assert_eq!(book.pick(&candidates), cloudflare);
+        assert_eq!(
+            book.snapshot()[&cloudflare.ip().to_string()]["zero_byte_runs"],
+            0
+        );
+
+        // A single candidate has nowhere to go, and must not panic or wait.
+        assert_eq!(book.pick(&[fastly]), fastly);
     }
 
     /// The spacing adapts: a stall widens that address's spacing by half again

@@ -175,6 +175,24 @@ fn serve_fixture(listener: TcpListener) {
     });
 }
 
+/// A target that accepts the TCP connection and closes it at once, without a
+/// byte of TLS — the fast shape of an edge that has stopped serving this egress
+/// address (measured live on api-m.paypal.com's Cloudflare address).
+async fn start_hanging_up_target() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind the hanging-up target");
+    let port = listener.local_addr().expect("hanging-up target address").port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            // Drop the socket immediately: a FIN before the ServerHello.
+            drop(stream);
+        }
+    });
+    port
+}
+
 /// A target whose behaviour can be switched at runtime: silent (accept TCP and
 /// never write — the shape of the edge that stalled eight-wide waves, HANDOVER
 /// §0.55), then the normal TLS fixture on the SAME port and IP.
@@ -760,6 +778,66 @@ async fn refuses_a_commit_whose_target_never_answers() -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// v243: a target that accepts the connection and closes it before a single
+/// handshake byte is the edge giving up on this egress, not the prover
+/// misbehaving — so the verdict must be a retryable stall that names the edge,
+/// not the io error from tlsn's proxy-finished wait. Measured live on
+/// `api-m.paypal.com`'s Cloudflare address, where the prover saw only
+/// "connection closed before message completed" and the ring blamed nobody.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calls_an_edge_that_hangs_up_a_stall_not_a_refusal(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _serial = SERIAL.lock().await;
+    let port = start_hanging_up_target().await;
+    let target = format!("127.0.0.1:{port}");
+    let proxy = Proxy::start(&[
+        ("TLS_PROXY_TARGET_ADDR", target.as_str()),
+        // Short bound so the test pays seconds, not the shipped 20 s.
+        ("TLS_PROXY_STALL_TIMEOUT", "3"),
+    ])
+    .await;
+    let socket = TcpStream::connect(("127.0.0.1", proxy.session_port)).await?;
+    // The prover's own error is whatever tlsn surfaces for an EOF mid-handshake;
+    // the claim under test is the proxy's verdict.
+    let _ = prover(socket).await;
+
+    let health = proxy.wait_for_failed(1).await;
+    assert_eq!(health["sessions_ok"].as_u64(), Some(0), "nothing was verified");
+    assert_eq!(
+        health["attestations"].as_u64(),
+        Some(0),
+        "a session that never reached the target's handshake signs nothing"
+    );
+
+    let refusals = proxy.refusals().await;
+    assert_eq!(
+        refusals["refusals"][0]["kind"], "stalled",
+        "an edge that hangs up is retryable, got: {refusals}"
+    );
+    let reason = refusals["refusals"][0]["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("sent no byte of its handshake"),
+        "the verdict must blame the edge's silence, not a slow relay, got: {reason}"
+    );
+    assert!(
+        reason.contains("127.0.0.1:"),
+        "the verdict must name the address it dialled, got: {reason}"
+    );
+    assert!(
+        reason.contains("retry this session"),
+        "the prover must be told retrying is the fix, got: {reason}"
+    );
+
+    // And the address is recorded as having answered nothing, which is what a
+    // host pinned to several addresses fails over on.
+    assert_eq!(
+        health["relay_endpoints"]["127.0.0.1"]["zero_byte_runs"],
+        1,
+        "the health report must carry the failover evidence, got: {health}"
+    );
+    Ok(())
+}
+
 /// An honest session whose transcript exceeds the bound is still refused
 /// before signing: the bound exists so one prover cannot size the guest's RAM.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1256,11 +1334,14 @@ async fn refuses_a_relayed_session_that_never_answers(
         "a silent relay is a stall, not a timeout or a refusal of the prover: {refusals}"
     );
     let reason = last["reason"].as_str().unwrap_or("");
-    // The verdict names the silence with the bound it exceeded, from either of
-    // the two places a stall can be judged: the relay itself ("moved no byte")
-    // or the hand-over after the dial ("sent nothing").
+    // The verdict names the silence with the bound it exceeded, from any of the
+    // places a stall can be judged: the relay itself ("moved no byte"), the
+    // hand-over after the dial ("sent nothing"), or a target whose handshake
+    // never produced a byte ("sent no byte of its handshake").
     assert!(
-        reason.contains("moved no byte for 2s") || reason.contains("sent nothing for 2s"),
+        reason.contains("moved no byte for 2s")
+            || reason.contains("sent nothing for 2s")
+            || reason.contains("sent no byte of its handshake for 2s"),
         "the reason must name the silence: {reason}"
     );
     assert!(
