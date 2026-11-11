@@ -20,7 +20,8 @@
 //   node scripts/check-live-smoke.mjs --solo-only | --wave-only
 //
 // Knobs (flags win over env): LIVE_NOTARY, LIVE_SERVER/SMOKE_TARGET, WAVE_WIDTH,
-// LIVE_ATTEMPTS (the wave's retry count), LIVE_CA_BUNDLE, SMOKE_BINARY/WAVE_BINARY.
+// LIVE_ATTEMPTS (the wave's retry count), WAVE_SPACING (ms between starts,
+// default 2000), LIVE_CA_BUNDLE, SMOKE_BINARY/WAVE_BINARY.
 //
 // Exit 0 = both phases passed, 1 = a phase failed (the notary's own sentence is
 // printed), 2 = the harness could not run (build failure, missing binary).
@@ -55,6 +56,11 @@ const target = args.target ?? process.env.SMOKE_TARGET ?? process.env.LIVE_SERVE
 const notary = args.notary ?? process.env.LIVE_NOTARY ?? '101.200.178.251:8443';
 const width = String(args.width ?? process.env.WAVE_WIDTH ?? 8);
 const waveAttempts = String(process.env.LIVE_ATTEMPTS ?? 2);
+// 8 provers arriving in the same instant is what produced the one or two
+// per-burst stalls measured on 2026-11-11 even with the edge-naming verdict in
+// place; 2 s apart is the spacing that measured 8/8, so that is the default the
+// smoke check ships with. `--spacing 0` measures the harsher shape.
+const waveSpacing = String(args.spacing ?? process.env.WAVE_SPACING ?? 2000);
 const caBundle = args['ca-bundle'] ?? process.env.LIVE_CA_BUNDLE;
 const soloOnly = Boolean(args['solo-only']);
 const waveOnly = Boolean(args['wave-only']);
@@ -138,6 +144,7 @@ function runWave(executable) {
       '--target', target,
       '--notary', notary,
       '--attempts', waveAttempts,
+      '--spacing', waveSpacing,
       '--binary', executable,
     ], { cwd: root, stdio: 'inherit' });
     child.on('close', (code) => done({ ok: code === 0, code }));
@@ -174,7 +181,7 @@ async function main() {
     results.push({ name: 'solo', ok: solo.ok });
   }
   if (!soloOnly) {
-    console.log(`\n--- wave: ${width} concurrent, up to ${waveAttempts} attempt(s) each`);
+    console.log(`\n--- wave: ${width} concurrent, ${waveSpacing} ms apart, up to ${waveAttempts} attempt(s) each`);
     const wave = await runWave(executable);
     results.push({ name: `wave x${width}`, ok: wave.ok });
   }

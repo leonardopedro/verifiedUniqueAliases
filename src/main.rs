@@ -4790,6 +4790,10 @@ async fn proxy_health() -> axum::response::Response {
                     "dial_spacing_base_ms": field("dial_spacing_base_ms"),
                     "dial_spacing_max_ms": field("dial_spacing_max_ms"),
                     "dial_spacing_ms": field("dial_spacing_ms"),
+                    // v243: which pinned address each host is being dialled at
+                    // and how often that address answered with nothing, so a
+                    // failover is visible from outside the VM.
+                    "relay_endpoints": field("relay_endpoints"),
                 })),
             )
                 .into_response()
