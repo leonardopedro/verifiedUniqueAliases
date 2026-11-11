@@ -169,15 +169,49 @@ rather than abandoned for the rest of the boot. Measured on 2026-11-11:
 name's Fastly address served it, and the two addresses are both valid for the
 host's certificate (checked with `openssl s_client -servername api-m.paypal.com`).
 
-That failover only helps when *one* address of a host is dark. Since 2026-11-11
-17:39 UTC `api-m.paypal.com` is dark on both pinned addresses for this notary's
-egress: `146.75.123.1` accepts and hangs up without a byte, `104.16.124.74`
-accepts and stays silent through the 20 s bound, while a direct
-`openssl s_client` to the same Fastly address from another network still returns
-`CN=api-m.paypal.com`, and every sandbox host stays 8/8 from the same notary in
-the same run. Two addresses cannot fix a refusal aimed at the source address, so
-the smoke check's failover probe defaults to `sandbox.paypal.com`; point it at
-`api-m.paypal.com` with `--failover-host` to watch the refusal.
+That failover only helps when *one* address of a host is dark. See "Egress, and
+what compensates for it" below for the case where a host refuses the notary's
+source address on every pinned address at once — two addresses cannot fix that,
+and the smoke check reports it as `INCONCLUSIVE` rather than a failover failure.
+
+### Egress, and what compensates for it
+
+On 2026-11-11 `api-m.paypal.com` stopped answering this notary on **both** pinned
+addresses for a window of about fifteen minutes, then recovered without a deploy.
+Measured, in the order it happened:
+
+| When (UTC) | Egress | Target | Result |
+|---|---|---|---|
+| 17:39 | Alibaba cn-beijing EIP | `api-m.paypal.com` | 2/2 refused: `146.75.123.1` closed with no byte after 27.9 s, `104.16.124.74` silent through the 20 s bound (46.2 s) |
+| 17:39, same run | same | `www.sandbox.paypal.com` | 8/8, wall 63.3 s |
+| 17:52–17:58 | same | `api-m.paypal.com` | 6/6 passed, 11–15 s each |
+| 18:05 | Alibaba cn-beijing EIP | `api-m.paypal.com` | 6/6 passed, 11–15 s each (repeat of the probe loop) |
+| 17:37 | local notary on a European host | `api-m.paypal.com` | 3/3 passed, **5.4–5.6 s**, `HTTP/1.1 403 Forbidden` from `/` |
+| 17:31 | third network, plain `openssl` | `146.75.123.1` + SNI | certificate `CN=api-m.paypal.com` in ~70 ms |
+
+The last two rows are what make this an egress question rather than a bug: the
+same `tls-proxy` binary, driving the same relay path, completes a notarized
+transaction to api-m in 5.4 s from a different source address, and the pinned
+address itself still serves the right certificate to anyone else. The sandbox
+hosts, on the same two CDN providers, never failed from the notary in the same
+minutes. So the refusals are keyed to the notary's source address and correlate
+with sustained probing of api-m, and they lift on their own.
+
+What this means for the options is worth writing down plainly:
+
+| Option | What it buys | What it costs |
+|---|---|---|
+| Keep the pins and the adaptive pacing, and surfacing the refusal (`/proxy/health`, the `INCONCLUSIVE` verdict) | nothing to build; the window recovers by itself | users lose api-m sessions during the window, and the notary can only say why |
+| Spare pin: keep both addresses and let the pacing widen on the first strike | fewer refusals during bursts, because the edge is reacting to arrival rate | a wider window before a burst completes; does not help when the edge refuses outright |
+| **TCP pass-through relay pinned as the target address** (`api-m.paypal.com@<relay-ip>`) | the notary dials an address on an egress PayPal accepts; a byte-level forwarder preserves the certificate chain, so the transcript, the measurement audit and `verify.html` are unchanged — no code change, config only | one small VM, an extra hop, and a new single point of failure that must itself be monitored |
+| Move the notary's egress (another Alibaba region, or another provider) | removes the problem at the source | a new region means a new OSS bucket, a re-import, and a full two-cycle pin rotation; a different provider means a different attestation path entirely (GCP vTPM or OCI SEV-SNP) |
+
+Recommendation: run the pass-through relay if api-m availability matters, because
+it is config-only and leaves the audit story intact; otherwise stay on the first
+row and treat a red `api-m` probe as a target finding, which is exactly what the
+`INCONCLUSIVE` verdict says. The relay option also documents itself: the pin list
+names the relay address, so the first thing an auditor reads is "this notary
+reaches api-m through a forwarder".
 
 The state is visible from outside: `/proxy/health` carries `relay_endpoints` as
 `{address: {zero_byte_runs, last_byte_secs_ago}}`, next to the pacing map, so a

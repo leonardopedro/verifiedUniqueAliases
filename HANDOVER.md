@@ -3812,3 +3812,68 @@ text now says which of the two situations it is in.
   PARITY OK, `check-live-tls-cert` OK, `/notary` list 200, envelope re-mints
   across a live restart (`6d5d993e…` → `7e02966a…`).
 - Tests: tls-proxy `--bins` **11/11**, `--test session` **16/16** (115.95 s).
+
+## 0.62 — v246 follow-up: the refusal is egress-keyed and reversible, and the probe now says so (2026-11-11 18:35 UTC)
+
+### Correction to 0.61
+
+§0.61 said `api-m.paypal.com` "is dark on both pinned addresses for this egress".
+That was true of the fifteen minutes it was measured in, and it is **wrong as a
+standing statement**. The probes below show the same notary passing 6/6 to api-m
+at 11–15 s within the hour, with no deploy in between, and a local notary on a
+European egress notarizing api-m in 5.4 s. What is true is narrower and more
+useful: PayPal's api-m edges intermittently refuse *this notary's source address*,
+in windows that correlate with sustained probing, and they lift by themselves.
+
+| When (UTC) | Egress | Target | Result |
+|---|---|---|---|
+| 17:39 | Alibaba cn-beijing EIP | `api-m.paypal.com` | 2/2 refused (Fastly no byte after 27.9 s; Cloudflare silent to the 20 s bound, 46.2 s) |
+| 17:39, same run | same | `www.sandbox.paypal.com` | 8/8, wall 63.3 s |
+| 17:52–18:05 | same | `api-m.paypal.com` | 10/10 passed, 11–15 s each |
+| 17:37 | local `tls-proxy` on a European host | `api-m.paypal.com` | 3/3 passed in **5.4–5.6 s**, `HTTP/1.1 403 Forbidden` from `/` |
+| 17:31 | third network, plain `openssl` | `146.75.123.1` + SNI | `CN=api-m.paypal.com` in ~70 ms |
+
+The local notary run is the control that matters: the same binary, the same relay
+and prover path, a different source address, and the notarized transaction
+completes in five seconds — so neither the addresses (still serving the right
+certificate) nor the code is at fault. Options and their costs are now written in
+`docs/tls-proxy.md` ("Egress, and what compensates for it"): keep pins + pacing
+and surface it; keep both pins and let pacing widen; **pin a TCP pass-through
+relay** (`api-m.paypal.com@<relay-ip>`) so the notary dials an accepted egress
+while the certificate chain, the transcript and the audit stay untouched — config
+only, one extra hop and one new single point of failure; or move the notary's
+egress, which costs a new region/bucket and a full two-cycle pin rotation.
+
+### The probe now separates "target refused us" from "our failover is broken"
+
+`scripts/check-live-smoke.mjs` gained a third outcome. Three states, and the pin
+list is what tells the last two apart:
+
+| Outcome | Condition | Exit |
+|---|---|---|
+| `PASS` | a session passed, at worst after a strike | 0 |
+| `INCONCLUSIVE` | every pinned address of the probed host was struck by this probe and none ever answered (target policy), **or** the prover itself failed before the edge was judged | 0 |
+| `FAIL` | sessions failed while the strike fell outside the pin list, or a pinned address answered but the session still failed | 1 |
+
+Pins come from `--failover-addresses a,b`, else the deployment config's
+`relay_targets` (`--config`, default `/tmp/prod-config.json`; only that key is
+read), and only failing both are they inferred from the health diff — an
+**inferred** list can never produce `INCONCLUSIVE`, so a pin that is never dialled
+(the v243 shape this probe exists for) still fails loudly. The judgement lives in
+`scripts/lib/failover-health.mjs` so it can be exercised without a notary.
+
+### One command that works on any host
+
+Building the live prover now tries three routes in order: local `cargo`; the
+project's build container (`--build-container`, default `localhost/tlsproxytest`,
+tree mounted at `/app`; this host cannot build tlsn natively); and the newest
+`live-*` binary already in `tls-proxy/target/debug/deps`, announced as possibly
+older than the tree. `--binary` still pins one explicitly.
+
+Verified: full run with no `--binary` → prover built in the container, **solo PASS
+13.1 s, wave 8/8 (wall 39.6 s)**, failover reported `INCONCLUSIVE` when the prover
+failed in its own bootstrap COT (exit 0). Classifier assertions: 8/8 (all-pins
+refusal → target policy; a struck address outside the pins → notary fault; one
+answering pin → notary question; inferred pins → never target policy; config
+parsing incl. case-insensitivity and missing file). Stub-origin runs: target-policy
+→ `INCONCLUSIVE` exit 0; one-pin strike → `FAIL` exit 1.

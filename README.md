@@ -282,23 +282,46 @@ node scripts/check-live-smoke.mjs
 ```
 
 It builds the live prover once, runs **one solo session**, a **width-8 burst**,
-and a **failover probe**, and prints a `PASS`/`FAIL` summary for each (exit 1 if
-any failed). That is the whole release check: the solo pass proves the relay, the
-commitment bound and the signed record; the burst proves the dial pacing and the
-retry path, which only appear when several provers arrive together; and the probe
-proves the notary still reaches a host served by two CDN edges — it dials
-`sandbox.paypal.com` one session at a time and reads `/proxy/health`, so a dark
-first address (an edge that accepts the connection and withholds the handshake)
-is caught here instead of in a customer's failed login. The probe uses a sandbox
-host on purpose: `api-m.paypal.com` currently refuses relayed handshakes from the
-notary's egress on **both** its pinned addresses (Fastly hangs up, Cloudflare
-holds silent) while `openssl s_client -servername api-m.paypal.com` from another
-network still gets a certificate — a target-policy finding an address change
-cannot fix, and a red probe that says nothing about the notary. Aim it at that
-host when you want to watch the refusal itself. Point it explicitly with
-`--target www.sandbox.paypal.com/robots.txt`, reuse a built binary with
-`--binary tls-proxy/target/.../deps/live-…`, skip a phase with `--solo-only` /
-`--wave-only` / `--no-failover`, or aim the probe with `--failover-host` and
+and a **failover probe**, and prints a `PASS`/`FAIL`/`INCONCLUSIVE` summary for
+each (exit 1 only if a phase failed with the notary at fault). That is the whole
+release check: the solo pass proves the relay, the commitment bound and the signed
+record; the burst proves the dial pacing and the retry path, which only appear
+when several provers arrive together; and the probe proves the notary still
+reaches a host served by two CDN edges — it dials `sandbox.paypal.com` one session
+at a time and reads `/proxy/health`, so a dark first address (an edge that accepts
+the connection and withholds the handshake) is caught here instead of in a
+customer's failed login.
+
+The build needs no special host: local `cargo` is tried first, then the project's
+build container (`--build-container`, default `localhost/tlsproxytest`, tree
+mounted at `/app`), then the newest `live-*` binary already in `tls-proxy/target/`
+with a warning that it may predate the tree. Pass `--binary tls-proxy/target/…`
+to pin one explicitly.
+
+The probe reports three outcomes, because two of them look identical from a
+success rate alone:
+
+| Outcome | Means | Exit |
+|---|---|---|
+| `PASS` | a session passed, at worst after a strike (that retry *is* the failover) | 0 |
+| `INCONCLUSIVE` | the host refused **every** pinned address this probe drove, none ever answered — target policy, not a notary fault | 0 |
+| `FAIL` | sessions failed and the strike fell outside the pin list, or another pinned address never answered — a real failover question | 1 |
+
+The pin list is what separates the last two, so the probe takes it from
+`--failover-addresses a,b`, else the deployment config's `relay_targets`
+(`--config`, default `/tmp/prod-config.json`; only that key is read, never the
+credentials), and only failing both does it infer the addresses from the health
+diff — an inferred list can never produce the `INCONCLUSIVE` verdict, so a pin
+that is never dialled still fails loudly.
+
+`api-m.paypal.com` is the known way to see the `INCONCLUSIVE` case:
+`--failover-host api-m.paypal.com`. From the Alibaba egress it intermittently
+refuses relayed handshakes on both pinned addresses (Fastly hangs up, Cloudflare
+holds silent) for minutes at a time, while the same notary serves every sandbox
+host and a local notary on a European egress notarizes api-m in 5 s. See
+`docs/tls-proxy.md` ("Egress, and what compensates for it"). Point the probe
+explicitly with `--target www.sandbox.paypal.com/robots.txt`, skip a phase with
+`--solo-only` / `--wave-only` / `--no-failover`, or set the origin with
 `--origin` (`https://login.airma.de` by default).
 
 ### Testing the notary — four tiers, cheapest first
