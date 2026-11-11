@@ -7,7 +7,11 @@
 //!   LIVE_NOTARY=101.200.178.251:8443 LIVE_SERVER=api-m.paypal.com \
 //!     cargo test --test live -- --ignored --nocapture
 //!
-//! `LIVE_PATH` (default `/`) picks the request path. The notary authorises a
+//! `LIVE_PATH` (default `/`) picks the request path. `LIVE_SERVER=host/path` is
+//! also accepted — the path is split off the host, so a one-liner harness can
+//! name a page without exporting a second variable (`LIVE_PATH` wins if both are
+//! set; a host that still carries `/` after the split is rejected rather than
+//! failing later as `invalid DNS name`). The notary authorises a
 //! *host*, so the page is the prover's choice: point it at
 //! `www.sandbox.paypal.com` with `LIVE_PATH=/checkoutnow` to attest that page
 //! rather than the sandbox's bare origin.
@@ -240,16 +244,54 @@ async fn public_fetch_url(
     .into())
 }
 
+#[test]
+fn splits_a_host_from_a_trailing_path_but_keeps_bare_hosts_intact() {
+    let cases = [
+        ("api-m.paypal.com", "api-m.paypal.com", None),
+        ("  api-m.paypal.com  ", "api-m.paypal.com", None),
+        ("sandbox.paypal.com/robots.txt", "sandbox.paypal.com", Some("/robots.txt")),
+        ("www.sandbox.paypal.com/", "www.sandbox.paypal.com", Some("/")),
+        ("www.sandbox.paypal.com/signin?x=1", "www.sandbox.paypal.com", Some("/signin?x=1")),
+        ("host//a", "host", Some("//a")),
+    ];
+    for (raw, host, path) in cases {
+        let (got_host, got_path) = split_target(raw);
+        assert_eq!(got_host, host, "host of {raw:?}");
+        assert_eq!(got_path.as_deref(), path, "path of {raw:?}");
+    }
+}
+
+/// Accepts `host` or `host/path` and returns the host plus the path it carried.
+/// A bare `host/` carries `/`, and `host//a` keeps `//a` as the path.
+fn split_target(raw: &str) -> (String, Option<String>) {
+    let raw = raw.trim();
+    match raw.split_once('/') {
+        Some((host, path)) => (host.to_string(), Some(format!("/{path}"))),
+        None => (raw.to_string(), None),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs a deployed notary and real internet egress"]
 async fn live_relay_of_a_real_website() -> Result<(), Box<dyn std::error::Error>> {
     let notary = std::env::var("LIVE_NOTARY").unwrap_or_else(|_| "101.200.178.251:8443".into());
-    let server = std::env::var("LIVE_SERVER").unwrap_or_else(|_| "api-m.paypal.com".into());
+    let (server, target_path) = split_target(
+        &std::env::var("LIVE_SERVER").unwrap_or_else(|_| "api-m.paypal.com".into()),
+    );
     let ca_bundle = std::env::var("LIVE_CA_BUNDLE")
         .unwrap_or_else(|_| "/etc/ssl/certs/ca-certificates.crt".into());
     // A host is what the notary authorises; the page is the prover's choice.
-    let path = std::env::var("LIVE_PATH").unwrap_or_else(|_| "/".into());
+    // `LIVE_PATH` wins when set; otherwise a `host/path` in `LIVE_SERVER` is the
+    // path, so a one-liner harness can name a page without a second variable.
+    let path = match std::env::var("LIVE_PATH") {
+        Ok(p) => p,
+        Err(_) => target_path.unwrap_or_else(|| "/".into()),
+    };
     let path = if path.starts_with('/') { path } else { format!("/{path}") };
+    assert!(
+        !server.is_empty() && !server.contains('/'),
+        "LIVE_SERVER must name a host (an optional /path is split off), got {server:?}"
+    );
     // One retry by default: a burst stall is an expected single failure and the
     // next attempt is the cheap answer to it (see the header).
     let attempts: u32 = std::env::var("LIVE_ATTEMPTS")

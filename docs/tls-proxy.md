@@ -407,23 +407,27 @@ actually relay PayPal's sandbox?" is a command instead of an anecdote. It is
 
 ```sh
 # every PayPal sandbox host the notary allows, one session each
-for target in "sandbox.paypal.com /" \
-              "sandbox.paypal.com /robots.txt" \
-              "www.sandbox.paypal.com /robots.txt"; do
-  set -- $target
-  LIVE_NOTARY=101.200.178.251:8443 LIVE_SERVER=$1 LIVE_PATH=$2 \
+for target in sandbox.paypal.com \
+              sandbox.paypal.com/robots.txt \
+              www.sandbox.paypal.com/robots.txt; do
+  LIVE_NOTARY=101.200.178.251:8443 LIVE_SERVER="$target" \
     cargo test --manifest-path tls-proxy/Cargo.toml --test live -- --ignored --nocapture
-  echo "--- $1$2: exit $?"
+  echo "--- $target: exit $?"
 done
 ```
+
+`LIVE_SERVER` takes a bare host or `host/path`; the path is split off, so a
+harness can name a page in one variable (a host still carrying `/` after the
+split is rejected instead of surfacing later as `invalid DNS name`).
 
 The default target (`api-m.paypal.com/`) needs only the notary address:
 `cargo test --manifest-path tls-proxy/Cargo.toml --test live -- --ignored --nocapture`.
 
 Knobs: `LIVE_NOTARY`, `LIVE_SERVER` (must be on the notary's relay-target
-allowlist — see *Relay targets*), `LIVE_PATH`, `LIVE_CA_BUNDLE` (default: the
-host bundle, so the relayed chain has to reach a real public root), and
-`LIVE_ATTEMPTS` (default 3), which retries a session that ends without a verdict
+allowlist — see *Relay targets*), `LIVE_PATH` (wins over a path in
+`LIVE_SERVER`), `LIVE_CA_BUNDLE` (default: the host bundle, so the relayed chain
+has to reach a real public root), and `LIVE_ATTEMPTS` (default 2 — one retry),
+which retries a session that ends without a verdict
 and reports the attempt that passed.
 
 A passing run prints, in this order, and ends in `test result: ok`:
