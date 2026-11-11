@@ -3682,3 +3682,61 @@ table.
 The v244c pass reported `rollback pointer: disk unknown` — the script could not
 record the previous disk id. The v240b image is still the rollback; nothing was
 lost.
+
+## 0.60 — v245: a strike lands while the burst is still arriving, and one command now checks failover (2026-11-11 15:40 UTC)
+
+### In-wave failover
+
+v243/v244 taught the endpoint book which address answered with silence, but only
+when the session **ended**. A burst is the case failover exists for, and a burst
+decides where to dial within seconds of its first session — so the first session's
+stall verdict arrived after every other session had already dialled the dead
+address (measured: three concurrent api-m sessions, 3/3 stranded on
+`104.16.124.74`, failover only for the session *after* them).
+
+`EndpointBook::note_silence` (`tls-proxy/src/main.rs`) records the strike at the
+moment the session learns it — the zero-byte close and the stall bound's
+zero-byte case — so the sessions queued behind it pick the host's other address.
+`run_session` remembers it struck (`edge_noted`) and the end-of-session feed skips
+a strike already counted, so one dead edge is one strike, not two. The log line
+fires on the first strike only: several sessions finding the same dead edge is
+one fact. Unit test
+`silence_is_recorded_mid_session_so_the_burst_fails_over` fixes the shape.
+
+### One command checks failover
+
+`scripts/check-live-smoke.mjs` gained a third phase (`--failover-only`,
+`--no-failover`, `--failover-host`, `--failover-sessions`, `--origin`): it reads
+`/proxy/health` from the origin, dials the multi-edge host (default
+`api-m.paypal.com`) one session at a time, and re-reads the health. It PASSes when
+a session passes (a pass after a strike *is* the failover) and FAILs when every
+session failed while no pinned address has ever answered — the v243 shape, where
+the strike was recorded and the alternate never existed. A prover-side commit
+failure is reported as inconclusive rather than blamed on the edge.
+
+Verified: live run **solo PASS (65.6 s), wave 8/8 (wall 115.2 s), failover PASS**
+(session 1 passed on `146.75.123.1`, `151.101.195.1` also answered); the FAIL
+branch was exercised against a stub health endpoint carrying one struck address
+and no answering one — exit 1 with
+`every session … failed and no pinned address ever answered (… 104.16.124.74 struck)`.
+
+### The 60 s commit timeout: measured, not the notary
+
+Three concurrent sessions to `api-m.paypal.com` produced one `stalled` (edge
+closed with no byte) and one `the prover computed its commitment for 60s without
+sending the next message`. Measured on the deployed notary from this host
+(215 ms RTT, **debug** prover, one session at a time and three at a time):
+
+| Run | `commit accepted` (preprocessing wall time) |
+|---|---|
+| solo, `www.sandbox.paypal.com` | **50.6 s** |
+| 3 concurrent, `www.sandbox.paypal.com` | 36.8 / 29.9 / 37.2 s |
+| 3 concurrent, `api-m.paypal.com` | 53.3 / 42.2 / 39.6 s |
+
+So concurrency is **not** the cause: the debug prover's tlsn preprocessing over
+this link sits at 30–53 s *by itself*, and the notary's 60 s `commit_timeout` has
+under 10 s of margin over a single healthy session. The bound is doing its job
+(it exists to release a slot when a prover dies in preprocessing); the local
+harness is simply slow. A release prover has not been measured from here, so the
+default stays 60 s (`TLS_PROXY_COMMIT_TIMEOUT` is the notary-side knob) rather
+than relaxing the anti-abuse bound on debug-build evidence.

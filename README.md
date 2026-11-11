@@ -281,14 +281,19 @@ reports `sandbox` rather than green.
 node scripts/check-live-smoke.mjs
 ```
 
-It builds the live prover once, runs **one solo session** and then a **width-8
-burst**, and prints a `PASS`/`FAIL` summary for each (exit 1 if either failed).
-That is the whole release check: the solo pass proves the relay, the commitment
-bound and the signed record, and the burst pass proves the dial pacing and the
-retry path, which only appear when several provers arrive together. Point it
-explicitly with `--target www.sandbox.paypal.com/robots.txt`, reuse a built
-binary with `--binary tls-proxy/target/.../deps/live-…`, or run one half with
-`--solo-only` / `--wave-only`.
+It builds the live prover once, runs **one solo session**, a **width-8 burst**,
+and a **failover probe**, and prints a `PASS`/`FAIL` summary for each (exit 1 if
+any failed). That is the whole release check: the solo pass proves the relay, the
+commitment bound and the signed record; the burst proves the dial pacing and the
+retry path, which only appear when several provers arrive together; and the probe
+proves the notary still reaches a host served by two CDN edges — it dials
+`api-m.paypal.com` one session at a time and reads `/proxy/health`, so a dark
+first address (an edge that accepts the connection and withholds the handshake)
+is caught here instead of in a customer's failed login. Point it explicitly with
+`--target www.sandbox.paypal.com/robots.txt`, reuse a built binary with
+`--binary tls-proxy/target/.../deps/live-…`, skip a phase with `--solo-only` /
+`--wave-only` / `--no-failover`, or aim the probe with `--failover-host` and
+`--origin` (`https://login.airma.de` by default).
 
 ### Testing the notary — four tiers, cheapest first
 

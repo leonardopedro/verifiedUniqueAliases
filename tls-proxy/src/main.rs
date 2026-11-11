@@ -436,10 +436,29 @@ impl EndpointBook {
         best
     }
 
+    /// Records that `addr` accepted the connection and said nothing, the moment
+    /// the session learns it rather than when the session ends.
+    ///
+    /// The timing is the whole point: a burst of provers arrives together, so
+    /// waiting for the first session's verdict means every other session in the
+    /// burst has already dialled the dead address. Marked here, the sessions
+    /// that dial next — seconds later, inside the same burst — see the strike and
+    /// take the other pinned address. Returns whether this was the first strike.
+    fn note_silence(&self, addr: IpAddr) -> bool {
+        let mut map = self.entries.lock().unwrap();
+        let entry = map.entry(addr).or_default();
+        let first = entry.zero_byte_runs == 0;
+        entry.zero_byte_runs = entry.zero_byte_runs.saturating_add(1);
+        first
+    }
+
     /// Feeds one relayed session back in. `target_sent_a_byte` is false only
     /// when the target accepted the connection and then produced nothing at all
     /// before the session ended — the shape that means "this address is not
     /// serving us right now", not "this prover failed".
+    ///
+    /// A silence already recorded mid-session by [`Self::note_silence`] is not
+    /// counted a second time; the caller checks that before calling.
     fn observe(&self, addr: IpAddr, target_sent_a_byte: bool) {
         let mut map = self.entries.lock().unwrap();
         let entry = map.entry(addr).or_default();
@@ -469,6 +488,28 @@ impl EndpointBook {
                 )
             })
             .collect()
+    }
+}
+
+/// Records a silent edge against its address the moment the session knows it,
+/// so the sessions behind it in the same burst dial the host's other address.
+///
+/// Logged only on the session's first strike: several sessions finding the same
+/// dead edge is one fact, and the ring should say it once.
+fn note_silence(
+    book: &EndpointBook,
+    ip: IpAddr,
+    noted: &AtomicBool,
+    peer: SocketAddr,
+    server_name: &str,
+) {
+    if noted.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if book.note_silence(ip) {
+        warn!(
+            "session from {peer}: {ip} accepted the connection to {server_name} and sent nothing — struck off now, so sessions already queued for this host dial another pinned address"
+        );
     }
 }
 
@@ -818,6 +859,10 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
     // the endpoint book uses to prefer a different address next time.
     let from_target = Arc::new(AtomicU64::new(0));
     let relayed_started = Arc::new(AtomicBool::new(false));
+    // Set once this session has already told the endpoint book that its address
+    // answered with silence, so the same session is not counted twice and the
+    // burst behind it fails over immediately instead of after this verdict.
+    let edge_noted = AtomicBool::new(false);
 
     let session = Session::new(stream.compat());
     let (driver, mut handle) = session.split();
@@ -1011,6 +1056,7 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
                         *stall_reason.lock().unwrap() = Some(format!(
                             "the target edge for {server_name} ({addr}) closed the connection without sending a byte of its handshake ({e})"
                         ));
+                        note_silence(&st.endpoints, addr.ip(), &edge_noted, peer, &server_name);
                     }
                     return Err(e.into());
                 }
@@ -1037,6 +1083,9 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
                         st.stall_timeout
                     )
                 });
+                if from_target.load(Ordering::Relaxed) == 0 {
+                    note_silence(&st.endpoints, addr.ip(), &edge_noted, peer, &server_name);
+                }
                 return Err(format!(
                     "the relayed connection to {server_name} ({addr}) moved no byte for {:?}",
                     st.stall_timeout
@@ -1134,11 +1183,17 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
     // actually started says anything about the target: a commit that never got
     // as far as the dial is not the edge's fault, and one that never got as far
     // as a handshake does not disprove the address either.
+    //
+    // A silence already recorded mid-session is not counted again — one dead
+    // edge must not look like two, or a burst would exhaust the address's
+    // credibility in a single wave.
     if let Some(ip) = dialled {
         if relayed_started.load(Ordering::SeqCst) {
             let answered = from_target.load(Ordering::Relaxed) > 0;
-            st.endpoints.observe(ip, answered);
-            if !answered {
+            if answered || !edge_noted.load(Ordering::SeqCst) {
+                st.endpoints.observe(ip, answered);
+            }
+            if !answered && !edge_noted.load(Ordering::SeqCst) {
                 warn!(
                     "session from {peer}: {ip} accepted the connection and sent nothing — the next session to that host will prefer another pinned address"
                 );
@@ -1763,6 +1818,39 @@ mod tests {
 
         // A single candidate has nowhere to go, and must not panic or wait.
         assert_eq!(book.pick(&[fastly]), fastly);
+    }
+
+    /// A silence is struck off the moment the session sees it, not when the
+    /// session ends: the burst behind it is already deciding where to dial, and
+    /// waiting for the verdict left every one of them on the dead address
+    /// (measured on api-m.paypal.com, 2026-11-11: three of three stalls, then the
+    /// failover only for the session after them).
+    #[test]
+    fn silence_is_recorded_mid_session_so_the_burst_fails_over() {
+        let cloudflare: SocketAddr = "104.16.124.74:443".parse().unwrap();
+        let fastly: SocketAddr = "146.75.123.1:443".parse().unwrap();
+        let candidates = [cloudflare, fastly];
+        let book = EndpointBook::new();
+
+        assert_eq!(book.pick(&candidates), cloudflare);
+        assert!(book.note_silence(cloudflare.ip()), "the first strike is news");
+        assert_eq!(
+            book.pick(&candidates),
+            fastly,
+            "the address is skipped without waiting for the session to end"
+        );
+        assert!(
+            !book.note_silence(cloudflare.ip()),
+            "a repeat strike is not news"
+        );
+        assert_eq!(
+            book.snapshot()[&cloudflare.ip().to_string()]["zero_byte_runs"],
+            2
+        );
+        // The answer still clears it, so the preferred address is retried rather
+        // than abandoned for the rest of the boot.
+        book.observe(cloudflare.ip(), true);
+        assert_eq!(book.pick(&candidates), cloudflare);
     }
 
     /// The spacing adapts: a stall widens that address's spacing by half again

@@ -159,7 +159,10 @@ reason a two-address pin silently had one candidate before v244). The first is
 what the notary dials, and each relayed session feeds an **endpoint book**: a session that ends
 without the target sending a single byte (the edge accepted the TCP connection
 and then hung up, or sat silent through the whole stall bound) counts against
-that address, and the next session for that host dials the next candidate. One
+that address, and the next session for that host dials the next candidate. The
+strike is recorded **the moment the session sees it**, not when the session
+ends: provers arrive in bursts, so a verdict that waits for the stall bound
+leaves every session behind it in the same burst dialling the dead address. One
 byte from the target clears the count, so the preferred address is retried
 rather than abandoned for the rest of the boot. Measured on 2026-11-11:
 `api-m.paypal.com`'s Cloudflare address answered nothing for days while the same
