@@ -1288,9 +1288,13 @@ async fn refuses_a_prover_that_commits_then_vanishes(
     let _serial = SERIAL.lock().await;
     let fixture_port = start_fixture().await;
     let target = format!("127.0.0.1:{fixture_port}");
+    // The wait for the prover's first relayed message is preprocessing time, so
+    // it is bounded by the commit timeout; the old 2 s relay bound sat here and
+    // killed healthy provers whose COT took longer (v242).
     let proxy = Proxy::start(&[
         ("TLS_PROXY_TARGET_ADDR", target.as_str()),
         ("TLS_PROXY_STALL_TIMEOUT", "2"),
+        ("TLS_PROXY_COMMIT_TIMEOUT", "2"),
     ])
     .await;
 

@@ -181,6 +181,12 @@ const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// finish the whole relayed phase in 1.4–1.6 s — so silence for 20 s is a stall,
 /// not slowness. Bounded below the session timeout on purpose, and settable so a
 /// genuinely slow target can be given more.
+///
+/// It applies to the **relayed phase only**, after `accept()`. The wait between
+/// the dial and `accept()` is still prover preprocessing (the target cannot send
+/// anything until the commitment finishes), so that arm uses
+/// [`DEFAULT_COMMIT_TIMEOUT`]; applying this bound there killed 2 of 3 healthy
+/// solo sessions on the deployed notary (measured 2026-11-11).
 const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ---------------------------------------------------------------------------
@@ -834,24 +840,38 @@ async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> Se
         //     session it committed to (`preprocessing proxy-tls failed …
         //     connection is closed`), which leaves the notary waiting in
         //     `accept()` forever — observed live in a v238 wave.
-        // Every measured healthy session moves bytes within 2 s of the dial, so
-        // `stall_timeout` of silence is a verdict, not slowness.
-        let activity = RelayActivity::new(st.stall_timeout);
-        activity.arm();
+        // The wait between the dial and the prover's first relayed message is
+        // NOT the relay stall verdict, however much it looks like one: tlsn is
+        // still computing the commitment on the prover, and the target's bytes
+        // cannot arrive before that finishes. Measured 2026-11-11 on the
+        // deployed notary: healthy solo provers over the 215 ms link took 8-31 s
+        // between the dial and `accept()`, so a 20 s silence bound here killed
+        // 2 of 3 *good* sessions with the prover reporting `bootstrap COT error:
+        // unexpected end of file` (the same mistake `commit_timeout` exists to
+        // avoid, one phase later). This phase therefore gets the commit bound —
+        // it is preprocessing time, and only the relayed phase that follows has
+        // the measured "bytes within 2 s" property.
+        let preprocessing = RelayActivity::new(st.commit_timeout);
+        preprocessing.arm();
         let verifier = tokio::select! {
             accepted = verifier.accept() => accepted?,
-            _ = activity.clone().stalled() => {
+            _ = preprocessing.clone().stalled() => {
                 *stall_reason.lock().unwrap() = Some(format!(
-                    "the prover sent nothing for {:?} after the target connection to {server_name} ({addr}) was established",
-                    st.stall_timeout
+                    "the prover computed its commitment for {:?} without sending the next message to {server_name} ({addr}) — last progress: {}",
+                    st.commit_timeout,
+                    phase.lock().unwrap()
                 ));
                 return Err(format!(
-                    "the prover sent nothing for {:?} after the target connection to {server_name} ({addr}) was established",
-                    st.stall_timeout
+                    "the prover sent nothing for {:?} while committing to {server_name} ({addr})",
+                    st.commit_timeout
                 )
                 .into());
             }
         };
+        // From here the relay is live: the handshake has bytes in flight between
+        // the target and the prover, so silence really is the edge stalling us.
+        let activity = RelayActivity::new(st.stall_timeout);
+        activity.arm();
         let relayed = Stamped::new(client, activity.clone());
         *phase.lock().unwrap() = format!("relayed TLS handshake to {server_name} ({addr})");
         let verifier = tokio::select! {

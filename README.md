@@ -275,6 +275,33 @@ proves *transport and bytes*, never that a real account was involved — that is
 what the production login report is for, and why the auditor marks sandbox
 reports `sandbox` rather than green.
 
+### Testing the notary — four tiers, cheapest first
+
+| Tier | What it proves | Command |
+|---|---|---|
+| **Unit + hermetic session** | the real notary binary relays, attests and verifies against tlsn's fixture server; every refusal path says why | `cargo test --manifest-path tls-proxy/Cargo.toml` |
+| **Live single session** | the *deployed* notary relays a real PayPal host and a prover finishes a presentation | `LIVE_NOTARY=101.200.178.251:8443 LIVE_SERVER=sandbox.paypal.com/robots.txt cargo test --manifest-path tls-proxy/Cargo.toml --test live -- --ignored --nocapture` |
+| **Burst (wave)** | the deployed notary survives N simultaneous provers — the only way to exercise dial pacing, the commit bound and the retry hint | `node scripts/check-live-wave.mjs --width 8 --target api-m.paypal.com` |
+| **No shell** | what an operator can see from outside the VM | `curl -s https://login.airma.de/proxy/health`, `/proxy/refusals`, `/proxy/attestations` |
+
+Tier 2 needs egress and a notary; `LIVE_SERVER` takes `host` or `host/path`,
+`LIVE_PATH` overrides the path, `LIVE_ATTEMPTS` (default 2 — one retry) is the
+cheap answer to a stalled edge, and `LIVE_PUBLIC=login.airma.de` makes the run
+print the ready-to-open download URL for the attestation it just produced. The
+`--target` must be on the notary's relay allowlist (`docs/tls-proxy.md` →
+*Relay targets*), so an unknown site is refused by design.
+
+Tier 3's `scripts/check-live-wave.mjs` builds `tests/live` once and spawns that
+binary per slot (a per-slot `cargo test` would serialise on the cargo lock and
+measure nothing). It prints a `PASS/FAIL` line and the elapsed time per session
+plus `n/width`, and exits non-zero if any slot failed. `--attempts 2` measures
+the shipped retry behaviour, `--spacing 1500` staggers the starts (which is what
+took the same eight sessions from 3/8 to 8/8 in §0.55), and `--binary <path>`
+reuses an already-built executable where cargo cannot link on the host. A FAIL is
+not automatically the notary's fault: the origin's `/proxy/refusals` says which
+side stalled (`kind:"stalled"` plus the sentence the prover was refused with),
+and `dial_spacing_ms` there shows whether the notary widened its pacing.
+
 ---
 
 ## 🔑 Rotating the Credentials (PayPal, ACME, DNS-01, heartbeat key)
