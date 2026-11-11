@@ -3611,3 +3611,74 @@ was introduced to fix, one phase later.
   proxy finished message`) occurred in 3 of 10 attempts on the Fastly target and
   then vanished; 5 clean solo runs afterwards. Unknown cause, tracked as the
   remaining reliability risk — retries absorb it.
+
+## 0.59 — v243/v244: the two-address pin actually resolves, and the notary gets a public page (2026-11-11 14:33 UTC)
+
+### The bug the multi-address pin hid
+
+`host@a,b` was written to `/etc/hosts` as one line and both addresses were
+admitted on 443, but **`getaddrinfo` (and therefore `tokio::net::lookup_host`)
+returns only the FIRST address of a multi-address hosts line** — measured
+2026-11-11 with tokio 1.x on glibc inside the build container:
+
+```
+# /etc/hosts: 104.16.124.74 146.75.123.1 api-m.paypal.com
+lookup_host(("api-m.paypal.com", 443)) -> [104.16.124.74:443]   # only one
+```
+
+So the v243 failover never had a second candidate: `api-m.paypal.com` kept
+dialling Cloudflare, `/proxy/health` showed `zero_byte_runs` climbing on
+`104.16.124.74` and no entry at all for `146.75.123.1`. **v244** replaces the
+getaddrinfo answer for pinned names with a direct parse of `/etc/hosts`
+(`pinned_from_hosts`, IPv4-only, file order preserved, aliases honoured) and
+falls back to `lookup_host` for anything not pinned. Unit test
+`every_address_of_a_hosts_line_is_a_candidate_in_file_order` pins the shape;
+`docs/tls-proxy.md` says the file is the authority after boot.
+
+### Measured, live
+
+- **Failover works.** Three concurrent `api-m.paypal.com` sessions all dial
+  Cloudflare before any verdict is recorded (0/3, each `stalled` naming the edge;
+  `zero_byte_runs: 3`). The next session picks `146.75.123.1` and **PASSes**
+  (`last_byte_secs_ago: 3`, `zero_byte_runs: 0`). Config then reordered to
+  `api-m.paypal.com@146.75.123.1,104.16.124.74` so the serving edge is dialled
+  first and the failover is the backup rather than the hot path.
+- **`api-m.paypal.com` solo after the swap: 1/3** with two distinct verdicts —
+  one edge stall and one **60 s commit timeout** ("the prover computed its
+  commitment for 60s without sending the next message"). That second one is the
+  local debug prover under three concurrent MPC sessions, not the notary.
+- **Smoke check (solo + width-8 wave) on `www.sandbox.paypal.com/robots.txt`:
+  PASS, PASS 8/8**, wall 103 s, two slots recovered on attempt 2 — the
+  fastly-served site is unaffected by the edge-hostile api-m endpoint.
+
+### Public page
+
+`GET /notary` now serves a self-contained page (4,823 B) with the notary
+endpoint, a live `/proxy/health` fetch (including `relay_endpoints` and the
+pacing map), copy-paste prover commands, and links to `/proxy/attestations`,
+`/proxy/refusals` and `/verify.html`. It is documented in README ("Is the notary
+up? One command" + the notary section) and in the `docs/tls-proxy.md` endpoint
+table.
+
+### Two deploy cycles
+
+- Cycle A image `m-2ze5cnizkdv1ypap12bc` (disk `3ca08ef63c985711…`) → learned
+  RTMR2 **`251f9806e8228733c4a132563d0eef00c5acafbaea498e141f7159345372c10cd66e9132c5511b2de22f574cf88ea4a5`**;
+  the enclave binary is **unchanged** (`0400da03e0a6fa14…`) because only the
+  `tls-proxy` crate changed, so its pin held.
+- Cycle B + config-only pass → live image **`m-2zeetx0vmo1cat2x5hv3`** —
+  `check-auditor-pins` **OK**, `check-manifest-parity` **PARITY OK**,
+  `check-live-tls-cert` **OK**, `/notary` **200**.
+- `verify.html` == `index.html` **280,318 B**
+  **`b04e72aaf62a3d681e77f6faa7a0988065da6b52dfa504382df055e3ab281cef`**; README
+  digest rotated.
+- Relay VM **Stopped** (`StopCharging`); storage swept to **two** images /
+  **two** snapshots — live `m-2zeetx0vmo1cat2x5hv3` (`s-2zeetx0vmo1cat323x0b`)
+  and rollback v240b `m-2ze024y1756o0dtl3o35` (`s-2ze024y1756o0dtq25no`).
+  Seven superseded images and their snapshots deleted.
+
+### Skinny disk (artifact, not image)
+
+The v244c pass reported `rollback pointer: disk unknown` — the script could not
+record the previous disk id. The v240b image is still the rollback; nothing was
+lost.
