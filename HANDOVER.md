@@ -3522,3 +3522,8 @@ Running belongs to whoever started it.
   form, not a notary regression).
 - Relay VM **Stopped** after the run (`StopInstance --StoppedMode StopCharging`
   from the `EXIT` trap).
+- Storage swept back to **two** images / **two** snapshots: pass-A
+  `m-2zeiafiaongjdsosprpy` (+`s-2zeiafiaongjdsow3888`) and the superseded
+  `m-2ze4lto0m4wqw3hxx9q0` (+`s-2ze4lto0m4wqw3htj730`) deleted; v241b (live,
+  `s-2zebw9kc74ccmafedmst`) and v240b (rollback, `s-2ze024y1756o0dtq25no`)
+  remain.
