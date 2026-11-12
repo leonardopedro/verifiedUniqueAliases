@@ -3938,3 +3938,50 @@ No `ReplaceSystemDisk`, no rebuild, no pin rotation: RTMR2, the disk sha and
 Revert: drop `47.76.138.55` from the pin and redo the same three calls.
 `DESTROY=1 bash deploy-forwarder.sh` removes the instance and EIP (the VPC,
 vswitch and security group are free and left in place for a future run).
+
+## 0.64 — the hop is stood down: the deployment is one confidential VM again (2026-11-12 10:05 UTC)
+
+§0.63 is superseded. The operator's requirement is explicit: **one single
+confidential VM in Beijing** carrying both services — the login site
+(`login.airma.de` → `101.200.178.251` = `i-2ze1zdxis0hcsg91qbh5`) and the
+TLSNotary child process. The hop was a second VM with a second EIP, so it was
+removed rather than kept as an exception.
+
+### What was reverted
+
+- `services.tls_proxy.relay_targets` back to the v246 direct pins (verified: the
+  `jq` diff against the hop-era config shows only that key moving):
+  `api-m.paypal.com@146.75.123.1,104.16.124.74`,
+  `api-m.sandbox.paypal.com@146.75.123.1`,
+  `sandbox.paypal.com@151.101.195.1,146.75.123.1`,
+  `www.sandbox.paypal.com@151.101.195.1,146.75.123.1`.
+  Applied with the config-only path (`StopInstance --ForceStop` →
+  `ModifyInstanceAttribute --UserData`, readback byte-identical → `StartInstance`).
+  Backups: `/tmp/prod-config.json.bak-v246` (current), `.bak-v246-hop-api-m`,
+  `.bak-hop-sandbox` (the two hop variants, for reference).
+- Deleted in cn-hongkong: instance `i-j6ch6am4v7r2f7hdu5h5`, EIP
+  `eip-j6cfv53ika765wfbluvm9` (`47.76.138.55`), security group, vswitch, VPC,
+  imported image `m-j6chmbd22gzwymi29cql`, and the `forwarder/disk-forwarder.raw`
+  OSS object. Verified afterwards: **0 instances, 0 VPCs, 0 EIPs in cn-hongkong**.
+  The local 1 GiB `output-forwarder/` artifact was removed too.
+- Kept in the repo, explicitly marked *not deployed*: `Dockerfile.forwarder`,
+  `build-forwarder-image.sh`, `deploy-forwarder.sh` (two commands to stand it up
+  again), and the "built, measured, stood down" section in `docs/tls-proxy.md`.
+
+### Verification of the reverted layout
+
+- `/proxy/health`: `running: true`, `enabled: true`, ports 8443/8081 after boot.
+- Release check on the single VM: **solo PASS, wave 8/8 (wall 82.6 s), failover
+  PASS** (`146.75.123.1 ok/answered, 151.101.195.1 ok/answered`).
+- api-m direct, measured immediately after the revert: **1 of 3 sessions** passed
+  (`406 Not Acceptable` on the one that did). The refusal windows are live; this is
+  the cost of dropping the hop and is recorded in `docs/tls-proxy.md` rather than
+  papered over. Nothing about it is a notary fault, and the `INCONCLUSIVE` verdict
+  in the smoke check already says so.
+
+### If api-m has to work from this VM
+
+1. Re-stand the hop: `bash build-forwarder-image.sh && bash deploy-forwarder.sh`,
+   then pin it first in the target list. (Two commands; the scripts are unchanged.)
+2. Or relocate the single VM's egress — new region, new image import, and a full
+   two-cycle pin rotation, but still exactly one confidential VM.

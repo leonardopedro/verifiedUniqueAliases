@@ -315,17 +315,19 @@ diff — an inferred list can never produce the `INCONCLUSIVE` verdict, so a pin
 that is never dialled still fails loudly.
 
 `api-m.paypal.com` is the host to watch for the `INCONCLUSIVE` case
-(`--failover-host api-m.paypal.com`): from the Alibaba egress it intermittently
-refuses relayed handshakes on both of its own edges (Fastly hangs up, Cloudflare
-holds silent) for minutes at a time. Since 2026-11-12 it is pinned through a
-TCP pass-through hop in Hong Kong first — `api-m.paypal.com@47.76.138.55,…` — so
-those windows no longer reach the notary, and a probe that goes `INCONCLUSIVE`
-again means the hop itself is in trouble. The hop, how to rebuild and redeploy
-it, and the option of moving the notary's egress instead are in
-`docs/tls-proxy.md` ("Egress, and what compensates for it"). Point the probe
-explicitly with `--target www.sandbox.paypal.com/robots.txt`, skip a phase with
-`--solo-only` / `--wave-only` / `--no-failover`, or set the origin with
-`--origin` (`https://login.airma.de` by default).
+(`--failover-host api-m.paypal.com`): from the notary's Beijing egress it
+intermittently refuses relayed handshakes on both of its own edges (Fastly hangs
+up, Cloudflare holds silent) for minutes at a time, measured again on 2026-11-12
+at 1 of 3 sessions. That is the target refusing the source address, not a notary
+fault, and an `INCONCLUSIVE` verdict says exactly that. The remedies — a
+pass-through hop on an accepted egress, or moving the notary itself — are
+written up with their costs in `docs/tls-proxy.md` ("Egress, and what
+compensates for it"); the hop is **not deployed**, because the notary is one
+single confidential VM in Beijing, so wiring it in is a deliberate decision, not
+a default. Point the probe explicitly with `--target
+www.sandbox.paypal.com/robots.txt`, skip a phase with `--solo-only` /
+`--wave-only` / `--no-failover`, or set the origin with `--origin`
+(`https://login.airma.de` by default).
 
 ### Testing the notary — four tiers, cheapest first
 

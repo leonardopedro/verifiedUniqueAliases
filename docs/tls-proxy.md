@@ -213,7 +213,16 @@ row and treat a red `api-m` probe as a target finding, which is exactly what the
 names the relay address, so the first thing an auditor reads is "this notary
 reaches api-m through a forwarder".
 
-#### The pass-through relay, as built (2026-11-12)
+#### The pass-through relay: built, measured, and stood down (2026-11-12)
+
+**Not deployed.** The notary is deliberately one single confidential VM in
+Beijing, serving both the login site and TLSNotary sessions, so no second
+instance or EIP is part of the production layout. What follows is the record of
+the hop that was stood up, measured and then removed on the operator's
+instruction, plus the scripts that reproduce it in one command. Treat it as an
+available remedy, not as infrastructure that exists.
+
+##### As built on 2026-11-12
 
 | | |
 |---|---|
@@ -259,21 +268,10 @@ LIVE_NOTARY=127.0.0.1:18443 LIVE_SERVER=api-m.paypal.com \
 #   -> "relayed response status: 406 Not Acceptable", 6.9 s, transcript 85 B → 431 B
 ```
 
-Result on the deployed notary after the pin landed: **3/3 api-m sessions**,
-`relay_endpoints` showing `47.76.138.55 ok/answered` with `zero_byte_runs: 0`, and
-the release check's failover probe going from `INCONCLUSIVE` to `PASS` against
-api-m with the hop in the list.
-
-Reverting is one entry: drop `47.76.138.55` from the pin and do a config-only
-redeploy (stop → `ModifyInstanceAttribute --UserData` → start, no image rebuild and
-no pin rotation). To remove the hop itself: `DESTROY=1 bash deploy-forwarder.sh`
-(instance + EIP; the VPC/vswitch/SG are left behind because they are free).
-
-Not covered by this: `sandbox.paypal.com` and `www.sandbox.paypal.com` still dial
-Fastly from the notary's own address. The same window that used to hit api-m also
-hits that edge (`host:0a191a6a` stalled 12 times in 52 sessions on 2026-11-12,
-42/52 succeeded), and the hop is a byte pipe to the same Fastly edge, so it can
-serve them **without any change** — verified with SNI through the hop:
+Measured while it was up: **3/3 api-m sessions** on the deployed notary,
+`relay_endpoints` showing the hop `ok/answered` with `zero_byte_runs: 0`, and the
+release check's failover probe against api-m going from `INCONCLUSIVE` to `PASS`.
+It also served the sandbox names unchanged (SNI passthrough, verified):
 
 ```
 www.sandbox.paypal.com -> CN=www.sandbox.paypal.com
@@ -281,12 +279,19 @@ sandbox.paypal.com     -> CN=paypal.com            (its 301-to-www cert)
 api-m.paypal.com       -> CN=api-m.paypal.com
 ```
 
-Extending the pin to the two sandbox names is therefore a config-only change
-(`"www.sandbox.paypal.com@47.76.138.55,151.101.195.1,146.75.123.1"`), not done
-here because this change was scoped to api-m: route a host through the hop only
-after watching its edge misbehave from the notary's own address, or the hop
-silently becomes the path for every session and its own failure becomes the
-notary's.
+**Why it was removed the same day.** The deployment is meant to be *one*
+confidential VM in Beijing carrying both services — the login site and TLSNotary —
+and a hop is a second VM with a second EIP, however small. So the pins went back
+to the direct edges, and the instance, EIP, VPC, vswitch, security group, imported
+image and staged OSS object were all deleted; nothing is left running or billed.
+The scripts stay in the repo because standing it up again is two commands.
+
+The cost of that choice is visible and should be stated, not hidden: with the hop
+gone, api-m is at the mercy of those refusal windows again — **1 of 3 sessions
+succeeded on 2026-11-12 09:5x UTC**, while the sandbox hosts stayed 8/8 in the
+same minutes. If api-m availability becomes a requirement, the two options are
+the hop (two commands, see above) or relocating the single VM's egress, which
+means a new region, a new image import and a full two-cycle pin rotation.
 
 The state is visible from outside: `/proxy/health` carries `relay_endpoints` as
 `{address: {zero_byte_runs, last_byte_secs_ago}}`, next to the pacing map, so a
