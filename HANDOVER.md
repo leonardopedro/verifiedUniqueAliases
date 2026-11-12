@@ -3877,3 +3877,64 @@ refusal → target policy; a struck address outside the pins → notary fault; o
 answering pin → notary question; inferred pins → never target policy; config
 parsing incl. case-insensitivity and missing file). Stub-origin runs: target-policy
 → `INCONCLUSIVE` exit 0; one-pin strike → `FAIL` exit 1.
+
+## 0.63 — the TCP pass-through hop for api-m is live (2026-11-12 09:05 UTC)
+
+### What was stood up
+
+| | |
+|---|---|
+| **Address** | `47.76.138.55` (EIP `eip-j6cfv53ika765wfbluvm9`, pay-by-traffic, 10 Mbps) |
+| **Instance** | `i-j6ch6am4v7r2f7hdu5h5` — `ecs.e-c1m1.large`, **cn-hongkong**, private `172.16.1.138` |
+| **Software** | haproxy `mode tcp`: `bind :443` → `146.75.123.1:443` (Fastly), `104.16.124.74:443` as `backup`, `retries 2` + `option redispatch`, no health checks (a `check` would open TLS-less connections to PayPal forever) |
+| **Image** | `Dockerfile.forwarder` + `build-forwarder-image.sh` → 1 GiB BIOS disk, Debian trixie minbase, no sshd / cloud-init / cloud agent, serial GRUB, imported as a custom image in cn-hongkong |
+| **Infra** | VPC `172.16.0.0/16`, vswitch `172.16.1.0/24`, security group admitting only 443/tcp — created by `deploy-forwarder.sh`, which is idempotent and takes `DESTROY=1` |
+| **Pin** | `"api-m.paypal.com@47.76.138.55,146.75.123.1,104.16.124.74"` (hop first, both direct edges kept as fallback) |
+
+Hong Kong on purpose: the refusals are keyed to the notary's *source address*, not
+to Alibaba, and cn-hongkong is the nearest region this account already uses (the
+staging OSS bucket lives there). The hop is a byte pipe — it knows nothing about
+PayPal — so any target could use it.
+
+### Why it is safe for the audit story
+
+Nothing is terminated or re-signed at the hop. Through it the notary sees
+`CN=api-m.paypal.com`, `DigiCert Global G2 TLS RSA SHA256 2020 CA1` — PayPal's own
+chain — so the transcript, the PCR/RTMR evidence and every `verify.html` digest
+are unchanged. The only thing that changes is the address the notary dials, and
+that address is visible in the pin list, i.e. an auditor reads "this notary reaches
+api-m through a forwarder" as the first thing in its target list.
+
+### Measured
+
+- `openssl s_client -connect 47.76.138.55:443 -servername api-m.paypal.com` →
+  PayPal subject, HTTP answered in **1191 ms** (from the operator host).
+- Local notary pinned at the hop: full notarized session in **6.9 s**, transcript
+  85 B → 431 B, `406 Not Acceptable` (PayPal's answer to `GET /`).
+- Deployed notary after the config-only redeploy: **3/3 api-m sessions**,
+  `relay_endpoints: {"47.76.138.55":{"zero_byte_runs":0,...}}`, release-check
+  failover probe against api-m went **INCONCLUSIVE → PASS** with the hop in the
+  list.
+- Hop cost on the relayed handshake: **~1.6 s** (Beijing → HK → Fastly). Session
+  time is dominated by the prover↔notary MPC (20–47 s at the time of writing),
+  which the hop does not touch.
+- Same-day control, unchanged by this: the sandbox Fastly edge is still flaky from
+  the notary's own address — `host:0a191a6a` (151.101.195.1) stalled 12 times in
+  52 sessions (42 ok). The hop presents the correct certificate for those names
+  too (`CN=www.sandbox.paypal.com`, `CN=paypal.com`), so routing them through it is
+  a one-line pin change — deliberately not done here, because this change was
+  scoped to api-m and every host moved to the hop makes the hop itself a shared
+  single point of failure.
+
+### How it was applied (config-only, no image work)
+
+`/tmp/prod-config.json` `services.tls_proxy.relay_targets` — one entry changed,
+verified with a `jq` diff that only that key moved — then the documented sequence
+from `rotate-alibaba.sh`: `StopInstance --ForceStop` → `ModifyInstanceAttribute
+--UserData` (**readback sha256 byte-identical**, 6520 B b64) → `StartInstance`.
+No `ReplaceSystemDisk`, no rebuild, no pin rotation: RTMR2, the disk sha and
+`verify.html` are untouched, because the boot chain did not change.
+
+Revert: drop `47.76.138.55` from the pin and redo the same three calls.
+`DESTROY=1 bash deploy-forwarder.sh` removes the instance and EIP (the VPC,
+vswitch and security group are free and left in place for a future run).

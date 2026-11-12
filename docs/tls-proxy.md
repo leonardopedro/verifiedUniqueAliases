@@ -213,6 +213,81 @@ row and treat a red `api-m` probe as a target finding, which is exactly what the
 names the relay address, so the first thing an auditor reads is "this notary
 reaches api-m through a forwarder".
 
+#### The pass-through relay, as built (2026-11-12)
+
+| | |
+|---|---|
+| Address | **`47.76.138.55`** (EIP `eip-j6cfv53ika765wfbluvm9`) |
+| Instance | `i-j6ch6am4v7r2f7hdu5h5`, `ecs.e-c1m1.large`, cn-hongkong, private 172.16.1.138 |
+| Software | haproxy `mode tcp`, `bind :443` → `146.75.123.1:443` (Fastly), `104.16.124.74:443` backup, `retries 2` + `redispatch`, no health checks |
+| Disk | `Dockerfile.forwarder` → `build-forwarder-image.sh` → 1 GiB BIOS GPT-less disk, Debian trixie minbase, **no sshd, no cloud-init, no cloud agent**, serial GRUB; imported as a custom image |
+| Provisioning | `deploy-forwarder.sh` (idempotent: reuses VPC `172.16.0.0/16`, vswitch `172.16.1.0/24`, SG admitting only 443/tcp, EIP, instance) |
+| Pin | `"api-m.paypal.com@47.76.138.55,146.75.123.1,104.16.124.74"` — hop first, then both direct edges |
+
+Why Hong Kong: the refusal is aimed at the notary's source address, not at
+Alibaba as a whole, and `cn-hongkong` is the nearest region this account already
+uses (the staging OSS bucket lives there). Nothing about the hop is PayPal-aware —
+it is a byte pipe, so it would serve any target the notary wanted.
+
+What it costs and what it does not: one `ecs.e-c1m1.large` plus a pay-by-traffic
+EIP capped at 10 Mbps (the payload is TLS binary, a few kB per session), and about
+**1.6 s** on the relayed handshake (Beijing → HK → Fastly). It costs nothing in
+trust: the certificate the notary verifies is still PayPal's (`CN=api-m.paypal.com`,
+DigiCert Global G2), the transcript is what PayPal sent, and no audit digest moves.
+It does add one single point of failure — if the hop is down, the pin's next two
+addresses are dialled instead, which is why they stay in the list.
+
+The list order is the argument for keeping them: the hop is preferred while it
+answers (one byte from the target clears a strike), and a dead hop falls back to
+the direct edges within one session instead of taking api-m down with it.
+
+Verification, in the order it was done:
+
+```bash
+bash build-forwarder-image.sh                 # 1 GiB disk, sha256 printed
+bash deploy-forwarder.sh                      # import + VPC + SG + EIP + boot + TLS check
+#   -> "subject=C=US, ... CN=api-m.paypal.com", "HTTP answered in 1191 ms"
+
+# from the notary's network, through the hop
+openssl s_client -connect 47.76.138.55:443 -servername api-m.paypal.com
+
+# a full notarized session through it (local notary, hop pinned)
+TLS_PROXY_TARGET_ADDR=47.76.138.55:443 TLS_PROXY_LISTEN=127.0.0.1:18443 \
+  tls-proxy/target/debug/tls-proxy &
+LIVE_NOTARY=127.0.0.1:18443 LIVE_SERVER=api-m.paypal.com \
+  tls-proxy/target/debug/deps/live-… --ignored --nocapture --exact live_relay_of_a_real_website
+#   -> "relayed response status: 406 Not Acceptable", 6.9 s, transcript 85 B → 431 B
+```
+
+Result on the deployed notary after the pin landed: **3/3 api-m sessions**,
+`relay_endpoints` showing `47.76.138.55 ok/answered` with `zero_byte_runs: 0`, and
+the release check's failover probe going from `INCONCLUSIVE` to `PASS` against
+api-m with the hop in the list.
+
+Reverting is one entry: drop `47.76.138.55` from the pin and do a config-only
+redeploy (stop → `ModifyInstanceAttribute --UserData` → start, no image rebuild and
+no pin rotation). To remove the hop itself: `DESTROY=1 bash deploy-forwarder.sh`
+(instance + EIP; the VPC/vswitch/SG are left behind because they are free).
+
+Not covered by this: `sandbox.paypal.com` and `www.sandbox.paypal.com` still dial
+Fastly from the notary's own address. The same window that used to hit api-m also
+hits that edge (`host:0a191a6a` stalled 12 times in 52 sessions on 2026-11-12,
+42/52 succeeded), and the hop is a byte pipe to the same Fastly edge, so it can
+serve them **without any change** — verified with SNI through the hop:
+
+```
+www.sandbox.paypal.com -> CN=www.sandbox.paypal.com
+sandbox.paypal.com     -> CN=paypal.com            (its 301-to-www cert)
+api-m.paypal.com       -> CN=api-m.paypal.com
+```
+
+Extending the pin to the two sandbox names is therefore a config-only change
+(`"www.sandbox.paypal.com@47.76.138.55,151.101.195.1,146.75.123.1"`), not done
+here because this change was scoped to api-m: route a host through the hop only
+after watching its edge misbehave from the notary's own address, or the hop
+silently becomes the path for every session and its own failure becomes the
+notary's.
+
 The state is visible from outside: `/proxy/health` carries `relay_endpoints` as
 `{address: {zero_byte_runs, last_byte_secs_ago}}`, next to the pacing map, so a
 failover is something an operator reads instead of inferring from a success

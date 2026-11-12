@@ -1,0 +1,112 @@
+# =============================================================================
+# Dockerfile.forwarder - Minimal 1 GiB TCP pass-through helper (haproxy).
+#
+# Why this exists: PayPal's api-m edges intermittently refuse the notary's
+# source address on every pinned address at once, and an address change cannot
+# fix a refusal aimed at the source. This helper is a byte-level TCP forwarder
+# on a different egress: the notary pins `api-m.paypal.com@<its IP>`, the TLS
+# handshake passes through UNTOUCHED, and the certificate the notary verifies
+# is still PayPal's. Nothing is terminated, inspected or re-signed here - which
+# is exactly why the transcript, the measurement audit and verify.html do not
+# change (see docs/tls-proxy.md, "Egress, and what compensates for it").
+#
+# Deliberately as bare as the OSS relay: Debian trixie minbase, no sshd, no
+# cloud-init, no cloud agent. The one thing it does not share with that image
+# is the poweroff: a forwarder has to stay up.
+# =============================================================================
+FROM debian@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        debootstrap fdisk e2fsprogs grub-common grub-pc-bin \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- rootfs (minbase + kernel + haproxy) -----------------------------------
+RUN debootstrap --variant=minbase --arch=amd64 \
+        --include=systemd-sysv,linux-image-cloud-amd64,haproxy,iproute2,ca-certificates \
+        trixie /rootfs http://deb.debian.org/debian
+
+# ---- chroot configuration ---------------------------------------------------
+RUN set -e; \
+    echo 'forwarder' > /rootfs/etc/hostname; \
+    printf '127.0.0.1 localhost\n127.0.1.1 forwarder\n' > /rootfs/etc/hosts; \
+    printf '/dev/vda1 / ext4 defaults 0 1\n' > /rootfs/etc/fstab; \
+    mkdir -p /rootfs/etc/systemd/network; \
+    printf '[Match]\nName=en* eth*\n\n[Network]\nDHCP=yes\n' \
+        > /rootfs/etc/systemd/network/10-dhcp.network; \
+    ln -sf /lib/systemd/system/systemd-networkd.service \
+        /rootfs/etc/systemd/system/multi-user.target.wants/systemd-networkd.service; \
+    ln -sf /lib/systemd/system/haproxy.service \
+        /rootfs/etc/systemd/system/multi-user.target.wants/haproxy.service; \
+    # Static resolvers: haproxy dials literal addresses and never resolves, but
+    # a dangling resolv.conf turns every later debug session into a dead end -
+    # and that exact bug already cost a night on the relay image.
+    printf 'nameserver 100.100.2.136\nnameserver 100.100.2.138\n' \
+        > /rootfs/etc/resolv.conf; \
+    # stable kernel/initrd names for grub
+    ln -sf "$(cd /rootfs/boot && ls vmlinuz-* | head -1)" /rootfs/boot/vmlinuz; \
+    ln -sf "$(cd /rootfs/boot && ls initrd.img-* | head -1)" /rootfs/boot/initrd.img
+
+# ---- the forwarder itself ---------------------------------------------------
+# mode tcp: no HTTP parsing, no header rewriting, no certificate of our own.
+# The two upstreams are api-m's pinned edges in the notary's config, Fastly
+# first (the one that answered through 2026-11-11) and Cloudflare as a backup
+# dialled only when the first refuses the connection (retries + redispatch).
+# No health checks on purpose: a `check` here would open a TLS-less connection
+# to PayPal every couple of seconds forever.
+RUN set -e; mkdir -p /rootfs/etc/haproxy /rootfs/etc/sysctl.d; \
+    printf '%s\n' \
+      'global' \
+      '    log stdout format raw local0' \
+      '    maxconn 64' \
+      '' \
+      'defaults' \
+      '    mode tcp' \
+      '    log global' \
+      '    option tcplog' \
+      '    option dontlognull' \
+      '    timeout connect 5s' \
+      '    timeout client 60s' \
+      '    timeout server 60s' \
+      '    retries 2' \
+      '    option redispatch' \
+      '' \
+      'frontend api_m_passthrough' \
+      '    bind *:443' \
+      '    default_backend api_m_edges' \
+      '' \
+      'backend api_m_edges' \
+      '    server fastly 146.75.123.1:443' \
+      '    server cloudflare 104.16.124.74:443 backup' \
+      > /rootfs/etc/haproxy/haproxy.cfg; \
+    printf '%s\n' \
+      'net.ipv4.tcp_keepalive_time = 60' \
+      'net.ipv4.tcp_fin_timeout = 15' \
+      > /rootfs/etc/sysctl.d/50-forwarder.conf
+
+# ---- serial console GRUB (visible over GetInstanceConsoleOutput) -----------
+RUN set -e; mkdir -p /rootfs/boot/grub; \
+    printf '%s\n' \
+      'serial --unit=0 --speed=115200' \
+      'terminal_output serial' \
+      'set default=0' \
+      'set timeout=0' \
+      'menuentry "forwarder" {' \
+      '  linux /boot/vmlinuz root=/dev/vda1 ro console=ttyS0,115200n8 console=tty0 net.ifnames=0 loglevel=6 earlyprintk=serial,ttyS0,115200' \
+      '  initrd /boot/initrd.img' \
+      '}' \
+      > /rootfs/boot/grub/grub.cfg
+
+# ---- assemble the 1 GiB raw disk (no loop devices anywhere) ----------------
+RUN set -e; \
+    truncate -s 1G /disk-forwarder.raw; \
+    printf 'label: dos\nstart=2048, size=2095104, type=83, bootable\n' | sfdisk /disk-forwarder.raw; \
+    mke2fs -F -t ext4 -q -E offset=1048576 -d /rootfs /disk-forwarder.raw; \
+    # GRUB i386-pc: boot code in MBR (bytes 0..440, partition table preserved),
+    # core image in the post-MBR gap.
+    grub-mkimage -O i386-pc -p '(hd0,msdos1)/boot/grub' -o /core.img \
+        biosdisk part_msdos ext2 linux configfile normal search gzio reboot; \
+    dd if=/usr/lib/grub/i386-pc/boot.img of=/disk-forwarder.raw bs=440 count=1 conv=notrunc; \
+    dd if=/core.img of=/disk-forwarder.raw bs=512 seek=1 conv=notrunc; \
+    echo "disk assembled: $(stat -c%s /disk-forwarder.raw) bytes"

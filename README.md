@@ -314,11 +314,14 @@ credentials), and only failing both does it infer the addresses from the health
 diff — an inferred list can never produce the `INCONCLUSIVE` verdict, so a pin
 that is never dialled still fails loudly.
 
-`api-m.paypal.com` is the known way to see the `INCONCLUSIVE` case:
-`--failover-host api-m.paypal.com`. From the Alibaba egress it intermittently
-refuses relayed handshakes on both pinned addresses (Fastly hangs up, Cloudflare
-holds silent) for minutes at a time, while the same notary serves every sandbox
-host and a local notary on a European egress notarizes api-m in 5 s. See
+`api-m.paypal.com` is the host to watch for the `INCONCLUSIVE` case
+(`--failover-host api-m.paypal.com`): from the Alibaba egress it intermittently
+refuses relayed handshakes on both of its own edges (Fastly hangs up, Cloudflare
+holds silent) for minutes at a time. Since 2026-11-12 it is pinned through a
+TCP pass-through hop in Hong Kong first — `api-m.paypal.com@47.76.138.55,…` — so
+those windows no longer reach the notary, and a probe that goes `INCONCLUSIVE`
+again means the hop itself is in trouble. The hop, how to rebuild and redeploy
+it, and the option of moving the notary's egress instead are in
 `docs/tls-proxy.md` ("Egress, and what compensates for it"). Point the probe
 explicitly with `--target www.sandbox.paypal.com/robots.txt`, skip a phase with
 `--solo-only` / `--wave-only` / `--no-failover`, or set the origin with
