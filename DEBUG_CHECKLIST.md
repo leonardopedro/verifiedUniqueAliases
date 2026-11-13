@@ -124,6 +124,8 @@ channel row checks.
 node scripts/test-verify-security.mjs                 # static + fixture harness
 CHROMIUM_PATH=$(command -v chromium) \
   node scripts/e2e-login-download.mjs                # live browser login → download → audit
+CHROMIUM_PATH=$(command -v chromium) \
+  node scripts/e2e-login-notarize.mjs                 # live browser login → notarise (all/headers/match) → assert no credential leaks
 ```
 
 The harness reads `verify.html`, `index.html`, `zk.html`, `zk-rsa.html` and
