@@ -31,6 +31,11 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Browsers cannot open a raw socket, so the session listener also accepts a
+# WebSocket upgrade (see `ws_bridge`): the extension is a prover without a CLI.
+tokio-tungstenite = "0.26"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+
 # Attestation signing reuses the same primitives the enclave's PayPal flow
 # already ships (OpenSSL + SHA-256), so the auditor needs no new verifier.
 openssl = "0.10"

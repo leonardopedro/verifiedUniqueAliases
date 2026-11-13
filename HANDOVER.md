@@ -3985,3 +3985,79 @@ removed rather than kept as an exception.
    then pin it first in the target list. (Two commands; the scripts are unchanged.)
 2. Or relocate the single VM's egress — new region, new image import, and a full
    two-cycle pin rotation, but still exactly one confidential VM.
+
+## 0.65 — v247: the notary speaks WebSocket, and selective reveals are findable (2026-11-13 16:40 UTC)
+
+The browser extension (`../primus-kaito`) can now use this notary as a plain
+webservice — no CLI, and the user's own logged-in browser session is what gets
+attested. Selective transcript reveal landed with it. Two things are worth
+knowing before touching either end.
+
+### The endpoint is the EIP, not the domain
+
+The session port `8443` now accepts **both** protocols: it peeks the first bytes
+for `GET ` (non-destructive, bytes are replayed) and either bridges the socket to
+a WebSocket message pipe or hands it to the raw TLSNotary codec. One port, one
+process, no new listener and no new firewall hole.
+
+That makes the endpoint nameable, and the nameable form is the one that fails:
+
+```
+ws://login.airma.de:8443/          -> HTTP/1.1 403, Server: Beaver   (ICP interceptor)
+ws://101.200.178.251:8443/         -> HTTP/1.1 101 Switching Protocols
+```
+
+A plaintext HTTP upgrade carrying an unfiled-domain `Host` never reaches the
+enclave — Alibaba's ICP front answers it itself. Dial the EIP instead and the
+upgrade arrives. The extension therefore keeps `https://login.airma.de` as the
+attestation origin (TLS, filed domain, valid cert) and uses `ws://<EIP>:8443/`
+only for the session channel. The `Host` header the interceptor keys on is
+simply the IP. If the EIP ever changes, `src/services/tlsn/config.js` in the
+extension is the one place to edit; the notary needs nothing.
+
+### Selective reveal and the digest pair
+
+A prover may now reveal only ranges of the transcript (`headers`, `match`, or
+`all`); everything else stays hidden. The notary signs the **full transcript
+length with the withheld bytes zero-filled**, and
+`GET /proxy/attestations/<id>` is keyed by `sha256` of exactly that buffer.
+
+That is not a detail — hashing the full transcript (the old prover behaviour)
+or the concatenated revealed bytes both produce a session that verifies
+perfectly and is then **unfindable** in the public listing ("the origin lists N
+session(s) but none accepts this transcript"). The prover must mask, not slice.
+Measured on this deployment: `headers` 849/3477 bytes revealed, `User-agent`
+match 890/3477, `all` 3477/3477 — and the record is found in all three.
+
+Request lines `cookie:`, `authorization:` and `proxy-authorization:` are always
+stripped from the reveal regardless of mode, because the records are public.
+The extension forwards the browser's cookies for the PayPal host (granted in
+its manifest) so the attested request is the user's logged-in session; the page
+itself is never touched.
+
+### Release
+
+- Disk `d-2ze3guu05v68xvf3sdzj` (1 GiB) from image **`m-zeh0ukk9ghbqyz20pk3`**
+  (`tlsproxy-ws2-20261113`, `NvmeSupport=supported`). Rollback image
+  `m-zeht6xe70y29n247a4q` (v246) is still Available.
+- Initramfs changed, so RTMR2 rotated: `313a87c6…` → `f27bbe6e…`
+  (MRTD/RTMR0/RTMR1/RTMR3 unchanged). `verify.html` = 280318 B,
+  sha256 `27dcd46a7888a1a34ccc0488fd08bc3398aeb34d91d128871fe5f9264c54526b`;
+  `index.html` re-mirrored. The served `/verify.html` is still the compiled-in
+  landing page, so the served digest is **not** a pin check — use
+  `scripts/check-manifest-parity.mjs`, which reported **PARITY OK** (6 same,
+  1 excluded) against the live disk.
+- Transfer path (Beijing buckets refuse the public OSS endpoint account-wide,
+  `PublicEndpointForbidden`, and `aliyun oss sign` cannot presign a PUT): local
+  → HK staging bucket → relay instance Cloud Assistant shell (HK GET → Beijing
+  PUT signed in `python3` with instance-role STS) → `ImportImage`. A temporary
+  instance RAM role was attached for the PUT and detached afterwards; the relay
+  instance was stopped with `--StoppedMode StopCharging`.
+- Verification: live WS upgrade `101`, both services up ~60 s after start,
+  `/proxy/health` 200, `check-auditor-pins.mjs` **OK** (README digest and size
+  match, `index.html` byte-identical), `test-verify-security.mjs`
+  **511 passed / 0 failed**, and a headless-extension E2E over all three reveal
+  modes plus a seeded-cookie run (cookie forwarded, value absent from the body).
+- Known and unchanged: sessions can still be refused by the target's edge
+  (`151.101.195.1` closing without a handshake byte). Those are retries, not
+  notary faults, and are the same windows recorded in 0.55/0.61.

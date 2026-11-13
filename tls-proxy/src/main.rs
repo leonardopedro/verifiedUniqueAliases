@@ -78,7 +78,9 @@ use base64::Engine as _;
 use openssl::{hash::MessageDigest, pkey::PKey, rsa::Rsa, sign::Signer, x509::X509};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::{error, info, warn};
@@ -108,6 +110,13 @@ const MAX_STORED_ATTESTATIONS: usize = 256;
 /// while an operator is looking; a ring, because they are diagnostic, not
 /// evidence, and a peer can produce them at will.
 const MAX_STORED_REFUSALS: usize = 32;
+/// Bytes a WebSocket-bridged session may have in flight between the pump and the
+/// protocol. Large enough that framing never throttles the MPC, small enough
+/// that one browser session cannot size the guest's memory.
+const WS_BRIDGE_BUFFER: usize = 256 * 1024;
+/// Read size of the pump in each direction: one TLS record or MPC message fits
+/// comfortably, and anything larger is split across frames.
+const WS_FRAME_BYTES: usize = 64 * 1024;
 /// A refusal reason quotes the prover's own commit (the site name it chose), so
 /// it is capped before it is stored.
 const MAX_REFUSAL_REASON_CHARS: usize = 400;
@@ -816,7 +825,90 @@ enum SessionOutcome {
     Stalled(String),
 }
 
-async fn handle_session(stream: TcpStream, peer: SocketAddr, st: Arc<ProxyState>) {
+/// How many bytes the peek needs before it can tell an HTTP request from the
+/// TLSNotary handshake. `GET ` is unambiguous: the protocol's first bytes are a
+/// length prefix, never ASCII.
+async fn is_websocket_handshake(stream: &TcpStream) -> bool {
+    let mut head = [0u8; 4];
+    match stream.peek(&mut head).await {
+        // An HTTP request line starts with a method; a browser's upgrade is the
+        // only one this port ever sees, and a CLI prover never sends one.
+        Ok(n) if n >= 4 => &head == b"GET ",
+        _ => false,
+    }
+}
+
+/// Accept a WebSocket on a connection that has already spoken HTTP, and hand
+/// back one end of a byte pipe the TLSNotary session can use.
+///
+/// The protocol is byte-oriented and does not care about framing, so the
+/// bridge is a straight pump: every binary frame becomes bytes the session
+/// reads, every byte the session writes becomes a binary frame. Keeping it
+/// dumb is deliberate — anything smarter (a message protocol, acks) would be a
+/// second protocol to keep in step with tlsn.
+///
+async fn ws_bridge(stream: TcpStream, peer: SocketAddr) -> Option<tokio::io::DuplexStream> {
+    let ws = match tokio_tungstenite::accept_async(stream).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            warn!("session from {peer}: WebSocket upgrade failed: {e}");
+            return None;
+        }
+    };
+    info!("session from {peer}: WebSocket transport");
+
+    let (session_io, mut pump_io) = tokio::io::duplex(WS_BRIDGE_BUFFER);
+    let (mut sink, mut source) = ws.split();
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; WS_FRAME_BYTES];
+        loop {
+            tokio::select! {
+                frame = source.next() => match frame {
+                    Some(Ok(tungstenite::Message::Binary(bytes))) => {
+                        if pump_io.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(tungstenite::Message::Ping(payload))) => {
+                        if sink.send(tungstenite::Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(tungstenite::Message::Close(_))) | None => break,
+                    // Text frames are not part of this transport; the prover
+                    // side is a byte pipe, so ignore rather than error.
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                },
+                read = pump_io.read(&mut buf) => match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sink
+                            .send(tungstenite::Message::Binary(buf[..n].to_vec().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                },
+            }
+        }
+        // Dropping the pipe end is the session's EOF.
+        drop(pump_io);
+    });
+
+    Some(session_io)
+}
+
+/// One accepted session, whatever carried it: a raw TCP connection from a CLI
+/// prover, or a WebSocket from a browser (a browser cannot open a raw socket,
+/// so the same port also speaks WebSocket — see [`ws_bridge`]).
+async fn handle_session<S>(stream: S, peer: SocketAddr, st: Arc<ProxyState>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     st.sessions_total.fetch_add(1, Ordering::Relaxed);
     info!("session from {peer}: accepted");
 
@@ -856,9 +948,10 @@ async fn handle_session(stream: TcpStream, peer: SocketAddr, st: Arc<ProxyState>
     }
 }
 
-async fn run_session(stream: TcpStream, peer: SocketAddr, st: &ProxyState) -> SessionOutcome {
-    stream.set_nodelay(true).ok();
-
+async fn run_session<S>(stream: S, peer: SocketAddr, st: &ProxyState) -> SessionOutcome
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // Where the session got to. A stall with no verdict is otherwise
     // indistinguishable from a slow prover, and the address the notary was
     // dialling is the one fact an operator needs: it comes from the boot-time
@@ -1725,7 +1818,26 @@ async fn main() -> Result<(), BoxError> {
                 // and spawn.
                 st.active_sessions.fetch_add(1, Ordering::SeqCst);
                 in_flight.spawn(async move {
-                    handle_session(stream, peer, st.clone()).await;
+                    // Browsers cannot open a raw socket, so the same listener
+                    // takes a WebSocket upgrade and bridges it to the same
+                    // session code. The peek is non-destructive: a CLI prover's
+                    // first bytes are still there for the protocol.
+                    if is_websocket_handshake(&stream).await {
+                        match ws_bridge(stream, peer).await {
+                            Some(io) => handle_session(io, peer, st.clone()).await,
+                            None => {
+                                st.remember_refusal(
+                                    "upgrade",
+                                    "WebSocket upgrade did not complete; the browser closed before the socket did"
+                                        .into(),
+                                );
+                                st.sessions_failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    } else {
+                        stream.set_nodelay(true).ok();
+                        handle_session(stream, peer, st.clone()).await;
+                    }
                     st.active_sessions.fetch_sub(1, Ordering::SeqCst);
                 });
             }
