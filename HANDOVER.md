@@ -4061,3 +4061,54 @@ itself is never touched.
 - Known and unchanged: sessions can still be refused by the target's edge
   (`151.101.195.1` closing without a handshake byte). Those are retries, not
   notary faults, and are the same windows recorded in 0.55/0.61.
+
+### The logged-in session, verified end to end
+
+A real PayPal sandbox login (the project test buyer) followed by three
+notarised sessions on the same browser profile, driven through the extension's
+Notary page and then read back from `/proxy/attestations`:
+
+| reveal | record | transcript | disclosed | status |
+|---|---|---|---|---|
+| `headers` | `fc513b3cf8495cc41c31839240741e7f` | 1695 sent / 150960 received | 220 + 5135 B | 200 OK |
+| `match "User-agent"` | `69040592a047f6a50692a89a73f2b5fa` | 1695 / 150960 | 220 + 5135 B | 200 OK |
+| `all` | `6b85e016a39cb092aae629f8f86a36dc` | 1695 / 150960 | 220 + 150960 B | 200 OK |
+
+The extension read **20 cookies** for `www.sandbox.paypal.com` and forwarded all
+20; the attested page was the logged-in account summary, not a redirect. The
+revealed request is `GET /myaccount/summary HTTP/1.1` followed by zero-filled
+bytes, then `host:`/`connection: close`/`user-agent:` — **no `cookie:` header,
+and no cookie value anywhere in the revealed request**. Record lengths equal the
+served transcript lengths, so the digest pair still keys them.
+
+Two things this run settled:
+
+- **`match` searches the request as well as the response** (`worker.js`,
+  `revealRanges`), case-insensitively, and says so when the needle is not in the
+  response (`warning: the response does not contain "…"` / `it matched the
+  request only`). Before this, `User-agent` — a request header — could never be
+  used, and the error blamed the response for something it could not contain. A
+  needle that only hits a withheld request line (cookie/authorization) is
+  reported as withheld and never disclosed.
+- **Path matters**: `/` answers `302 Found` with a 59-byte body, which no needle
+  can match; use a page that answers 200 while logged in. And a response may
+  echo its own preference cookies into its HTML (`ts_c`, `LANG`,
+  `enforce_policy` on PayPal) — that is the target disclosing them, keyed by the
+target, not the prover leaking the request.
+
+The run is committed as **`scripts/e2e-login-notarize.mjs`** — Node built-ins
+and the DevTools protocol only, no `npm install`, because the extension needs a
+Chromium started with `--load-extension` and Playwright's bundled *headless
+shell* cannot load extensions at all:
+
+```
+CHROMIUM_PATH=$(command -v chromium) node scripts/e2e-login-notarize.mjs
+MODES=match NEEDLE=User-agent ATTEST_PATH=/myaccount/summary ...   # narrower run
+```
+
+It fails (exit 1, naming the check) unless the login leaves `/signin`, the
+cookie jar is readable, every mode produces a signed record, the record's
+lengths match the transcript it serves, the target answered 200, and no cookie
+header or live cookie value reached the revealed request. Exit 2 means no
+Chromium/extension build. Transient target-edge refusals are retried three times
+before a failure is recorded.
