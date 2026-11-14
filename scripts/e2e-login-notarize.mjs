@@ -35,6 +35,10 @@
 //                  REQUEST header on purpose: it only became usable once the
 //                  match search covered the request too)
 //   KEEP_PROFILE   keep the throwaway browser profile for debugging
+//   COOKIE_MODE    'browser' (default) reads cookies from the browser jar, or
+//                  'manual' pastes a Cookie header into the Notary page — the
+//                  path a user takes when they want to control the session
+//
 //
 // Exit code 0 = login completed, cookies were forwarded, every mode produced a
 // signed record, and no credential reached the revealed request. 1 = an
@@ -56,6 +60,7 @@ const EMAIL = process.env.PPEMAIL || 'sb-fuobx47090577@personal.example.com';
 const PASSWORD = process.env.PPPASS || '4&itWr>M';
 const MODES = (process.env.MODES || 'headers,match,all').split(',').map((m) => m.trim()).filter(Boolean);
 const NEEDLE = process.env.NEEDLE || 'User-agent';
+const COOKIE_MODE = (process.env.COOKIE_MODE || 'browser').toLowerCase(); // 'browser' | 'manual'
 const PORT = Number(process.env.CDP_PORT || 9336);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log(...a);
@@ -217,6 +222,7 @@ try {
     `chrome.cookies.getAll({ url: 'https://${HOST}/' }).then((cs) => cs.map((c) => ({ name: c.name, value: c.value })))`
   );
   const distinctive = jar.filter((c) => c.value && c.value.length > 6);
+  const cookieHeader = jar.map((c) => `${c.name}=${c.value}`).join('; ');
   log(`cookies readable for ${HOST}: ${jar.length}`);
   check(jar.length > 0, 'the extension can read the logged-in cookie jar');
 
@@ -225,7 +231,12 @@ try {
       document.getElementById('host').value = ${JSON.stringify(HOST)};
       document.getElementById('path').value = ${JSON.stringify(PATH)};
       document.getElementById('notary').value = ${JSON.stringify(NOTARY_WS)};
-      document.getElementById('useCookies').checked = true;
+      const manual = ${JSON.stringify(COOKIE_MODE === 'manual')};
+      document.getElementById('useCookies').checked = !manual;
+      const ta = document.getElementById('manualCookie');
+      ta.value = manual ? ${JSON.stringify(cookieHeader)} : '';
+      ta.dispatchEvent(new Event('input'));
+      ta.dispatchEvent(new Event('change'));
       const sel = document.getElementById('reveal');
       sel.value = ${JSON.stringify(reveal.mode)};
       sel.dispatchEvent(new Event('change'));
@@ -264,9 +275,12 @@ try {
       run = await notarize(reveal);
     }
     for (const line of run.text.split('\n')) {
-      if (/sending \d|notarised|revealed \d|warning|withheld|record|failed/.test(line)) {
+      if (/sending \d|notarised|revealed \d|warning|withheld|record|failed|using a pasted/.test(line)) {
         log(`  | ${line.trim()}`);
       }
+    }
+    if (COOKIE_MODE === 'manual') {
+      check(/using a pasted Cookie header/.test(run.text), `${mode}: the manual cookie-paste path was used`);
     }
     check(/signed record found/.test(run.text), `${mode}: the notary published a signed record for this session`);
     if (!run.link) continue;
@@ -322,4 +336,4 @@ if (failures.length) {
   for (const f of failures) console.error(`  - ${f}`);
   process.exit(1);
 }
-log('\nPASS — logged-in session notarised through the extension; records disclose only the chosen ranges.');
+log(`\nPASS — logged-in session notarised through the extension (${COOKIE_MODE} cookie path); records disclose only the chosen ranges.`);
